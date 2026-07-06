@@ -5,17 +5,57 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "coastal_sst_data"
 version = "0.0.1"
+description = "Acquire and grid coastal SST and covariate data products into analysis-ready datacubes."
+readme = "README.md"
 requires-python = ">=3.10"
+authors = [{ name = "Jack Buckner" }]
+keywords = ["sea-surface-temperature", "remote-sensing", "coastal", "xarray", "zarr", "ECOSTRESS", "MODIS"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+# Core runtime deps: everything needed to load a config, build the grids, run the
+# always-available stages (MUR/ECOSTRESS/MODIS acquisition + datacube assembly).
+# Feature backends with heavier or narrower deps are lazy-imported and live in the
+# optional-dependencies extras below, so the base install stays lean.
+dependencies = [
+    "numpy",
+    "pandas",
+    "xarray",
+    "pydantic>=2",
+    "pyyaml",
+    "pyproj",
+    "shapely",
+    "affine",
+    "rasterio",
+    "rioxarray",
+    "requests",
+    "earthaccess",
+    "zarr>=3",
+    "numcodecs",
+    "scipy",
+]
+
+[project.optional-dependencies]
+# Per-product backends -- install only what your config selects.
+landsat = ["planetary-computer", "pystac-client"]        # landsat_pc source
+landcover = ["planetary-computer", "pystac-client"]      # landcover_esa source
+modis = ["pyresample"]                                    # swath -> grid resampling
+met = ["herbie-data", "gcsfs", "pyresample"]              # HRRR + ARCO-ERA5 forcing
+tides = ["pytides2"]                                      # NOAA CO-OPS harmonic synthesis
+tides-global = ["eo-tides"]                               # global tide-model backup
+plot = ["matplotlib", "cartopy"]                          # `grids --plot` maps
+# Convenience bundles.
+all = [
+    "planetary-computer", "pystac-client", "pyresample",
+    "herbie-data", "gcsfs", "pytides2", "eo-tides",
+    "matplotlib", "cartopy",
+]
+dev = ["pytest"]
 
 [project.scripts]
 coastal-sst-data = "coastal_sst_data.cli:main"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-
-[project.optional-dependencies]
-dev = ["pytest"]

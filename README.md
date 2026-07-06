@@ -40,6 +40,145 @@ regions:
         buffer_ns_km: 25
         buffer_ew_km: 15
 ```
+## Installation and basic usage
+
+### Requirements
+
+Python **3.10+** (the environment pins 3.11). The package leans on a heavy geospatial stack — `rasterio`, `rioxarray`, `pyproj`, `xarray`, `zarr`, `earthaccess`, `pyresample` — so **conda/mamba is strongly recommended** over a bare `pip` install, which would leave you to source the compiled GDAL/PROJ libraries yourself.
+
+### Install (recommended: conda / mamba)
+
+```bash
+git clone <repository-url> coastal_sst_data
+cd coastal_sst_data
+
+mamba env create -f environment.yml       # or: conda env create -f environment.yml
+conda activate coastal_sst_data
+```
+
+The environment file installs the package itself in editable mode (its `pip:` section runs `pip install -e ".[dev]"`), so the `coastal-sst-data` command is on your path as soon as the env is active. Confirm the install with:
+
+```bash
+coastal-sst-data --help
+pytest                                     # optional: run the test suite
+```
+
+To pick up dependency changes later (e.g. after a `git pull`):
+
+```bash
+mamba env update -f environment.yml --prune
+```
+
+Two optional extras are used only if present: **cartopy** (coastlines on the `grids --plot` maps) and a downloaded **eo-tides** model directory (the global tide backup — see the [Tides](#tides) section). Neither is required for a normal run.
+
+### Install (pip only)
+
+The package declares its runtime dependencies in `pyproject.toml`, so a plain `pip install` pulls everything the core needs (config, grids, MUR/ECOSTRESS/MODIS acquisition, and datacube assembly):
+
+```bash
+pip install -e .              # from a clone (editable)
+pip install .                 # from a clone (copy)
+```
+
+**Optional feature backends** are split into extras so you install only what your config uses. Add them in brackets:
+
+| Extra | Enables |
+| --- | --- |
+| `landsat`, `landcover` | Planetary Computer sources (`planetary-computer`, `pystac-client`) |
+| `modis` | swath→grid resampling (`pyresample`) |
+| `met` | HRRR + ERA5 forcing (`herbie-data`, `gcsfs`, `pyresample`) |
+| `tides` | NOAA CO-OPS backend (`pytides2`) |
+| `tides-global` | global tide-model backup (`eo-tides`) |
+| `plot` | `grids --plot` maps (`matplotlib`, `cartopy`) |
+| `all` | every feature backend at once |
+
+```bash
+pip install ".[landsat,met,plot]"    # just the backends you need
+pip install ".[all]"                 # the lot
+```
+
+The caveat is unchanged: the compiled geospatial libraries (GDAL via `rasterio`/`rioxarray`/`pyproj`, and `cartopy`) install far more reliably from conda-forge than from PyPI. For a pip-first setup make sure those resolve on your platform (they ship manylinux/macOS wheels, but a conda base is still the smoother path).
+
+### Use it in another project (as a library)
+
+Once installed, `coastal_sst_data` is importable from any project or working directory — an editable install is on the environment's path globally, not tied to a directory. The CLI is a thin wrapper over a small public API you can call directly:
+
+```python
+import coastal_sst_data as csd
+
+project = csd.load_config("config.yaml")     # validated Project
+grids = csd.project_grids(project)           # {aoi_name: AoiGrid}, computed once
+csd.run_pipeline(project, assemble=True)     # acquire everything, then build the cubes
+```
+
+To depend on it from another project, install it from a path or git (adding whichever extras that project needs):
+
+```bash
+pip install "/path/to/coastal_sst_data[met,plot]"
+pip install "coastal_sst_data[all] @ git+https://<host>/<repo>.git"
+```
+
+The simplest way to reuse it across projects is to `conda activate coastal_sst_data` (the env from the recommended install) and import it there — no per-project install needed.
+
+### Credentials
+
+Most data products stream from open archives that need **no login** (Landsat, land-cover, bathymetry, met, tides). Only **ECOSTRESS, MODIS, and MUR** require a free [NASA Earthdata](https://urs.earthdata.nasa.gov) account, and secrets never go in the config — they live in `~/.netrc` (or env vars). See [Authenticating to data services](#authenticating-to-data-services) for the details.
+
+### Basic usage
+
+**1. Write a config.** A project is one YAML file describing the time range, the areas of interest (grouped into regions), and which products to acquire. A minimal example:
+
+```yaml
+name: my_project
+output_dir: ./data                 # where everything is written
+
+time:
+  start_date: "2023-07-01"
+  end_date: "2023-07-31"
+
+auth:
+  earthdata:
+    auth_strategy: netrc           # only needed because mur/ecostress are selected
+
+products:
+  mur:                             # gap-free SST backbone   (NASA Earthdata)
+  ecostress:                       # high-res thermal scenes (NASA Earthdata)
+  bathymetry:                      # static depth covariate  (no login)
+  landcover:                       # static water mask       (no login)
+  tides:                           # tide-height forcing     (no login)
+
+regions:
+  - name: oregon_coast
+    areas:
+      - name: tillamook_bay
+        center_lat: 45.52
+        center_lon: -123.925
+        buffer_ns_km: 25
+        buffer_ew_km: 15
+```
+
+A fuller, annotated example lives at [`examples/config.test.yaml`](examples/config.test.yaml). Every product's options (and which are set at the project vs. region level) are documented under [Data sources](#data-sources).
+
+**2. Sanity-check, then run.** Build up from the cheap offline checks to the full run:
+
+```bash
+coastal-sst-data validate --config config.yaml           # config valid? products implemented?
+coastal-sst-data grids    --config config.yaml --plot     # do the AOIs land where you expect?
+coastal-sst-data verify   --config config.yaml            # do the Earthdata credentials connect?
+coastal-sst-data run      --config config.yaml --assemble # acquire everything, then build the cubes
+```
+
+**3. Use the result.** Acquisition writes one aligned file per product under `output_dir` (e.g. `data/ECOSTRESS/aligned/<aoi>/…`), and `--assemble` knits them into one analysis-ready Zarr cube per AOI:
+
+```python
+import xarray as xr
+
+cube = xr.open_zarr("data/datacube/tillamook_bay.zarr")
+print(cube)                        # sensors, covariates, masks on a common daily grid
+cube["eco_sst"].isel(time=0).plot()
+```
+
+See [Command line interface](#command-line-interface) below for every subcommand and flag.
 
 ## Command line interface
 

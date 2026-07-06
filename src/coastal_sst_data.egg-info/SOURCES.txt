@@ -27,6 +27,7 @@ tests/test_auth.py
 tests/test_bathymetry.py
 tests/test_cli.py
 tests/test_config.py
+tests/test_datacube.py
 tests/test_ecostress.py
 tests/test_grid.py
 tests/test_landcover_esa.py

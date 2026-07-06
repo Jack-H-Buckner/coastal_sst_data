@@ -1,13 +1,30 @@
-# Conda/mamba environment for OCEANSR (recommended path for the geospatial stack).
+# Conda/mamba environment for coastal_sst_data -- the recommended install path,
+# because conda provides the compiled geospatial stack (GDAL/PROJ) that the core
+# runtime deps in pyproject.toml build on. Conda installs those libs, then the
+# `pip install -e` step below adds the package itself (deps already satisfied).
 #   mamba env create -f environment.yml      # or: conda env create -f environment.yml
-#   conda activate oceansr
+#   conda activate coastal_sst_data
 name: coastal_sst_data
 channels:
   - conda-forge
 dependencies:
   - python=3.11
-  - pydantic
   - pytest
+  # Core stack (also declared in pyproject.toml [project.dependencies]); pinned
+  # here via conda so the compiled GDAL/PROJ libs come from conda-forge, not pip.
+  - numpy
+  - pandas
+  - xarray
+  - pydantic
+  - pyyaml
+  - pyproj
+  - shapely
+  - rasterio
+  - rioxarray
+  - requests
+  - earthaccess
+  - zarr
+  - numcodecs
   # Landsat via Planetary Computer (landsat_pc.py): STAC search + COG reads.
   - pystac-client
   - planetary-computer
@@ -30,5 +47,10 @@ dependencies:
   - cartopy
   - pip
   - pip:
-      - -e ".[dev]"  # installs YOUR package + its deps + test extras from pyproject
+      # Editable install of the package itself (core deps already provided by conda
+      # above); [dev] adds the test extras from pyproject.
+      - -e ".[dev]"
+      # pytides2 is the CO-OPS tide backend and is NOT on conda-forge, so install
+      # it here (the `tides` pyproject extra). If the build fails, see tides.py.
+      - pytides2
 
