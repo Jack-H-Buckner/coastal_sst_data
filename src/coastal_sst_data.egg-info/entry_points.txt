@@ -1,0 +1,2 @@
+[console_scripts]
+coastal-sst-data = coastal_sst_data.cli:main

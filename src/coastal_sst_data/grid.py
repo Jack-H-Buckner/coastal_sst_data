@@ -20,7 +20,9 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+import numpy as np
 from affine import Affine
 from pyproj import Transformer
 from rasterio.transform import from_origin
@@ -29,6 +31,9 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as shp_transform
 
 from .config import AreaOfInterest, GridSpec, Project
+
+if TYPE_CHECKING:
+    from pyresample.geometry import AreaDefinition
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +69,30 @@ class AoiGrid:
     def shape(self) -> tuple[int, int]:
         """(height, width) -- the array shape products are reprojected to."""
         return (self.height, self.width)
+
+    def xy_centers(self) -> tuple[np.ndarray, np.ndarray]:
+        """Pixel-center coordinates ``(xs, ys)`` in the target CRS.
+
+        1D arrays of length ``width`` / ``height`` -- the ``x`` / ``y`` coords of
+        an aligned Dataset. ``ys`` runs top-down (descending) to match the affine.
+        """
+        xs = self.transform.c + (np.arange(self.width) + 0.5) * self.transform.a
+        ys = self.transform.f - (np.arange(self.height) + 0.5) * self.transform.a
+        return xs, ys
+
+    def to_area_def(self) -> "AreaDefinition":
+        """A pyresample ``AreaDefinition`` matching this grid (projected).
+
+        Used to resample swath/curvilinear products (MODIS L2P, HRRR) onto the
+        grid with ``pyresample`` nearest-neighbour. Imported lazily so pyresample
+        is only required by the products that actually swath-resample.
+        """
+        from pyresample.geometry import AreaDefinition
+        res = self.transform.a
+        minx, maxy = self.transform.c, self.transform.f
+        extent = (minx, maxy - self.height * res, minx + self.width * res, maxy)  # x0,y0,x1,y1
+        return AreaDefinition("aoi", "aoi", "aoi", self.target_crs,
+                              self.width, self.height, extent)
 
 
 def compute_aoi_grid(area: AreaOfInterest, grid: GridSpec) -> AoiGrid:

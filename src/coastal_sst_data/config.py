@@ -139,6 +139,7 @@ class DataProduct(str, Enum):
     ecostress = "ecostress"
     mur = "mur"
     landsat = "landsat"
+    modis = "modis"
     met = "met"
     tides = "tides"
     landcover = "landcover"
@@ -223,6 +224,35 @@ class GridSpec(BaseModel):
     snap_origin: bool = True                   # snap grid origin to a resolution multiple
 
 
+class CompressionSpec(BaseModel):
+    """Per-variable Zarr compression for the assembled datacube.
+
+    Lossless: values are kept as-is (float32 / uint8); only a Blosc entropy codec
+    is applied. Smooth/interpolated fields still compress well via byte-shuffle.
+    The block exists so the codec can be tuned (or later extended to packing/
+    quantization) without changing the cube layout.
+    """
+    model_config = {"extra": "forbid"}
+    codec: str = "zstd"                                        # Blosc cname
+    level: int = Field(5, ge=0, le=9)                          # Blosc clevel
+    shuffle: Literal["shuffle", "bitshuffle", "noshuffle"] = "shuffle"
+
+
+class DataCubeSpec(BaseModel):
+    """How the assembler knits the aligned per-product files into one Zarr cube.
+
+    Every field has a default, so the whole `datacube:` block is optional. The
+    water/land mask is derived from land-cover (authoritative where known), so
+    there are no elevation/depth threshold knobs here.
+    """
+    model_config = {"extra": "forbid"}
+    chunks: dict[str, int] = Field(default_factory=lambda: {"time": 64, "y": 128, "x": 128})
+    fill_mur_water: bool = True                # NN-fill the MUR backbone over land-cover water
+    compression: CompressionSpec = Field(default_factory=CompressionSpec)
+    output_subdir: str = "datacube"            # cube dir under output_dir
+    overwrite: bool = False                    # rebuild existing <aoi>.zarr cubes
+
+
 # ---------------------------------------------------------------------------
 # Authentication (NON-SECRET settings only)
 # ---------------------------------------------------------------------------
@@ -274,23 +304,53 @@ class AuthConfig(BaseModel):
     gee: GeeAuth | None = None
 
 
-# Which auth backend each product needs. Products NOT listed here use public
-# sources (bathymetry=CUDEM/GMRT, met=HRRR, tides=NOAA CO-OPS) -> no auth.
-# Landsat is special-cased: its backend depends on the `source` selector (see
-# _LANDSAT_SOURCE_AUTH) because it can be fetched several ways.
-_REQUIRED_AUTH: dict[DataProduct, str] = {
+# ---------------------------------------------------------------------------
+# Auth requirements: the SINGLE source of truth for which backend each product
+# needs. One table + one resolver replace the old per-product special-casing.
+#
+# A value is either:
+#   * a backend name (str)         -- always requires that backend
+#   * None / absent                -- public, needs no auth
+#   * {source: backend | None}     -- source-selectable; backend depends on
+#                                     products.<product>.source
+# Adding a product (or a new source) is a one-line edit here; the validator and
+# the runtime auth layer (coastal_sst_data.auth) both read this table, so nothing
+# else needs to change.
+# ---------------------------------------------------------------------------
+AUTH_REQUIREMENTS: dict[DataProduct, "str | None | dict[str, str | None]"] = {
     DataProduct.ecostress: "earthdata",
     DataProduct.mur: "earthdata",
-    DataProduct.landcover: "gee",
+    DataProduct.modis: "earthdata",
+    # Source-selectable: PC/ESA (anonymous) and AWS (env creds) need no config
+    # auth; only the GEE source needs auth.gee.
+    DataProduct.landsat: {"pc": None, "planetary_computer": None, "aws": None, "gee": "gee"},
+    DataProduct.landcover: {"esa": None, "worldcover": None, "gee": "gee"},
+    # bathymetry, met, tides: absent -> public, no auth.
 }
 
-# Landsat can come from different sources; each needs different (or no) auth.
-# 'pc' (Planetary Computer, default) and 'aws' need no config-level auth -- PC is
-# anonymous, AWS creds come from the environment. Only 'gee' needs auth.gee.
-DEFAULT_LANDSAT_SOURCE = "pc"
-_LANDSAT_SOURCE_AUTH: dict[str, str | None] = {
-    "pc": None, "planetary_computer": None, "aws": None, "gee": "gee",
+# Default `source` for source-selectable products (when the config omits it).
+DEFAULT_SOURCE: dict[DataProduct, str] = {
+    DataProduct.landsat: "pc",
+    DataProduct.landcover: "esa",
 }
+
+
+def required_backend(product: DataProduct, opts) -> "str | None":
+    """The auth backend a selected product needs, or None if it needs none.
+
+    For source-selectable products, resolves via the product's `source` option
+    (validated against the known set here, failing loudly on a typo).
+    """
+    req = AUTH_REQUIREMENTS.get(product)
+    if isinstance(req, dict):
+        source = getattr(opts, "source", DEFAULT_SOURCE.get(product))
+        if source not in req:
+            raise ValueError(
+                f"{product.value}.source {source!r} is not recognized; "
+                f"choose from {sorted(req)}."
+            )
+        return req[source]
+    return req
 
 
 class Project(BaseModel):
@@ -306,6 +366,8 @@ class Project(BaseModel):
     regions: list[Region] = Field(..., min_length=1)
     # All grid fields have defaults, so the whole block is optional.
     grid: GridSpec = Field(default_factory=GridSpec)
+    # Datacube assembler settings; all default, so the block is optional.
+    datacube: DataCubeSpec = Field(default_factory=DataCubeSpec)
     # Non-secret auth settings; required per selected product (see validator).
     auth: AuthConfig = Field(default_factory=AuthConfig)
 
@@ -337,22 +399,12 @@ class Project(BaseModel):
     def _auth_present_for_products(self):
         """Every selected product that needs auth must have it configured.
 
-        Fail loudly at load time: ECOSTRESS/MUR need `auth.earthdata`; landcover
-        needs `auth.gee`; Landsat depends on its `source` (pc/aws need none, gee
-        needs `auth.gee`). Public-source products (bathymetry, met, tides) need
-        nothing.
+        Uniform over all products via the AUTH_REQUIREMENTS table -- ECOSTRESS/
+        MUR/MODIS need `auth.earthdata`; Landsat/landcover depend on their
+        `source`; public products need nothing. Fails loudly at load time.
         """
         for product, opts in self.products.items():
-            if product == DataProduct.landsat:
-                source = getattr(opts, "source", DEFAULT_LANDSAT_SOURCE)
-                if source not in _LANDSAT_SOURCE_AUTH:
-                    raise ValueError(
-                        f"landsat.source {source!r} is not recognized; "
-                        f"choose from {sorted(_LANDSAT_SOURCE_AUTH)}."
-                    )
-                backend = _LANDSAT_SOURCE_AUTH[source]
-            else:
-                backend = _REQUIRED_AUTH.get(product)
+            backend = required_backend(product, opts)   # resolves source, validates it
             if backend and getattr(self.auth, backend) is None:
                 raise ValueError(
                     f"product {product.value!r} requires `auth.{backend}` but it "

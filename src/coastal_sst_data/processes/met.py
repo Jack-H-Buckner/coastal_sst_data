@@ -1,171 +1,129 @@
 #!/usr/bin/env python3
 """
-OCEANSR -- meteorological forcing acquisition (NOAA HRRR via Herbie).
+coastal_sst_data -- meteorological forcing acquisition (HRRR, ERA5 fallback).
 
-Reads the common project config (configs/config.yaml): AOIs, grid, dates and
-paths are shared; HRRR settings come from `sources.met`. For each AOI it pulls
-2 m air temperature, 10 m wind (u/v + speed) and downward shortwave, regrids the
-HRRR field onto the AOI grid (identical to the SST stages), and writes:
+Reads the validated project config (coastal_sst_data.config.Project) and the
+shared per-AoI grids (coastal_sst_data.grid.AoiGrid), exactly like the SST
+stages. For each AoI it pulls 2 m air temperature, 10 m wind (u/v + speed),
+downward shortwave and total cloud cover, regrids onto the AoI grid, and writes:
 
-  * a daily-mean file per day:           data/MET/aligned/<aoi>/<aoi>_<YYYYMMDD>.nc
-  * an instantaneous file per overpass:  data/MET/aligned/<aoi>/<aoi>_<YYYYMMDDThhmmss>.nc
+  * a daily-mean file per day:           <output_dir>/MET/aligned/<aoi>/<aoi>_<YYYYMMDD>.nc
+  * an instantaneous file per overpass:  <output_dir>/MET/aligned/<aoi>/<aoi>_<YYYYMMDDThhmmss>.nc
 
 Overpass times are discovered from the ECOSTRESS/Landsat aligned dirs so the
 forcing can be matched to each thermal scene (for the skin->bulk correction).
-The CONUS domain ('hrrr') is used below ~50N; SE Alaska AOIs use 'hrrrak'.
+
+Two sources, tried in order (the "source chain"):
+  * hrrr -- NOAA HRRR 3 km surface fields via Herbie. CONUS uses the 'hrrr'
+    domain; AoIs above ~50N use the Alaska domain 'hrrrak' (auto by latitude).
+    Curvilinear grid -> pyresample nearest-neighbour resample.
+  * era5 -- ECMWF ERA5 0.25 deg hourly reanalysis, streamed from Google's public
+    ARCO-ERA5 Zarr on GCS (no auth). Global, so it fills any AoI/date/cycle HRRR
+    cannot cover. Regular lat/lon grid -> rioxarray bilinear reproject.
+
+With `source: auto` (default) the chain is [hrrr, era5]: ERA5 transparently
+backfills wherever HRRR misses. Both sources are unit-harmonized to a single
+convention (airtemp K, swrad W m-2, cloud_cover %) so the written files are
+source-agnostic; each file records its provenance in `ds.attrs["source"]`.
 
 Forcing is gap-free, so there is no mask -- these are complete driver channels.
 
-Usage (run AFTER the SST stages, from the project root):
-    python src/acquire_met.py --config configs/config.yaml --aoi hood_canal
-    python src/acquire_met.py --config configs/config.yaml --dry-run
+Usage (run AFTER the SST stages so overpass times exist):
+    python -m coastal_sst_data.processes.met --config config.yaml
+    python -m coastal_sst_data.processes.met --config config.yaml --aoi hood_canal
+    python -m coastal_sst_data.processes.met --config config.yaml --dry-run
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import math
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-import yaml
 
-from herbie import Herbie
-from pyproj import Transformer
-from pyresample.geometry import SwathDefinition, AreaDefinition
-from pyresample.kd_tree import resample_nearest
-from rasterio.transform import from_origin
-from shapely.geometry import box, shape
-from shapely.ops import transform as shp_transform, unary_union
+import rioxarray  # noqa: F401  (registers the .rio accessor)
 
-log = logging.getLogger("acquire_met")
+from ..config import Project, DataProduct, load_config
+from ..grid import AoiGrid, project_grids
+
+log = logging.getLogger(__name__)
+
 SOURCE = "met"
-_DT_RE = re.compile(r"(\d{8}T\d{6})")
+_DT_RE = re.compile(r"(\d{8}T\d{6})")     # aligned-scene filename stamp
 
-# config var key -> (Herbie search regex, {cfgrib var name: output name})
-VAR_SEARCH = {
+# --- met product defaults (overridable via the met product options block) ---- #
+DEFAULT_SOURCE = "auto"                   # auto (hrrr->era5) | hrrr | era5
+DEFAULT_FALLBACK = "era5"                 # era5 | none
+DEFAULT_VARIABLES = ["airtemp", "wind", "swrad", "cloud"]
+DEFAULT_MEAN_HOURS = [0, 6, 12, 18]       # UTC hours averaged for the daily field
+DEFAULT_RADIUS_M = 6000.0                 # pyresample search radius (HRRR ~3 km px)
+DEFAULT_PAD_DEG = 0.25                    # ERA5 window pad (>= one 0.25 deg cell)
+DEFAULT_FXX = 0                           # HRRR forecast hour (0 = analysis)
+DEFAULT_PRODUCT = "sfc"                   # HRRR 2D surface fields
+# Google Analysis-Ready Cloud-Optimized ERA5 (public, no auth).
+ARCO_ERA5_URI = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
+
+# Common output var name -> units (after harmonization). Shared by both sources.
+OUT_UNITS = {"airtemp": "K", "swrad": "W m-2", "cloud_cover": "%", "wind_speed": "m s-1"}
+
+# HRRR: config var key -> (Herbie search regex, {cfgrib var name: output name}).
+HRRR_VAR_SEARCH = {
     "airtemp": (r"TMP:2 m above ground", {"t2m": "airtemp"}),
     "wind":    (r":(U|V)GRD:10 m above ground", {"u10": "wind_u", "v10": "wind_v"}),
     "swrad":   (r"DSWRF:surface", {"dswrf": "swrad"}),
-    # total cloud cover, whole atmosphere (modeled, gap-free, %). HRRR also has
-    # LCDC/MCDC/HCDC (low/mid/high) if a vertical split is ever wanted.
     "cloud":   (r"TCDC:entire atmosphere", {"tcc": "cloud_cover"}),
 }
 
+# ERA5 (ARCO): config var key -> {ARCO variable name: output name}.
+ERA5_VARS = {
+    "airtemp": {"2m_temperature": "airtemp"},
+    "wind":    {"10m_u_component_of_wind": "wind_u", "10m_v_component_of_wind": "wind_v"},
+    "swrad":   {"surface_solar_radiation_downwards": "swrad"},
+    "cloud":   {"total_cloud_cover": "cloud_cover"},
+}
 
-# --------------------------------------------------------------------------- #
-# Config plumbing
-# --------------------------------------------------------------------------- #
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def build_effective(cfg: dict, source: str) -> dict:
-    if source not in cfg.get("sources", {}):
-        raise SystemExit(f"Source '{source}' not found under 'sources' in config.")
-    src_cfg = cfg["sources"][source]
-    time_cfg = {**cfg.get("time", {}), **src_cfg.get("time", {})}
-    grid_cfg = {**cfg.get("grid", {}), **src_cfg.get("grid", {})}
-    root = Path(cfg.get("project", {}).get("root", "."))
-    paths = cfg["paths"]
-    return {
-        "aois": cfg["aois"],
-        "time": time_cfg,
-        "grid": grid_cfg,
-        "ds": src_cfg,
-        "root": root,
-        "paths": paths,
-        "out_dir": root / paths["data"] / paths[source] / "aligned",
-        "fmt": src_cfg.get("output_format", "netcdf"),
-        "overwrite": src_cfg.get("overwrite", False),
-    }
+# Coarse North America bounds (S, N, W, E) in EPSG:4326. HRRR (CONUS + Alaska)
+# covers North America only; an AoI outside this box (e.g. Europe) is skipped so
+# it falls through to ERA5 without a wasted Herbie fetch. Within it, the CONUS
+# 'hrrr' vs Alaska 'hrrrak' domain is chosen by latitude (>= 50N -> Alaska).
+_HRRR_NA_BOX = (18.0, 72.0, -179.0, -52.0)
 
 
 # --------------------------------------------------------------------------- #
-# Geometry / grid helpers
+# HRRR source (curvilinear grid -> pyresample nearest)
 # --------------------------------------------------------------------------- #
-def utm_epsg_from_lonlat(lon, lat) -> str:
-    zone = int((lon + 180.0) // 6.0) + 1
-    return f"EPSG:{(32600 if lat >= 0 else 32700) + zone}"
-
-
-def aoi_geometry_4326(aoi):
-    if aoi.get("geometry"):
-        import json
-        gj = json.load(open(aoi["geometry"]))
-        if gj.get("type") == "FeatureCollection":
-            return unary_union([shape(f["geometry"]) for f in gj["features"]])
-        if gj.get("type") == "Feature":
-            return shape(gj["geometry"])
-        return shape(gj)
-    w, s, e, n = aoi["bbox"]
-    return box(w, s, e, n)
-
-
-def resolve_target_crs(geom_4326, grid_cfg) -> str:
-    tc = str(grid_cfg.get("target_crs", "auto")).lower()
-    if tc == "auto":
-        c = geom_4326.centroid
-        return utm_epsg_from_lonlat(c.x, c.y)
-    return grid_cfg["target_crs"]
-
-
-def buffered_geom_in_crs(geom_4326, target_crs, buffer_m):
-    fwd = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True).transform
-    g = shp_transform(fwd, geom_4326)
-    return g.buffer(buffer_m) if buffer_m and buffer_m > 0 else g
-
-
-def build_target_grid(geom_proj, resolution_m, snap):
-    minx, miny, maxx, maxy = geom_proj.bounds
-    r = float(resolution_m)
-    if snap:
-        minx = math.floor(minx / r) * r
-        miny = math.floor(miny / r) * r
-        maxx = math.ceil(maxx / r) * r
-        maxy = math.ceil(maxy / r) * r
-    width = int(round((maxx - minx) / r))
-    height = int(round((maxy - miny) / r))
-    return from_origin(minx, maxy, r, r), width, height
-
-
-def make_area(target_crs, transform, width, height) -> AreaDefinition:
-    res = transform.a
-    minx, maxy = transform.c, transform.f
-    extent = (minx, maxy - height * res, minx + width * res, maxy)  # (xmin,ymin,xmax,ymax)
-    return AreaDefinition("aoi", "aoi", "aoi", target_crs, width, height, extent)
-
-
-# --------------------------------------------------------------------------- #
-# HRRR fetch + regrid
-# --------------------------------------------------------------------------- #
-def model_for_aoi(geom_4326, configured: str) -> str:
+def _hrrr_model_for_grid(g: AoiGrid, configured: str) -> str | None:
+    """HRRR domain covering this AoI: 'hrrr', 'hrrrak', or None (uncovered)."""
     if configured and configured != "auto":
         return configured
-    return "hrrrak" if geom_4326.centroid.y >= 50.0 else "hrrr"
+    w, s, e, n = g.search_bbox
+    lat, lon = (s + n) / 2.0, (w + e) / 2.0
+    bs, bn, bw, be = _HRRR_NA_BOX
+    if not (bs <= lat <= bn and bw <= lon <= be):
+        return None                                  # off-continent -> ERA5
+    return "hrrrak" if lat >= 50.0 else "hrrr"
 
 
-def snap_to_cycle(dt: datetime, model: str) -> datetime:
-    """Round to the nearest available analysis cycle (1h for hrrr, 3h for hrrrak)."""
+def _snap_to_cycle(dt: datetime, model: str) -> datetime:
+    """Round to the nearest available analysis cycle (1h hrrr, 3h hrrrak)."""
     step = 3 if model == "hrrrak" else 1
     h = int(round(dt.hour / step) * step)
     base = dt.replace(minute=0, second=0, microsecond=0, hour=0)
     return base + timedelta(hours=min(h, 24 - step))
 
 
-def fetch_hrrr(model, dt, fxx, product, var_keys):
-    """Return ({outname: 2D array}, lon2d, lat2d) for one cycle, or None on miss."""
+def _hrrr_fetch_cycle(model, dt, fxx, product, var_keys):
+    """Fetch one HRRR cycle -> ({outname: 2D array}, lon2d, lat2d) or None."""
+    from herbie import Herbie
     H = Herbie(dt.strftime("%Y-%m-%d %H:00"), model=model, product=product, fxx=fxx)
     fields, lon2d, lat2d = {}, None, None
     for key in var_keys:
-        search, rename = VAR_SEARCH[key]
+        search, rename = HRRR_VAR_SEARCH[key]
         ds = H.xarray(search, remove_grib=True)
         if isinstance(ds, list):
             ds = xr.merge(ds, compat="override")
@@ -177,7 +135,7 @@ def fetch_hrrr(model, dt, fxx, product, var_keys):
         # single-field searches (e.g. TCDC) can come back under a different
         # cfgrib shortName -> fall back to the lone data variable.
         if not matched and len(rename) == 1:
-            dvs = [v for v in ds.data_vars]
+            dvs = list(ds.data_vars)
             if len(dvs) == 1:
                 fields[next(iter(rename.values()))] = np.asarray(ds[dvs[0]].values)
         if lon2d is None and "longitude" in ds.coords:
@@ -185,63 +143,186 @@ def fetch_hrrr(model, dt, fxx, product, var_keys):
             lat2d = np.asarray(ds.latitude.values)
     if not fields or lon2d is None:
         return None
-    lon2d = ((lon2d + 180.0) % 360.0) - 180.0  # 0..360 -> -180..180
+    lon2d = ((lon2d + 180.0) % 360.0) - 180.0        # 0..360 -> -180..180
     return fields, lon2d, lat2d
 
 
-def regrid(fields, lon2d, lat2d, area, radius_m) -> dict:
+def _regrid_nearest(fields, lon2d, lat2d, g: AoiGrid, radius_m) -> dict:
+    """Nearest-neighbour resample curvilinear fields onto the AoI grid."""
+    from pyresample.geometry import SwathDefinition
+    from pyresample.kd_tree import resample_nearest
     swath = SwathDefinition(lons=lon2d, lats=lat2d)
-    out = {}
-    for name, arr in fields.items():
-        out[name] = resample_nearest(swath, arr, area, radius_of_influence=radius_m,
-                                     fill_value=np.nan)
-    return out
+    area = g.to_area_def()
+    return {name: resample_nearest(swath, arr, area, radius_of_influence=radius_m,
+                                   fill_value=np.nan)
+            for name, arr in fields.items()}
 
 
-def to_dataset(grids, coords, t, grid_cfg) -> xr.Dataset:
-    """grids: {name: 2D array} on the AOI grid -> Dataset with wind_speed + time."""
-    y, x = coords
-    dv = {k: (("y", "x"), v.astype("float32")) for k, v in grids.items()}
-    ds = xr.Dataset(dv, coords={"y": y, "x": x})
+def _fetch_hrrr(g: AoiGrid, dt: datetime, cfg: dict) -> dict | None:
+    """Fetch + regrid HRRR for one timestamp -> {outname: 2D array} or None."""
+    model = _hrrr_model_for_grid(g, cfg.get("model", "auto"))
+    if model is None:
+        return None                                  # AoI outside HRRR coverage
+    cyc = _snap_to_cycle(dt, model)
+    got = _hrrr_fetch_cycle(model, cyc, cfg["fxx"], cfg["product"], cfg["variables"])
+    if got is None:
+        return None
+    fields, lon2d, lat2d = got
+    return _regrid_nearest(fields, lon2d, lat2d, g, cfg["regrid_radius_m"])
+
+
+# --------------------------------------------------------------------------- #
+# ERA5 source (ARCO Zarr on GCS -> rioxarray bilinear reproject)
+# --------------------------------------------------------------------------- #
+_ERA5_CACHE: dict[str, xr.Dataset] = {}
+
+
+def _era5_store(uri: str) -> xr.Dataset:
+    """Lazily open (and cache) the ARCO-ERA5 Zarr store; metadata only."""
+    if uri not in _ERA5_CACHE:
+        _ERA5_CACHE[uri] = xr.open_zarr(uri, chunks="auto",
+                                        storage_options={"token": "anon"})
+    return _ERA5_CACHE[uri]
+
+
+def _era5_normalize(fields: dict) -> dict:
+    """Harmonize ERA5 fields to the common convention (in place, returns dict).
+
+    ERA5 differs from HRRR in two channels: shortwave is an hourly accumulation
+    in J m-2 (-> W m-2 by /3600) and cloud cover is a 0-1 fraction (-> % by x100).
+    2 m temperature and wind are already in the common units.
+    """
+    if "swrad" in fields:
+        fields["swrad"] = fields["swrad"] / 3600.0           # J m-2 (1h) -> W m-2
+    if "cloud_cover" in fields:
+        fields["cloud_cover"] = fields["cloud_cover"] * 100.0  # fraction -> %
+    return fields
+
+
+def _fetch_era5(g: AoiGrid, dt: datetime, cfg: dict) -> dict | None:
+    """Fetch + regrid ERA5 for one timestamp -> {outname: 2D array} or None."""
+    from rasterio.enums import Resampling
+
+    var_map: dict[str, str] = {}
+    for key in cfg["variables"]:
+        var_map.update(ERA5_VARS.get(key, {}))
+    if not var_map:
+        return None
+
+    ds = _era5_store(cfg["era5_zarr"])
+    t = pd.Timestamp(dt).round("1h")
+    src_names = list(var_map)
+    try:
+        snap = ds[src_names].sel(time=t, method="nearest")
+    except (KeyError, ValueError):
+        return None
+
+    # ARCO longitude is 0..360 ascending, latitude 90..-90 descending. Subset the
+    # AoI window in that frame, then relabel longitude to -180..180 for reproject.
+    w, s, e, n = g.search_bbox
+    pad = cfg["pad_deg"]
+    lon0, lon1 = (w - pad) % 360.0, (e + pad) % 360.0
+    sub = snap.sel(latitude=slice(n + pad, s - pad),
+                   longitude=slice(lon0, lon1)).load()
+    if sub.longitude.size == 0 or sub.latitude.size == 0:
+        return None
+
+    sub = sub.assign_coords(longitude=(((sub.longitude + 180.0) % 360.0) - 180.0))
+    sub = sub.sortby("longitude").rename({"longitude": "x", "latitude": "y"})
+    sub = sub.rio.set_spatial_dims(x_dim="x", y_dim="y").rio.write_crs("EPSG:4326")
+    out = sub.rio.reproject(dst_crs=g.target_crs, shape=g.shape, transform=g.transform,
+                            resampling=Resampling.bilinear, nodata=np.nan)
+    fields = {dst: np.asarray(out[src].values, dtype="float32")
+              for src, dst in var_map.items()}
+    return _era5_normalize(fields)
+
+
+# --------------------------------------------------------------------------- #
+# Source chain
+# --------------------------------------------------------------------------- #
+_SOURCES = {"hrrr": _fetch_hrrr, "era5": _fetch_era5}
+
+
+def _resolve_chain(source: str, fallback: str) -> list[str]:
+    """Ordered source chain from the `source`/`fallback` selectors.
+
+    auto  -> [hrrr]  (then + fallback)   hrrr -> [hrrr]   era5 -> [era5]
+    A non-'none' fallback is appended if not already the primary, so the default
+    (source=auto, fallback=era5) yields [hrrr, era5].
+    """
+    source = str(source or "auto").lower()
+    if source == "auto":
+        chain = ["hrrr"]
+    elif source in _SOURCES:
+        chain = [source]
+    else:
+        raise ValueError(f"met source {source!r} not recognized; choose from "
+                         f"{['auto'] + sorted(_SOURCES)}.")
+    fb = str(fallback or "none").lower()
+    if fb != "none":
+        if fb not in _SOURCES:
+            raise ValueError(f"met fallback {fb!r} not recognized; choose from "
+                             f"{['none'] + sorted(_SOURCES)}.")
+        if fb not in chain:
+            chain.append(fb)
+    return chain
+
+
+def _fetch_at(chain, g: AoiGrid, dt: datetime, cfg: dict):
+    """Walk the source chain; return (grids, source_name) of the first hit."""
+    for name in chain:
+        try:
+            grids = _SOURCES[name](g, dt, cfg)
+        except Exception as exc:
+            log.warning("    %s fetch failed @ %s (%s)", name, dt, exc)
+            grids = None
+        if grids:
+            return grids, name
+    return None, None
+
+
+# --------------------------------------------------------------------------- #
+# Dataset assembly + overpass discovery + IO
+# --------------------------------------------------------------------------- #
+def to_dataset(grids: dict, g: AoiGrid, t, to_celsius: bool) -> xr.Dataset:
+    """Grids {name: 2D array} on the AoI grid -> Dataset (+ wind_speed, units)."""
+    xs, ys = g.xy_centers()
+    dv = {k: (("y", "x"), np.asarray(v, dtype="float32")) for k, v in grids.items()}
+    ds = xr.Dataset(dv, coords={"y": ys, "x": xs})
     if "wind_u" in ds and "wind_v" in ds:
         ds["wind_speed"] = np.sqrt(ds["wind_u"] ** 2 + ds["wind_v"] ** 2)
+        ds["wind_speed"].attrs["units"] = OUT_UNITS["wind_speed"]
     if "airtemp" in ds:
-        if grid_cfg.get("to_celsius", False):
+        if to_celsius:
             ds["airtemp"] = ds["airtemp"] - 273.15
             ds["airtemp"].attrs["units"] = "degC"
         else:
-            ds["airtemp"].attrs["units"] = "K"
-    if "wind_speed" in ds:
-        ds["wind_speed"].attrs["units"] = "m s-1"
+            ds["airtemp"].attrs["units"] = OUT_UNITS["airtemp"]
     if "swrad" in ds:
-        ds["swrad"].attrs["units"] = "W m-2"
+        ds["swrad"].attrs["units"] = OUT_UNITS["swrad"]
     if "cloud_cover" in ds:
-        ds["cloud_cover"].attrs["units"] = "%"
-    return ds.expand_dims(time=[pd.Timestamp(t)])
+        ds["cloud_cover"].attrs["units"] = OUT_UNITS["cloud_cover"]
+    ds = ds.expand_dims(time=[pd.Timestamp(t)])
+    ds = ds.rio.write_crs(g.target_crs)
+    return ds
 
 
-# --------------------------------------------------------------------------- #
-# Overpass discovery
-# --------------------------------------------------------------------------- #
-def overpass_times_for_day(root, paths, sources, aoi_id, day) -> list:
-    """Datetimes (UTC, naive) of ECOSTRESS/Landsat scenes for this AOI on `day`."""
+def overpass_times_for_day(overpass_dirs, aoi_id: str, day) -> list[datetime]:
+    """Datetimes (UTC, naive) of thermal scenes for this AoI on `day`."""
     daystr = day.strftime("%Y%m%d")
     times = []
-    for src in sources:
-        d = root / paths["data"] / paths[src] / "aligned" / aoi_id
-        if not d.exists():
+    for d in overpass_dirs:
+        adir = Path(d) / aoi_id
+        if not adir.exists():
             continue
-        for f in d.glob(f"{aoi_id}_{daystr}T*.nc"):
+        for f in adir.glob(f"{aoi_id}_{daystr}T*.nc"):
             m = _DT_RE.search(f.name)
             if m:
                 times.append(datetime.strptime(m.group(1), "%Y%m%dT%H%M%S"))
     return sorted(set(times))
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-def write_output(ds, out_dir, aoi_id, fmt, stem) -> Path:
+def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str, stem: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if fmt == "netcdf":
         path = out_dir / f"{stem}.nc"
@@ -256,95 +337,155 @@ def write_output(ds, out_dir, aoi_id, fmt, stem) -> Path:
     return path
 
 
-def run(eff, only_aoi, dry_run):
+# --------------------------------------------------------------------------- #
+# Main loop
+# --------------------------------------------------------------------------- #
+def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
+    """Acquire met forcing onto the pre-computed per-AoI grids."""
     ds_cfg, grid_cfg = eff["ds"], eff["grid"]
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
-    var_keys = ds_cfg.get("variables", ["airtemp", "wind", "swrad"])
-    fxx = int(ds_cfg.get("fxx", 0))
-    product = ds_cfg.get("product", "sfc")
-    mean_hours = ds_cfg.get("daily_mean_hours", [0, 6, 12, 18])
-    radius_m = float(ds_cfg.get("regrid_radius_m", 6000))
-    op_sources = ds_cfg.get("overpass_from", [])
+    to_celsius = grid_cfg.get("to_celsius", False)
+    chain = ds_cfg["chain"]
+    mean_hours = ds_cfg["daily_mean_hours"]
+    overpass_dirs = eff["overpass_dirs"]
     start = pd.Timestamp(eff["time"]["start_date"])
     end = pd.Timestamp(eff["time"]["end_date"])
     days = pd.date_range(start, end, freq="D")
 
-    aois = eff["aois"]
+    names = list(grids)
     if only_aoi:
-        aois = [a for a in aois if a["id"] == only_aoi]
-        if not aois:
-            raise SystemExit(f"AOI '{only_aoi}' not found in config.")
+        req = set(only_aoi)
+        missing = req - set(names)
+        if missing:
+            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
+        names = [n for n in names if n in req]
 
-    for aoi in aois:
-        aoi_id = aoi["id"]
-        geom_4326 = aoi_geometry_4326(aoi)
-        target_crs = resolve_target_crs(geom_4326, grid_cfg)
-        geom_proj = buffered_geom_in_crs(geom_4326, target_crs, aoi.get("buffer_m", 0))
-        transform, width, height = build_target_grid(
-            geom_proj, grid_cfg["resolution_m"], grid_cfg.get("snap_origin", True))
-        area = make_area(target_crs, transform, width, height)
-        xs = transform.c + (np.arange(width) + 0.5) * transform.a
-        ys = transform.f - (np.arange(height) + 0.5) * transform.a
-        model = model_for_aoi(geom_4326, ds_cfg.get("model", "auto"))
-        log.info("=== AOI: %s (%s) | model=%s grid=%dx%d ===",
-                 aoi_id, aoi.get("name", ""), model, width, height)
+    for name in names:
+        g = grids[name]
+        log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s ===",
+                 name, g.target_crs, g.width, g.height, "->".join(chain))
         if dry_run:
-            log.info("  [dry-run] %d days; daily hours=%s + overpass snapshots", len(days), mean_hours)
+            log.info("  [dry-run] %d day(s); daily hours=%s + overpass snapshots",
+                     len(days), mean_hours)
             continue
-        aoi_out = out_root / aoi_id
+        aoi_out = out_root / name
 
         for day in days:
             dstr = day.strftime("%Y%m%d")
             # ---- daily mean over mean_hours ----
-            if overwrite or not (aoi_out / f"{aoi_id}_{dstr}.nc").exists():
-                stack = {}
+            if overwrite or not (aoi_out / f"{name}_{dstr}.nc").exists():
+                stack, srcs = {}, set()
                 for hh in mean_hours:
-                    dt = snap_to_cycle(day.to_pydatetime().replace(hour=int(hh)), model)
-                    try:
-                        got = fetch_hrrr(model, dt, fxx, product, var_keys)
-                        if got is None:
-                            continue
-                        grids = regrid(got[0], got[1], got[2], area, radius_m)
-                    except Exception as exc:
-                        log.warning("    %s %02dZ fetch failed (%s)", dstr, hh, exc)
+                    dt = day.to_pydatetime().replace(hour=int(hh))
+                    got, src = _fetch_at(chain, g, dt, ds_cfg)
+                    if not got:
                         continue
-                    for k, v in grids.items():
+                    srcs.add(src)
+                    for k, v in got.items():
                         stack.setdefault(k, []).append(v)
                 if stack:
                     mean_grids = {k: np.nanmean(np.stack(v), axis=0) for k, v in stack.items()}
-                    ds = to_dataset(mean_grids, (ys, xs), day, grid_cfg)
-                    ds.attrs.update(aoi_id=aoi_id, source=f"NOAA {model} daily mean",
+                    ds = to_dataset(mean_grids, g, day, to_celsius)
+                    ds.attrs.update(aoi_id=name, source=f"{'+'.join(sorted(srcs))} daily mean",
                                     daily_mean_hours=str(mean_hours))
                     log.info("  %s daily -> %s", dstr,
-                             write_output(ds, aoi_out, aoi_id, fmt, f"{aoi_id}_{dstr}"))
+                             write_output(ds, aoi_out, name, fmt, f"{name}_{dstr}"))
 
             # ---- overpass snapshots ----
-            for op in overpass_times_for_day(eff["root"], eff["paths"], op_sources, aoi_id, day):
+            for op in overpass_times_for_day(overpass_dirs, name, day):
                 tstr = op.strftime("%Y%m%dT%H%M%S")
-                if not overwrite and (aoi_out / f"{aoi_id}_{tstr}.nc").exists():
+                if not overwrite and (aoi_out / f"{name}_{tstr}.nc").exists():
                     continue
-                dt = snap_to_cycle(op, model)
-                try:
-                    got = fetch_hrrr(model, dt, fxx, product, var_keys)
-                    if got is None:
-                        continue
-                    grids = regrid(got[0], got[1], got[2], area, radius_m)
-                except Exception as exc:
-                    log.warning("    overpass %s fetch failed (%s)", tstr, exc)
+                got, src = _fetch_at(chain, g, op, ds_cfg)
+                if not got:
                     continue
-                ds = to_dataset(grids, (ys, xs), op, grid_cfg)
-                ds.attrs.update(aoi_id=aoi_id, source=f"NOAA {model} @overpass",
-                                cycle=dt.strftime("%Y-%m-%dT%H:00"))
+                ds = to_dataset(got, g, op, to_celsius)
+                ds.attrs.update(aoi_id=name, source=f"{src} @overpass")
                 log.info("  overpass %s -> %s", tstr,
-                         write_output(ds, aoi_out, aoi_id, fmt, f"{aoi_id}_{tstr}"))
+                         write_output(ds, aoi_out, name, fmt, f"{name}_{tstr}"))
     log.info("Done.")
 
 
+# --------------------------------------------------------------------------- #
+# Config adapter + pipeline entry point
+# --------------------------------------------------------------------------- #
+def _opt(opts, name, default):
+    """Read an optional override off a product-options bag (extra='allow')."""
+    return getattr(opts, name, default) if opts is not None else default
+
+
+def _build_eff(project: Project) -> dict:
+    """Map a validated Project into the flat `eff` dict `run()` consumes."""
+    opts = project.products.get(DataProduct.met)
+    if opts is None:
+        raise ValueError("met is not a selected product in this config")
+
+    chain = _resolve_chain(_opt(opts, "source", DEFAULT_SOURCE),
+                           _opt(opts, "fallback", DEFAULT_FALLBACK))
+    overpass_from = list(_opt(opts, "overpass_from", []))
+
+    ds_cfg = {
+        "chain": chain,
+        "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
+        "daily_mean_hours": list(_opt(opts, "daily_mean_hours", DEFAULT_MEAN_HOURS)),
+        "regrid_radius_m": float(_opt(opts, "regrid_radius_m", DEFAULT_RADIUS_M)),
+        "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
+        "fxx": int(_opt(opts, "fxx", DEFAULT_FXX)),
+        "product": _opt(opts, "product", DEFAULT_PRODUCT),
+        "model": _opt(opts, "model", "auto"),
+        "era5_zarr": _opt(opts, "era5_zarr", ARCO_ERA5_URI),
+    }
+    grid_cfg = project.grid.model_dump()
+    grid_cfg.setdefault("to_celsius", False)          # GridSpec has no such field yet
+
+    root = Path(project.output_dir)
+    return {
+        "ds": ds_cfg,
+        "grid": grid_cfg,
+        "out_dir": root / "MET" / "aligned",
+        # thermal-scene dirs to snapshot forcing at (e.g. ECOSTRESS, LANDSAT).
+        "overpass_dirs": [root / s.upper() / "aligned" for s in overpass_from],
+        "fmt": _opt(opts, "output_format", "netcdf"),
+        "overwrite": bool(_opt(opts, "overwrite", False)),
+        "time": {
+            "start_date": project.time.start_date.isoformat(),
+            "end_date": project.time.end_date.isoformat(),
+        },
+    }
+
+
+def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
+            overwrite=False) -> None:
+    """Acquire met forcing for a validated Project. Entry point for pipeline.py.
+
+    Parameters
+    ----------
+    project      validated config (coastal_sst_data.config.Project)
+    grids        pre-computed {aoi_name: AoiGrid}; if None, computed here so all
+                 products share one grid computation.
+    aois         restrict to these AoI name(s); default all
+    dry_run      report only, no fetch/write
+    overwrite    reprocess days even if the aligned file exists
+
+    Runs AFTER the SST stages when `overpass_from` is set, so their aligned files
+    exist to snapshot forcing against.
+    """
+    eff = _build_eff(project)
+    if overwrite:
+        eff["overwrite"] = True
+    if grids is None:
+        grids = project_grids(project)
+    run(eff, grids, aois, dry_run)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="OCEANSR HRRR meteorological forcing acquisition.")
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--aoi", help="Process only this AOI id.")
-    ap.add_argument("--dry-run", action="store_true")
+    ap = argparse.ArgumentParser(
+        description="coastal_sst_data meteorological forcing acquisition (HRRR/ERA5).")
+    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
+    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="reprocess days even if the aligned file exists")
+    ap.add_argument("--dry-run", action="store_true", help="Report only; no fetch.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -352,9 +493,8 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
-    cfg = load_config(args.config)
-    eff = build_effective(cfg, SOURCE)
-    run(eff, args.aoi, args.dry_run)
+    project = load_config(args.config)
+    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
 
 
 if __name__ == "__main__":

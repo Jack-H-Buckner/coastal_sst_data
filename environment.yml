@@ -11,6 +11,23 @@ dependencies:
   # Landsat via Planetary Computer (landsat_pc.py): STAC search + COG reads.
   - pystac-client
   - planetary-computer
+  # MODIS swath -> grid resampling (modis.py) and HRRR regridding (met.py).
+  - pyresample
+  # datacube.py assembler: nearest-neighbour water fill of the MUR backbone.
+  - scipy
+  # met.py forcing: HRRR via Herbie; ERA5 fallback streamed from the public
+  # ARCO-ERA5 Zarr on GCS (zarr reader + anonymous GCS filesystem).
+  - herbie-data
+  - zarr
+  - gcsfs
+  # tides.py global backup: eo-tides (pyTMD) samples a global ocean-tide model
+  # (EOT20 etc.) where NOAA CO-OPS has no nearby gauge. Needs a downloaded
+  # tide-model directory (see the eo-tides "Setting up tide models" docs).
+  - eo-tides
+  # Optional plotting: `coastal-sst-data grids --plot` draws AoI maps. matplotlib
+  # is required for the maps; cartopy is optional (adds coastlines/land context).
+  - matplotlib
+  - cartopy
   - pip
   - pip:
       - -e ".[dev]"  # installs YOUR package + its deps + test extras from pyproject

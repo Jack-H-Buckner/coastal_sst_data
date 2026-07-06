@@ -19,7 +19,8 @@ def test_load_config():
     assert cfg.regions[0].areas[0].name == "tillamook_bay"
     # products is a mapping: keys = selection, values = global options.
     assert list(cfg.products) == [DataProduct.bathymetry, DataProduct.ecostress,
-                                  DataProduct.mur, DataProduct.landsat]
+                                  DataProduct.mur, DataProduct.landsat, DataProduct.met,
+                                  DataProduct.tides, DataProduct.landcover]
     # a bare `bathymetry:` -> default (empty) global options
     assert cfg.products[DataProduct.bathymetry].model_dump() == {}
     # global options land on the product's ProductOptions bag (extra=allow)
@@ -231,6 +232,29 @@ def test_grid_spec_rejects_non_positive_resolution(bad):
 
 
 # ---------------------------------------------------------------------------
+# DataCubeSpec: optional block, all defaults; unknown keys rejected.
+# ---------------------------------------------------------------------------
+def test_datacube_defaults_when_omitted(base_project):
+    cfg = parse_config(base_project)                       # no datacube block
+    assert cfg.datacube.fill_mur_water is True
+    assert cfg.datacube.output_subdir == "datacube"
+    assert cfg.datacube.compression.codec == "zstd"
+    assert cfg.datacube.compression.shuffle == "shuffle"
+
+
+def test_datacube_rejects_unknown_key(base_project):
+    base_project["datacube"] = {"bogus": 1}
+    with pytest.raises(ValidationError):
+        parse_config(base_project)
+
+
+def test_datacube_rejects_bad_compression_level(base_project):
+    base_project["datacube"] = {"compression": {"level": 99}}   # blosc clevel 0-9
+    with pytest.raises(ValidationError):
+        parse_config(base_project)
+
+
+# ---------------------------------------------------------------------------
 # wrap_lon: the seam helper everything else leans on. Normalizes any longitude
 # into [-180, 180), with +180 folding to -180.
 # ---------------------------------------------------------------------------
@@ -293,7 +317,6 @@ def test_boundingbox_accepts_antimeridian_crossing():
 @pytest.mark.parametrize("product, backend", [
     ("ecostress", "earthdata"),
     ("mur", "earthdata"),
-    ("landcover", "gee"),
 ])
 def test_missing_auth_for_selected_product_rejected(base_project, product, backend):
     """Selecting an auth-requiring product with no matching auth -> ValidationError."""
@@ -306,7 +329,7 @@ def test_missing_auth_for_selected_product_rejected(base_project, product, backe
 
 @pytest.mark.parametrize("product, auth", [
     ("ecostress", {"earthdata": {"auth_strategy": "netrc"}}),
-    ("landcover", {"gee": {"project": "my-gcp-project"}}),
+    ("mur", {"earthdata": {"auth_strategy": "netrc"}}),
 ])
 def test_auth_present_for_selected_product_ok(base_project, product, auth):
     """Control: the required backend present -> the project validates."""
@@ -325,6 +348,33 @@ def test_landsat_default_source_pc_needs_no_auth(base_project):
     base_project["regions"][0]["sources"] = {}
     cfg = parse_config(base_project)               # must NOT raise
     assert list(cfg.products) == [DataProduct.landsat]
+
+
+# --- Landcover auth likewise depends on the `source` selector --------------- #
+def test_landcover_default_source_esa_needs_no_auth(base_project):
+    """Landcover defaults to the ESA WorldCover (PC) source -> no auth required."""
+    base_project["products"] = {"landcover": None}   # bare -> default source 'esa'
+    base_project["auth"] = {}
+    base_project["regions"][0]["sources"] = {}
+    cfg = parse_config(base_project)                 # must NOT raise
+    assert list(cfg.products) == [DataProduct.landcover]
+
+
+def test_landcover_gee_source_requires_auth(base_project):
+    """The landcover 'gee' source (JRC + NDWI) needs auth.gee."""
+    base_project["products"] = {"landcover": {"source": "gee"}}
+    base_project["auth"] = {}
+    base_project["regions"][0]["sources"] = {}
+    with pytest.raises(ValidationError, match="auth.gee"):
+        parse_config(base_project)
+
+
+def test_landcover_gee_source_with_auth_ok(base_project):
+    base_project["products"] = {"landcover": {"source": "gee"}}
+    base_project["auth"] = {"gee": {"project": "my-gcp-project"}}
+    base_project["regions"][0]["sources"] = {}
+    cfg = parse_config(base_project)
+    assert list(cfg.products) == [DataProduct.landcover]
 
 
 def test_landsat_gee_source_requires_gee_auth(base_project):

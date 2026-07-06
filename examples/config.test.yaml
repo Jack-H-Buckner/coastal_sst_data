@@ -32,6 +32,20 @@ products:
     variable: analysed_sst
   landsat:
     source: "pc"        # pc (default) | aws | gee
+  met:
+    source: auto              # auto (HRRR -> ERA5) | hrrr | era5
+    fallback: era5            # era5 | none  (backfill where the primary misses)
+    variables: [airtemp, wind, swrad, cloud]
+    daily_mean_hours: [0, 6, 12, 18]   # UTC hours averaged for the daily field
+    overpass_from: [ecostress, landsat]  # snapshot forcing at these scenes' times
+  tides:
+    interval: h               # prediction step (h = hourly)
+    # Optional per-AOI gauge overrides (else nearest CO-OPS water-level station):
+    # stations: {hood_canal: "9445133"}
+  landcover:
+    source: esa               # esa (ESA WorldCover via Planetary Computer) | gee (future)
+    year: 2021                # WorldCover v200 (2021); 2020 -> v100
+    water_classes: [80]       # WorldCover: 80 = permanent water bodies
 
 regions:
   - name: pnw_estuaries
