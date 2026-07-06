@@ -1,0 +1,329 @@
+# ============================================================
+# Tasmania East Coast SST Calibration Project
+# Config file - edit this before running any scripts
+# ============================================================
+
+project:
+  name: "tas_east_coast_sst"
+  description: "High-resolution SST for Tasmania east coast using Landsat/MODIS calibration (Speiser & Largier 2024 methodology)"
+  gee_project: "hawaii-workshop"   # replace with your Google Cloud project ID
+
+# ---- Study region ----
+# Bounding box for the Tasmania east coast
+# Adjust these coordinates to your specific area of interest
+region:
+  name: "Southeast Tasmania"
+  lon_min: 146.875715
+  lon_max: 147.382114
+  lat_min: -43.622936
+  lat_max: -43.055348
+  # WRS path/row for Landsat scene covering this region
+  # Check https://landsat.usgs.gov/landsat_acq to confirm
+  landsat_wrs_path: 90
+  landsat_wrs_row: 90
+
+# Sub-regions of interest (used for targeted analysis and validation)
+# Add or remove sub-regions as needed
+sub_regions:
+  storm_bay:
+    name: "Storm Bay Open Water"
+    lon_min: 147.1
+    lon_max: 147.382114
+    lat_min: -43.622936
+    lat_max: -43.2
+    modis_suitable: true   # Open water - MODIS reliable
+  dentrecasteaux_channel:
+    name: "D'Entrecasteaux Channel"
+    lon_min: 146.875715
+    lon_max: 147.1
+    lat_min: -43.5
+    lat_max: -43.055348
+    modis_suitable: false  # Narrow channel - MODIS land adjacency issues
+  huon_estuary:
+    name: "Huon Estuary"
+    lon_min: 146.875715
+    lon_max: 147.05
+    lat_min: -43.35
+    lat_max: -43.1
+    modis_suitable: false  # Narrow estuary - use generalized equation only
+
+# ---- Temporal range ----
+# 1984-03-01 → 2022-12-31 gives ~39 years of coverage.
+# L5 covers 1984-2012; L7 covers 1999-present; L8 covers 2013-present; L9 from Feb 2022.
+# Calibration constants derived from MODIS-Landsat pairs; applying
+# them to pre-MODIS and post-MODIS periods is valid extrapolation using the generalised equation.
+dates:
+  start: "2000-03-01"
+  end: "2022-12-31"
+  # Seasons to prioritise (southern hemisphere)
+  # EAC influence strongest Dec-Apr; adjust cloud thresholds by season
+  seasons:
+    summer:  {months: [12, 1, 2], cloud_threshold: 0.40}
+    autumn:  {months: [3, 4, 5],  cloud_threshold: 0.40}
+    winter:  {months: [6, 7, 8],  cloud_threshold: 0.50}
+    spring:  {months: [9, 10, 11],cloud_threshold: 0.45}
+
+# ---- Data sources ----
+data_sources:
+  modis:
+    product: "MODIS_T-JPL-L2P-v2019.0"  # MODIS Terra L2 SST (NASA OB.DAAC)
+    # Alternatively: NASA Ocean Color L2 product - check earthaccess
+    quality_levels_accepted: [4, 5]      # GHRSST convention: 4=acceptable, 5=best (0=no data, 1=bad)
+    max_time_diff_minutes: 720           # Max time difference Landsat/MODIS overpass (±12 hours)
+    day_window: 0                         # Match MODIS granules within ±N calendar days of Landsat date (0 = same day only)
+  mur:
+    short_name: "MUR-JPL-L4-GLOB-v4.1"     # GHRSST MUR L4 SST (JPL, 0.01° daily)
+    provider: "PODAAC"                       # NASA PO.DAAC via earthaccess
+    resolution_deg: 0.01                     # ~1 km
+    max_time_diff_hours: 0                   # MUR is daily composite — match by calendar date
+    min_valid_frac: 0.10                     # Min fraction of valid MUR pixels in study region
+  landsat:
+    platforms: ["LANDSAT_5", "LANDSAT_7", "LANDSAT_8", "LANDSAT_9"]   # L5 1984-2012, L9 from Feb 2022
+    collection: "C02"
+    tier: "T1"
+    bt_band:
+      L5: "ST_B6"    # 120m native - resample to 100m
+      L7: "ST_B6"    # 60m native - resample to 100m
+      L8: "ST_B10"   # 100m native
+      L9: "ST_B10"   # 100m native
+    target_resolution_m: 100
+    cloud_cover_max: 0.90                # Pre-filter relaxed; pixel-level QA handles cloud removal
+
+# ---- Cloud / haze masking ----
+# Applied in addition to QA_PIXEL cloud flags
+masking:
+  # GEE-side filters (applied during export in 01_acquire_data.py)
+  cloud_buffer_pixels: 10              # ST_CDIST buffer size in pixels (~1 km at 100m); exported as aux band, not masked server-side
+  ndwi_threshold: 0.1                  # NDWI >= threshold retains water (tighter than 0.0; clouds have NDWI ~ 0)
+  # Note: SR_B9 (cirrus) is not available in Landsat C2 Level 2 products
+  # ST_CDIST and ST_QA are exported as auxiliary bands (bands 2-3) for post-download filtering
+  # Post-download filters (applied in 03_apply_calibration.py)
+  bt_outlier_method: "tukey"           # "tukey" (p15 - 1.5*IQR) adaptive filter for cold outliers
+  # Climatology-based outlier filter (replaces fixed sst_floor_celsius)
+  climatology_file: "data/processed/sst_climatology.csv"
+  climatology_sigma: 3.0              # mask SST outside ±N sigma of OISST DOY climatology
+  # sst_floor_celsius: 4.0            # (deprecated — replaced by climatology filter)
+  # Aux-band filters (only applied when 4-band GeoTIFFs are available)
+  ndwi_postdownload_min: 0.3          # Tighter NDWI filter (GEE-side uses 0.1; post-download can be stricter)
+  cdist_min_km: 1.0                   # ST_CDIST minimum distance from cloud (km)
+  # st_qa_max_k: null                 # ST_QA max uncertainty (K); null = disabled
+
+# ---- ECOSTRESS L2T v3 SST fetch (script 33) ----
+# ECOSTRESS v3 has no standalone SST product: the SST layer is a band inside the
+# tiled ECO_L2T_LSTE v003 product (LP DAAC, 70 m UTM COGs). Script 33 fetches it
+# over `region` within `dates` and regrids it onto the 100 m target grid
+# (super_resolution.target_grid_ref / water_mask). Independent of the modelling
+# code — produces GeoTIFFs only; how they become CNN targets is decided later.
+ecostress:
+  short_name: "ECO_L2T_LSTE"   # tiled LSTE product (contains the SST band in v3)
+  version: "003"                # Collection 3 / v003
+  output_dir: "data/processed/sst_ecostress"
+  bands: ["SST", "cloud", "water"]   # COG layer tokens downloaded per granule (v003 names)
+  min_valid_frac: 0.01          # skip scenes with < this fraction of domain-water valid
+
+# ---- Pixel matching (Speiser & Largier 2024, Section 2.3) ----
+pixel_matching:
+  method: "median_aggregation"           # Median of Landsat Bt within each MODIS footprint
+  outlier_removal:
+    std_threshold: 2.0                   # Remove pairs >2 SD from regression (1.0 over-strips to ~5 pairs)
+    min_r_threshold: 0.70               # Discard image if Pearson r < 0.70 (R0 dataset)
+    max_iterations: 20                  # Safety cap on outlier removal loop
+  min_valid_pairs: 10                   # Minimum matched pairs to attempt calibration
+
+# ---- Calibration ----
+calibration:
+  method: "OLS"                          # Ordinary Least Squares: SST = m*Bt + b
+  generalized_from: "median_of_perimage" # Final constants = median of per-image slopes/intercepts
+  # Initial constants from Speiser & Largier (2024) - Northern California
+  # These will NOT transfer directly; derive new constants for Tasmania
+  reference_slope: 0.00297
+  reference_intercept: -105.88
+
+# ---- Paths ----
+paths:
+  raw_landsat:    "data/raw/landsat"
+  raw_modis:      "data/raw/modis_cape_bruny"
+  proc_landsat:   "data/processed/landsat_bt_cape_bruny"
+  proc_modis:     "data/processed/modis_sst"
+  matched_pairs:  "data/processed/matched_pairs_cape_bruny"
+  insitu:         "data/validation/insitu"
+  val_outputs:    "data/validation/outputs"
+  results:        "results/calibration_outputs"
+  figures:        "results/figures"
+  mur_cache:      "data/processed/mur_sst"
+  mur_outputs:    "data/validation/mur_outputs"
+  logs:           "logs"
+
+# ---- Barrier SPDE spatio-temporal model (Bakka et al. 2019) ----
+# Uses R-INLA via rpy2 for inference. Coastline forms a barrier to
+# spatial correlation so SST fields don't leak across land.
+barrier_spde:
+  # Mesh construction
+  mesh:
+    # Sub-region with finer mesh resolution (override with CLI --dense-lon-min etc.)
+    dense_region:
+      # ~5 km radius around Maria Island NRS (-42.600, 148.233)
+      lon_min: 148.173
+      lon_max: 148.293
+      lat_min: -42.645
+      lat_max: -42.555
+    max_edge_dense: 0.02       # ~2 km in degrees (fine triangles in dense region)
+    max_edge_coarse: 0.08      # ~8 km (coarser triangles elsewhere)
+    max_edge_outer: 0.15       # Extension zone beyond study domain
+    cutoff: 0.01               # Minimum distance between mesh nodes (~1 km)
+    offset: [0.1, 0.3]        # Inner and outer extension beyond domain boundary
+    coastline_simplify_m: 500  # Douglas-Peucker simplification tolerance for coastline
+
+  # Temporal structure
+  temporal:
+    bin_method: "monthly"      # "monthly", "weekly", or "scene"
+    ar_order: 1                # AR(1) temporal correlation between spatial fields
+
+  # Observation subsampling per scene (for tractability)
+  observation:
+    max_obs_per_scene: 2000    # Spatially subsample water pixels per scene
+    min_obs_per_scene: 20      # Skip scenes with fewer valid pixels
+    min_scenes: 100            # Minimum total scenes required to fit model
+
+  # Model specification
+  model:
+    n_harmonics: 2             # Fourier harmonics for seasonal cycle
+    include_trend: true        # Linear trend term in fixed effects
+    barrier_range_fraction: 0.1  # Barrier range = fraction * domain range
+    prior_range: [0.1, 0.5]   # PC prior on spatial range: P(range < 0.1) = 0.5
+    prior_sigma: [2.0, 0.5]   # PC prior on marginal std: P(sigma > 2.0) = 0.5
+    prior_rho: [0.9, 0.9]     # PC prior on AR(1) rho: P(cor > 0.9) = 0.9
+    exceedance_thresholds: [16, 18, 20, 22]  # SST thresholds for exceedance maps
+
+    # Spatially varying coefficients — each listed term gets its own
+    # barrier SPDE field instead of a scalar fixed effect.
+    # Possible values: "intercept", "trend", "cos1", "sin1", "cos2", "sin2", ...
+    # Terms NOT listed here remain global (scalar) fixed effects.
+    # Example: ["intercept", "trend"] gives b0(s) + b_trend(s)*t + fixed harmonics
+    spatially_varying: ["intercept"]  # spatially varying intercept b0(s)
+
+  # Output paths
+  paths:
+    mesh_dir: "results/barrier_spde/mesh"
+    model_dir: "results/barrier_spde/model"
+    maps_dir: "results/barrier_spde/maps"
+    figures_dir: "results/figures/barrier_spde"
+
+# ---- Super-resolution / downscaling CNN (scripts 22-27) ----
+# Patch-based residual CNN: SST_100m = bilinear(MUR_1km) + CNN(MUR, bathy, slope, u, v)
+# Designed to train CPU-only on a laptop overnight. Nearshore-focused.
+super_resolution:
+  # Reference defining the 100 m target grid (transform/shape/CRS reused everywhere)
+  target_grid_ref: "data/processed/water_mask/water_mask_tas_east_coast.tif"
+  water_mask:      "data/processed/water_mask/water_mask_tas_east_coast.tif"
+  sst_dir:         "data/processed/sst_calibrated"   # target (100 m, degC) GeoTIFFs
+  mur_dir:         "data/processed/mur_sst"           # input (1 km, Kelvin) daily NetCDF
+  static_dir:      "data/processed/static"            # bathy.tif, slope.tif (script 22)
+  currents_dir:    "data/processed/currents"          # per-date u/v GeoTIFFs (script 23)
+  dataset_dir:     "data/processed/sr_dataset"        # patch manifest + norm stats (script 24)
+  model_dir:       "results/sr_model"                 # checkpoints, logs, predictions
+
+  # GEBCO bathymetry source (script 22). Download once to data/raw/gebco/.
+  gebco_file:      "data/raw/gebco/gebco_2024.nc"
+
+  # Copernicus GLORYS currents (script 23). Requires a free CMEMS account.
+  glorys:
+    dataset_id_reanalysis: "cmems_mod_glo_phy_my_0.083deg_P1D-m"   # 1993-2021
+    dataset_id_interim:    "cmems_mod_glo_phy_myint_0.083deg_P1D-m" # 2021-near-present
+    variables: ["uo", "vo"]
+    depth_m: 0.5            # surface layer
+
+  # Patch sampling
+  patch_size: 128
+  patch_stride: 64
+  min_valid_frac: 0.05     # min fraction of valid (finite, water) target pixels per patch
+  min_land_frac: 0.10      # NEARSHORE filter: require >=10% land pixels per patch
+
+  # Model
+  channels: 48
+  n_res_blocks: 5
+  use_currents: true
+
+  # Training
+  batch_size: 16
+  epochs: 40
+  lr: 0.0003
+  grad_loss_weight: 0.5    # weight on Sobel-gradient loss term (front sharpening)
+  num_threads: 6           # torch CPU threads (i7-9750H = 6 cores)
+  seed: 42
+
+  # Temporal split (inclusive year ranges)
+  splits:
+    train: [2002, 2017]
+    val:   [2018, 2019]
+    test:  [2020, 2022]
+
+# ---- Per-pixel linear baseline (script 28) ----
+# Simplest downscaling model: at each pixel, fit  Landsat = b0 + b1 * MUR
+# across the time stack of matchups -> spatially-varying (b0, b1) map.
+# Image-level k-fold CV (whole scenes held out -> no pixel leakage).
+pixel_linear:
+  # Storm Bay study area. NOTE: calibrated-SST grid only covers lon>=147.5,
+  # so the config `sub_regions.storm_bay` box (lon 147.1-147.38) is OUTSIDE the
+  # data. Box below is open Storm Bay within the grid. Alternatives:
+  #   open water : 147.50-147.75 / -43.45 to -43.10  (85% water)
+  #   coastal    : 147.60-147.95 / -43.30 to -42.95  (58% water)
+  area:
+    lon_min: 147.55
+    lon_max: 147.90
+    lat_min: -43.40
+    lat_max: -43.05
+  start_date: "20020601"     # MUR begins 2002-06
+  seasonal: true             # add b2*sin + b3*cos (annual cycle) to the bias term
+  use_wind: true             # add per-scene ERA5 wind covariate (skin effect); needs script 30
+  wind_interaction: false    # also add wind*sin, wind*cos (wind modulates seasonal skin cycle)
+  n_folds: 5                 # 5 -> each held-out fold is 20% of images
+  min_train_obs: 8           # min valid matchups per pixel to fit a line
+  min_valid_pixels: 50       # skip a scene with fewer valid pixels in the area
+  output_dir: "results/pixel_linear"
+
+# ---- Wind speed covariate (script 30) ----
+# ERA5 10 m wind from the public Google ARCO-ERA5 zarr (no account needed).
+# Wind modulates the skin/foundation SST offset: low wind -> warm diurnal skin
+# layer (Landsat >> MUR); high wind mixes it out. Added as a per-scene covariate.
+wind:
+  source: "era5_arco"
+  zarr: "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
+  # Broad coastal region covering all study boxes (Storm Bay, Frederick Henry,
+  # D'Entrecasteaux, Cape Bruny). Wind is ~uniform at 0.25 deg over these scales.
+  region: {lon_min: 146.9, lon_max: 148.4, lat_min: -43.6, lat_max: -42.6}
+  overpass_hour_utc: 0          # ~10:00 local (AEST = UTC+10) Landsat overpass
+  sst_dirs: ["data/processed/sst_calibrated", "data/processed/sst_calibrated_cape_bruny"]
+  start_date: "20020601"        # MUR era
+  output: "data/processed/wind/wind_daily.csv"
+
+# ---- In situ validation (script 31) ----
+# Validate the per-pixel MUR->Landsat model (MUR + seasonal) against independent
+# in situ SST, vs raw-MUR and climatology baselines. Stratified by season & depth.
+insitu_validation:
+  output_dir: "results/insitu_validation"
+  min_train_obs: 8
+  start_date: "20020601"
+  # Optional temperature-dependent bias correction of the MUR->Landsat model,
+  # fit per region & season (model error vs predicted SST). Removes the cool
+  # skin bias. Coefficients saved to <output_dir>/bias_correction.json.
+  apply_bias_correction: false
+  bias_correction_min_n: 30   # min matchups to fit a per-(region,season) correction
+  sources:
+    maria_island:
+      csv: "data/validation/insitu/Maria_Island_NRS.csv"
+      time_col: "datetime"
+      region: "east_coast"
+      lat: -42.596            # fixed NRS station (CSV has no coords)
+      lon: 148.233
+      sst_dir: "data/processed/sst_calibrated"
+      mur_dir: "data/processed/mur_sst"
+      box: {lon_min: 148.13, lon_max: 148.33, lat_min: -42.70, lat_max: -42.50}
+    storm_bay_glider:
+      csv: "data/validation/insitu/Storm_Bay_daily_gridded.csv"
+      time_col: "date"
+      region: "dentrecasteaux"
+      per_row_latlon: true    # gridded glider has lat/lon per row
+      sst_dir: "data/processed/sst_calibrated_cape_bruny"
+      mur_dir: "data/processed/mur_sst_cape_bruny"
+      box: {lon_min: 147.40, lon_max: 147.95, lat_min: -43.67, lat_max: -42.90}

@@ -1,0 +1,56 @@
+name: COASTAL_DATA_TESTS
+
+# output directory
+output_dir: "path/to/data"
+
+# Date range to load data for the project
+time:
+  start_date: "2026-06-01"
+  end_date: "2026-06-30"
+
+# How to authenticate (NON-secret). Real credentials live in ~/.netrc, a key
+# file, or env vars -- never here. Required for the products that need them
+# (ecostress/mur -> earthdata; landsat/landcover -> gee).
+auth:
+  earthdata:
+    auth_strategy: netrc
+
+# Grid  
+grid:
+  resolution_m: 100          # target posting in metres
+  target_crs: auto           # "auto" -> local UTM per AOI, or e.g. "EPSG:32610"
+  resampling_continuous: bilinear
+  resampling_categorical: nearest
+  snap_origin: true
+
+# Data products to acquire, with GLOBAL (project-wide) options per product.
+products:
+  bathymetry:
+  ecostress:
+    version: "002"
+  mur:
+    variable: analysed_sst
+  landsat:
+    source: "pc"        # pc (default) | aws | gee
+
+regions:
+  - name: pnw_estuaries
+    # Region-DEPENDENT source options (which source has coverage here, etc.).
+    sources:
+      bathymetry:
+        dem_source: cudem
+    # list aois in the region.
+    areas:
+      - name: tillamook_bay
+        center_lat: 45.52
+        center_lon: -123.925
+        buffer_ns_km: 25
+        buffer_ew_km: 15
+  - name: puget_sound
+        # list aois in the region.
+    areas:
+      - name: padilla_bay
+        center_lat: 48.45
+        center_lon: -122.58
+        buffer_ns_km: 10
+        buffer_ew_km: 10

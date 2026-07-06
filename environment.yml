@@ -1,0 +1,17 @@
+# Conda/mamba environment for OCEANSR (recommended path for the geospatial stack).
+#   mamba env create -f environment.yml      # or: conda env create -f environment.yml
+#   conda activate oceansr
+name: coastal_sst_data
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pydantic
+  - pytest
+  # Landsat via Planetary Computer (landsat_pc.py): STAC search + COG reads.
+  - pystac-client
+  - planetary-computer
+  - pip
+  - pip:
+      - -e ".[dev]"  # installs YOUR package + its deps + test extras from pyproject
+
