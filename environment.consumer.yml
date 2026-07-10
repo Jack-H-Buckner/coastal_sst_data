@@ -1,0 +1,62 @@
+# TEMPLATE -- starting point for ANOTHER project that wants to *use*
+# coastal_sst_data as a library alongside its own dependencies.
+#
+# Copy this into your project, rename it, add your own deps, and trim the
+# coastal_sst_data backends you don't use. The pattern that matters:
+#
+#   * conda-forge provides ALL the compiled/geospatial deps (GDAL via
+#     rasterio/rioxarray/pyproj, eccodes via herbie, pyresample, cartopy).
+#     This is what keeps native libraries coordinated -- a single OpenMP
+#     runtime and a matched eccodes C-lib/bindings -- so nothing segfaults.
+#   * pip then installs ONLY the coastal_sst_data package from GitHub. Every
+#     one of its runtime deps is already satisfied by conda above, so pip
+#     pulls no wheels of its own.
+#
+# Build:  conda env create -f environment.consumer.yml   (add -n <name> to rename)
+name: my_project           # <-- rename to your project
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+
+  # ---- your project's own dependencies go here ----
+  # - scikit-learn
+  # - jupyterlab
+  # - ...
+
+  # ---- coastal_sst_data's core deps (always needed) ----
+  - numpy
+  - pandas
+  - xarray
+  - pydantic
+  - pyyaml
+  - pyproj
+  - shapely
+  - rasterio
+  - rioxarray
+  - requests
+  - earthaccess
+  - zarr
+  - numcodecs
+  - scipy
+
+  # ---- coastal_sst_data backend deps: keep only the products you use ----
+  - pystac-client       # landsat / landcover (Planetary Computer)
+  - planetary-computer  # landsat / landcover
+  - pyresample          # modis + met resampling
+  - herbie-data         # met (HRRR)
+  - gcsfs               # met (ERA5 fallback)
+  - eo-tides            # global tide-model backup
+  - matplotlib          # grids --plot maps
+  - cartopy             # grids --plot coastlines (optional)
+
+  - pip
+  - pip:
+      # Install coastal_sst_data itself from GitHub. PIN to a tag or commit for
+      # reproducibility -- @main is a moving target. Examples:
+      #   ...coastal_sst_data.git@v0.0.1     (a git tag)
+      #   ...coastal_sst_data.git@21c14a1    (a commit SHA)
+      - git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@main
+      # pytides2 is the CO-OPS tide backend and is NOT on conda-forge; include
+      # it only if you use the `tides` product.
+      - pytides2

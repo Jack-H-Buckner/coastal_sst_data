@@ -111,14 +111,58 @@ grids = csd.project_grids(project)           # {aoi_name: AoiGrid}, computed onc
 csd.run_pipeline(project, assemble=True)     # acquire everything, then build the cubes
 ```
 
-To depend on it from another project, install it from a path or git (adding whichever extras that project needs):
+#### Depending on it from another project's conda env
 
-```bash
-pip install "/path/to/coastal_sst_data[met,plot]"
-pip install "coastal_sst_data[all] @ git+https://<host>/<repo>.git"
+The common case is another project — with its **own conda environment, its own dependencies, and its own directory** — that wants to import `coastal_sst_data`. The install is directory-independent: nothing needs the repo cloned anywhere. The rule that keeps it working is:
+
+> **conda-forge provides all of `coastal_sst_data`'s compiled deps; pip installs only the package itself from GitHub.**
+
+This matters because the package pulls in GDAL/PROJ- and eccodes-backed libraries (`rasterio`, `rioxarray`, `pyproj`, `pyresample`, `herbie`, `cartopy`). If pip is left to resolve those, it installs them as **wheels**, which mix incompatible native runtimes (e.g. multiple OpenMP copies) and can **segfault** at import or during the met/regrid stages. Installing them from conda-forge first — so pip finds every dependency already satisfied and adds nothing of its own — avoids that entirely.
+
+So in the **consuming project's** `environment.yml`, list the conda-forge deps you need, then add the package on the pip line:
+
+```yaml
+name: my_other_project
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  # ... that project's own deps ...
+
+  # coastal_sst_data's compiled deps (add only the backends you use):
+  - numpy
+  - pandas
+  - xarray
+  - pyproj
+  - shapely
+  - rasterio
+  - rioxarray
+  - zarr
+  - numcodecs
+  - scipy
+  - earthaccess
+  - pyresample        # modis / met
+  - herbie-data       # met (HRRR)
+  - gcsfs             # met (ERA5 fallback)
+  # ... pystac-client, planetary-computer, eo-tides, matplotlib, cartopy as needed
+
+  - pip
+  - pip:
+      - git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@main
+      - pytides2       # only if you use the CO-OPS tides backend (not on conda-forge)
 ```
 
-The simplest way to reuse it across projects is to `conda activate coastal_sst_data` (the env from the recommended install) and import it there — no per-project install needed.
+A ready-to-copy version of this file lives at [`environment.consumer.yml`](environment.consumer.yml) — copy it into your project, rename it, add your own deps, and trim the backends you don't need.
+
+**Pin the version for reproducibility.** `@main` is a moving target — two projects set up a week apart can get different code. Pin to a git tag or commit so each project's env is reproducible:
+
+```yaml
+- git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@v0.0.1     # a git tag
+- git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@21c14a1    # a commit SHA
+```
+
+To bump a consumer to a newer version later: `pip install --upgrade --force-reinstall --no-deps "git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@v0.1.0"`.
+
+**Alternative — no per-project install.** If a project just needs to *run* the package occasionally, you can skip embedding it and instead `conda activate coastal_sst_data` (the standalone env from `environment.github.yml`) and work there. That's simplest for one-off use, but it doesn't let the package coexist with another project's own dependencies — for that, use the embedded pattern above.
 
 ### Credentials
 
