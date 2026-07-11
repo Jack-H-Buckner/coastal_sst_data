@@ -148,10 +148,19 @@ dependencies:
   - pip
   - pip:
       - git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@main
-      - pytides2       # only if you use the CO-OPS tides backend (not on conda-forge)
 ```
 
 A ready-to-copy version of this file lives at [`environment.consumer.yml`](environment.consumer.yml) — copy it into your project, rename it, add your own deps, and trim the backends you don't need.
+
+**The CO-OPS tides backend needs a separate step.** Don't add `pytides2` to the `pip:` block above: it's not on conda-forge and declares a broken pin (`numpy>=1.19,<1.19.4`), so pip tries to downgrade numpy and fails building an ancient sdist. The package ships a compatibility shim, so `pytides2` runs fine on modern numpy when installed *without its dependencies*. If your config uses the default CO-OPS tide source, install it after the env is created:
+
+```bash
+conda env create -f environment.my_other_project.yml -n my_other_project
+conda activate my_other_project
+pip install --no-build-isolation --no-deps pytides2
+```
+
+(Skip this if you don't use CO-OPS tides — the `eo-tides` global fallback is a normal conda-forge dep.)
 
 **Pin the version for reproducibility.** `@main` is a moving target — two projects set up a week apart can get different code. Pin to a git tag or commit so each project's env is reproducible:
 

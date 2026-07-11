@@ -39,11 +39,13 @@ dependencies:
   - zarr
   - numcodecs
   - scipy
+  - h5netcdf            # xarray engine for the MUR SST backbone (mur.py)
 
   # ---- coastal_sst_data backend deps: keep only the products you use ----
   - pystac-client       # landsat / landcover (Planetary Computer)
   - planetary-computer  # landsat / landcover
   - pyresample          # modis + met resampling
+  - netcdf4             # modis (reads MODIS L2P swaths, modis.py)
   - herbie-data         # met (HRRR)
   - gcsfs               # met (ERA5 fallback)
   - eo-tides            # global tide-model backup
@@ -52,11 +54,22 @@ dependencies:
 
   - pip
   - pip:
-      # Install coastal_sst_data itself from GitHub. PIN to a tag or commit for
-      # reproducibility -- @main is a moving target. Examples:
+      # Install coastal_sst_data itself from GitHub. Its deps are all provided by
+      # conda above, so pip installs only the package (no wheels pulled). PIN to a
+      # tag or commit for reproducibility -- @main/@dev are moving targets:
       #   ...coastal_sst_data.git@v0.0.1     (a git tag)
       #   ...coastal_sst_data.git@21c14a1    (a commit SHA)
-      - git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@main
-      # pytides2 is the CO-OPS tide backend and is NOT on conda-forge; include
-      # it only if you use the `tides` product.
-      - pytides2
+      - git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@dev
+
+# --- CO-OPS tides backend: a required SEPARATE step (do NOT add pytides2 above) ---
+# The `tides` product's default CO-OPS source uses pytides2, which is NOT on
+# conda-forge AND declares a broken pin (numpy>=1.19,<1.19.4). Listing it in the
+# pip: block above makes pip downgrade numpy and fail to build an ancient sdist.
+# coastal_sst_data ships a compat shim, so pytides2 runs fine on modern numpy when
+# installed WITHOUT its deps. After the env is created:
+#
+#   conda activate my_project
+#   pip install --no-build-isolation --no-deps pytides2
+#
+# Skip this entirely if you don't use the CO-OPS tide source (eo-tides, installed
+# above via conda, covers the global fallback).
