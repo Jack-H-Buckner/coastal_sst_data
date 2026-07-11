@@ -31,20 +31,21 @@ dependencies = [
     "zarr>=3",
     "numcodecs",
     "scipy",
+    "h5netcdf",                # xarray engine for the MUR SST backbone (mur.py)
 ]
 
 [project.optional-dependencies]
 # Per-product backends -- install only what your config selects.
 landsat = ["planetary-computer", "pystac-client"]        # landsat_pc source
 landcover = ["planetary-computer", "pystac-client"]      # landcover_esa source
-modis = ["pyresample"]                                    # swath -> grid resampling
+modis = ["pyresample", "netcdf4"]                         # swath -> grid resampling (netcdf4 reads MODIS L2P)
 met = ["herbie-data", "gcsfs", "pyresample"]              # HRRR + ARCO-ERA5 forcing
 tides = ["pytides2"]                                      # NOAA CO-OPS harmonic synthesis
 tides-global = ["eo-tides"]                               # global tide-model backup
 plot = ["matplotlib", "cartopy"]                          # `grids --plot` maps
 # Convenience bundles.
 all = [
-    "planetary-computer", "pystac-client", "pyresample",
+    "planetary-computer", "pystac-client", "pyresample", "netcdf4",
     "herbie-data", "gcsfs", "pytides2", "eo-tides",
     "matplotlib", "cartopy",
 ]

@@ -1,9 +1,13 @@
-# Conda/mamba environment for coastal_sst_data -- the recommended install path,
-# because conda provides the compiled geospatial stack (GDAL/PROJ) that the core
-# runtime deps in pyproject.toml build on. Conda installs those libs, then the
-# `pip install -e` step below adds the package itself (deps already satisfied).
-#   mamba env create -f environment.yml      # or: conda env create -f environment.yml
+# Conda/mamba environment for coastal_sst_data -- installs the package straight
+# from GitHub (no local clone needed). Use this to *run* the project on another
+# machine; for developing the package use environment.yml (editable install).
+#
+#   conda env create -f environment.github.yml     # add -n <name> for a custom env name
 #   conda activate coastal_sst_data
+#
+# conda-forge provides the compiled geospatial stack (GDAL/PROJ, eccodes, a single
+# coordinated OpenMP) so no native deps come from pip wheels. pip then pulls only
+# the package from GitHub -- every runtime dep is already satisfied by conda above.
 name: coastal_sst_data
 channels:
   - conda-forge
@@ -51,18 +55,16 @@ dependencies:
   - cartopy
   - pip
   - pip:
-      # Editable install of the package itself (core deps already provided by conda
-      # above); [dev] adds the test extras from pyproject.
-      - -e ".[dev]"
+      # Install the package itself from GitHub (core deps already provided by conda
+      # above). Change @main to @dev, @<tag>, or @<commit-sha> to pin a version.
+      - git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@main
 
 # --- CO-OPS tides backend: a required SEPARATE step (do NOT add pytides2 above) ---
 # pytides2 (the `tides` product's default CO-OPS source) is NOT on conda-forge and
 # declares a broken pin (numpy>=1.19,<1.19.4); listing it in the pip: block makes
 # pip downgrade numpy and fail building an ancient sdist. coastal_sst_data ships a
-# compat shim (tides.py: _patch_legacy_compat), so it runs fine on modern numpy
-# when installed WITHOUT its deps. After the env is created, only if you use the
-# CO-OPS tide source:
+# compat shim, so it runs fine on modern numpy when installed WITHOUT its deps.
+# After the env is created, only if you use the CO-OPS tide source:
 #
 #   conda activate coastal_sst_data
 #   pip install --no-build-isolation --no-deps pytides2
-

@@ -1,0 +1,75 @@
+# TEMPLATE -- starting point for ANOTHER project that wants to *use*
+# coastal_sst_data as a library alongside its own dependencies.
+#
+# Copy this into your project, rename it, add your own deps, and trim the
+# coastal_sst_data backends you don't use. The pattern that matters:
+#
+#   * conda-forge provides ALL the compiled/geospatial deps (GDAL via
+#     rasterio/rioxarray/pyproj, eccodes via herbie, pyresample, cartopy).
+#     This is what keeps native libraries coordinated -- a single OpenMP
+#     runtime and a matched eccodes C-lib/bindings -- so nothing segfaults.
+#   * pip then installs ONLY the coastal_sst_data package from GitHub. Every
+#     one of its runtime deps is already satisfied by conda above, so pip
+#     pulls no wheels of its own.
+#
+# Build:  conda env create -f environment.consumer.yml   (add -n <name> to rename)
+name: my_project           # <-- rename to your project
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+
+  # ---- your project's own dependencies go here ----
+  # - scikit-learn
+  # - jupyterlab
+  # - ...
+
+  # ---- coastal_sst_data's core deps (always needed) ----
+  - numpy
+  - pandas
+  - xarray
+  - pydantic
+  - pyyaml
+  - pyproj
+  - shapely
+  - rasterio
+  - rioxarray
+  - requests
+  - earthaccess
+  - zarr
+  - numcodecs
+  - scipy
+  - h5netcdf            # xarray engine for the MUR SST backbone (mur.py)
+
+  # ---- coastal_sst_data backend deps: keep only the products you use ----
+  - pystac-client       # landsat / landcover (Planetary Computer)
+  - planetary-computer  # landsat / landcover
+  - pyresample          # modis + met resampling
+  - netcdf4             # modis (reads MODIS L2P swaths, modis.py)
+  - herbie-data         # met (HRRR)
+  - gcsfs               # met (ERA5 fallback)
+  - eo-tides            # global tide-model backup
+  - matplotlib          # grids --plot maps
+  - cartopy             # grids --plot coastlines (optional)
+
+  - pip
+  - pip:
+      # Install coastal_sst_data itself from GitHub. Its deps are all provided by
+      # conda above, so pip installs only the package (no wheels pulled). PIN to a
+      # tag or commit for reproducibility -- @main/@dev are moving targets:
+      #   ...coastal_sst_data.git@v0.0.1     (a git tag)
+      #   ...coastal_sst_data.git@21c14a1    (a commit SHA)
+      - git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@dev
+
+# --- CO-OPS tides backend: a required SEPARATE step (do NOT add pytides2 above) ---
+# The `tides` product's default CO-OPS source uses pytides2, which is NOT on
+# conda-forge AND declares a broken pin (numpy>=1.19,<1.19.4). Listing it in the
+# pip: block above makes pip downgrade numpy and fail to build an ancient sdist.
+# coastal_sst_data ships a compat shim, so pytides2 runs fine on modern numpy when
+# installed WITHOUT its deps. After the env is created:
+#
+#   conda activate my_project
+#   pip install --no-build-isolation --no-deps pytides2
+#
+# Skip this entirely if you don't use the CO-OPS tide source (eo-tides, installed
+# above via conda, covers the global fallback).
