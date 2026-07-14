@@ -59,7 +59,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -420,7 +420,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
-    tally: dict[str, int] = {}     # {source: n fetches} -- reported at the end of the run
+    rep = report.ProductReport("met")
+    tally: dict[str, int] = {}     # {source: n fetches} -- folded into `rep` at the end
 
     for name in names:
         g = grids[name]
@@ -453,6 +454,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                     log.info("  %s reference [%s] (%s %s -> %s UTC) -> %s", dstr, src,
                              ref_time, ref_basis, rt.strftime("%H:%M"),
                              write_output(ds, aoi_out, name, fmt, f"{name}_ref_{dstr}"))
+                    rep.wrote(source=src)
+                else:
+                    rep.fail(f"{name} ref {dstr}", "no source in the chain had data")
 
             # ---- daily mean over mean_hours (skipped when daily_mean_hours: []) ----
             if mean_hours and not store.done(
@@ -488,6 +492,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                     log.info("  %s daily [%s, %dh] -> %s", dstr, "+".join(sorted(srcs)),
                              len(used_hours),
                              write_output(ds, aoi_out, name, fmt, f"{name}_{dstr}"))
+                    rep.wrote(source="+".join(sorted(srcs)) + " daily mean")
+                else:
+                    rep.fail(f"{name} daily {dstr}", "no source had data at any hour")
 
             # ---- overpass snapshots ----
             for op in overpass_times_for_day(overpass_dirs, name, day):
@@ -497,22 +504,25 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                     continue
                 got, src = _fetch_at(chain, g, op, ds_cfg, tally)
                 if not got:
+                    rep.fail(f"{name} overpass {tstr}", "no source in the chain had data")
                     continue
                 ds = to_dataset(got, g, op, to_celsius)
                 ds.attrs.update(aoi_id=name, source=f"{src} @overpass", **provenance.stamp(eff))
                 log.info("  overpass %s [%s] -> %s", tstr, src,
                          write_output(ds, aoi_out, name, fmt, f"{name}_{tstr}"))
+                rep.wrote(source=src)
 
-    # Which source actually served this run. A per-file `source` attr is the truth, but
-    # nobody reads 3,000 attrs -- so the run says out loud, once, what it fell back to.
-    if tally:
-        summary = ", ".join(f"{k}: {v}" for k, v in sorted(tally.items()))
-        fell_back = [k for k in tally if k not in ("<none>", chain[0])]
-        (log.warning if fell_back else log.info)(
-            "met: fetches by source -- %s%s", summary,
-            f"  (FELL BACK from {chain[0]} for {sum(tally[k] for k in fell_back)} fetch(es); "
-            "the sources differ in resolution and in what swrad MEANS)" if fell_back else "")
-    log.info("Done.")
+    # Which source actually SERVED this run -- not which was configured. The per-file
+    # `source` attr is the truth, but nobody reads 3,000 attrs, so the run says it once.
+    fell_back = [k for k in tally if k not in ("<none>", chain[0])]
+    if fell_back:
+        n = sum(tally[k] for k in fell_back)
+        rep.note = (f"FELL BACK from {chain[0]} for {n} fetch(es) -> "
+                    f"{', '.join(sorted(fell_back))} (different resolution; swrad means "
+                    "something different)")
+        log.warning("met: %s", rep.note)
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -587,7 +597,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

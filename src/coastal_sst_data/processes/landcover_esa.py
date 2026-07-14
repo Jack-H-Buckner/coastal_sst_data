@@ -49,7 +49,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +163,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("landcover")
+
     for name in names:
         g = grids[name]
         aoi_out = out_root / name
@@ -185,7 +187,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 continue
             ds = items_to_dataset(items, g, water_classes, name)
         except Exception as exc:
-            log.warning("  skipping %s (%s)", name, exc)
+            log.warning("  FAILED %s (%s)", name, exc)
+            rep.fail(name, exc)
             continue
         if ds is None:
             continue
@@ -193,7 +196,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         wf = float((ds["water"].values == 1).mean())
         ds.attrs.update(**provenance.stamp(eff))
         log.info("  wrote %s  (water=%.0f%% of grid)", write_output(ds, aoi_out, name, fmt), 100 * wf)
-    log.info("Done.")
+        rep.wrote(source="ESA WorldCover (Planetary Computer)")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -238,7 +243,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

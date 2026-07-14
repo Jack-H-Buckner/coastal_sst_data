@@ -574,3 +574,61 @@ def test_source_channel_is_absent_when_the_product_never_ran(project, grids, day
     write_landcover(project, g, land_cols=slice(0, 0))
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
     assert "cmems_source" not in ds.data_vars    # no CMEMS files -> no channel to explain
+
+
+# --------------------------------------------------------------------------- #
+# Coverage: the cube's time axis is built from the CONFIG, so a lost day is a NaN
+# slice that looks exactly like a cloudy day. Count what actually landed.
+# --------------------------------------------------------------------------- #
+def test_coverage_counts_the_days_that_actually_landed(project, grids, days):
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    # drop one of the three MUR days, as a failed download would
+    (project.output_dir / "MUR" / "aligned" / AOI /
+     f"{AOI}_{days[1].strftime('%Y%m%d')}.nc").unlink()
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    cov = json.loads(ds.attrs["coverage"])
+
+    assert cov["mur"]["days_expected"] == 3
+    assert cov["mur"]["days_with_data"] == 2      # the lost day is COUNTED, not hidden
+    assert cov["mur"]["fraction"] == 2 / 3
+    assert ds.sizes["time"] == 3                  # ...while the axis is still full-length
+
+
+def test_thin_coverage_is_warned_about(project, grids, days, caplog):
+    g = grids[AOI]
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    write_mur(project, g, [days[0]], water_hole_cols=slice(0, 0))   # 1 of 3 days only
+
+    with caplog.at_level("WARNING"):
+        datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "covers only 1 of 3" in caplog.text
+    assert "look exactly like cloudy days" in caplog.text
+
+
+def test_full_coverage_does_not_warn(project, grids, days, caplog):
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    with caplog.at_level("WARNING"):
+        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert json.loads(ds.attrs["coverage"])["mur"]["fraction"] == 1.0
+    assert "covers only" not in caplog.text
+
+
+def test_overpass_sensors_are_not_judged_on_daily_coverage(project, grids, days):
+    """ECOSTRESS/Landsat/MODIS are overpass sensors: a day with no scene is NORMAL. Warning
+    on those would train the user to ignore the warning."""
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    write_ecostress_two_scenes(project, g, days[0])          # a scene on ONE day of three
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert "ecostress" not in json.loads(ds.attrs["coverage"])

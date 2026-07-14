@@ -85,7 +85,7 @@ import xarray as xr
 
 from ..config import CompressionSpec, DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
@@ -619,6 +619,25 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     )
     ds.attrs.update(aoi_id=aid, crs=g.target_crs, met_time=mlabel)
 
+    # COVERAGE. The time axis is built from the CONFIG (start..end), not from the data, and
+    # every loader defaults a missing day to NaN. So a run that lost 40 of 100 days to a
+    # flaky network still yields a 100-step cube whose gaps are indistinguishable from
+    # cloudy days -- and the old log line printed `t=100` either way. Count what actually
+    # landed, stamp it on the cube, and say so when a product is thin.
+    # Which products actually wrote files for this AoI -- needed to tell a product that is
+    # THIN (ran, lost days) from one that is ABSENT (never ran). Also feeds the provenance
+    # record below, so it is collected once.
+    prod = provenance.collect(eff["aligned_root"], aid, PRODUCT_DIRS)
+    cov = coverage(ds, days, present=set(prod))
+    ds.attrs["coverage"] = json.dumps(cov, sort_keys=True)
+    for product, c in sorted(cov.items()):
+        if c["fraction"] < COVERAGE_WARN:
+            log.warning("  %s: %s covers only %d of %d day(s) (%.0f%%) -- the rest are NaN "
+                        "slices, which look exactly like cloudy days. Check the run report "
+                        "for what failed.",
+                        aid, product, c["days_with_data"], c["days_expected"],
+                        100 * c["fraction"])
+
     # The valid/filled distinction has to travel WITH the cube: a downstream reader who
     # trains on `mur_sst` without knowing which cells were invented has no way to find out.
     ds["mur_valid"].attrs["long_name"] = "MUR SST was OBSERVED in this cell (not filled)"
@@ -656,7 +675,6 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     # PROVENANCE: the config that built this cube, and for every field the source(s) it
     # came from and when they were accessed. Zarr attrs must be JSON-serialisable, so the
     # structured parts are JSON strings.
-    prod = provenance.collect(eff["aligned_root"], aid, PRODUCT_DIRS)
     rec = provenance.build(eff["project"], list(ds.data_vars), prod)
     ds.attrs.update(
         created_at=rec["created_at"], package_version=rec["package_version"],
@@ -689,6 +707,56 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
                                   water_level.UNKNOWN], dtype="uint8"),
             flag_meanings="submerged exposed unknown")
     return ds
+
+
+# --------------------------------------------------------------------------- #
+# Coverage
+# --------------------------------------------------------------------------- #
+COVERAGE_WARN = 0.95      # below this fraction of days, a daily product is reported thin
+
+# Products that SHOULD have a value every day, and the channel that proves it. Only these
+# can be judged on coverage: ECOSTRESS/Landsat/MODIS are overpass sensors, so a day with no
+# scene is normal and not a defect -- warning on those would train the user to ignore the
+# warning. `cmems` is matched by prefix because its channels are config-dependent.
+DAILY_CHANNELS = {"mur": "mur_sst", "met": "airtemp", "tide": "tide"}
+
+
+# provenance names the tide product in the plural; the cube's channel is singular.
+_COVERAGE_ALIASES = {"tide": "tides"}
+
+
+def coverage(ds: xr.Dataset, days, present=None) -> dict:
+    """{product: {days_with_data, days_expected, fraction}} for the daily products.
+
+    A day "has data" if its slice holds at least one finite value. This is the check that
+    makes a network-shaped hole visible: the cube's time axis is always len(days) long, so
+    the ONLY evidence a day was lost is that its slice is entirely NaN.
+
+    `present` is the set of products that actually wrote files for this AoI. A product that
+    was never run is ABSENT, not thin -- reporting it at 0% would bury the products that
+    really are thin under noise about products nobody asked for.
+    """
+    out = {}
+    channels = dict(DAILY_CHANNELS)
+    cm = [v for v in ds.data_vars if v.startswith("cmems_") and not v.endswith("_filled")]
+    if cm:
+        channels["cmems"] = sorted(cm)[0]
+
+    for product, var in channels.items():
+        if present is not None and _COVERAGE_ALIASES.get(product, product) not in present:
+            continue
+        if var not in ds:
+            continue
+        da = ds[var]
+        if "time" not in da.dims:
+            continue
+        finite = np.isfinite(da.values)
+        axes = tuple(range(1, finite.ndim))          # everything but time
+        has = finite.any(axis=axes) if axes else finite
+        n = int(has.sum())
+        out[product] = {"days_with_data": n, "days_expected": len(days),
+                        "fraction": (n / len(days)) if len(days) else 0.0}
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -800,6 +868,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("datacube")
+
     if not dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -808,6 +878,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         zpath = out_dir / f"{name}.zarr"
         if zpath.exists() and not overwrite:
             log.info("=== %s: %s exists, skipping (use overwrite) ===", name, zpath.name)
+            rep.skip()
             continue
         store.sweep_scratch(zpath)      # clear scratch from a run that died mid-write
         if dry_run:
@@ -818,9 +889,21 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         log.info("=== assembling %s (%d days, grid=%dx%d) ===", name, len(days), g.width, g.height)
         ds = assemble_aoi(g, eff, days)
         write_zarr_safe(ds, zpath, build_encoding(ds, eff["compression"], eff["chunks"]))
-        log.info("  wrote %s  vars=%d shape=(t=%d,y=%d,x=%d)", zpath.name,
-                 len(ds.data_vars), ds.sizes["time"], ds.sizes["y"], ds.sizes["x"])
-    log.info("Done.")
+
+        # `t=%d` was always len(days) -- it said nothing about how much of the cube is real.
+        # Report the coverage the cube actually has, so a thin product is visible here.
+        cov = json.loads(ds.attrs.get("coverage", "{}"))
+        cov_str = ", ".join(f"{p} {100 * c['fraction']:.0f}%" for p, c in sorted(cov.items()))
+        log.info("  wrote %s  vars=%d shape=(t=%d,y=%d,x=%d)  coverage: %s", zpath.name,
+                 len(ds.data_vars), ds.sizes["time"], ds.sizes["y"], ds.sizes["x"],
+                 cov_str or "n/a")
+        rep.wrote()
+        thin = [p for p, c in cov.items() if c["fraction"] < COVERAGE_WARN]
+        if thin:
+            rep.note = f"thin coverage: {', '.join(sorted(thin))} (see the cube's `coverage` attr)"
+
+    rep.log_summary()
+    return rep
 
 
 def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
@@ -835,7 +918,7 @@ def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

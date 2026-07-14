@@ -42,7 +42,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -267,6 +267,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("ecostress")
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
@@ -297,6 +299,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
             if store.done(aoi_out / f"{name}_{tstr}.nc", expected_vars(ds_cfg),
                           shape=(g.height, g.width), overwrite=overwrite):
                 log.info("  [%d/%d] %s already processed, skipping", gi, len(granules), tstr)
+                rep.skip()
                 continue
 
             log.info("  [%d/%d] streaming %d layer(s) for %s",
@@ -304,18 +307,23 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
             try:
                 fobjs = earthaccess.open(list(role_to_url.values()))
             except Exception as exc:
-                log.warning("    open failed (%s); skipping", exc)
+                log.warning("    FAILED to open %s (%s)", tstr, exc)
+                rep.fail(f"{name} {tstr}", exc)
                 continue
             role_to_file = dict(zip(role_to_url.keys(), fobjs))
 
             ds = process_granule(role_to_file, ds_cfg, grid_cfg, g.target_crs,
                                  g.transform, g.width, g.height, g.geom_proj, name, t)
             if ds is None:
+                # dropped as degraded (a mask layer was missing) -- a LOSS, not a no-op
+                rep.fail(f"{name} {tstr}", "granule dropped (missing core layer)")
                 continue
             ds.attrs.update(**provenance.stamp(eff))
             log.info("      wrote %s", write_output(ds, aoi_out, name, fmt))
+            rep.wrote(source=ds.attrs.get("source"))
 
-    log.info("Done.")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -393,7 +401,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if grids is None:
         grids = project_grids(project)
     _setup_gdal_env()
-    run(eff, grids, aois, dry_run, list_layers)
+    return run(eff, grids, aois, dry_run, list_layers)
 
 
 def main():

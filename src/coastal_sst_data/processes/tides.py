@@ -49,7 +49,7 @@ import xarray as xr
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -324,6 +324,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
     coops_in_play = fallback == "coops" or any(aoi_sources[n] == "coops" for n in names)
     stations = None
 
+    rep = report.ProductReport("tides")
+
     for name in names:
         g = grids[name]
         lon, lat = grid_centroid_lonlat(g)
@@ -365,6 +367,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
         out_path = out_root / name / f"{name}_tides.nc"
         if store.done(out_path, store.REQUIRED_VARS["TIDE"], overwrite=overwrite):
             log.info("  already processed, skipping")
+            rep.skip()
             continue
         if dry_run:
             log.info("  [dry-run] would build tides (%s) for %s (%s..%s @ %s)",
@@ -374,7 +377,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
         res = _predict_with_fallback(effective, fallback, lon, lat, start, end,
                                      ds_cfg, station, name)
         if res is None:
-            log.warning("  skipping %s (no tide series from %s or fallback)", name, effective)
+            log.warning("  FAILED %s (no tide series from %s or fallback)", name, effective)
+            rep.fail(name, f"no tide series from {effective} or fallback")
             continue
         s, attrs, used = res
 
@@ -385,7 +389,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
         ds.attrs.update(aoi_id=name, source=used, **attrs, **provenance.stamp(eff))
         log.info("  wrote %s (%d steps) [%s]",
                  write_output(ds, out_root / name, name, fmt), ds.sizes["time"], used)
-    log.info("Done.")
+        rep.wrote(source=used)
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -476,7 +482,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if bad:
         raise ValueError(f"tides source not recognized ({', '.join(bad)}); "
                          f"choose from {sorted(SOURCES)}.")
-    run(eff, grids, aoi_sources, aois, dry_run)
+    return run(eff, grids, aoi_sources, aois, dry_run)
 
 
 def main():

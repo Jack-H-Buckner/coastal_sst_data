@@ -54,7 +54,7 @@ import xarray as xr
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -261,11 +261,14 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in only_aoi]
 
+    rep = report.ProductReport("insitu")
+
     for name in names:
         g = grids[name]
         out_path = out_root / name / f"{name}_insitu.nc"
         if store.done(out_path, store.REQUIRED_VARS["INSITU"], overwrite=overwrite):
             log.info("=== %s: %s exists, skipping ===", name, out_path.name)
+            rep.skip()
             continue
 
         log.info("=== AOI: %s ===", name)
@@ -304,7 +307,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         for e in empty:
             log.warning("  dropped %s", e)
         if not records:
-            log.warning("  %s: no usable in-situ stations; nothing written", name)
+            log.warning("  %s: NO usable in-situ stations; nothing written", name)
+            rep.fail(name, f"no usable stations ({len(empty)} dropped)")
             continue
 
         ds = build_dataset(records)
@@ -313,7 +317,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         log.info("  wrote %s  (%d station(s), %d timestep(s))",
                  write_output(ds, out_root / name, name).name,
                  ds.sizes["station"], ds.sizes["time"])
-    log.info("Done.")
+        rep.wrote(source="IOOS Sensors ERDDAP")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -356,7 +362,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

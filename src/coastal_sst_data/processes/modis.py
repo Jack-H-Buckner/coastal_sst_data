@@ -49,7 +49,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -226,6 +226,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("modis")
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | match_landsat=%s access=%s ===",
@@ -263,7 +265,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 sst_g, fp_g = resample_to_grid(sst, lat, lon, g, radius, fp)
                 Path(path).unlink(missing_ok=True)
             except Exception as exc:
-                log.warning("  skipping %s (%s)", tstr, exc)
+                log.warning("  FAILED %s (%s)", tstr, exc)
+                rep.fail(f"{name} {tstr}", exc)
                 continue
             if not np.isfinite(sst_g).any():
                 log.info("  %s: no valid MODIS pixels over AOI, skipping", tstr)
@@ -272,7 +275,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                                 short_name=ds_cfg["short_name"])
             ds.attrs.update(**provenance.stamp(eff))
             log.info("  wrote %s", write_output(ds, aoi_out, name, fmt))
-    log.info("Done.")
+            rep.wrote(source=f"GHRSST {ds_cfg['short_name']}")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -342,7 +347,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["ds"]["match_landsat"] = False
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

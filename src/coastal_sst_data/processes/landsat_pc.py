@@ -48,7 +48,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -194,6 +194,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("landsat")
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
@@ -219,13 +221,16 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             try:
                 ds = scene_to_dataset(it, g, mask_cfg, to_celsius, acq, name)
             except Exception as exc:
-                log.warning("    skipping %s (%s)", it.id, exc)
+                log.warning("    FAILED %s (%s)", it.id, exc)
+                rep.fail(f"{name} {it.id}", exc)
                 continue
             if ds is None:
                 continue
             ds.attrs.update(**provenance.stamp(eff))
             log.info("      wrote %s", write_output(ds, aoi_out, name, fmt))
-    log.info("Done.")
+            rep.wrote(source="Landsat C2 L2 (Planetary Computer)")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -279,7 +284,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

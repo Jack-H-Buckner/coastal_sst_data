@@ -42,7 +42,7 @@ from rasterio.transform import from_origin
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 SOURCE = "bathymetry"
@@ -309,6 +309,8 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("bathymetry")
+
     for name in names:
         g = grids[name]
         source = aoi_sources[name]
@@ -318,13 +320,15 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
         out_path = out_root / name / f"{name}.nc"
         if store.done(out_path, store.REQUIRED_VARS["BATHYMETRY"],
                       shape=(g.height, g.width), overwrite=overwrite):
-            log.info("  already processed, skipping"); continue
+            log.info("  already processed, skipping"); rep.skip(); continue
         if dry_run:
             log.info("  [dry-run] would build bathymetry (%s) for %s", source, name); continue
 
         res = _fetch_with_fallback(source, g, params, fallback)
         if res is None:
-            log.warning("  skipping %s (no bathymetry from %s or fallback)", name, source); continue
+            log.warning("  FAILED %s (no bathymetry from %s or fallback)", name, source)
+            rep.fail(name, f"no bathymetry from {source} or fallback")
+            continue
         elev, depth, dp25, dp75, used = res
 
         xs = g.transform.c + (np.arange(g.width) + 0.5) * g.transform.a
@@ -342,7 +346,11 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
                         processing="aggregated to AOI grid (mean, p25, p75 depth per cell)",
                         **provenance.stamp(eff))
         log.info("  wrote %s  [%s]", write_output(ds, out_root / name, name, fmt), used)
-    log.info("Done.")
+        # `used` is the DEM that actually won -- this is what stops "bathymetry ok" from
+        # hiding a silent 3 m CUDEM -> ~100 m GMRT downgrade.
+        rep.wrote(source=used)
+    rep.log_summary()
+    return rep
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
@@ -365,7 +373,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         bad = ", ".join(f"{n}:{s}" for n, s in unknown)
         raise ValueError(f"bathymetry dem_source not recognized ({bad}); "
                          f"choose from {sorted(SOURCES)}.")
-    run(eff, grids, aoi_sources, aois, dry_run)
+    return run(eff, grids, aoi_sources, aois, dry_run)
 
 
 def main():

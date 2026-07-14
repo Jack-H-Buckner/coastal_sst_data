@@ -56,7 +56,7 @@ import xarray as xr
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import store
+from .. import report, store
 from . import tides
 
 log = logging.getLogger(__name__)
@@ -548,6 +548,8 @@ def run(project: Project, grids: dict[str, AoiGrid], only_aoi, dry_run, overwrit
         names = [n for n in names if n in only_aoi]
 
     stations = None                       # fetched lazily, once, and reused across AoIs
+    rep = report.ProductReport("datum")
+
     for name in names:
         g = grids[name]
         try:
@@ -584,7 +586,14 @@ def run(project: Project, grids: dict[str, AoiGrid], only_aoi, dry_run, overwrit
         f = write_sidecar(root, name, rec)
         log.info("  wrote %s  offset=%.3f m  method=%s  status=%s", f.name,
                  rec["datum_offset_m"], rec["method"], rec["status"])
-    log.info("Done.")
+        # An UNRESOLVED datum is written (offset 0.0) and the cube stays plausible-looking,
+        # so it has to show up in the tally or nothing tells the user the cube is biased.
+        if rec["status"].startswith("unresolved"):
+            rep.fail(name, f"datum unresolved ({rec['status']}); offset assumed 0.0 m")
+        else:
+            rep.wrote(source=rec["method"])
+    rep.log_summary()
+    return rep
 
 
 def resolve_override(project: Project, aoi_name: str) -> float | None:
@@ -603,7 +612,7 @@ def resolve(project: Project, *, grids=None, aois=None, dry_run=False,
     """Resolve the DEM->MSL offset for each AoI. Runs after bathymetry; reads it off disk."""
     if grids is None:
         grids = project_grids(project)
-    run(project, grids, aois, dry_run, overwrite)
+    return run(project, grids, aois, dry_run, overwrite)
 
 
 def main():

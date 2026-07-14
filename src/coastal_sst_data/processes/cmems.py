@@ -62,7 +62,7 @@ from rasterio.enums import Resampling
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, store
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -239,6 +239,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in only_aoi]
 
+    rep = report.ProductReport("cmems")
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s | vars=%s depths=%s ===",
@@ -254,6 +256,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                      if not store.done(aoi_out / f"{name}_{d.strftime('%Y%m%d')}.nc",
                                        store.REQUIRED_VARS["CMEMS"], shape=(g.height, g.width),
                                        overwrite=overwrite)]
+        rep.expect(len(days))
+        rep.skip(len(days) - len(remaining))
         if not remaining:
             log.info("  all %d day(s) already processed, skipping", len(days))
             continue
@@ -290,13 +294,17 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                                 **provenance.stamp(eff))
                 log.info("  [%s] %s -> %s", src, day.strftime("%Y%m%d"),
                          write_output(ds, aoi_out, name, fmt).name)
+                rep.wrote(source=DATASET_IDS[src])
             remaining = still
             sds.close()
 
         if remaining:
-            log.warning("  %s: %d day(s) not covered by %s", name, len(remaining),
+            log.warning("  %s: %d day(s) NOT COVERED by %s", name, len(remaining),
                         " or ".join(chain))
-    log.info("Done.")
+            for d in remaining:
+                rep.fail(f"{name} {d.strftime('%Y%m%d')}", f"not covered by {' or '.join(chain)}")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -357,7 +365,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():
