@@ -138,6 +138,7 @@ class DataProduct(str, Enum):
     bathymetry = "bathymetry"
     ecostress = "ecostress"
     mur = "mur"
+    cmems = "cmems"
     landsat = "landsat"
     modis = "modis"
     met = "met"
@@ -248,6 +249,9 @@ class DataCubeSpec(BaseModel):
     model_config = {"extra": "forbid"}
     chunks: dict[str, int] = Field(default_factory=lambda: {"time": 64, "y": 128, "x": 128})
     fill_mur_water: bool = True                # NN-fill the MUR backbone over land-cover water
+    # Same for the CMEMS ocean-model channels: at ~9 km its land mask can swallow a
+    # whole estuary, so fill those cells from the nearest resolved water column.
+    fill_cmems_water: bool = True
     # Emit the per-sensor water-level fields (bathymetry + tide re-referenced to the
     # tide-adjusted waterline at each overpass). Needs both products. The DEM->MSL
     # datum offset is RESOLVED automatically by the `datum` stage (processes.datum),
@@ -317,11 +321,24 @@ class GeeAuth(BaseModel):
         return self
 
 
+class CopernicusAuth(BaseModel):
+    """How the copernicusmarine toolbox authenticates to Copernicus Marine (CMEMS).
+
+    Only the strategy is set here; the toolbox reads the actual credentials from
+    ~/.netrc under `machine auth.marine.copernicus.eu` ("netrc"), the
+    COPERNICUSMARINE_SERVICE_USERNAME/PASSWORD env vars ("environment"), or its own
+    ~/.copernicusmarine credentials file / a prompt ("interactive").
+    """
+    model_config = {"extra": "forbid"}
+    auth_strategy: Literal["netrc", "environment", "interactive"] = "netrc"
+
+
 class AuthConfig(BaseModel):
     """Non-secret authentication settings, one block per backend."""
     model_config = {"extra": "forbid"}
     earthdata: EarthdataAuth | None = None
     gee: GeeAuth | None = None
+    copernicus: CopernicusAuth | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +358,7 @@ AUTH_REQUIREMENTS: dict[DataProduct, "str | None | dict[str, str | None]"] = {
     DataProduct.ecostress: "earthdata",
     DataProduct.mur: "earthdata",
     DataProduct.modis: "earthdata",
+    DataProduct.cmems: "copernicus",
     # Source-selectable: PC/ESA (anonymous) and AWS (env creds) need no config
     # auth; only the GEE source needs auth.gee.
     DataProduct.landsat: {"pc": None, "planetary_computer": None, "aws": None, "gee": "gee"},

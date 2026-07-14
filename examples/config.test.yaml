@@ -14,6 +14,8 @@ time:
 auth:
   earthdata:
     auth_strategy: netrc
+  copernicus:                # CMEMS; secret lives in ~/.netrc under
+    auth_strategy: netrc     #   machine auth.marine.copernicus.eu
 
 # Grid  
 grid:
@@ -30,6 +32,11 @@ products:
     version: "002"
   mur:
     variable: analysed_sst
+  cmems:                     # Copernicus Marine global physics (offshore water column)
+    source: my               # my (GLORYS12 reanalysis, default) | anfc (analysis/forecast)
+    fallback: anfc           # covers days past the end of the reanalysis | none
+    variables: [thetao]      # also: so, uo, vo, zos, mlotst
+    depths: [0, 10]      # metres; each SNAPPED to the nearest model level
   landsat:
     source: "pc"        # pc (default) | aws | gee
   met:
@@ -57,6 +64,7 @@ products:
 datacube:
   chunks: {time: 64, y: 128, x: 128}
   fill_mur_water: true       # NN-fill the MUR backbone over land-cover water
+  fill_cmems_water: true     # ...and the CMEMS channels (its ~9 km land mask is coarse)
   water_level: true          # emit the per-sensor water level (needs bathymetry + tides)
   met_time: reference        # reference (products.met.reference_time) | daily_mean
   # Met also emitted at each sensor's own overpass, as <sensor>_<var> ([] to disable):
