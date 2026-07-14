@@ -270,3 +270,6 @@ def test_the_fill_can_be_turned_off(project, g, days):
     eff["fill_cmems_water"] = False
     ds = datacube.assemble_aoi(g, eff, days)
     assert np.isnan(ds["cmems_thetao_0m"].isel(time=0).values[:, :7]).all()
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])

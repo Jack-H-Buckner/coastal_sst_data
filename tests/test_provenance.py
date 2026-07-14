@@ -210,3 +210,6 @@ def test_provenance_survives_the_zarr_round_trip(project, g, days, tmp_path):
     assert back.attrs["config_yaml"] == project.config_text     # byte-for-byte
     assert json.loads(back.attrs["provenance"])["mur_sst"]["inputs"] == ["mur"]
     back.close()
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])

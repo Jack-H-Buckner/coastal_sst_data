@@ -329,3 +329,6 @@ def test_insitu_can_be_turned_off(project, g, days):
     eff["insitu"] = False
     ds = datacube.assemble_aoi(g, eff, days)
     assert "insitu_sst" not in ds.data_vars
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
