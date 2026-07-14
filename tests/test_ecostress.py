@@ -220,6 +220,53 @@ def test_process_granule(tmp_path, aoi_grid, base_project):
     assert str(out["sst"].rio.crs) == aoi_grid.target_crs
 
 
+def _granule_args(tmp_path, aoi_grid, base_project):
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["ecostress"] = {"version": "002"}
+    eff = ecostress._build_eff(parse_config(cfg))
+    return (eff["ds"], eff["grid"], aoi_grid.target_crs, aoi_grid.transform,
+            aoi_grid.width, aoi_grid.height, aoi_grid.geom_proj, "test-aoi", "12:00pm")
+
+
+@pytest.mark.parametrize("lost", ["cloud", "water"])
+def test_granule_is_dropped_when_a_mask_layer_fails_to_read(tmp_path, aoi_grid,
+                                                            base_project, caplog, lost):
+    """A granule whose mask COG failed is WORSE than no granule: without `water`/`cloud`
+    the `valid` mask is never built, and the assembler reads that as a scene with nothing
+    valid in it -- a silent total cloud-out, indistinguishable from a real overcast day."""
+    roles = make_granule_cogs(tmp_path, aoi_grid)
+    roles[lost] = str(tmp_path / "does_not_exist.tif")     # the COG read will fail
+
+    with caplog.at_level("WARNING"):
+        out = ecostress.process_granule(roles, *_granule_args(tmp_path, aoi_grid, base_project))
+
+    assert out is None                                     # dropped, not written degraded
+    assert "dropping granule" in caplog.text and lost in caplog.text
+
+
+def test_granule_is_dropped_when_the_mask_asset_was_never_published(tmp_path, aoi_grid,
+                                                                    base_project, caplog):
+    """The other way a layer goes missing: the granule simply has no cloud asset, so it is
+    filtered out upstream and never even attempted. Same outcome required."""
+    roles = make_granule_cogs(tmp_path, aoi_grid)
+    roles.pop("cloud")                                     # as filter_links_for_granule leaves it
+
+    with caplog.at_level("WARNING"):
+        out = ecostress.process_granule(roles, *_granule_args(tmp_path, aoi_grid, base_project))
+
+    assert out is None
+    assert "dropping granule" in caplog.text
+
+
+def test_expected_vars_follows_the_configured_layers(tmp_path, aoi_grid, base_project):
+    """The skip guard's completeness check is derived from config, not hardcoded: demanding
+    a layer the user never asked for would re-fetch every granule forever."""
+    assert set(ecostress.expected_vars({"layers": ecostress.LAYERS})) == {
+        "sst", "water", "cloud", "valid"}
+    # a config that never asks for the masks cannot be required to have them
+    assert ecostress.expected_vars({"layers": {"sst": "LST"}}) == ("sst",)
+
+
 # ---------------------------------------------------------------------------
 # run() orchestration: control flow around the (expensive) network + raster
 # work. The boundary calls are stubbed with spies, so these are offline and
@@ -366,3 +413,20 @@ def test_run_no_granules_skips_cleanly(tmp_path, aoi_grid, run_stubs):
 
 
 
+
+
+def test_source_attr_names_the_version_actually_searched(tmp_path, aoi_grid, base_project):
+    """The attr provenance.source_of() reads, and that every eco_* field in every cube is
+    stamped with. It used to be the literal "v003" while the search ran v002."""
+    roles = make_granule_cogs(tmp_path, aoi_grid)
+    args = list(_granule_args(tmp_path, aoi_grid, base_project))
+    ds_cfg = dict(args[0])
+    ds_cfg.update(short_name="ECO_L2T_LSTE", version="002")
+    args[0] = ds_cfg
+    out = ecostress.process_granule(roles, *args)
+    assert out.attrs["source"] == "ECOSTRESS ECO_L2T_LSTE v002"
+
+    ds_cfg = dict(ds_cfg); ds_cfg["version"] = "003"      # a config asking for v003
+    args[0] = ds_cfg
+    out = ecostress.process_granule(roles, *args)
+    assert out.attrs["source"] == "ECOSTRESS ECO_L2T_LSTE v003"   # follows config, not a literal

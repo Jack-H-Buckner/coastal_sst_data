@@ -102,6 +102,9 @@ _EXACT = {
     "tide": ["tides"], "tide_range": ["tides"],
     "airtemp": ["met"], "wind_u": ["met"], "wind_v": ["met"], "wind_speed": ["met"],
     "swrad": ["met"], "cloud_cover": ["met"],
+    # which source served met on each day (see daily_sources); cmems_source is caught by
+    # the cmems_ prefix rule below
+    "met_source": ["met"],
     "depth": ["bathymetry"], "depth_p25": ["bathymetry"], "depth_p75": ["bathymetry"],
     "landmask": ["landcover", "bathymetry"],
     "landcover_water": ["landcover"],
@@ -181,6 +184,39 @@ def collect_product(d: Path, product: str) -> dict | None:
         # its weakest entry.
         "basis": STAMPED if bases == {STAMPED} else FILE_MTIME,
     }
+
+
+def daily_sources(d: Path, aoi_id: str, days, prefix: str = "") -> tuple[list[int], list[str]]:
+    """Per-DAY source code for one product in one AoI, plus the legend naming each code.
+
+    `collect_product` above unions a product's sources into a SET, which answers "which
+    sources appear somewhere in this cube" and destroys the per-day answer this module's
+    docstring promises. That union is exactly wrong for the products that switch source
+    underneath you: a CMEMS product with 300 reanalysis days and 65 forecast days reports
+    `[glorys, forecast]` and tells you nothing about any given day, and a met product that
+    fell back to ERA5 for a fortnight in March looks identical to one that never did.
+
+    So the cube carries the answer per timestep. Code 0 is always "none" (no file that
+    day); legend[i] names code i. `prefix` selects a variant written into the same
+    directory (met writes both `<aoi>_<date>.nc` and `<aoi>_ref_<date>.nc`), matched WHOLE
+    so the two cannot be confused.
+    """
+    codes = [0] * len(days)
+    legend = ["none"]
+    if not d.exists():
+        return codes, legend
+
+    pat = re.compile(rf"^{re.escape(aoi_id)}_{re.escape(prefix)}(\d{{8}})\.nc$")
+    idx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
+    for f in sorted(d.glob(f"{aoi_id}_{prefix}*.nc")):
+        m = pat.match(f.name)
+        if not m or m.group(1) not in idx:
+            continue
+        s = str(source_of(f) or "unknown")
+        if s not in legend:
+            legend.append(s)
+        codes[idx[m.group(1)]] = legend.index(s)
+    return codes, legend
 
 
 # The assembler's directory key for the tide product is singular; the product (and every

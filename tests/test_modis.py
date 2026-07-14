@@ -174,3 +174,18 @@ def test_scene_dataset_schema(tmp_path, aoi_grid):
     assert ds["sst"].attrs["units"] == "K"
     assert ds.sizes["y"] == aoi_grid.height and ds.sizes["x"] == aoi_grid.width
     assert "time" in ds.coords
+
+
+def test_source_attr_names_the_configured_sensor(aoi_grid):
+    """Configure Aqua and every file used to still claim Terra, because the attr was built
+    from the module constant rather than the short_name the search actually used."""
+    g = aoi_grid
+    sst = np.full((g.height, g.width), 290.0, "float32")
+
+    terra = modis._scene_dataset(sst, None, g, datetime(2023, 7, 15, 21, 0), "aoi", False)
+    assert terra.attrs["source"] == f"GHRSST {modis.SHORT_NAME}"          # default
+
+    aqua = modis._scene_dataset(sst, None, g, datetime(2023, 7, 15, 21, 0), "aoi", False,
+                                short_name="MODIS_A-JPL-L2P-v2019.0")
+    assert aqua.attrs["source"] == "GHRSST MODIS_A-JPL-L2P-v2019.0"       # follows config
+    assert "MODIS_T" not in aqua.attrs["source"]                          # NOT Terra

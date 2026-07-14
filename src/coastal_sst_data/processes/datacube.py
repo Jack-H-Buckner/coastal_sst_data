@@ -40,19 +40,26 @@ Design (locked with the maintainer):
     grid cell it sits in, at the INSTANT each satellite flew, so a scene can be validated
     against a buoy pixel-for-pixel and minute-for-minute (see processes.insitu).
 
+  * OBSERVED vs FILLED are different channels. `*_valid` means the value was MEASURED;
+    `*_filled` means it was invented by the NN fill and is plausible, not observed. A
+    model told that a fabricated pixel is valid has no way to learn otherwise.
+
 Channel layout in each <aoi>.zarr:
-  3D (time,y,x): mur_sst, mur_valid, eco_sst, eco_cloud, eco_valid,
+  3D (time,y,x): mur_sst, mur_valid, mur_filled, eco_sst, eco_cloud, eco_valid,
                  lst_sst, lst_cloud, lst_valid, modis_sst, modis_valid,
                  airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover,
                  {eco,lst,modis}_water_elev, {eco,lst,modis}_water_class,
                  {eco,lst,modis}_{airtemp,wind_speed,swrad,cloud_cover},
-                 cmems_<var>_<depth>m,
+                 cmems_<var>_<depth>m, cmems_<var>_<depth>m_filled,
                  insitu_sst, insitu_n, {eco,lst,modis}_insitu_sst,
                  {eco,lst,modis}_insitu_dt_min
   2D (y,x) static: depth, depth_p25, depth_p75, landmask, landcover_water,
                    insitu_station (index into the insitu_stations attr)
   1D (time): tide, tide_range, eco_hour, lst_hour, modis_hour, doy_sin, doy_cos,
-             {eco,lst,modis}_tide
+             {eco,lst,modis}_tide,
+             met_source, cmems_source -- which source served that DAY (uint8 code; the
+             `legend` attr names each code). These exist because met and CMEMS fall back
+             per-day, and a set-of-sources cannot say which day came from which.
 
 Usage:
     python -m coastal_sst_data.processes.datacube --config config.yaml
@@ -274,11 +281,24 @@ def load_tide_daily(d: Path, aoi_id, days):
 
 
 def load_bathy(d: Path, aoi_id, H, W):
-    """Static bathymetry: (elevation, depth, depth_p25, depth_p75), NaN where absent."""
+    """Static bathymetry: (elevation, depth, depth_p25, depth_p75), NaN where absent.
+
+    An ABSENT DEM must produce NaN, never zeros. The obvious derivation --
+    `np.where(elev < 0, -elev, 0.0)` -- looks right and is catastrophically wrong when the
+    file is missing: `elev` is then all-NaN, `np.nan < 0` is False, so every cell takes the
+    0.0 branch and the cube ships a flawless, NaN-free "everything is exactly at sea level"
+    bathymetry. That is fabricated data wearing the costume of real data, and it feeds
+    landmask and every *_water_elev channel. Depth is therefore derived only where the
+    elevation is actually KNOWN.
+    """
     elev = np.full((H, W), np.nan, "float32")
     depth = dp25 = dp75 = None
     f = d / f"{aoi_id}.nc"
-    if f.exists():
+    if not f.exists():
+        log.warning("  %s: no bathymetry file (%s); depth/depth_p25/depth_p75 will be NaN "
+                    "and the land mask falls back to the sensor water union",
+                    aoi_id, f.name)
+    else:
         ds = xr.open_dataset(f)
 
         def g(name):
@@ -286,10 +306,15 @@ def load_bathy(d: Path, aoi_id, H, W):
                     if name in ds and ds[name].shape == (H, W) else None)
         if g("elevation") is not None:
             elev = g("elevation")
+        else:
+            log.warning("  %s: bathymetry file has no usable `elevation` on this grid; "
+                        "depth fields will be NaN", aoi_id)
         depth, dp25, dp75 = g("depth"), g("depth_p25"), g("depth_p75")
         ds.close()
-    if depth is None:                                    # derive mean depth from elevation
-        depth = np.where(elev < 0, -elev, 0.0).astype("float32")
+
+    known = np.isfinite(elev)
+    if depth is None:      # derive mean depth from elevation -- ONLY where it is known
+        depth = np.where(known, np.where(elev < 0, -elev, 0.0), np.nan).astype("float32")
     if dp25 is None:
         dp25 = depth.copy()
     if dp75 is None:
@@ -487,21 +512,48 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     # MUR is 1 km upsampled: NN-fill it over land-cover water so the backbone has
     # no holes in narrow estuaries.
+    #
+    # `valid` is computed BEFORE the fill, and this ordering is the whole point: a filled
+    # pixel's value was INVENTED by copying the nearest offshore cell, and flagging it
+    # valid would tell a model that a fabricated number is an observation. So `valid` means
+    # OBSERVED, `filled` means INVENTED-BUT-USABLE, and a consumer can choose. (There is no
+    # distance cap on the fill, so a filled pixel can be far from the cell it copied --
+    # another reason the two must be distinguishable.)
+    mur_observed = np.isfinite(mur_sst)
     if eff["fill_mur_water"]:
         mur_sst = fill_water_nn(mur_sst, water)
-    mur_valid = np.isfinite(mur_sst).astype("uint8")
+    mur_valid = mur_observed.astype("uint8")
+    mur_filled = (np.isfinite(mur_sst) & ~mur_observed).astype("uint8")
+
+    # PER-DAY SOURCE. The products that fall back do so a DAY AT A TIME -- CMEMS can serve
+    # reanalysis in March and forecast in April, met can drop from HRRR to ERA5 for a
+    # fortnight -- and the per-product provenance record unions those into a set, which
+    # says "both" and tells you nothing about the day you are looking at. These channels
+    # carry the answer on the time axis, so a row of the cube can be traced to the file
+    # that made it. (mur/modis have one source each, so a channel would be a constant.)
+    src_channels, src_legends = {}, {}
+    for product, prefix in (("met", mprefix), ("cmems", "")):
+        codes, legend = provenance.daily_sources(adir(product), aid, days, prefix=prefix)
+        if len(legend) > 1:                       # >1 means at least one file was found
+            src_channels[f"{product}_source"] = (("time",), np.array(codes, "uint8"))
+            src_legends[f"{product}_source"] = legend
 
     # CMEMS is a ~9 km ocean model, so its land mask is far coarser than the AoI grid:
     # an entire estuary can fall in its land cells. NN-fill over land-cover water for the
     # same reason MUR is filled -- the nearest offshore water column is the honest value
     # for a cell the model never resolved. Channels are discovered from the files, so
     # whatever variables/depths were acquired come through without a second config list.
+    # Each variable carries its OWN filled mask: the model's land mask deepens with depth,
+    # so thetao_0m and thetao_50m are not filled in the same cells.
     cmems_vars = {}
     for var in cmems_channels(adir("cmems"), aid):
         arr = load_daily_sensor(adir("cmems"), aid, days, H, W, var)
+        observed = np.isfinite(arr)
         if eff["fill_cmems_water"]:
             arr = fill_water_nn(arr, water)
         cmems_vars[f"cmems_{var}"] = (("time", "y", "x"), arr)
+        cmems_vars[f"cmems_{var}_filled"] = (
+            ("time", "y", "x"), (np.isfinite(arr) & ~observed).astype("uint8"))
 
     # In-situ: the cube's only ground truth. The value goes in the cell the station sits
     # in, sampled at the SAME INSTANT each satellite flew -- so a scene can be validated
@@ -545,8 +597,9 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     ds = xr.Dataset(
         {
-            **wl, **op_met, **cmems_vars, **insitu_vars,
+            **wl, **op_met, **cmems_vars, **insitu_vars, **src_channels,
             "mur_sst": (T, mur_sst), "mur_valid": (T, mur_valid),
+            "mur_filled": (T, mur_filled),
             "eco_sst": (T, eco_sst), "eco_cloud": (T, eco_cloud), "eco_valid": (T, eco_valid),
             "lst_sst": (T, lst_sst), "lst_cloud": (T, lst_cloud), "lst_valid": (T, lst_valid),
             "modis_sst": (T, modis_sst), "modis_valid": (T, modis_valid),
@@ -565,6 +618,32 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
         coords={"time": days, "y": ys, "x": xs},
     )
     ds.attrs.update(aoi_id=aid, crs=g.target_crs, met_time=mlabel)
+
+    # The valid/filled distinction has to travel WITH the cube: a downstream reader who
+    # trains on `mur_sst` without knowing which cells were invented has no way to find out.
+    ds["mur_valid"].attrs["long_name"] = "MUR SST was OBSERVED in this cell (not filled)"
+    ds["mur_filled"].attrs["long_name"] = (
+        "MUR SST was nearest-neighbour filled from the closest observed water cell "
+        "(a plausible value, NOT an observation; no distance cap)")
+    # The legend has to travel WITH the cube: a `met_source` of 2 is meaningless without
+    # the list that says 2 == era5. flag_meanings cannot hold it (source names contain
+    # spaces), so it goes as JSON alongside the numeric flag_values.
+    for cname, legend in src_legends.items():
+        ds[cname].attrs.update(
+            long_name=f"which source produced {cname[:-len('_source')]} on this day",
+            flag_values=np.arange(len(legend), dtype="uint8"),
+            legend=json.dumps(legend))
+        if len(legend) > 2:      # more than "none" + one source -> the source CHANGED
+            log.warning("  %s: %s changed source mid-series (%s); see the `%s` channel "
+                        "for which day came from which",
+                        aid, cname[:-len("_source")], ", ".join(legend[1:]), cname)
+
+    for name in cmems_vars:
+        if name.endswith("_filled"):
+            ds[name].attrs["long_name"] = (
+                f"{name[:-len('_filled')]} was nearest-neighbour filled over water the "
+                "~9 km model did not resolve (NOT an observation)")
+
     if station_table:
         # The station map is an index INTO this table, so the table must travel with the
         # cube -- a pixel that says "station 3" is useless without it.

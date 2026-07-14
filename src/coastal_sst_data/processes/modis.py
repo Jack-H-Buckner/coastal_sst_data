@@ -142,7 +142,8 @@ def resample_to_grid(sst, lat, lon, g: AoiGrid, radius_m, footprint=None):
     return sst_g, fp_g
 
 
-def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius) -> xr.Dataset:
+def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius,
+                   short_name=SHORT_NAME) -> xr.Dataset:
     xs, ys = g.xy_centers()
     data = {
         "sst": (("y", "x"), sst_g.astype("float32")),
@@ -158,7 +159,9 @@ def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius) -> xr.
             "MODIS swath pixel index (for footprint-median matchups); -1 = none")
     ds = ds.expand_dims(time=[pd.Timestamp(acq_time)])
     ds = ds.rio.write_crs(g.target_crs)
-    ds.attrs.update(aoi_id=aoi_id, source=f"GHRSST {SHORT_NAME}",
+    # The short_name we actually SEARCHED, not the module default: configure Aqua and the
+    # old constant still stamped every file "Terra", so the cube misnamed its own sensor.
+    ds.attrs.update(aoi_id=aoi_id, source=f"GHRSST {short_name}",
                     processing="swath -> nearest resample onto AoI grid")
     return ds
 
@@ -265,7 +268,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             if not np.isfinite(sst_g).any():
                 log.info("  %s: no valid MODIS pixels over AOI, skipping", tstr)
                 continue
-            ds = _scene_dataset(sst_g, fp_g, g, t, name, to_celsius)
+            ds = _scene_dataset(sst_g, fp_g, g, t, name, to_celsius,
+                                short_name=ds_cfg["short_name"])
             ds.attrs.update(**provenance.stamp(eff))
             log.info("  wrote %s", write_output(ds, aoi_out, name, fmt))
     log.info("Done.")
