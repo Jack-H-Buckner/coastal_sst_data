@@ -24,12 +24,18 @@ Design (locked with the maintainer):
   * The MUR backbone is nearest-neighbour filled over land-cover water so the
     always-present channel has no holes in narrow estuaries.
 
+  * Water level: bathymetry + tide give, per sensor and at that sensor's OVERPASS
+    time, the ground elevation relative to the tide-adjusted waterline and a
+    submerged/exposed class (see processes.water_level).
+
 Channel layout in each <aoi>.zarr:
   3D (time,y,x): mur_sst, mur_valid, eco_sst, eco_cloud, eco_valid,
                  lst_sst, lst_cloud, lst_valid, modis_sst, modis_valid,
-                 airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover
+                 airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover,
+                 {eco,lst,modis}_water_elev, {eco,lst,modis}_water_class
   2D (y,x) static: depth, depth_p25, depth_p75, landmask, landcover_water
-  1D (time): tide, tide_range, eco_hour, lst_hour, modis_hour, doy_sin, doy_cos
+  1D (time): tide, tide_range, eco_hour, lst_hour, modis_hour, doy_sin, doy_cos,
+             {eco,lst,modis}_tide
 
 Usage:
     python -m coastal_sst_data.processes.datacube --config config.yaml
@@ -54,6 +60,7 @@ import xarray as xr
 
 from ..config import CompressionSpec, Project, load_config
 from ..grid import AoiGrid, project_grids
+from . import water_level
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +71,7 @@ _D_RE = re.compile(r"_(\d{8})\.nc$")      # per-day filename stamp
 PRODUCT_DIRS = {
     "mur": "MUR", "ecostress": "ECOSTRESS", "landsat": "LANDSAT", "modis": "MODIS",
     "met": "MET", "bathymetry": "BATHYMETRY", "tide": "TIDE", "landcover": "LANDCOVER",
+    "datum": "DATUM",
 }
 
 
@@ -212,6 +220,15 @@ def load_bathy(d: Path, aoi_id, H, W):
     return elev, depth, dp25, dp75
 
 
+def load_bathy_attrs(d: Path, aoi_id) -> dict:
+    """The bathymetry file's global attrs (its `source` is the DEM fingerprint)."""
+    f = d / f"{aoi_id}.nc"
+    if not f.exists():
+        return {}
+    with xr.open_dataset(f) as ds:
+        return dict(ds.attrs)
+
+
 def load_landcover(d: Path, aoi_id, H, W):
     """Static land-cover water mask -> float (1=water, 0=land, NaN=unknown/absent)."""
     water = np.full((H, W), np.nan, "float32")
@@ -303,8 +320,28 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     doy_cos = np.cos(2 * np.pi * doy / 365.25).astype("float32")
 
     T = ("time", "y", "x")
+
+    # Water level per sensor, at that sensor's overpass time: the DEM re-referenced
+    # to the tide-adjusted waterline, plus its submerged/exposed class. All-NaN /
+    # all-UNKNOWN when bathymetry or tide is absent.
+    wl = {}
+    datum_attrs = {}
+    if eff["water_level"]:
+        series = water_level.load_tide_series(adir("tide"), aid)
+        # The offset follows the DEM that actually ran, so it is resolved against that
+        # file's fingerprint (see water_level.resolve_datum_offset / processes.datum).
+        offset, datum_attrs = water_level.resolve_datum_offset(
+            eff["project"], aid, bathy_attrs=load_bathy_attrs(adir("bathymetry"), aid))
+        for pre, hours in (("eco", eco_hour), ("lst", lst_hour), ("modis", modis_hour)):
+            th = water_level.tide_at_overpass(series, days, hours)
+            elev_rel, cls = water_level.water_level_fields(elev, th, datum_offset_m=offset)
+            wl[f"{pre}_tide"] = (("time",), th)
+            wl[f"{pre}_water_elev"] = (T, elev_rel)
+            wl[f"{pre}_water_class"] = (T, cls)
+
     ds = xr.Dataset(
         {
+            **wl,
             "mur_sst": (T, mur_sst), "mur_valid": (T, mur_valid),
             "eco_sst": (T, eco_sst), "eco_cloud": (T, eco_cloud), "eco_valid": (T, eco_valid),
             "lst_sst": (T, lst_sst), "lst_cloud": (T, lst_cloud), "lst_valid": (T, lst_valid),
@@ -323,6 +360,25 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
         coords={"time": days, "y": ys, "x": xs},
     )
     ds.attrs.update(aoi_id=aid, crs=g.target_crs)
+    # Datum provenance is a GLOBAL cube attr, not just a per-variable one: a cube whose
+    # offset could not be resolved is complete and plausible-looking, so the only thing
+    # that tells a downstream user it is biased is `datum_status` travelling with it.
+    ds.attrs.update({k: v for k, v in datum_attrs.items() if v is not None})
+    for pre in ("eco", "lst", "modis"):
+        if f"{pre}_water_elev" not in ds:
+            continue
+        ds[f"{pre}_tide"].attrs.update(
+            units="m", long_name=f"tide height at the {pre} overpass (rel. MSL)")
+        ds[f"{pre}_water_elev"].attrs.update(
+            units="m",
+            long_name=f"ground elevation rel. to the waterline at the {pre} overpass "
+                      "(0 at the waterline, + exposed, - submerged)",
+            datum_offset_m=offset)
+        ds[f"{pre}_water_class"].attrs.update(
+            long_name=f"submerged/exposed at the {pre} overpass",
+            flag_values=np.array([water_level.SUBMERGED, water_level.EXPOSED,
+                                  water_level.UNKNOWN], dtype="uint8"),
+            flag_meanings="submerged exposed unknown")
     return ds
 
 
@@ -403,6 +459,9 @@ def _build_eff(project: Project) -> dict:
         "out_dir": root / dc.output_subdir,
         "chunks": dict(dc.chunks),
         "fill_mur_water": bool(dc.fill_mur_water),
+        "water_level": bool(dc.water_level),
+        # Needed to resolve the datum offset per AoI (region override + sidecar lookup).
+        "project": project,
         "compression": dc.compression,
         "overwrite": bool(dc.overwrite),
         "time": {

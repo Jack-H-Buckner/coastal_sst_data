@@ -33,7 +33,8 @@ from . import auth
 from .config import DataProduct, Project, load_config
 from .grid import AoiGrid, compute_aoi_grid
 from .processes import (
-    bathymetry, datacube, ecostress, landcover_esa, landsat_pc, met, modis, mur, tides,
+    bathymetry, datacube, datum, ecostress, landcover_esa, landsat_pc, met, modis, mur,
+    tides,
 )
 
 log = logging.getLogger(__name__)
@@ -167,6 +168,22 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
             log.error("=== %s FAILED: %s ===", product.value, exc)
             outcomes[product] = f"failed: {exc}"
 
+    # Derived stage: resolve each AoI's DEM->MSL datum offset from the bathymetry file
+    # that was just written (which DEM won is only known now -- bathymetry falls back
+    # cudem->gmrt on coverage failure). Cheap, network-light, and idempotent; it must
+    # run before the assembler, which reads its sidecar to build the water-level fields.
+    if DataProduct.bathymetry in selected and project.datacube.water_level:
+        log.info("=== datum (DEM->MSL offset) ===")
+        try:
+            datum.resolve(project, grids=grids, aois=aois,
+                          dry_run=dry_run, overwrite=overwrite)
+            outcomes["datum"] = "ok"
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            log.error("=== datum FAILED: %s ===", exc)
+            outcomes["datum"] = f"failed: {exc}"
+
     # Terminal stage: knit the aligned outputs into per-AoI datacubes.
     if assemble:
         log.info("=== datacube (assemble) ===")
@@ -183,8 +200,9 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     log.info("Pipeline done. Summary:")
     for product in ordered:
         log.info("  %-12s %s", product.value, outcomes[product])
-    if assemble:
-        log.info("  %-12s %s", "datacube", outcomes["datacube"])
+    for stage in ("datum", "datacube"):
+        if stage in outcomes:
+            log.info("  %-12s %s", stage, outcomes[stage])
     return outcomes
 
 

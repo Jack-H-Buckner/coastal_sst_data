@@ -248,6 +248,13 @@ class DataCubeSpec(BaseModel):
     model_config = {"extra": "forbid"}
     chunks: dict[str, int] = Field(default_factory=lambda: {"time": 64, "y": 128, "x": 128})
     fill_mur_water: bool = True                # NN-fill the MUR backbone over land-cover water
+    # Emit the per-sensor water-level fields (bathymetry + tide re-referenced to the
+    # tide-adjusted waterline at each overpass). Needs both products. The DEM->MSL
+    # datum offset is RESOLVED automatically by the `datum` stage (processes.datum),
+    # not configured: it is a property of the DEM that actually ran and of where the
+    # AoI is, so no project-wide constant can be right across a study area. The only
+    # knob is an optional per-region override, regions[].sources.bathymetry.datum_offset_m.
+    water_level: bool = True
     compression: CompressionSpec = Field(default_factory=CompressionSpec)
     output_subdir: str = "datacube"            # cube dir under output_dir
     overwrite: bool = False                    # rebuild existing <aoi>.zarr cubes

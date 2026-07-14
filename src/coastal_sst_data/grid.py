@@ -80,6 +80,20 @@ class AoiGrid:
         ys = self.transform.f - (np.arange(self.height) + 0.5) * self.transform.a
         return xs, ys
 
+    def lonlat_centers(self) -> tuple[np.ndarray, np.ndarray]:
+        """Pixel-center coordinates ``(lons, lats)`` in WGS84, as 2D (H,W) arrays.
+
+        The inverse of the projection ``compute_aoi_grid`` applied: needed by any
+        consumer that has to hand a grid cell's position to a lon/lat service (the
+        datum resolver queries VDatum per cell). 2D rather than 1D because a
+        projected grid's rows/columns are not constant-lat/constant-lon lines.
+        """
+        xs, ys = self.xy_centers()
+        xx, yy = np.meshgrid(xs, ys)
+        inv = Transformer.from_crs(self.target_crs, "EPSG:4326", always_xy=True)
+        lons, lats = inv.transform(xx, yy)
+        return np.asarray(lons), np.asarray(lats)
+
     def to_area_def(self) -> "AreaDefinition":
         """A pyresample ``AreaDefinition`` matching this grid (projected).
 

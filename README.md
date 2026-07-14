@@ -157,7 +157,7 @@ A ready-to-copy version of this file lives at [`environment.consumer.yml`](envir
 ```bash
 conda env create -f environment.my_other_project.yml -n my_other_project
 conda activate my_other_project
-pip install --no-build-isolation --no-deps pytides2
+python -m pip install --no-build-isolation --no-deps pytides2 # ensure you are usign the correct python instance 
 ```
 
 (Skip this if you don't use CO-OPS tides — the `eo-tides` global fallback is a normal conda-forge dep.)
@@ -245,6 +245,7 @@ There are five subcommands:
 | `grids` | Show the target grid (CRS, size, bounding box) computed for each AOI | no |
 | `verify` | Connect to every credentialed service the selected products need and confirm the credentials work | yes |
 | `run` | Run the pipeline: compute the shared grid once, then acquire each selected product in order | yes |
+| `datum` | Resolve each AOI's DEM→MSL vertical-datum offset (runs inside `run`; standalone for backfill) | yes (small) |
 | `assemble` | Knit the aligned per-product outputs into one analysis-ready datacube (`.zarr`) per AOI | no |
 
 **A typical workflow** builds up from cheap, offline checks to the full run:
@@ -290,7 +291,49 @@ Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `m
 - `--overwrite` — rebuild cubes that already exist.
 - `--dry-run` — report what would be assembled; write nothing.
 
-Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `fill_mur_water`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision.
+Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `fill_mur_water`, `water_level`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision.
+
+#### Water level (derived at assembly)
+
+The assembler also **derives** a water level from two products it already has: the static bathymetry DEM and the 1D tide series. Because a tidal flat's state depends on *when* the sensor flew, the water level is evaluated **at each sensor's overpass time** — the hourly tide series is linearly interpolated to the scene's hour — giving, for each of `eco` / `lst` / `modis`:
+
+| Channel | Dims | Meaning |
+| --- | --- | --- |
+| `<sensor>_water_elev` | (time, y, x) | ground elevation relative to the tide-adjusted waterline, in metres: **0 at the waterline**, positive above it (exposed, height above water), negative below it (submerged — the magnitude is the water depth) |
+| `<sensor>_water_class` | (time, y, x) | `0` = submerged, `1` = exposed, `255` = unknown |
+| `<sensor>_tide` | (time,) | the interpolated tide height at that overpass (m, rel. MSL) |
+
+On a day with no scene from that sensor there is no overpass time, so the fields are NaN / `255` rather than carrying a stale value; the same holds where the DEM has no coverage. This is a pure function of `bathymetry` + `tides`, so it needs both selected in the config; it is a derived stage rather than an acquisition product and is turned off with `datacube.water_level: false`.
+
+Two things to know about the classification:
+
+- **Datum.** Tides are relative to **MSL** (a *tidal* datum — the 19-year mean of observed water level at a gauge), but a DEM need not be: CUDEM is **NAVD88** (a *geodetic* datum). The gap between the two surfaces is **local** and far from negligible — MSL sits roughly **1.0–1.4 m above NAVD88 in the Pacific Northwest** (vs. ~0.1–0.3 m on the Gulf coast), which is comparable to the entire intertidal range, so ignoring it misclassifies much of a tidal flat. This offset is **resolved automatically** by the [`datum` stage](#datum) — you do not configure it.
+- **It is purely geometric** — "is this cell's ground below the waterline?" — and deliberately does **not** consult land-cover. Land-cover routinely classifies tidal flats as non-water, so letting it override here would erase exactly the intertidal signal these fields exist to capture. The cost is that diked or reclaimed ground lying below the waterline reads as submerged; intersect with the cube's `landmask` / `landcover_water` if you need a hydrologically-connected water mask.
+
+### `datum`
+
+Resolves each AOI's **DEM→MSL vertical-datum offset** — the number the [water-level fields](#water-level-derived-at-assembly) need to put the DEM and the tide on one surface. It runs automatically inside `run` (after bathymetry, before the assembler) whenever bathymetry is selected and `datacube.water_level` is on; the subcommand exists to **backfill an existing data tree** without re-downloading a single DEM tile, since it reads the bathymetry output off disk rather than re-fetching it.
+
+Why it can't be a config constant: the right offset depends on **which DEM actually ran**, and bathymetry silently falls back CUDEM→GMRT where CUDEM has no coverage. So two AOIs in one region can legitimately need different offsets, and a project-wide number would be wrong for one of them.
+
+How each case resolves:
+
+| DEM that ran | Vertical datum | Offset |
+| --- | --- | --- |
+| **CUDEM** | NAVD88 | looked up from [NOAA VDatum](https://vdatum.noaa.gov/) (NAVD88 → LMSL), **cross-checked** against the nearest CO-OPS gauge's published datums |
+| **GMRT** | ~sea level | `0.0` — no network call; GMRT is already sea-level referenced |
+
+VDatum is sampled at **several points spread across the AOI's waterline band**, not at its centroid: coverage is patchy at point scale (the Padilla Bay centroid falls in a hole while points a few km away resolve fine), and out-of-coverage comes back as a `-999999` sentinel rather than an error. The median is taken; if the samples span more than 0.5 m the AOI straddles tidal zones and a single scalar is refused rather than averaged into something wrong everywhere.
+
+The result is written to `<output_dir>/DATUM/aligned/<aoi>/<aoi>_datum.json` with its full provenance (method, sample count, spread, uncertainty, the gauge it was cross-checked against, and a fingerprint of the DEM it was resolved for). The assembler reads that sidecar — so `assemble` stays entirely offline — and **refuses a stale one** whose fingerprint no longer matches the DEM on disk.
+
+- `--aoi <name> …` — resolve only specific AOIs (default: all).
+- `--overwrite` — re-resolve offsets already on disk (otherwise it's a no-op, zero requests).
+- `--dry-run` — report what would be resolved; write nothing, call nothing.
+
+**Override.** If you know better than VDatum for a region, assert it under `regions[].sources.bathymetry.datum_offset_m` (the elevation of MSL in the DEM's datum, in metres). It wins — but it is still validated: a >0.5 m offset on a DEM that turned out to be GMRT is rejected as a NAVD88 number applied to an MSL DEM, which is exactly the silent-metre error this stage exists to prevent.
+
+**If it cannot be resolved** (VDatum has no coverage and no NAVD88 gauge is within 30 km), the offset falls back to `0.0` with a loud error, and the cube is stamped `datum_status = "unresolved_assumed_zero"` so the bias is visible in the artifact and not only in a log line that scrolls away.
 
 ### `validate` and `grids`
 
@@ -458,13 +501,14 @@ MUR is the always-present, gap-free SST backbone the high-resolution products ad
 ### Bathymetry
 Bathymetry is a static (time-invariant) covariate: one file per AOI describing water depth, used both as a model input and to build the land mask.
 
-- **Where it comes from**: the NOAA NCEI CUDEM 1/9 arc-second (~3 m) seamless topobathy DEM, read straight from its `/vsicurl` tiles, with the GMRT GridServer (~100 m, global) as a fallback where CUDEM has no coverage (e.g. SE Alaska). **No credentials required.** The fine CUDEM pixels are aggregated to depth statistics within each grid cell; CUDEM is referenced to NAVD88 rather than MSL, so the 0 contour may shift slightly.
+- **Where it comes from**: the NOAA NCEI CUDEM 1/9 arc-second (~3 m) seamless topobathy DEM, read straight from its `/vsicurl` tiles, with the GMRT GridServer (~100 m, global) as a fallback where CUDEM has no coverage (e.g. SE Alaska). **No credentials required.** The fine CUDEM pixels are aggregated to depth statistics within each grid cell; CUDEM is referenced to NAVD88 rather than MSL, so its 0 contour is not the mean waterline — set `datum_offset_m` (below) to reconcile the two.
 - **What it measures** (all in metres): `elevation` (mean, negative below sea level — drives the land mask), `depth` (mean water depth over the cell), and `depth_p25` / `depth_p75` (sub-grid depth variability). For GMRT there is no sub-grid, so `depth_p25 = depth_p75 = depth`.
 
 **Project-level options** (`products.bathymetry`):
 
 - `default_source`: DEM source used when a region does not override it (default `gmrt`).
 - `fallback`: source tried when the chosen source lacks coverage (default `gmrt`).
+*(There is no project-level datum option: the DEM→MSL offset is resolved per AOI by the [`datum` stage](#datum), because it follows the DEM that actually ran.)*
 - `stats_subgrid_m`: fine sub-grid resolution for CUDEM depth statistics (default `10.0`).
 - `min_cudem_cover`: minimum fraction of the AOI CUDEM must cover before falling back (default `0.5`).
 - `pad_deg`: padding around the AOI bbox in degrees (default `0.02`).
@@ -476,6 +520,7 @@ Bathymetry is a static (time-invariant) covariate: one file per AOI describing w
 **Region-level options** (`regions[].sources.bathymetry`):
 
 - `dem_source`: the DEM source (`cudem` or `gmrt`) to use for the AOIs in this region, overriding the project-level `default_source`. This is the option to set when different parts of the study area have different DEM coverage.
+- `datum_offset_m`: **optional** override of the automatically-resolved DEM→MSL offset (the elevation of MSL in the DEM's vertical datum, in metres). Leave it unset unless you know better than VDatum for this region; see [`datum`](#datum).
 
 ### Met
 Met provides the gap-free meteorological forcing that drives nearshore ocean temperatures — air temperature, wind, shortwave radiation and cloud cover — used both as model inputs and for the skin-to-bulk SST correction. Unlike the SST products these are complete driver channels, so there is no `valid`/mask layer.
