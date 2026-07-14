@@ -373,3 +373,5 @@ def test_overpass_met_is_configurable(project, grids, days):
     eff["overpass_met"] = []                                  # disabled entirely
     ds = datacube.assemble_aoi(g, eff, days)
     assert not [v for v in ds.data_vars if v.startswith("eco_") and "airtemp" in v]
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

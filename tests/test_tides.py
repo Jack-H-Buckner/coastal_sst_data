@@ -218,3 +218,6 @@ def test_predict_with_fallback_returns_none_when_both_fail(monkeypatch):
                                        "2026-06-01", "2026-06-01",
                                        {"interval": "h"}, None, "a1")
     assert res is None
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

@@ -166,3 +166,6 @@ def test_block_stats_depth_from_elevation():
     assert np.isnan(elev_mean[1, 1])                     # all-NaN cell stays NaN
     # uniform cells -> percentiles equal the mean
     assert d_p25[0, 0] == 10 and d_p75[0, 0] == 10
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

@@ -330,7 +330,7 @@ def test_run_no_granules_skips_cleanly(tmp_path, aoi_grid, run_stubs):
     assert run_stubs["write"] == []
 
         
-
-
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
 
 
