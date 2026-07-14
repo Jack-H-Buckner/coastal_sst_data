@@ -14,6 +14,34 @@ dist/
 .venv/
 venv/
 
+# Credentials -- secrets live OUTSIDE the repo (see auth.py: ~/.netrc, env vars, or a
+# key file referenced by path only). These patterns are the backstop for the local copy.
+.netrc
+_netrc
+.env
+.env.*
+!.env.example
+.copernicusmarine/
+.copernicusmarine-credentials
+
+# Earth Engine service-account keys (config gee.key_file). Narrow globs, not *.json --
+# the repo has legitimate JSON (STAC responses in tests).
+*service-account*.json
+*service_account*.json
+*-key.json
+*_key.json
+gee-*.json
+credentials.json
+client_secret*.json
+
+# Keys / certs of any kind
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
 # Editor / OS
 .DS_Store
 .idea/
