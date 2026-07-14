@@ -1,5 +1,6 @@
 
 import numpy as np
+import pandas as pd
 import pytest
 from pathlib import Path
 
@@ -148,3 +149,44 @@ def test_to_dataset_to_celsius(aoi_grid):
     ds = met.to_dataset(grids, g, "2026-06-15", to_celsius=True)
     assert float(ds["airtemp"].isel(time=0).values[0, 0]) == pytest.approx(290.0 - 273.15)
     assert ds["airtemp"].attrs["units"] == "degC"
+
+
+# --------------------------------------------------------------------------- #
+# Reference time of day (the cube's met channel; default 10:30 Landsat overpass)
+# --------------------------------------------------------------------------- #
+def test_parse_hhmm():
+    assert met.parse_hhmm("10:30") == pytest.approx(10.5)
+    assert met.parse_hhmm("6") == pytest.approx(6.0)
+    assert met.parse_hhmm(None) is None          # None -> no reference snapshot
+    assert met.parse_hhmm("") is None
+
+
+def test_solar_reference_is_the_same_time_of_day_in_every_aoi():
+    """10:30 LOCAL SOLAR is a different UTC hour per AoI -- that is the whole point.
+
+    A fixed UTC hour would be mid-morning in Oregon and the middle of the night in
+    Maine, so cross-AoI forcing would not be like-for-like.
+    """
+    day = pd.Timestamp("2026-06-15")
+    # Tillamook (-123.9): UTC = 10.5 + 8.26 = 18.76 -> 19:00
+    assert met.reference_time_utc(day, -123.925, 10.5, "solar").hour == 19
+    # Chesapeake (-76.0): UTC = 10.5 + 5.07 = 15.57 -> 16:00
+    assert met.reference_time_utc(day, -76.0, 10.5, "solar").hour == 16
+
+
+def test_utc_basis_is_taken_literally():
+    day = pd.Timestamp("2026-06-15")
+    t = met.reference_time_utc(day, -123.925, 10.5, "utc")
+    assert (t.hour, t.day) == (10, 15)           # longitude ignored
+
+
+def test_solar_reference_rolls_the_date_across_the_dateline():
+    day = pd.Timestamp("2026-06-15")
+    t = met.reference_time_utc(day, 170.0, 10.5, "solar")   # 10.5 - 11.33 = -0.83 h
+    assert t.day == 14 and t.hour == 23                     # previous UTC day
+
+
+def test_reference_defaults_are_the_landsat_overpass():
+    eff = met._build_eff(load_config(EXAMPLE))
+    assert eff["ds"]["reference_time"] == "10:30"
+    assert eff["ds"]["reference_basis"] == "solar"

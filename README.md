@@ -291,7 +291,15 @@ Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `m
 - `--overwrite` — rebuild cubes that already exist.
 - `--dry-run` — report what would be assembled; write nothing.
 
-Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `fill_mur_water`, `water_level`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision.
+Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `fill_mur_water`, `water_level`, `met_time`, `overpass_met`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision.
+
+#### Met in the cube: reference time, and per-overpass
+
+**A day gets one met value per channel, taken at a fixed *time of day* — not a daily mean.** A mean over `[0, 6, 12, 18]` UTC averages pre-dawn and mid-afternoon forcing together, which is the wrong thing to hand a model of a sensor that flew at one instant. The cube's `airtemp` / `wind_u` / `wind_v` / `wind_speed` / `swrad` / `cloud_cover` therefore come from the **reference-time snapshot**: by default **10:30 local solar time**, Landsat's overpass.
+
+The basis is *solar*, not UTC, because a fixed UTC hour is a different time of day in every AOI — mid-morning in Oregon, the middle of the night in Maine — so cross-AOI forcing would not be like-for-like. Each AOI's reference instant is derived from its own longitude (`UTC = local − lon/15`, rounded to the hour, rolling the date where it crosses midnight). Change it with `products.met.reference_time` / `reference_basis`, or set `datacube.met_time: daily_mean` to get the old averaging behavior back. If no reference files exist (an older MET tree), the assembler falls back to the daily mean rather than emitting an empty channel, and records which it used in the cube's `met_time` attribute.
+
+**Each sensor additionally carries the forcing at its own overpass.** Where `products.met.overpass_from` made met snapshot the thermal scenes, the cube emits `<sensor>_<var>` — `eco_airtemp`, `lst_wind_speed`, `modis_swrad`, and so on — so an ECOSTRESS scene at 03:00 and a Landsat scene at 19:00 on the same day see *different* air temperature and wind, rather than sharing one value. Pick the variables with `datacube.overpass_met` (default `[airtemp, wind_speed, swrad, cloud_cover]`; `[]` disables). These are matched to the **exact scene the cube kept** — when a sensor flies twice in a day, only the clearest scene survives, and the forcing follows *that* scene's timestamp, not merely its date. Days with no scene from a sensor stay NaN rather than carrying a stale value.
 
 #### Water level (derived at assembly)
 
@@ -535,7 +543,9 @@ Met provides the gap-free meteorological forcing that drives nearshore ocean tem
 - `source`: primary source, `auto` (default), `hrrr`, or `era5`. `auto` is equivalent to `hrrr` as the primary with the fallback appended.
 - `fallback`: source used where the primary misses, `era5` (default) or `none` to disable. With the defaults (`source: auto`, `fallback: era5`) the chain is `hrrr → era5`.
 - `variables`: which fields to acquire (default `airtemp`, `wind`, `swrad`, `cloud`).
-- `daily_mean_hours`: UTC hours averaged into the daily-mean field (default `[0, 6, 12, 18]`).
+- `reference_time`: the **time of day** the daily snapshot is taken at (default `"10:30"`, Landsat's overpass); `null` to skip it. This is the cube's default met channel — see [met in the cube](#met-in-the-cube-reference-time-and-per-overpass).
+- `reference_basis`: how `reference_time` is interpreted — `solar` (default; **local** solar time, converted per AOI from its longitude) or `utc` (taken literally).
+- `daily_mean_hours`: UTC hours averaged into the daily-mean field (default `[0, 6, 12, 18]`; set `[]` to skip it and save the four fetches per day).
 - `overpass_from`: SST products whose aligned scenes set the instantaneous snapshot times, e.g. `[ecostress, landsat]` (default none — daily means only). Run met *after* these products so their outputs exist.
 - `regrid_radius_m`: nearest-neighbour search radius for HRRR regridding in metres (default `6000`).
 - `pad_deg`: degrees of padding around the AOI window for the ERA5 subset (default `0.25`, i.e. ≥ one ERA5 cell).

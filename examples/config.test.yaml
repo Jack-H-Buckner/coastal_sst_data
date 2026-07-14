@@ -36,7 +36,12 @@ products:
     source: auto              # auto (HRRR -> ERA5) | hrrr | era5
     fallback: era5            # era5 | none  (backfill where the primary misses)
     variables: [airtemp, wind, swrad, cloud]
-    daily_mean_hours: [0, 6, 12, 18]   # UTC hours averaged for the daily field
+    # One snapshot per day at a fixed TIME OF DAY -- the cube's default met channel.
+    # 10:30 is Landsat's overpass; the basis is LOCAL SOLAR, so it is the same time of
+    # day in every AOI (a fixed UTC hour would not be). null to skip.
+    reference_time: "10:30"
+    reference_basis: solar    # solar (local, per-AOI longitude) | utc
+    daily_mean_hours: [0, 6, 12, 18]   # UTC hours averaged for the daily field ([] = skip)
     overpass_from: [ecostress, landsat]  # snapshot forcing at these scenes' times
   tides:
     interval: h               # prediction step (h = hourly)
@@ -53,6 +58,9 @@ datacube:
   chunks: {time: 64, y: 128, x: 128}
   fill_mur_water: true       # NN-fill the MUR backbone over land-cover water
   water_level: true          # emit the per-sensor water level (needs bathymetry + tides)
+  met_time: reference        # reference (products.met.reference_time) | daily_mean
+  # Met also emitted at each sensor's own overpass, as <sensor>_<var> ([] to disable):
+  overpass_met: [airtemp, wind_speed, swrad, cloud_cover]
 
 regions:
   - name: pnw_estuaries
