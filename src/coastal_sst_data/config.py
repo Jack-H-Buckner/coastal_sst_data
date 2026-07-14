@@ -144,6 +144,7 @@ class DataProduct(str, Enum):
     met = "met"
     tides = "tides"
     landcover = "landcover"
+    insitu = "insitu"
 
 
 class ProductOptions(BaseModel):
@@ -272,6 +273,12 @@ class DataCubeSpec(BaseModel):
     # to include the sensor, so the snapshots exist.
     overpass_met: list[str] = Field(
         default_factory=lambda: ["airtemp", "wind_speed", "swrad", "cloud_cover"])
+    # Emit the in-situ channels: the buoy value at the reference time, plus a matchup at
+    # each sensor's own overpass (the ground truth a satellite scene is validated against).
+    insitu: bool = True
+    # Matchup tolerance, minutes: beyond this an overpass gets NaN rather than a stale
+    # observation -- a buoy reading two hours off is not a matchup.
+    insitu_max_dt_min: float = 60.0
     compression: CompressionSpec = Field(default_factory=CompressionSpec)
     output_subdir: str = "datacube"            # cube dir under output_dir
     overwrite: bool = False                    # rebuild existing <aoi>.zarr cubes
@@ -363,6 +370,9 @@ AUTH_REQUIREMENTS: dict[DataProduct, "str | None | dict[str, str | None]"] = {
     # auth; only the GEE source needs auth.gee.
     DataProduct.landsat: {"pc": None, "planetary_computer": None, "aws": None, "gee": "gee"},
     DataProduct.landcover: {"esa": None, "worldcover": None, "gee": "gee"},
+    # In-situ networks are public (IOOS ERDDAP needs no key); a future network that
+    # does need one adds it here as {source: backend}.
+    DataProduct.insitu: {"ioos": None},
     # bathymetry, met, tides: absent -> public, no auth.
 }
 
@@ -370,6 +380,7 @@ AUTH_REQUIREMENTS: dict[DataProduct, "str | None | dict[str, str | None]"] = {
 DEFAULT_SOURCE: dict[DataProduct, str] = {
     DataProduct.landsat: "pc",
     DataProduct.landcover: "esa",
+    DataProduct.insitu: "ioos",
 }
 
 

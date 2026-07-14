@@ -54,6 +54,13 @@ products:
     interval: h               # prediction step (h = hourly)
     # Optional per-AOI gauge overrides (else nearest CO-OPS water-level station):
     # stations: {hood_canal: "9445133"}
+  insitu:                    # in-situ buoys/gauges -- the cube's ground truth
+    source: ioos             # IOOS Sensors ERDDAP (NDBC + CO-OPS + CDIP + regionals)
+    variables: [sea_water_temperature]   # falls back to sea_surface_temperature per station
+    qc_flags: [1, 2]         # QARTOD: 1 pass, 2 not-evaluated (3/4/9 dropped)
+    max_sensor_depth_m: 5    # ignore deep sensors on profiling moorings
+    # stations: [noaa_nos_co_ops_9437540]   # optional allow-list (else auto-discovered)
+    # exclude_stations: []
   landcover:
     source: esa               # esa (ESA WorldCover via Planetary Computer) | gee (future)
     year: 2021                # WorldCover v200 (2021); 2020 -> v100
@@ -67,6 +74,8 @@ datacube:
   fill_cmems_water: true     # ...and the CMEMS channels (its ~9 km land mask is coarse)
   water_level: true          # emit the per-sensor water level (needs bathymetry + tides)
   met_time: reference        # reference (products.met.reference_time) | daily_mean
+  insitu: true               # buoy value at the reference time + a matchup per overpass
+  insitu_max_dt_min: 60      # matchup tolerance; beyond it an overpass gets NaN
   # Met also emitted at each sensor's own overpass, as <sensor>_<var> ([] to disable):
   overpass_met: [airtemp, wind_speed, swrad, cloud_cover]
 
