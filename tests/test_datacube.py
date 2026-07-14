@@ -513,7 +513,6 @@ def test_overpass_met_is_configurable(project, grids, days):
     ds = datacube.assemble_aoi(g, eff, days)
     assert not [v for v in ds.data_vars if v.startswith("eco_") and "airtemp" in v]
 
-
 def test_nn_filled_cmems_gets_its_own_filled_flag(project, grids, days):
     """Each CMEMS variable carries its OWN filled mask -- the model's land mask deepens
     with depth, so two levels are not filled in the same cells."""
@@ -632,3 +631,6 @@ def test_overpass_sensors_are_not_judged_on_daily_coverage(project, grids, days)
     write_ecostress_two_scenes(project, g, days[0])          # a scene on ONE day of three
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
     assert "ecostress" not in json.loads(ds.attrs["coverage"])
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

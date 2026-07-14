@@ -238,3 +238,6 @@ def test_water_level_survives_missing_bathymetry_and_tide(project, grids, days):
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
     assert np.isnan(ds["eco_water_elev"].values).all()
     assert (ds["eco_water_class"].values == UNKNOWN).all()
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])

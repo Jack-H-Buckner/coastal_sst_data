@@ -77,3 +77,6 @@ def test_project_grids_one_per_aoi():
     assert all(g.name == name for name, g in grids.items())
     # both AoIs share the same UTM zone here -> the "one grid per AoI" guarantee
     assert {g.target_crs for g in grids.values()} == {"EPSG:32610"}
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

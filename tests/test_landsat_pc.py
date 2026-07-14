@@ -104,3 +104,7 @@ def test_scene_to_dataset_valid_mask_east_west(aoi_grid, landsat_scene):
     v = ds["valid"].isel(time=0).values
     assert v[:, : v.shape[1] // 4].sum() == 0      # deep west: cloudy -> invalid
     assert v[:, 3 * v.shape[1] // 4 :].sum() > 0   # deep east: clear water -> valid
+
+if __name__ == "__main__":
+    import pytest
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

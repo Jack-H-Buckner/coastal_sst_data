@@ -180,3 +180,6 @@ def test_missing_subcommand_errors():
 def test_missing_config_errors():
     with pytest.raises(SystemExit):
         cli.main(["validate"])
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

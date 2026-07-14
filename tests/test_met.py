@@ -266,3 +266,7 @@ def test_daily_mean_records_the_hours_that_ACTUALLY_contributed(monkeypatch, tmp
         assert ds.attrs["daily_mean_hours_requested"] == "[0, 6, 12, 18]"   # what we asked
     assert "built from 1 of 4 hours" in caplog.text
     assert "NOT a full-day mean" in caplog.text
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
+

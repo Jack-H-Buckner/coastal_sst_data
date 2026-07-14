@@ -263,3 +263,8 @@ def test_a_successful_granule_also_cleans_up_its_scratch(monkeypatch, tmp_path, 
 
     assert rep.written == 1 and rep.failed == 0
     assert list((tmp_path / "_tmp").rglob("*.nc")) == []     # scratch removed on success too
+
+if __name__ == "__main__":
+    import pytest
+    pytest.main([__file__, "-v", "-s"])
+

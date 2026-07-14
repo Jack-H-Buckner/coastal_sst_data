@@ -296,3 +296,6 @@ def test_no_verify_skips_preflight(acquire_calls, monkeypatch):
     pipeline.run_pipeline(_make_project({"mur": None}, auth=EARTHDATA),
                           dry_run=False, verify_auth=False)
     assert seen == []                        # explicitly opted out
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

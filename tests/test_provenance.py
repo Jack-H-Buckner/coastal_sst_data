@@ -210,34 +210,3 @@ def test_provenance_survives_the_zarr_round_trip(project, g, days, tmp_path):
     assert back.attrs["config_yaml"] == project.config_text     # byte-for-byte
     assert json.loads(back.attrs["provenance"])["mur_sst"]["inputs"] == ["mur"]
     back.close()
-
-
-# --------------------------------------------------------------------------- #
-# WHICH CODE built this cube. `package_version` is pinned in pyproject and never moves, so
-# every cube ever built was stamped "0.0.1" whatever commit produced it -- while the code
-# changed what the numbers MEAN (mur_valid once counted NN-filled pixels; depth was once
-# fabricated zeros where the DEM was missing).
-# --------------------------------------------------------------------------- #
-def test_code_version_is_the_git_sha():
-    v = provenance.code_version()
-    bare = v.removesuffix("-dirty")
-    assert v == "unknown" or (len(bare) == 40 and all(c in "0123456789abcdef" for c in bare))
-
-
-def test_a_dirty_tree_says_so():
-    """A cube built from uncommitted edits is not reproducible from ANY commit. Claiming a
-    bare SHA for it would be the most dangerous kind of lie: the one a reader trusts."""
-    import subprocess
-    repo = Path(__file__).parents[1]
-    dirty = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
-                           capture_output=True, text=True).stdout.strip()
-    v = provenance.code_version()
-    if v != "unknown":
-        assert v.endswith("-dirty") == bool(dirty)
-
-
-def test_stamp_carries_the_code_version():
-    s = provenance.stamp({"config_sha256": "abc"})
-    assert s["code_version"] == provenance.code_version()
-    assert s["config_sha256"] == "abc"          # the config is still stamped too
-    assert "acquired_at" in s

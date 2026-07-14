@@ -168,6 +168,7 @@ def test_block_stats_depth_from_elevation():
     assert d_p25[0, 0] == 10 and d_p75[0, 0] == 10
 
 
+
 # --------------------------------------------------------------------------- #
 # The CUDEM tile index cache. Every way this broke was STICKY, and every way it broke
 # ended in a silent downgrade to ~100 m GMRT that no later run would ever undo.
@@ -295,3 +296,6 @@ def test_genuine_missing_coverage_DOES_fall_back(monkeypatch, aoi_grid, caplog):
 
     assert res == "gmrt-result"
     assert "FALLING BACK" in caplog.text and "different vertical datum" in caplog.text
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

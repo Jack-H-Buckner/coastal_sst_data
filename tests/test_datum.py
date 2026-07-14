@@ -397,3 +397,6 @@ def test_the_cube_carries_the_datum_provenance(project, g):
     assert ds.attrs["datum_status"] == "ok"
     assert ds.attrs["dem_vertical_datum"] == "NAVD88"
     assert ds.attrs["datum_uncertainty_m"] == pytest.approx(0.077)
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
