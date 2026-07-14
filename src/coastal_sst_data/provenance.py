@@ -39,6 +39,8 @@ from pathlib import Path
 
 import xarray as xr
 
+from . import products
+
 log = logging.getLogger(__name__)
 
 STAMPED = "stamped"          # the file recorded its own acquisition time
@@ -134,7 +136,16 @@ def source_of(path: Path) -> str | None:
 # --------------------------------------------------------------------------- #
 # field -> the product(s) that made it
 # --------------------------------------------------------------------------- #
-SENSORS = {"eco": "ecostress", "lst": "landsat", "modis": "modis"}
+# DERIVED from the product registry: a sensor declares its channel prefix ONCE (in its
+# ProductSpec.sensor) and every cube channel it names is attributed automatically. Adding a
+# fourth thermal sensor used to mean remembering to extend this dict AND the regex below --
+# and forgetting either was silent, because an unmapped field does not raise, it just ships
+# with a blank provenance record.
+SENSORS: dict[str, str] = {s.sensor.prefix: s.product.value for s in products.sensors()}
+
+# `^(eco|lst|modis)_(.+)$`, built from the registry rather than written out.
+_SENSOR_RE = re.compile(
+    rf"^({'|'.join(re.escape(p) for p in SENSORS)})_(.+)$") if SENSORS else None
 
 # Fields whose name is exactly this -> inputs.
 _EXACT = {
@@ -171,7 +182,7 @@ def field_inputs(name: str) -> list[str]:
     if name.startswith("mur_"):
         return ["mur"]
 
-    m = re.match(r"^(eco|lst|modis)_(.+)$", name)
+    m = _SENSOR_RE.match(name) if _SENSOR_RE else None
     if m:
         pre, rest = m.group(1), m.group(2)
         sensor = SENSORS[pre]
@@ -258,17 +269,17 @@ def daily_sources(d: Path, aoi_id: str, days, prefix: str = "") -> tuple[list[in
     return codes, legend
 
 
-# The assembler's directory key for the tide product is singular; the product (and every
-# field mapping) is plural. Normalize, or tide-derived fields would silently find no
-# provenance record at all.
-_DIR_KEY_ALIASES = {"tide": "tides"}
-
-
 def collect(aligned_root: Path, aoi: str, product_dirs: dict) -> dict:
-    """{product: record} for every product that actually wrote files for this AoI."""
+    """{product: record} for every product that actually wrote files for this AoI.
+
+    `product_dirs` is keyed by the PRODUCT's own name (products.product_dirs()). It used to
+    be keyed by the assembler's own idea of the name, which called the tide product `tide`
+    while every field mapping called it `tides` -- so an alias table existed here purely to
+    reconcile two hand-maintained lists that disagreed. With one registry there is one name,
+    and the alias is gone.
+    """
     out = {}
-    for dir_key, sub in product_dirs.items():
-        product = _DIR_KEY_ALIASES.get(dir_key, dir_key)
+    for product, sub in product_dirs.items():
         rec = collect_product(Path(aligned_root) / sub / "aligned" / aoi, product)
         if rec is not None:
             out[product] = rec

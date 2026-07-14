@@ -173,8 +173,11 @@ def test_pipeline_splits_when_regions_resolve_to_different_modules(tmp_path, mon
     """Register a second in-situ network for one region only: the pipeline must dispatch
     BOTH modules, each with just its own AoIs. This is the case the old project-wide
     `project.products[insitu].source` lookup could not express at all."""
+    # Register a stub network. `SOURCE_MODULES` holds dotted module paths, resolved lazily,
+    # but an already-imported module object passes straight through -- which is exactly what
+    # lets a test register a source without shipping a module for it.
     sentinel = object()
-    monkeypatch.setitem(pipeline.INSITU_SOURCES, "emodnet", sentinel)
+    monkeypatch.setitem(pipeline.SOURCE_MODULES[DataProduct.insitu], "emodnet", sentinel)
 
     project = _two_continent_project(tmp_path)
     # The Mediterranean region switches to the (newly registered) European network.

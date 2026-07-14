@@ -27,63 +27,81 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import logging
 
-from . import auth, report
+from . import auth, products, report
 from .config import (DataProduct, DEFAULT_SOURCE, Project, load_config, opt, resolve_opts)
 from .grid import AoiGrid, compute_aoi_grid
-from .processes import (
-    bathymetry, cmems, datacube, datum, ecostress, insitu_ioos, landcover_esa, landsat_pc,
-    met, modis, mur, tides,
-)
+from .processes import datacube, datum
 
 log = logging.getLogger(__name__)
 
-# product -> acquisition module. Landsat is special (source selector, below).
-PROCESSES = {
-    DataProduct.bathymetry: bathymetry,
-    DataProduct.mur: mur,
-    DataProduct.cmems: cmems,
-    DataProduct.ecostress: ecostress,
-    DataProduct.met: met,
-    DataProduct.modis: modis,
-    DataProduct.tides: tides,
+# --------------------------------------------------------------------------- #
+# Dispatch tables -- DERIVED from the product registry (coastal_sst_data.products)
+#
+# These used to be four hand-maintained dicts plus a hand-ordered list, and every one of
+# them had to be edited to add a product. They are now views of the registry: a product
+# declares its module (or its {source: module} map) once, in its ProductSpec.
+#
+# Modules are named as DOTTED STRINGS and imported LAZILY -- see the import-cycle note in
+# products.py. A value may also be an already-imported module object, which is what lets a
+# test register a stub source without touching the filesystem.
+# --------------------------------------------------------------------------- #
+PROCESS_MODULES: dict[DataProduct, object] = {
+    s.product: s.module for s in products.REGISTRY if s.module
 }
 
-# Landsat source -> module. Only Planetary Computer is implemented so far.
-LANDSAT_SOURCES = {"pc": landsat_pc, "planetary_computer": landsat_pc}
-
-# Landcover source -> module. Only ESA WorldCover (via PC) is implemented so far;
-# the 'gee' source (JRC + NDWI water mask) is a future landcover_gee module.
-LANDCOVER_SOURCES = {"esa": landcover_esa, "worldcover": landcover_esa}
-
-# In-situ network -> module. IOOS (ERDDAP) covers most of North America; other networks
-# register here and honour the same output contract.
-INSITU_SOURCES = {"ioos": insitu_ioos}
-
-# Execution order: statics + backbone first; Landsat BEFORE MODIS (coincidence);
-# not-yet-implemented products last. Every DataProduct appears exactly once.
-PROCESS_ORDER = [
-    DataProduct.bathymetry,
-    DataProduct.mur,
-    DataProduct.cmems,
-    DataProduct.ecostress,
-    DataProduct.landsat,
-    DataProduct.modis,
-    DataProduct.met,
-    DataProduct.tides,
-    DataProduct.landcover,
-    DataProduct.insitu,
-]
-
-
-# product -> its {source name: module} registry. A product absent here has exactly one
-# implementation (PROCESSES); one listed here picks its module from the resolved `source`.
-SOURCE_REGISTRIES = {
-    DataProduct.landsat: LANDSAT_SOURCES,
-    DataProduct.landcover: LANDCOVER_SOURCES,
-    DataProduct.insitu: INSITU_SOURCES,
+# product -> {source name: module}. A product listed here picks its module from its
+# RESOLVED source, which is per-AoI (see _modules_for). A value of None is a recognised
+# source with no implementation yet (Landsat via aws/gee, landcover via gee).
+SOURCE_MODULES: dict[DataProduct, dict[str, object]] = {
+    s.product: dict(s.sources) for s in products.REGISTRY if s.sources
 }
+
+
+def _resolve(target):
+    """A dotted module path -> the imported module. None and module objects pass through."""
+    if target is None:
+        return None
+    if isinstance(target, str):
+        return importlib.import_module(target)
+    return target                       # already a module (or a test double)
+
+
+def process_order() -> list[DataProduct]:
+    """Every product, in an order that honours its declared dependencies.
+
+    This replaces a hand-ordered list whose two real constraints lived only in a comment:
+    Landsat must precede MODIS (MODIS's coincidence filter reads Landsat's aligned files),
+    and the sensors must precede met (met's overpass snapshots are taken at times read from
+    their directories). Both are now `depends_on` edges on the specs, so a new product
+    declares what it needs and is placed correctly -- rather than the author having to
+    reason about a global ordering and get it right by hand.
+
+    A stable topological sort: registry declaration order is preserved wherever the
+    dependencies allow, so the result still reads as "statics and backbone first".
+    """
+    order: list[DataProduct] = []
+    placed: set[DataProduct] = set()
+    remaining = [s.product for s in products.REGISTRY]
+
+    while remaining:
+        ready = [p for p in remaining
+                 if all(d in placed for d in products.spec(p).depends_on)]
+        if not ready:
+            # Only reachable if a spec declares a dependency cycle; products.py cannot catch
+            # that (it validates each spec alone), so say so loudly rather than loop forever.
+            raise RuntimeError(
+                f"product dependency cycle among {[p.value for p in remaining]}")
+        nxt = ready[0]                  # stable: first in declaration order among the ready
+        order.append(nxt)
+        placed.add(nxt)
+        remaining.remove(nxt)
+    return order
+
+
+PROCESS_ORDER = process_order()
 
 
 def _source_for(project: Project, product: DataProduct, aoi: str) -> str:
@@ -98,12 +116,12 @@ def _module_for(project: Project, product: DataProduct, aoi: str | None = None):
     `aoi=None` answers for the project as a whole (the first AoI's module) -- used by
     `validate`, which is summarising rather than dispatching.
     """
-    registry = SOURCE_REGISTRIES.get(product)
-    if registry is None:
-        return PROCESSES.get(product)
+    sources = SOURCE_MODULES.get(product)
+    if sources is None:
+        return _resolve(PROCESS_MODULES.get(product))
     if aoi is None:
         aoi = project.all_areas[0].name
-    return registry.get(_source_for(project, product, aoi))
+    return _resolve(sources.get(_source_for(project, product, aoi)))
 
 
 def _modules_for(project: Project, product: DataProduct, aoi_names):

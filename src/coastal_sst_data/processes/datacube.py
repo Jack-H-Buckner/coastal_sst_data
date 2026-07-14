@@ -79,17 +79,17 @@ import xarray as xr
 
 from ..config import CompressionSpec, DataProduct, Project
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, naming, provenance, report, store
+from .. import entry, naming, products, provenance, report, store
 from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
 
-# source -> the ALLCAPS "<DIR>/aligned/<aoi>/" folder each acquisition stage wrote.
-PRODUCT_DIRS = {
-    "mur": "MUR", "ecostress": "ECOSTRESS", "landsat": "LANDSAT", "modis": "MODIS",
-    "met": "MET", "bathymetry": "BATHYMETRY", "tide": "TIDE", "landcover": "LANDCOVER",
-    "datum": "DATUM", "cmems": "CMEMS", "insitu": "INSITU",
-}
+# product -> the ALLCAPS "<DIR>/aligned/<aoi>/" folder its acquisition stage wrote.
+# DERIVED from the product registry, and keyed by the PRODUCT's own name throughout -- so
+# the tide product is `tides` here, in provenance, and in the coverage report, even though
+# it writes to TIDE/. Two alias tables used to exist solely because this dict said `tide`
+# and the others said `tides`.
+PRODUCT_DIRS = products.product_dirs()
 
 
 # --------------------------------------------------------------------------- #
@@ -475,7 +475,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     airtemp, wind_u, wind_v = met("airtemp"), met("wind_u"), met("wind_v")
     wind_speed, swrad, cloud_cover = met("wind_speed"), met("swrad"), met("cloud_cover")
-    tide, tide_range = load_tide_daily(adir("tide"), aid, days)
+    tide, tide_range = load_tide_daily(adir("tides"), aid, days)
 
     # ...and, per sensor, the forcing at that sensor's own overpass, so a pre-dawn
     # ECOSTRESS scene and a mid-morning Landsat scene on the same day do not share one
@@ -573,7 +573,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     wl = {}
     datum_attrs = {}
     if eff["water_level"]:
-        series = water_level.load_tide_series(adir("tide"), aid)
+        series = water_level.load_tide_series(adir("tides"), aid)
         # The offset follows the DEM that actually ran, so it is resolved against that
         # file's fingerprint (see water_level.resolve_datum_offset / processes.datum).
         offset, datum_attrs = water_level.resolve_datum_offset(
@@ -705,15 +705,16 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 # --------------------------------------------------------------------------- #
 COVERAGE_WARN = 0.95      # below this fraction of days, a daily product is reported thin
 
-# Products that SHOULD have a value every day, and the channel that proves it. Only these
-# can be judged on coverage: ECOSTRESS/Landsat/MODIS are overpass sensors, so a day with no
-# scene is normal and not a defect -- warning on those would train the user to ignore the
-# warning. `cmems` is matched by prefix because its channels are config-dependent.
-DAILY_CHANNELS = {"mur": "mur_sst", "met": "airtemp", "tide": "tide"}
-
-
-# provenance names the tide product in the plural; the cube's channel is singular.
-_COVERAGE_ALIASES = {"tide": "tides"}
+# Products that SHOULD have a value every day, and the channel that proves it. DERIVED from
+# the registry (products.ProductSpec.coverage_channel).
+#
+# Only daily products can be judged this way: ECOSTRESS/Landsat/MODIS are OVERPASS sensors,
+# so a day with no scene is normal and not a defect -- warning on those would train the user
+# to ignore the warning. They declare no coverage_channel, so they are not listed here.
+# `cmems` is matched by prefix below, because its channels are config-dependent and so
+# cannot be named up front.
+DAILY_CHANNELS = {s.product.value: s.coverage_channel
+                  for s in products.REGISTRY if s.coverage_channel}
 
 
 def coverage(ds: xr.Dataset, days, present=None) -> dict:
@@ -734,7 +735,9 @@ def coverage(ds: xr.Dataset, days, present=None) -> dict:
         channels["cmems"] = sorted(cm)[0]
 
     for product, var in channels.items():
-        if present is not None and _COVERAGE_ALIASES.get(product, product) not in present:
+        # `present` is keyed by the product's own name, and so is `channels` -- one registry,
+        # one name. The alias table that used to reconcile `tide` with `tides` is gone.
+        if present is not None and product not in present:
             continue
         if var not in ds:
             continue
