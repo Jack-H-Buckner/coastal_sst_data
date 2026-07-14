@@ -3,6 +3,8 @@ output tree, assembles them, and asserts the knit result: channel layout, the
 clearest-overpass pick, the land-cover water mask + MUR fill, and that the Zarr
 was written with the expected chunking/compressor. No network, no real data."""
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -267,6 +269,78 @@ def test_assemble_skips_existing_without_overwrite(project, grids, days, caplog)
 def test_assemble_unknown_aoi_errors(project, grids):
     with pytest.raises(SystemExit, match="not found"):
         datacube.assemble(project, grids=grids, aois=["nope"])
+
+
+# --------------------------------------------------------------------------- #
+# write_zarr_safe: a run that dies mid-write must not leave a cube behind
+# --------------------------------------------------------------------------- #
+def _cube(n=4, h=8, w=8):
+    return xr.Dataset(
+        {"f": (("time", "y", "x"), np.arange(n * h * w, dtype="float32").reshape(n, h, w))},
+        coords={"time": range(n), "y": range(h), "x": range(w)})
+
+
+def _write_cube(ds, zpath):
+    datacube.write_zarr_safe(ds, zpath, datacube.build_encoding(ds, CompressionSpec(), {}))
+
+
+def test_write_zarr_safe_leaves_nothing_at_the_final_path_when_the_write_dies(tmp_path, monkeypatch):
+    """The point of the whole exercise: a killed write must not park a partial cube at the
+    final path, where the next run's exists() check would take it for a finished one."""
+    zpath = tmp_path / "aoi.zarr"
+
+    def die(self, store, *a, **kw):
+        Path(store).mkdir()                   # half-write the scratch dir, then drop the wire
+        (Path(store) / "chunk.0.0").write_text("truncated")
+        raise ConnectionError("connection reset mid-write")
+
+    monkeypatch.setattr(xr.Dataset, "to_zarr", die)
+    with pytest.raises(ConnectionError):
+        _write_cube(_cube(), zpath)
+
+    assert not zpath.exists()                          # nothing at the final path
+    assert not list(tmp_path.glob("*.tmp-*"))          # and the scratch was cleaned up
+
+
+def test_write_zarr_safe_keeps_the_previous_cube_when_the_rewrite_dies(tmp_path, monkeypatch):
+    """An overwrite that fails must leave the OLD cube intact -- losing a good cube to a
+    failed refresh would be a worse outcome than not refreshing it."""
+    zpath = tmp_path / "aoi.zarr"
+    _write_cube(_cube(), zpath)
+    before = xr.open_zarr(zpath)["f"].values.copy()
+
+    def die(self, *a, **kw):
+        raise ConnectionError("connection reset mid-write")
+
+    monkeypatch.setattr(xr.Dataset, "to_zarr", die)
+    with pytest.raises(ConnectionError):
+        _write_cube(_cube() * 99, zpath)
+
+    assert np.array_equal(xr.open_zarr(zpath)["f"].values, before)   # old cube survived
+    assert not list(tmp_path.glob("*.old-*"))                        # not stranded aside
+
+
+def test_write_zarr_safe_overwrites_and_cleans_up(tmp_path):
+    zpath = tmp_path / "aoi.zarr"
+    _write_cube(_cube(), zpath)
+    _write_cube(_cube() + 100.0, zpath)
+
+    assert xr.open_zarr(zpath)["f"].values[0, 0, 0] == 100.0        # new cube won
+    assert not list(tmp_path.glob("*.tmp-*")) and not list(tmp_path.glob("*.old-*"))
+
+
+def test_write_zarr_safe_sweeps_scratch_left_by_an_earlier_crash(tmp_path, caplog):
+    zpath = tmp_path / "aoi.zarr"
+    stale = tmp_path / "aoi.zarr.tmp-999-1"
+    stale.mkdir()
+    (stale / "junk").write_text("half a chunk")
+
+    with caplog.at_level("WARNING"):
+        _write_cube(_cube(), zpath)
+
+    assert not stale.exists()
+    assert "partial cube" in caplog.text            # and the user is TOLD a run had died
+    assert xr.open_zarr(zpath).sizes["time"] == 4
 
 
 # --------------------------------------------------------------------------- #

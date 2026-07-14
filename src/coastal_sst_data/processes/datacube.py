@@ -649,32 +649,79 @@ def build_encoding(ds: xr.Dataset, compression: CompressionSpec, chunks: dict) -
 
 
 # --------------------------------------------------------------------------- #
-# Write (NFS-safe overwrite)
+# Write (atomic, NFS-safe)
 # --------------------------------------------------------------------------- #
-def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
-    """Write a Zarr cube, tolerating NFS 'Directory not empty' on overwrite.
+TMP_SUFFIX = ".tmp-"      # a cube being built; junk if a run dies
+OLD_SUFFIX = ".old-"      # the previous cube, kept until the swap succeeds
 
-    Overwriting rmtree's the old dir in place, which fails on networked
-    filesystems when a chunk is still open (silly-renamed to a hidden .nfs*). So
-    move any existing cube ASIDE (atomic rename, works with open handles), write
-    fresh, then best-effort delete the stash.
+
+def _rm(path: Path) -> None:
+    """Best-effort recursive delete. Never raises: failing to clean up scratch must not
+    fail a run that has already written its cube."""
+    if not path.exists():        # to_zarr can fail before creating anything -- not a problem
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:                     # NFS .nfs* leftovers, etc.
+        log.warning("  could not remove %s (%s); delete it by hand", path.name, exc)
+
+
+def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
+    """Write a Zarr cube ATOMICALLY. The final path only ever holds a COMPLETE cube.
+
+    Two distinct hazards, handled by one mechanism -- build aside, then swap:
+
+      * A run killed mid-write (dropped connection, Ctrl-C, OOM) must not leave a partial
+        cube AT the final path. `run()` decides a cube is already done by asking whether
+        its path exists, so a truncated cube parked there would be taken for a finished
+        one and silently skipped on every subsequent run. We therefore write into a
+        scratch dir and only os.replace() it into place once `to_zarr` has RETURNED: a
+        crash leaves the scratch dir (clearly named, and swept on the next run) and the
+        previous cube untouched.
+      * Overwriting rmtree's the old dir in place, which fails on networked filesystems
+        when a chunk is still open (silly-renamed to a hidden .nfs*). So the old cube is
+        moved ASIDE by rename -- atomic, and works with open handles -- rather than
+        deleted out from under a reader, and only deleted once the new one is in place.
     """
     zpath = Path(zpath)
+    tag = f"{os.getpid()}-{int(time.time())}"
+
+    # Scratch from a previous crashed run is junk, not data. Sweep it, and say so: a
+    # leftover is the only trace that an earlier run died partway through a write.
+    for stale in sorted(zpath.parent.glob(f"{zpath.name}{TMP_SUFFIX}*")):
+        log.warning("  discarding partial cube %s left by an unfinished run", stale.name)
+        _rm(stale)
+
+    tmp = zpath.with_name(f"{zpath.name}{TMP_SUFFIX}{tag}")
+    try:
+        with warnings.catch_warnings():
+            # Zarr v3 warns that consolidated metadata isn't in the v3 spec; xarray
+            # still writes+reads it and it speeds opening a many-variable cube.
+            warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
+            ds.to_zarr(tmp, mode="w-", consolidated=True, encoding=encoding)
+    except BaseException:
+        # BaseException, not Exception: a Ctrl-C halfway through to_zarr must not leave a
+        # half-cube behind either. Nothing at zpath has been touched, so the previous
+        # cube (if any) survives the failure intact.
+        _rm(tmp)
+        raise
+
+    # The new cube is complete on disk. Swap it in. os.replace() cannot clobber a
+    # non-empty directory, so an existing cube has to move aside first.
     stash = None
     if zpath.exists():
-        stash = zpath.with_name(f"{zpath.name}.old-{os.getpid()}-{int(time.time())}")
+        stash = zpath.with_name(f"{zpath.name}{OLD_SUFFIX}{tag}")
         zpath.rename(stash)
-    with warnings.catch_warnings():
-        # Zarr v3 warns that consolidated metadata isn't in the v3 spec; xarray
-        # still writes+reads it and it speeds opening a many-variable cube.
-        warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
-        ds.to_zarr(zpath, mode="w-", consolidated=True, encoding=encoding)
+    try:
+        os.replace(tmp, zpath)
+    except OSError:
+        if stash is not None:        # put the old cube back: leaving NOTHING is worse
+            stash.rename(zpath)
+        _rm(tmp)
+        raise
+
     if stash is not None:
-        try:
-            shutil.rmtree(stash)
-        except OSError as exc:                 # NFS .nfs* leftovers -> non-fatal
-            log.warning("  wrote %s but could not remove old cube %s (%s); delete it later",
-                        zpath.name, stash.name, exc)
+        _rm(stash)
 
 
 # --------------------------------------------------------------------------- #
