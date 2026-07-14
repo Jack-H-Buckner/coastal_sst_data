@@ -42,6 +42,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 
@@ -275,6 +276,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
                                  g.transform, g.width, g.height, g.geom_proj, name, t)
             if ds is None:
                 continue
+            ds.attrs.update(**provenance.stamp(eff))
             log.info("      wrote %s", write_output(ds, aoi_out, name, fmt))
 
     log.info("Done.")
@@ -313,6 +315,7 @@ def _build_eff(project: Project) -> dict:
     grid_cfg.setdefault("to_celsius", False)      # GridSpec has no such field yet
 
     return {
+        "config_sha256": project.config_sha256,
         "ds": ds_cfg,
         "grid": grid_cfg,
         "out_dir": Path(project.output_dir) / "ECOSTRESS" / "aligned",

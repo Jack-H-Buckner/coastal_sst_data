@@ -35,6 +35,7 @@ from rasterio.enums import Resampling
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 
@@ -153,7 +154,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             ds["valid"].attrs["long_name"] = "finite MUR SST (water)"
             ds = ds.expand_dims(time=[t])
             ds.attrs.update(aoi_id=name, source=f"GHRSST {ds_cfg['short_name']}",
-                            processing="subset + bilinear upsample to AOI grid")
+                            processing="subset + bilinear upsample to AOI grid",
+                            **provenance.stamp(eff))
             log.info("  [%d/%d] wrote %s", gi, len(granules),
                      write_output(ds, aoi_out, name, fmt))
     log.info("Done.")
@@ -184,6 +186,7 @@ def _build_eff(project: Project) -> dict:
     grid_cfg.setdefault("to_celsius", False)      # GridSpec has no such field yet
 
     return {
+        "config_sha256": project.config_sha256,
         "ds": ds_cfg,
         "grid": grid_cfg,
         "out_dir": Path(project.output_dir) / "MUR" / "aligned",

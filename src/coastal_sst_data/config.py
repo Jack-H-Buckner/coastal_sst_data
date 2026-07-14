@@ -19,7 +19,8 @@ from typing import Any, Literal
 from math import cos, radians
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (BaseModel, Field, PrivateAttr, ValidationError, field_validator,
+                      model_validator)
 
 log = logging.getLogger(__name__)
 
@@ -480,6 +481,36 @@ class Project(BaseModel):
                 )
         return self
 
+    # What this project was LOADED FROM. Kept so an assembled datacube can embed the
+    # exact config that produced it -- a cube whose config has since been edited, moved,
+    # or deleted is still reproducible from its own attrs. Private (not config fields), so
+    # `extra="forbid"` and round-tripping are untouched.
+    _config_path: str | None = PrivateAttr(default=None)
+    _config_text: str | None = PrivateAttr(default=None)
+
+    @property
+    def config_path(self) -> str | None:
+        """Path the config was read from; None when built from a dict."""
+        return self._config_path
+
+    @property
+    def config_text(self) -> str:
+        """The config's YAML text.
+
+        For a project built from a dict (parse_config) there is no file, so the validated
+        model is serialized back to YAML -- a programmatically-built project stays just as
+        self-describing as a file-backed one.
+        """
+        if self._config_text is None:
+            self._config_text = yaml.safe_dump(
+                self.model_dump(mode="json", exclude_defaults=True), sort_keys=False)
+        return self._config_text
+
+    @property
+    def config_sha256(self) -> str:
+        import hashlib
+        return hashlib.sha256(self.config_text.encode("utf-8")).hexdigest()
+
     @property
     def all_areas(self) -> list[AreaOfInterest]:
         return [a for r in self.regions for a in r.areas]
@@ -510,7 +541,12 @@ def load_config(path: str | Path) -> Project:
             f"Config root must be a mapping/dict, got {type(raw).__name__}"
         )
 
-    return parse_config(raw)
+    project = parse_config(raw)
+    # Keep the file VERBATIM, not a re-serialization: the cube should embed what you
+    # actually wrote, comments and all.
+    project._config_text = path.read_text(encoding="utf-8")
+    project._config_path = str(path.resolve())
+    return project
 
 
 if __name__ == "__main__":

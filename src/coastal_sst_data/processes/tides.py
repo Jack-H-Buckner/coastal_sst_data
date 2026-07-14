@@ -49,6 +49,7 @@ import xarray as xr
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 
@@ -382,7 +383,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
                           coords={"time": s.index.values}, dims="time", name="tide")
         da.attrs.update(units="m", long_name="tide height (harmonic prediction, rel. MSL)")
         ds = da.to_dataset()
-        ds.attrs.update(aoi_id=name, source=used, **attrs)
+        ds.attrs.update(aoi_id=name, source=used, **attrs, **provenance.stamp(eff))
         log.info("  wrote %s (%d steps) [%s]",
                  write_output(ds, out_root / name, name, fmt), ds.sizes["time"], used)
     log.info("Done.")
@@ -432,6 +433,7 @@ def _build_eff(project: Project) -> dict:
 
     root = Path(project.output_dir)
     return {
+        "config_sha256": project.config_sha256,
         "ds": ds_cfg,
         "out_dir": root / "TIDE" / "aligned",
         "fmt": _opt(opts, "output_format", "netcdf"),

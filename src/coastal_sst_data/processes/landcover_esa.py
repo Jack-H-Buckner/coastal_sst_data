@@ -49,6 +49,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 
@@ -194,6 +195,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             continue
 
         wf = float((ds["water"].values == 1).mean())
+        ds.attrs.update(**provenance.stamp(eff))
         log.info("  wrote %s  (water=%.0f%% of grid)", write_output(ds, aoi_out, name, fmt), 100 * wf)
     log.info("Done.")
 
@@ -219,6 +221,7 @@ def _build_eff(project: Project) -> dict:
         "water_classes": list(_opt(opts, "water_classes", DEFAULT_WATER_CLASSES)),
     }
     return {
+        "config_sha256": project.config_sha256,
         "ds": ds_cfg,
         "out_dir": Path(project.output_dir) / "LANDCOVER" / "aligned",
         "fmt": _opt(opts, "output_format", "netcdf"),

@@ -59,6 +59,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 
@@ -428,7 +429,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                     ds = to_dataset(got, g, rt, to_celsius)
                     ds.attrs.update(aoi_id=name, source=f"{src} @reference",
                                     reference_time=str(ref_time), reference_basis=ref_basis,
-                                    reference_time_utc=rt.isoformat())
+                                    reference_time_utc=rt.isoformat(),
+                                    **provenance.stamp(eff))
                     log.info("  %s reference (%s %s -> %s UTC) -> %s", dstr, ref_time,
                              ref_basis, rt.strftime("%H:%M"),
                              write_output(ds, aoi_out, name, fmt, f"{name}_ref_{dstr}"))
@@ -448,7 +450,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                     mean_grids = {k: np.nanmean(np.stack(v), axis=0) for k, v in stack.items()}
                     ds = to_dataset(mean_grids, g, day, to_celsius)
                     ds.attrs.update(aoi_id=name, source=f"{'+'.join(sorted(srcs))} daily mean",
-                                    daily_mean_hours=str(mean_hours))
+                                    daily_mean_hours=str(mean_hours),
+                                    **provenance.stamp(eff))
                     log.info("  %s daily -> %s", dstr,
                              write_output(ds, aoi_out, name, fmt, f"{name}_{dstr}"))
 
@@ -461,7 +464,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 if not got:
                     continue
                 ds = to_dataset(got, g, op, to_celsius)
-                ds.attrs.update(aoi_id=name, source=f"{src} @overpass")
+                ds.attrs.update(aoi_id=name, source=f"{src} @overpass", **provenance.stamp(eff))
                 log.info("  overpass %s -> %s", tstr,
                          write_output(ds, aoi_out, name, fmt, f"{name}_{tstr}"))
     log.info("Done.")
@@ -503,6 +506,7 @@ def _build_eff(project: Project) -> dict:
 
     root = Path(project.output_dir)
     return {
+        "config_sha256": project.config_sha256,
         "ds": ds_cfg,
         "grid": grid_cfg,
         "out_dir": root / "MET" / "aligned",

@@ -78,6 +78,7 @@ import xarray as xr
 
 from ..config import CompressionSpec, DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
@@ -572,6 +573,23 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     for name in op_met:
         ds[name].attrs["long_name"] = (
             f"{name.split('_', 1)[1]} at the {name.split('_', 1)[0]} overpass")
+
+    # PROVENANCE: the config that built this cube, and for every field the source(s) it
+    # came from and when they were accessed. Zarr attrs must be JSON-serialisable, so the
+    # structured parts are JSON strings.
+    prod = provenance.collect(eff["aligned_root"], aid, PRODUCT_DIRS)
+    rec = provenance.build(eff["project"], list(ds.data_vars), prod)
+    ds.attrs.update(
+        created_at=rec["created_at"], package_version=rec["package_version"],
+        config_sha256=rec["config_sha256"] or "", config_path=rec["config_path"] or "",
+        config_yaml=rec["config_yaml"] or "",
+        provenance=json.dumps(rec["fields"], sort_keys=True),
+        provenance_products=json.dumps(rec["products"], sort_keys=True))
+    guessed = [p for p, r in prod.items() if r["basis"] == provenance.FILE_MTIME]
+    if guessed:
+        log.warning("  %s: access dates for %s came from FILE MTIMES, not recorded stamps "
+                    "(acquired before provenance existed, or the tree was copied)",
+                    aid, ", ".join(sorted(guessed)))
     # Datum provenance is a GLOBAL cube attr, not just a per-variable one: a cube whose
     # offset could not be resolved is complete and plausible-looking, so the only thing
     # that tells a downstream user it is biased is `datum_status` travelling with it.

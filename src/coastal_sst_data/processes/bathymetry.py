@@ -42,6 +42,7 @@ from rasterio.transform import from_origin
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 SOURCE = "bathymetry"
@@ -288,6 +289,7 @@ def _build_eff(project: Project) -> dict:
         "tmp_dir": Path(project.output_dir) / "BATHYMETRY" / "_tmp",
     }
     return {
+        "config_sha256": project.config_sha256,
         "params": params,
         "out_dir": out_root,
         "fmt": _opt(opts, "output_format", "netcdf"),
@@ -340,7 +342,8 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
         ds["depth_p75"].attrs.update(units="m", long_name="75th-percentile depth in cell")
         ds = ds.rio.write_crs(g.target_crs)
         ds.attrs.update(aoi_id=name, source=used,
-                        processing="aggregated to AOI grid (mean, p25, p75 depth per cell)")
+                        processing="aggregated to AOI grid (mean, p25, p75 depth per cell)",
+                        **provenance.stamp(eff))
         log.info("  wrote %s  [%s]", write_output(ds, out_root / name, name, fmt), used)
     log.info("Done.")
 
