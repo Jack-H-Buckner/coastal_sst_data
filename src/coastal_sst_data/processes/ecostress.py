@@ -22,9 +22,7 @@ Usage (run from the OCEANSR project root):
 
 from __future__ import annotations
 
-import argparse
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -37,16 +35,12 @@ import xarray as xr
 import earthaccess
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
-from pyproj import Transformer
-from shapely.ops import transform as shp_transform
 
-from ..config import Project, DataProduct, load_config
-from ..grid import AoiGrid, project_grids
-from .. import net, provenance, report, store
+from ..config import Project, DataProduct, opt as _opt
+from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
+from .. import entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
-
-_DT_RE = re.compile(r"(\d{8}T\d{6})")  # ..._20230715T210043_....tif
 
 # --- ECOSTRESS product constants -------------------------------------------- #
 # These describe the ECO_L2T_LSTE product itself (not user choices), so they
@@ -129,38 +123,26 @@ def filter_links_for_granule(granule, layers: dict) -> dict:
 
 
 def parse_acq_time(filename: str) -> Optional[datetime]:
-    m = _DT_RE.search(filename)
-    return datetime.strptime(m.group(1), "%Y%m%dT%H%M%S") if m else None
+    """The overpass stamp in a granule id (..._20230715T210043_...), or None."""
+    return naming.parse_time(filename)
 
 
 # --------------------------------------------------------------------------- #
 # Per-granule processing
 # --------------------------------------------------------------------------- #
-def read_window_reproject(fobj, geom_target, target_crs, transform, width,
-                          height, resampling):
-    """Open a remote COG, read ONLY the AOI window, reproject to the AOI grid.
+# ECOSTRESS COGs are read through the shared windowed reader (grid.read_cog_window). Its
+# 110 km tiles want a slightly wider pad than the 300 m the optical products use -- ~6
+# pixels of slack at the 70 m native posting -- so that is passed explicitly.
+ECO_PAD_M = 600.0
 
-    `fobj` is an fsspec file object from earthaccess.open(); rioxarray reads it
-    lazily, so clip_box triggers HTTP range reads of just the windowed blocks
-    rather than pulling the whole 110 km tile.
+
+def process_granule(role_to_file, ds_cfg, grid_cfg, g: AoiGrid, aoi_id,
+                    acq_time) -> Optional[xr.Dataset]:
+    """One granule's COG assets -> the aligned sst/water/cloud/valid Dataset, or None.
+
+    `role_to_file` maps a role to anything rioxarray opens: the fsspec objects
+    earthaccess.open() returns for the remote assets, or plain paths in a test.
     """
-    da = rioxarray.open_rasterio(fobj, masked=True)
-    if "band" in da.dims:
-        da = da.squeeze("band", drop=True)
-    cog_crs = da.rio.crs
-    # AOI bounds expressed in the COG's CRS, padded a few pixels for clean edges.
-    to_cog = Transformer.from_crs(target_crs, cog_crs, always_xy=True).transform
-    minx, miny, maxx, maxy = shp_transform(to_cog, geom_target).bounds
-    pad = 600.0  # ~6 pixels of slack (COG units are metres)
-    da = da.rio.clip_box(minx - pad, miny - pad, maxx + pad, maxy + pad, crs=cog_crs)
-    return da.rio.reproject(
-        dst_crs=target_crs, shape=(height, width), transform=transform,
-        resampling=resampling, nodata=np.nan,
-    )
-
-
-def process_granule(role_to_file, ds_cfg, grid_cfg, target_crs, transform,
-                    width, height, geom_proj, aoi_id, acq_time) -> Optional[xr.Dataset]:
     categorical = set(ds_cfg.get("categorical", []))
     rs_cont = Resampling[grid_cfg.get("resampling_continuous", "bilinear")]
     rs_cat = Resampling[grid_cfg.get("resampling_categorical", "nearest")]
@@ -169,9 +151,8 @@ def process_granule(role_to_file, ds_cfg, grid_cfg, target_crs, transform,
     for role, fobj in role_to_file.items():
         resampling = rs_cat if ds_cfg["layers"][role] in categorical else rs_cont
         try:
-            da = read_window_reproject(fobj, geom_proj, target_crs, transform,
-                                       width, height, resampling)
-            da = da.rio.clip([geom_proj], target_crs, drop=False)
+            da = read_cog_window(fobj, g, resampling=resampling, pad_m=ECO_PAD_M)
+            da = da.rio.clip([g.geom_proj], g.target_crs, drop=False)
         except Exception as exc:  # window outside this tile, transient COG read failure...
             log.warning("    layer %s failed to read (%s)", role, exc)
             failed.append(role)
@@ -229,21 +210,6 @@ def process_granule(role_to_file, ds_cfg, grid_cfg, target_crs, transform,
     return ds
 
 
-def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    t = pd.Timestamp(ds["time"].values[0]).strftime("%Y%m%dT%H%M%S") \
-        if "time" in ds.coords else "unknown"
-    stem = f"{aoi_id}_{t}"
-    if fmt == "netcdf":
-        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
-    if fmt == "geotiff":
-        return store.write_rasters(
-            ds, out_dir / stem,
-            [(v, ds[v].isel(time=0) if "time" in ds[v].dims else ds[v]) for v in ds.data_vars])
-    raise ValueError(f"Unknown output format: {fmt}")
-    return path
-
-
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -261,13 +227,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
     login(eff["earthdata"]["auth_strategy"])
     layers = dict(ds_cfg["layers"])
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("ecostress")
 
@@ -297,8 +257,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
             if not role_to_url:
                 continue
             t = parse_acq_time(granule_name(granule))
-            tstr = t.strftime("%Y%m%dT%H%M%S") if t else f"g{gi}"
-            if store.done(aoi_out / f"{name}_{tstr}.nc", expected_vars(ds_cfg),
+            tstr = naming.time_stamp(t) if t else f"g{gi}"
+            stem = f"{name}_{tstr}"
+            if store.done(aoi_out / f"{stem}.nc", expected_vars(ds_cfg),
                           shape=(g.height, g.width), overwrite=overwrite):
                 log.info("  [%d/%d] %s already processed, skipping", gi, len(granules), tstr)
                 rep.skip()
@@ -315,14 +276,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
                 continue
             role_to_file = dict(zip(role_to_url.keys(), fobjs))
 
-            ds = process_granule(role_to_file, ds_cfg, grid_cfg, g.target_crs,
-                                 g.transform, g.width, g.height, g.geom_proj, name, t)
+            ds = process_granule(role_to_file, ds_cfg, grid_cfg, g, name, t)
             if ds is None:
                 # dropped as degraded (a mask layer was missing) -- a LOSS, not a no-op
                 rep.fail(f"{name} {tstr}", "granule dropped (missing core layer)")
                 continue
             ds.attrs.update(**provenance.stamp(eff))
-            log.info("      wrote %s", write_output(ds, aoi_out, name, fmt))
+            log.info("      wrote %s", store.write_output(ds, aoi_out, stem, fmt))
             rep.wrote(source=ds.attrs.get("source"))
 
     rep.log_summary()
@@ -332,11 +292,6 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    """Read an optional override off a product-options bag (extra='allow')."""
-    return getattr(opts, name, default) if opts is not None else default
-
-
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes.
 
@@ -376,15 +331,6 @@ def _build_eff(project: Project) -> dict:
     }
 
 
-def _setup_gdal_env():
-    """Efficiency AND a deadline for remote COG range reads (see net.setup_gdal_env).
-
-    This used to set only the efficiency knobs, so a stalled connection could hang the run
-    indefinitely and one transient 503 permanently lost the scene.
-    """
-    net.setup_gdal_env()
-
-
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
             overwrite=False, list_layers=False) -> None:
     """Acquire ECOSTRESS for a validated Project. Entry point for pipeline.py.
@@ -405,29 +351,15 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    _setup_gdal_env()
+    net.setup_gdal_env()      # windowed COG reads: deadline + retries
     return run(eff, grids, aois, dry_run, list_layers)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="coastal_sst_data ECOSTRESS acquisition.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="reprocess overpasses even if the aligned file exists")
-    ap.add_argument("--dry-run", action="store_true", help="Search only; no download.")
-    ap.add_argument("--list-layers", action="store_true",
-                    help="Print available COG suffixes for the first granule and exit.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run,
-            overwrite=args.overwrite, list_layers=args.list_layers)
+    entry.process_main(
+        acquire, "coastal_sst_data ECOSTRESS acquisition.",
+        extra=[entry.Flag("--list-layers",
+                          "Print available COG suffixes for the first granule and exit.")])
 
 
 if __name__ == "__main__":

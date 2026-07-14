@@ -68,30 +68,21 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
-import os
-import re
-import shutil
-import time
 import warnings
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from ..config import CompressionSpec, DataProduct, Project, load_config
-from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from ..config import CompressionSpec, DataProduct, Project
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, naming, provenance, report, store
 from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
-
-_DT_RE = re.compile(r"(\d{8}T\d{6})")     # per-overpass filename stamp
-_D_RE = re.compile(r"_(\d{8})\.nc$")      # per-day filename stamp
 
 # source -> the ALLCAPS "<DIR>/aligned/<aoi>/" folder each acquisition stage wrote.
 PRODUCT_DIRS = {
@@ -119,8 +110,8 @@ def load_daily_sensor(d: Path, aoi_id, days, H, W, var, *, prefix=""):
     out = _empty3d(days, H, W)
     if not d.exists():
         return out
-    pat = re.compile(rf"^{re.escape(aoi_id)}_{re.escape(prefix)}(\d{{8}})\.nc$")
-    didx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
+    pat = naming.day_pattern(aoi_id, prefix)
+    didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
     for f in d.glob(f"{aoi_id}_{prefix}*.nc"):
         m = pat.match(f.name)
         if not m or m.group(1) not in didx:
@@ -147,7 +138,7 @@ def load_at_times(d: Path, aoi_id, times, H, W, var):
     for i, t in enumerate(times):
         if t is None:
             continue
-        f = d / f"{aoi_id}_{t.strftime('%Y%m%dT%H%M%S')}.nc"
+        f = d / f"{naming.time_stem(aoi_id, t)}.nc"
         if not f.exists():
             continue
         ds = xr.open_dataset(f)
@@ -167,7 +158,7 @@ def met_prefix(d: Path, aoi_id, days, want: str) -> tuple[str, str]:
     than silently emitting an all-NaN forcing channel.
     """
     def has(prefix):
-        return any((d / f"{aoi_id}_{prefix}{dd.strftime('%Y%m%d')}.nc").exists()
+        return any((d / f"{naming.day_stem(aoi_id, dd, prefix)}.nc").exists()
                    for dd in days)
 
     want_prefix = "ref_" if want == "reference" else ""
@@ -206,14 +197,13 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
     if not d.exists():
         return sst, cloud, valid, hour, water_union, times
     qset = list(qc_levels) if qc_levels is not None else None
-    didx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
+    didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
     best = {}  # day -> (valid_count, sst, cloud, valid, datetime)
     for f in d.glob(f"{aoi_id}_*T*.nc"):
-        m = _DT_RE.search(f.name)
-        if not m:
+        dt = naming.parse_time(f.name)
+        if dt is None:
             continue
-        dt = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S")
-        day = dt.strftime("%Y%m%d")
+        day = naming.day_stamp(dt)
         if day not in didx:
             continue
         ds = xr.open_dataset(f)
@@ -269,10 +259,10 @@ def load_tide_daily(d: Path, aoi_id, days):
     t = ds["tide"]
     dm = t.resample(time="1D").mean()
     dr = t.resample(time="1D").max() - t.resample(time="1D").min()
-    lut_m = dict(zip(dm["time"].dt.strftime("%Y%m%d").values, dm.values))
-    lut_r = dict(zip(dr["time"].dt.strftime("%Y%m%d").values, dr.values))
+    lut_m = dict(zip(dm["time"].dt.strftime(naming.DAY_FMT).values, dm.values))
+    lut_r = dict(zip(dr["time"].dt.strftime(naming.DAY_FMT).values, dr.values))
     for i, dd in enumerate(days):
-        k = dd.strftime("%Y%m%d")
+        k = naming.day_stamp(dd)
         if k in lut_m:
             mean[i] = lut_m[k]
             rng[i] = lut_r[k]
@@ -861,13 +851,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     overwrite = eff["overwrite"]
     days = pd.date_range(eff["time"]["start_date"], eff["time"]["end_date"], freq="D")
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("datacube")
 
@@ -923,20 +907,9 @@ def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="coastal_sst_data datacube assembler.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Assemble only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true", help="rebuild existing .zarr cubes")
-    ap.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    assemble(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    # The terminal stage's entry point is `assemble`, not `acquire`, but it takes the same
+    # (project, aois, dry_run, overwrite) arguments -- so it rides the shared parser too.
+    entry.process_main(assemble, "coastal_sst_data datacube assembler.")
 
 
 if __name__ == "__main__":

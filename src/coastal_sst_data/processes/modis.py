@@ -34,9 +34,7 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import logging
-import re
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -48,9 +46,9 @@ import xarray as xr
 import earthaccess
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 
-from ..config import Project, DataProduct, load_config
-from ..grid import AoiGrid, project_grids
-from .. import net, provenance, report, store
+from ..config import Project, DataProduct, opt as _opt
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -63,22 +61,22 @@ DEFAULT_QUALITY_MIN = 4
 DEFAULT_RADIUS_M = 1500.0                      # pyresample search radius (~1 km px)
 DEFAULT_MAX_TIME_DIFF_MIN = 360               # +/- 6 h Landsat<->MODIS overpass
 
-_DT_RE = re.compile(r"(\d{8}T\d{6})")          # Landsat aligned filename stamp
-
 
 # --------------------------------------------------------------------------- #
 # Coincidence helpers
 # --------------------------------------------------------------------------- #
 def _landsat_times(landsat_dir: Path, aoi: str) -> list[datetime]:
-    """Acquisition times of the Landsat aligned files already written for an AoI."""
+    """Acquisition times of the Landsat aligned files already written for an AoI.
+
+    Reads the stamp Landsat WROTE via the shared convention (coastal_sst_data.naming), so
+    the two cannot drift: this coincidence filter is the one place where one product's
+    filenames are parsed by another product's code.
+    """
     d = landsat_dir / aoi
-    out = []
-    if d.exists():
-        for f in d.glob(f"{aoi}_*T*.nc"):
-            m = _DT_RE.search(f.name)
-            if m:
-                out.append(datetime.strptime(m.group(1), "%Y%m%dT%H%M%S"))
-    return out
+    if not d.exists():
+        return []
+    return [t for f in d.glob(f"{aoi}_*T*.nc")
+            if (t := naming.parse_time(f.name)) is not None]
 
 
 def _granule_time(granule) -> datetime:
@@ -178,18 +176,6 @@ def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius,
     return ds
 
 
-def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    t = pd.Timestamp(ds["time"].values[0]).strftime("%Y%m%dT%H%M%S")
-    stem = f"{aoi_id}_{t}"
-    if fmt == "netcdf":
-        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
-    if fmt == "geotiff":
-        return store.write_rasters(ds, out_dir / stem,
-                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
-    raise ValueError(f"Unknown output format: {fmt}")
-
-
 # --------------------------------------------------------------------------- #
 # Coincidence filter (day/time + Landsat matchup)
 # --------------------------------------------------------------------------- #
@@ -230,13 +216,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     log.info("Authenticating with Earthdata (strategy=%s)", eff["earthdata"]["auth_strategy"])
     earthaccess.login(strategy=eff["earthdata"]["auth_strategy"])
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("modis")
 
@@ -267,8 +247,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
         aoi_out = out_root / name
         for gr, t in kept:
-            tstr = t.strftime("%Y%m%dT%H%M%S")
-            if store.done(aoi_out / f"{name}_{tstr}.nc", store.REQUIRED_VARS["MODIS"],
+            tstr = naming.time_stamp(t)
+            stem = naming.time_stem(name, t)
+            if store.done(aoi_out / f"{stem}.nc", store.REQUIRED_VARS["MODIS"],
                           shape=(g.height, g.width), overwrite=overwrite):
                 log.info("  %s already processed, skipping", tstr)
                 continue
@@ -292,7 +273,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             ds = _scene_dataset(sst_g, fp_g, g, t, name, to_celsius,
                                 short_name=ds_cfg["short_name"])
             ds.attrs.update(**provenance.stamp(eff))
-            log.info("  wrote %s", write_output(ds, aoi_out, name, fmt))
+            log.info("  wrote %s", store.write_output(ds, aoi_out, stem, fmt))
             rep.wrote(source=f"GHRSST {ds_cfg['short_name']}")
     rep.log_summary()
     return rep
@@ -301,11 +282,6 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    """Read an optional override off a product-options bag (extra='allow')."""
-    return getattr(opts, name, default) if opts is not None else default
-
-
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     opts = project.products.get(DataProduct.modis)
@@ -369,25 +345,10 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="coastal_sst_data MODIS Terra L2P SST acquisition.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="reprocess granules even if the aligned file exists")
-    ap.add_argument("--full-series", action="store_true",
-                    help="ignore Landsat coincidence; load the full MODIS time series")
-    ap.add_argument("--dry-run", action="store_true", help="Search only; no download.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run,
-            overwrite=args.overwrite, full_series=args.full_series)
+    entry.process_main(
+        acquire, "coastal_sst_data MODIS Terra L2P SST acquisition.",
+        extra=[entry.Flag("--full-series",
+                          "ignore Landsat coincidence; load the full MODIS time series")])
 
 
 if __name__ == "__main__":

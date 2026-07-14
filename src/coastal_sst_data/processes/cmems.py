@@ -49,7 +49,6 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import logging
 from pathlib import Path
 
@@ -60,9 +59,9 @@ import xarray as xr
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 
-from ..config import DataProduct, Project, load_config
-from ..grid import AoiGrid, project_grids
-from .. import net, provenance, report, store
+from ..config import DataProduct, Project, opt as _opt
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -219,18 +218,6 @@ def day_dataset(src_ds: xr.Dataset, day, g: AoiGrid, variables, level_of, grid_c
     return ds
 
 
-def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    d = pd.Timestamp(ds["time"].values[0]).strftime("%Y%m%d")
-    stem = f"{aoi_id}_{d}"
-    if fmt == "netcdf":
-        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
-    if fmt == "geotiff":
-        return store.write_rasters(ds, out_dir / stem,
-                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
-    raise ValueError(f"Unknown output format: {fmt}")
-
-
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
@@ -243,12 +230,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
     days = pd.date_range(start, end, freq="D")
 
-    names = list(grids)
-    if only_aoi:
-        missing = set(only_aoi) - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in only_aoi]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("cmems")
 
@@ -264,7 +246,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
         aoi_out = out_root / name
         remaining = [d for d in days
-                     if not store.done(aoi_out / f"{name}_{d.strftime('%Y%m%d')}.nc",
+                     if not store.done(aoi_out / f"{naming.day_stem(name, d)}.nc",
                                        store.REQUIRED_VARS["CMEMS"], shape=(g.height, g.width),
                                        overwrite=overwrite)]
         rep.expect(len(days))
@@ -303,8 +285,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 ds.attrs.update(aoi_id=name, source=DATASET_IDS[src], cmems_source=src,
                                 processing="subset + bilinear reproject to AOI grid",
                                 **provenance.stamp(eff))
-                log.info("  [%s] %s -> %s", src, day.strftime("%Y%m%d"),
-                         write_output(ds, aoi_out, name, fmt).name)
+                log.info("  [%s] %s -> %s", src, naming.day_stamp(day),
+                         store.write_output(ds, aoi_out, naming.day_stem(name, day), fmt).name)
                 rep.wrote(source=DATASET_IDS[src])
             remaining = still
             sds.close()
@@ -313,7 +295,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             log.warning("  %s: %d day(s) NOT COVERED by %s", name, len(remaining),
                         " or ".join(chain))
             for d in remaining:
-                rep.fail(f"{name} {d.strftime('%Y%m%d')}", f"not covered by {' or '.join(chain)}")
+                rep.fail(f"{name} {naming.day_stamp(d)}", f"not covered by {' or '.join(chain)}")
     rep.log_summary()
     return rep
 
@@ -321,10 +303,6 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    return getattr(opts, name, default) if opts is not None else default
-
-
 def _build_eff(project: Project) -> dict:
     opts = project.products.get(DataProduct.cmems)
     if opts is None:
@@ -380,20 +358,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="coastal_sst_data CMEMS physics acquisition.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true", help="reprocess existing days")
-    ap.add_argument("--dry-run", action="store_true", help="Report only; download nothing.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    entry.process_main(acquire, "coastal_sst_data CMEMS physics acquisition.")
 
 
 if __name__ == "__main__":

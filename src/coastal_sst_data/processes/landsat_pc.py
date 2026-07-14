@@ -31,7 +31,6 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import logging
 from datetime import timezone
 from pathlib import Path
@@ -43,12 +42,10 @@ import xarray as xr
 
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
-from pyproj import Transformer
-from shapely.ops import transform as shp_transform
 
-from ..config import Project, DataProduct, load_config
-from ..grid import AoiGrid, project_grids
-from .. import net, provenance, report, store
+from ..config import Project, DataProduct, opt as _opt
+from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
+from .. import entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -96,22 +93,12 @@ def search_scenes(collection, stac_url, bbox, start, end, platforms, cloud_max):
 # Per-scene: windowed COG reads -> shared grid -> sst/cloud/water/valid
 # --------------------------------------------------------------------------- #
 def _read_asset(href, g: AoiGrid, *, resampling, masked=True):
-    """Open a remote COG, read ONLY the AoI window, reproject onto the shared grid.
+    """One Landsat COG asset, windowed onto the shared grid (see grid.read_cog_window).
 
-    Range reads (via rioxarray/GDAL) pull just the windowed blocks, not the whole
-    tile. `masked=False` keeps raw integer values (for bit-packed QA).
+    `masked=False` keeps raw integer values, which is what the bit-packed QA_PIXEL band
+    needs. 300 m of pad is a few Landsat pixels of slack for the reprojection edges.
     """
-    da = rioxarray.open_rasterio(href, masked=masked)
-    if "band" in da.dims:
-        da = da.squeeze("band", drop=True)
-    cog_crs = da.rio.crs
-    to_cog = Transformer.from_crs(g.target_crs, cog_crs, always_xy=True).transform
-    minx, miny, maxx, maxy = shp_transform(to_cog, g.geom_proj).bounds
-    pad = 300.0  # a few pixels of slack (metres)
-    da = da.rio.clip_box(minx - pad, miny - pad, maxx + pad, maxy + pad, crs=cog_crs)
-    nodata = np.nan if masked else 0
-    return da.rio.reproject(dst_crs=g.target_crs, shape=(g.height, g.width),
-                            transform=g.transform, resampling=resampling, nodata=nodata)
+    return read_cog_window(href, g, resampling=resampling, masked=masked, pad_m=300.0)
 
 
 def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
@@ -164,18 +151,6 @@ def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
     return ds
 
 
-def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    t = pd.Timestamp(ds["time"].values[0]).strftime("%Y%m%dT%H%M%S")
-    stem = f"{aoi_id}_{t}"
-    if fmt == "netcdf":
-        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
-    if fmt == "geotiff":
-        return store.write_rasters(ds, out_dir / stem,
-                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
-    raise ValueError(f"Unknown output format: {fmt}")
-
-
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
@@ -189,13 +164,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
     to_celsius = grid_cfg.get("to_celsius", False)
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("landsat")
 
@@ -216,10 +185,10 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         aoi_out = out_root / name
         for it in sorted(items, key=lambda i: i.properties["datetime"]):
             acq = pd.Timestamp(it.datetime.astimezone(timezone.utc).replace(tzinfo=None))
-            tstr = acq.strftime("%Y%m%dT%H%M%S")
-            if store.done(aoi_out / f"{name}_{tstr}.nc", store.REQUIRED_VARS["LANDSAT"],
+            stem = naming.time_stem(name, acq)
+            if store.done(aoi_out / f"{stem}.nc", store.REQUIRED_VARS["LANDSAT"],
                           shape=(g.height, g.width), overwrite=overwrite):
-                log.info("  %s already processed, skipping", tstr)
+                log.info("  %s already processed, skipping", naming.time_stamp(acq))
                 continue
             try:
                 ds = scene_to_dataset(it, g, mask_cfg, to_celsius, acq, name)
@@ -230,7 +199,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             if ds is None:
                 continue
             ds.attrs.update(**provenance.stamp(eff))
-            log.info("      wrote %s", write_output(ds, aoi_out, name, fmt))
+            log.info("      wrote %s", store.write_output(ds, aoi_out, stem, fmt))
             rep.wrote(source="Landsat C2 L2 (Planetary Computer)")
     rep.log_summary()
     return rep
@@ -239,11 +208,6 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    """Read an optional override off a product-options bag (extra='allow')."""
-    return getattr(opts, name, default) if opts is not None else default
-
-
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     opts = project.products.get(DataProduct.landsat)
@@ -292,22 +256,8 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="coastal_sst_data Landsat C2 L2 acquisition (Planetary Computer).")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="reprocess scenes even if the aligned file exists")
-    ap.add_argument("--dry-run", action="store_true", help="Search only; no download.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    entry.process_main(
+        acquire, "coastal_sst_data Landsat C2 L2 acquisition (Planetary Computer).")
 
 
 if __name__ == "__main__":

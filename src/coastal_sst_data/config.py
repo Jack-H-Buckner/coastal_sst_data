@@ -159,6 +159,19 @@ class ProductOptions(BaseModel):
     model_config = {"extra": "allow"}
 
 
+def opt(opts, name: str, default=None):
+    """Read an optional override off a product-options bag (extra='allow').
+
+    The bags are open at the pydantic level, so a key that was never set is simply absent
+    and `getattr` needs a default. `opts` itself is None when the product is unselected.
+
+    Every process module used to carry a private copy of this three-line function -- ten
+    byte-identical definitions. It lives here, next to the ProductOptions/SourceOptions it
+    reads, because it is part of how those bags are consumed.
+    """
+    return getattr(opts, name, default) if opts is not None else default
+
+
 class SourceOptions(BaseModel):
     """REGION-DEPENDENT options for one data product's source.
 

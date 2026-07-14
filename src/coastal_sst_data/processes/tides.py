@@ -36,7 +36,6 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import logging
 import math
 import time
@@ -47,9 +46,9 @@ import pandas as pd
 import requests
 import xarray as xr
 
-from ..config import Project, DataProduct, load_config
-from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from ..config import Project, DataProduct, opt as _opt
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -237,9 +236,14 @@ def predict_global(lon, lat, start, end, interval="h", model=DEFAULT_MODEL,
 
 
 def write_output(ds, out_dir, aoi_id, fmt) -> Path:
+    """Tide is a 1D series, not a raster: it does NOT go through store.write_output.
+
+    A GeoTIFF has no meaning for a time series with no y/x, so `output_format: geotiff`
+    is deliberately ignored here rather than raising -- a project that asks for GeoTIFF
+    rasters should still get its tide series.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     if fmt != "netcdf":
-        # Tide is 1D; geotiff doesn't apply -> always NetCDF.
         log.info("  (tide is a 1D series; writing NetCDF regardless of output_format)")
     return store.write_netcdf(ds, out_dir / f"{aoi_id}_tides.nc",
                               encoding={"tide": {"zlib": True, "complevel": 4}})
@@ -311,13 +315,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
     fallback_km = ds_cfg["fallback_distance_km"]
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     # The CO-OPS station list is only needed if some AoI uses coops (as its
     # source or as the fallback); load it lazily on first use.
@@ -397,11 +395,6 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    """Read an optional override off a product-options bag (extra='allow')."""
-    return getattr(opts, name, default) if opts is not None else default
-
-
 def _resolve_source(project: Project, aoi_name: str, default: str) -> str:
     """The tide source for one AoI: its region's `sources.tides.source`, else the
     project default. The two-level lookup mirrors bathymetry's dem_source."""
@@ -486,22 +479,8 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="coastal_sst_data tide-height acquisition (NOAA CO-OPS).")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="reprocess AoIs even if the aligned file exists")
-    ap.add_argument("--dry-run", action="store_true", help="Resolve gauges only; no fetch.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    entry.process_main(
+        acquire, "coastal_sst_data tide-height acquisition (NOAA CO-OPS + global model).")
 
 
 if __name__ == "__main__":

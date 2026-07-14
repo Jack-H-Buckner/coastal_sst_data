@@ -181,6 +181,32 @@ def write_text(path: Path, text: str) -> Path:
     return path
 
 
+def write_output(ds: xr.Dataset, out_dir: Path, stem: str, fmt: str = "netcdf",
+                 *, encoding: dict | None = None) -> Path:
+    """Write one aligned output in the configured format -> the path written.
+
+    `stem` is the filename without an extension (see coastal_sst_data.naming, which owns
+    the stamp convention it encodes). NetCDF gets `<stem>.nc`; GeoTIFF gets a DIRECTORY
+    `<stem>/` holding one .tif per variable -- staged and swapped whole, because a
+    directory carrying three of four bands is exactly the half-output the skip guard would
+    take for done.
+
+    This was ten near-identical `write_output`s, one per process, differing only in how
+    they built the stem -- so the stem is now the caller's business and the writing is
+    ours. Products whose output has no time dimension (bathymetry, land-cover) fall out of
+    the same code path: a variable is squeezed only if it HAS a time dim.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if fmt == "netcdf":
+        return write_netcdf(ds, out_dir / f"{stem}.nc", encoding=encoding)
+    if fmt == "geotiff":
+        layers = [(v, ds[v].isel(time=0) if "time" in ds[v].dims else ds[v])
+                  for v in ds.data_vars]
+        return write_rasters(ds, out_dir / stem, layers)
+    raise ValueError(f"Unknown output format: {fmt!r}; choose 'netcdf' or 'geotiff'.")
+
+
 # --------------------------------------------------------------------------- #
 # Completeness
 # --------------------------------------------------------------------------- #

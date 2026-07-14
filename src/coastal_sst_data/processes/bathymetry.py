@@ -25,7 +25,6 @@ Usage (from the project root):
 
 from __future__ import annotations
 
-import argparse
 import logging
 import math
 import re
@@ -41,9 +40,9 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 from rasterio.transform import from_origin
 
-from ..config import Project, DataProduct, load_config
-from ..grid import AoiGrid, project_grids
-from .. import net, provenance, report, store
+from ..config import Project, DataProduct, opt as _opt
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 SOURCE = "bathymetry"
@@ -266,20 +265,6 @@ def from_gmrt(bbox_ll, pad, layer, resolution, target_crs, transform, W, H, geom
 
 
 # --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-def write_output(ds, out_dir, aoi_id, fmt) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if fmt == "netcdf":
-        return store.write_netcdf(ds, out_dir / f"{aoi_id}.nc")
-    if fmt == "geotiff":
-        return store.write_rasters(ds, out_dir / aoi_id,
-                                   [(v, ds[v]) for v in ds.data_vars])
-    raise ValueError(f"Unknown output format: {fmt}")
-    return path
-
-
-# --------------------------------------------------------------------------- #
 # Source registry. Each fetcher: (g: AoiGrid, params) -> (elev, depth, p25, p75,
 # used) on the shared grid, or None to signal "insufficient coverage" (-> the
 # configured fallback source is tried). Extensible: gebco, copernicus_glo30, ...
@@ -342,11 +327,6 @@ def _fetch_with_fallback(source, g: AoiGrid, params, fallback):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    """Read an optional override off a product-options bag (extra='allow')."""
-    return getattr(opts, name, default) if opts is not None else default
-
-
 def _resolve_source(project: Project, aoi_name: str, default: str) -> str:
     """The DEM source for one AoI: its region's `dem_source`, else the default.
 
@@ -400,13 +380,7 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
     fallback = eff["fallback"]
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("bathymetry")
 
@@ -444,7 +418,9 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
         ds.attrs.update(aoi_id=name, source=used,
                         processing="aggregated to AOI grid (mean, p25, p75 depth per cell)",
                         **provenance.stamp(eff))
-        log.info("  wrote %s  [%s]", write_output(ds, out_root / name, name, fmt), used)
+        # Static layer: the stem is the bare AoI name -- no time stamp to encode.
+        log.info("  wrote %s  [%s]",
+                 store.write_output(ds, out_root / name, name, fmt), used)
         # `used` is the DEM that actually won -- this is what stops "bathymetry ok" from
         # hiding a silent 3 m CUDEM -> ~100 m GMRT downgrade.
         rep.wrote(source=used)
@@ -477,22 +453,8 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="coastal_sst_data bathymetry (per-region CUDEM/GMRT) acquisition.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="rebuild even if the static file exists")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    entry.process_main(
+        acquire, "coastal_sst_data bathymetry (per-region CUDEM/GMRT) acquisition.")
 
 
 if __name__ == "__main__":

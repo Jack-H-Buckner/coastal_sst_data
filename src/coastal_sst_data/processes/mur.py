@@ -21,7 +21,6 @@ Usage (run from the OCEANSR project root, Earthdata auth via ~/.netrc):
 
 from __future__ import annotations
 
-import argparse
 import logging
 from pathlib import Path
 
@@ -33,9 +32,9 @@ import earthaccess
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 
-from ..config import Project, DataProduct, load_config
-from ..grid import AoiGrid, project_grids
-from .. import net, provenance, report, store
+from ..config import Project, DataProduct, opt as _opt
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -78,18 +77,6 @@ def subset_and_reproject(fobj, variable, bbox_ll, pad, target_crs, transform,
     return out, t
 
 
-def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    d = pd.Timestamp(ds["time"].values[0]).strftime("%Y%m%d")
-    stem = f"{aoi_id}_{d}"
-    if fmt == "netcdf":
-        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
-    if fmt == "geotiff":
-        return store.write_rasters(ds, out_dir / stem,
-                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
-    raise ValueError(f"Unknown output format: {fmt}")
-
-
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -104,13 +91,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     log.info("Authenticating with Earthdata (strategy=%s)", eff["earthdata"]["auth_strategy"])
     earthaccess.login(strategy=eff["earthdata"]["auth_strategy"])
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("mur")
 
@@ -147,10 +128,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 rep.fail(f"{name} granule {gi}", exc)
                 continue
 
-            dstr = t.strftime("%Y%m%d")
-            if store.done(aoi_out / f"{name}_{dstr}.nc", store.REQUIRED_VARS["MUR"],
+            stem = naming.day_stem(name, t)
+            if store.done(aoi_out / f"{stem}.nc", store.REQUIRED_VARS["MUR"],
                           shape=(g.height, g.width), overwrite=overwrite):
-                log.info("  [%d/%d] %s already processed, skipping", gi, len(granules), dstr)
+                log.info("  [%d/%d] %s already processed, skipping", gi, len(granules),
+                         naming.day_stamp(t))
                 rep.skip()
                 continue
 
@@ -164,7 +146,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                             processing="subset + bilinear upsample to AOI grid",
                             **provenance.stamp(eff))
             log.info("  [%d/%d] wrote %s", gi, len(granules),
-                     write_output(ds, aoi_out, name, fmt))
+                     store.write_output(ds, aoi_out, stem, fmt))
             rep.wrote(source=src)
 
     rep.log_summary()
@@ -174,11 +156,6 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    """Read an optional override off a product-options bag (extra='allow')."""
-    return getattr(opts, name, default) if opts is not None else default
-
-
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     opts = project.products.get(DataProduct.mur)
@@ -232,21 +209,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="coastal_sst_data MUR L4 SST acquisition.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="reprocess days even if the aligned file exists")
-    ap.add_argument("--dry-run", action="store_true", help="Search only; no download.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    entry.process_main(acquire, "coastal_sst_data MUR L4 SST acquisition.")
 
 
 if __name__ == "__main__":
