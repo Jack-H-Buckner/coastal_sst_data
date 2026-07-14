@@ -117,3 +117,6 @@ def test_subset_and_reproject_to_celsius(tmp_path, aoi_grid):
         {"resampling_continuous": "bilinear", "to_celsius": True})
     finite = out.values[np.isfinite(out.values)]
     assert finite.min() == pytest.approx(290.0 - 273.15, abs=1e-3)   # 16.85
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

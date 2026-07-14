@@ -101,3 +101,6 @@ def test_verify_only_checks_requested_products(monkeypatch):
     proj = _project({"mur": None, "bathymetry": None}, earthdata=True)
     # verifying only the public product must NOT touch earthdata
     assert auth.verify(proj, products=[DataProduct.bathymetry]) == {}
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

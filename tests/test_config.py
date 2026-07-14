@@ -515,3 +515,6 @@ def test_duplicate_aoi_names_across_project_rejected(base_project):
     })
     with pytest.raises(ValidationError, match="AoI names must be unique"):
         parse_config(base_project)
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

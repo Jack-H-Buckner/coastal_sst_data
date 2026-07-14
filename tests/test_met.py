@@ -190,3 +190,5 @@ def test_reference_defaults_are_the_landsat_overpass():
     eff = met._build_eff(load_config(EXAMPLE))
     assert eff["ds"]["reference_time"] == "10:30"
     assert eff["ds"]["reference_basis"] == "solar"
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

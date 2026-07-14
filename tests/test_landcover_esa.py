@@ -129,3 +129,6 @@ def test_items_to_dataset_water_classes_configurable(aoi_grid, tmp_path):
     w = ds["water"].values
     assert w[:, : w.shape[1] // 4].sum() > 0           # west (class 10) now water
     assert w[:, 3 * w.shape[1] // 4:].sum() == 0       # east (class 80) now "land"
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

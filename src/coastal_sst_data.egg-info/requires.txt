@@ -13,11 +13,13 @@ earthaccess
 zarr>=3
 numcodecs
 scipy
+h5netcdf
 
 [all]
 planetary-computer
 pystac-client
 pyresample
+netcdf4
 herbie-data
 gcsfs
 pytides2
@@ -43,6 +45,7 @@ pyresample
 
 [modis]
 pyresample
+netcdf4
 
 [plot]
 matplotlib

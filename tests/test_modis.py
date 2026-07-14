@@ -174,3 +174,7 @@ def test_scene_dataset_schema(tmp_path, aoi_grid):
     assert ds["sst"].attrs["units"] == "K"
     assert ds.sizes["y"] == aoi_grid.height and ds.sizes["x"] == aoi_grid.width
     assert "time" in ds.coords
+
+if __name__ == "__main__":
+    import pytest
+    pytest.main([__file__, "-v", "-s"])

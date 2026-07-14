@@ -7,7 +7,7 @@ pytest.importorskip("matplotlib")   # plotting is an optional capability
 
 from coastal_sst_data.config import parse_config
 from coastal_sst_data import plot
-
+from pathlib import Path
 
 def _two_region_project():
     """A project with two regions (2 AoIs + 1 AoI) for map tests."""
@@ -64,6 +64,7 @@ def test_default_out_dir_is_output_dir_figures(tmp_path):
     assert all((tmp_path / "data" / "figures") == p.parent for p in paths)
 
 
+
 def test_grids_filter_drops_ungridded_aois(tmp_path):
     """AoIs absent from `grids` are omitted; a region left empty is skipped."""
     proj = _two_region_project()
@@ -87,3 +88,6 @@ def test_slug_sanitizes_names():
     assert plot._slug("puget sound") == "puget_sound"
     assert plot._slug("a/b c") == "a_b_c"
     assert plot._slug("  ") == "unnamed"
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
