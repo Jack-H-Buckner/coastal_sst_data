@@ -255,6 +255,19 @@ class DataCubeSpec(BaseModel):
     # AoI is, so no project-wide constant can be right across a study area. The only
     # knob is an optional per-region override, regions[].sources.bathymetry.datum_offset_m.
     water_level: bool = True
+    # Which met file feeds the cube's met channels (airtemp, wind_*, swrad, cloud_cover):
+    #   "reference"  -- the daily snapshot at products.met.reference_time (default 10:30
+    #                   local solar, Landsat's overpass). One time of day, every day.
+    #   "daily_mean" -- the mean over products.met.daily_mean_hours (the old behaviour),
+    #                   which smears the diurnal cycle.
+    # Falls back to the other if the chosen file is absent.
+    met_time: Literal["reference", "daily_mean"] = "reference"
+    # Met variables ALSO emitted at each sensor's own overpass, as <sensor>_<var>
+    # (e.g. eco_airtemp, lst_wind_speed) -- so a scene is paired with the forcing that
+    # was actually present when it was taken. [] disables. Needs products.met.overpass_from
+    # to include the sensor, so the snapshots exist.
+    overpass_met: list[str] = Field(
+        default_factory=lambda: ["airtemp", "wind_speed", "swrad", "cloud_cover"])
     compression: CompressionSpec = Field(default_factory=CompressionSpec)
     output_subdir: str = "datacube"            # cube dir under output_dir
     overwrite: bool = False                    # rebuild existing <aoi>.zarr cubes

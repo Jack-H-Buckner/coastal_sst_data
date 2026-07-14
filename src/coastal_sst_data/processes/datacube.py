@@ -28,11 +28,17 @@ Design (locked with the maintainer):
     time, the ground elevation relative to the tide-adjusted waterline and a
     submerged/exposed class (see processes.water_level).
 
+  * Met is taken at a REFERENCE time of day (default 10:30 local solar -- Landsat's
+    overpass), not as a daily mean, which would smear the diurnal cycle. Each sensor
+    additionally carries the forcing at ITS OWN overpass (datacube.overpass_met), so
+    two sensors that flew hours apart on one day do not share one value.
+
 Channel layout in each <aoi>.zarr:
   3D (time,y,x): mur_sst, mur_valid, eco_sst, eco_cloud, eco_valid,
                  lst_sst, lst_cloud, lst_valid, modis_sst, modis_valid,
                  airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover,
-                 {eco,lst,modis}_water_elev, {eco,lst,modis}_water_class
+                 {eco,lst,modis}_water_elev, {eco,lst,modis}_water_class,
+                 {eco,lst,modis}_{airtemp,wind_speed,swrad,cloud_cover}
   2D (y,x) static: depth, depth_p25, depth_p75, landmask, landcover_water
   1D (time): tide, tide_range, eco_hour, lst_hour, modis_hour, doy_sin, doy_cos,
              {eco,lst,modis}_tide
@@ -82,14 +88,21 @@ def _empty3d(days, H, W):
     return np.full((len(days), H, W), np.nan, dtype="float32")
 
 
-def load_daily_sensor(d: Path, aoi_id, days, H, W, var):
-    """MUR/met style: one file per day (<aoi>_YYYYMMDD.nc). Returns a (T,H,W) array."""
+def load_daily_sensor(d: Path, aoi_id, days, H, W, var, *, prefix=""):
+    """MUR/met style: one file per day (<aoi>_<prefix><YYYYMMDD>.nc) -> (T,H,W).
+
+    `prefix` selects a variant written into the same directory -- met writes both a
+    daily mean (`<aoi>_20230715.nc`) and a reference-time snapshot
+    (`<aoi>_ref_20230715.nc`). The name is matched WHOLE rather than by suffix, so the
+    two cannot be confused for each other.
+    """
     out = _empty3d(days, H, W)
     if not d.exists():
         return out
+    pat = re.compile(rf"^{re.escape(aoi_id)}_{re.escape(prefix)}(\d{{8}})\.nc$")
     didx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
-    for f in d.glob(f"{aoi_id}_*.nc"):
-        m = _D_RE.search(f.name)
+    for f in d.glob(f"{aoi_id}_{prefix}*.nc"):
+        m = pat.match(f.name)
         if not m or m.group(1) not in didx:
             continue
         ds = xr.open_dataset(f)
@@ -99,6 +112,53 @@ def load_daily_sensor(d: Path, aoi_id, days, H, W, var):
                 out[didx[m.group(1)]] = arr
         ds.close()
     return out
+
+
+def load_at_times(d: Path, aoi_id, times, H, W, var):
+    """Per-overpass file (<aoi>_YYYYMMDDThhmmss.nc) at each day's chosen scene time.
+
+    `times` is one datetime per day (None where that sensor had no scene), so the value
+    read is the forcing at the EXACT scene the cube kept -- not merely something from
+    that day. Days with no scene stay NaN.
+    """
+    out = _empty3d(times, H, W)
+    if not d.exists():
+        return out
+    for i, t in enumerate(times):
+        if t is None:
+            continue
+        f = d / f"{aoi_id}_{t.strftime('%Y%m%dT%H%M%S')}.nc"
+        if not f.exists():
+            continue
+        ds = xr.open_dataset(f)
+        if var in ds:
+            arr = ds[var].isel(time=0).values if "time" in ds[var].dims else ds[var].values
+            if arr.shape == (H, W):
+                out[i] = arr
+        ds.close()
+    return out
+
+
+def met_prefix(d: Path, aoi_id, days, want: str) -> tuple[str, str]:
+    """Which met variant to feed the cube's met channels: ('ref_'|'', label).
+
+    Honours `datacube.met_time`, but falls back to the other variant if the one asked
+    for was never written (e.g. an older MET tree with no reference snapshots) rather
+    than silently emitting an all-NaN forcing channel.
+    """
+    def has(prefix):
+        return any((d / f"{aoi_id}_{prefix}{dd.strftime('%Y%m%d')}.nc").exists()
+                   for dd in days)
+
+    want_prefix = "ref_" if want == "reference" else ""
+    if has(want_prefix):
+        return want_prefix, ("reference" if want_prefix else "daily_mean")
+    other = "" if want_prefix else "ref_"
+    if has(other):
+        label = "reference" if other else "daily_mean"
+        log.warning("  no %s met files; falling back to the %s", want, label)
+        return other, label
+    return want_prefix, ("reference" if want_prefix else "daily_mean")
 
 
 def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
@@ -113,15 +173,18 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
           - use_cloud gates on the binary cloud layer (Landsat: reliable).
           - qc_levels (e.g. {0,1}) gates on QC mandatory-QA bits 0-1 instead of
             cloud (ECOSTRESS: cloud over-masks cold water, so gate on QC).
-    Returns (sst, cloud, valid, hour, water_union). `water_union` is the OR of the
-    water mask over scenes -- a high-res static water hint for narrow estuaries.
+    Returns (sst, cloud, valid, hour, water_union, times). `water_union` is the OR of the
+    water mask over scenes -- a high-res static water hint for narrow estuaries. `times`
+    is the CHOSEN scene's datetime per day (None where the sensor had no scene), so the
+    tide and the met snapshot can be matched to that exact scene rather than to the day.
     """
     sst, cloud = _empty3d(days, H, W), _empty3d(days, H, W)
     valid = np.zeros((len(days), H, W), dtype="uint8")
     hour = np.full(len(days), np.nan, dtype="float32")
+    times: list = [None] * len(days)
     water_union = np.zeros((H, W), dtype=bool)
     if not d.exists():
-        return sst, cloud, valid, hour, water_union
+        return sst, cloud, valid, hour, water_union, times
     qset = list(qc_levels) if qc_levels is not None else None
     didx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
     best = {}  # day -> (valid_count, sst, cloud, valid, datetime)
@@ -171,7 +234,8 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
         cloud[i] = np.nan_to_num(c, nan=0.0)
         valid[i] = v.astype("uint8")
         hour[i] = dt.hour + dt.minute / 60.0
-    return sst, cloud, valid, hour, water_union
+        times[i] = dt
+    return sst, cloud, valid, hour, water_union, times
 
 
 def load_tide_daily(d: Path, aoi_id, days):
@@ -278,23 +342,36 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     mur_sst = load_daily_sensor(adir("mur"), aid, days, H, W, "sst")
     # ECOSTRESS: water + QC-produced (its cloud over-masks cold water; gate on QC).
-    eco_sst, eco_cloud, eco_valid, eco_hour, eco_wu = load_clearest_overpass(
+    eco_sst, eco_cloud, eco_valid, eco_hour, eco_wu, eco_times = load_clearest_overpass(
         adir("ecostress"), aid, days, H, W, water_is_land=True, use_cloud=False,
         qc_levels=[0, 1])
     # Landsat: water + cloud (its QA_PIXEL-based cloud is reliable).
-    lst_sst, lst_cloud, lst_valid, lst_hour, lst_wu = load_clearest_overpass(
+    lst_sst, lst_cloud, lst_valid, lst_hour, lst_wu, lst_times = load_clearest_overpass(
         adir("landsat"), aid, days, H, W, water_is_land=False, use_cloud=True)
     # MODIS: already quality-filtered upstream -> trust its `valid` layer.
-    modis_sst, _, modis_valid, modis_hour, _ = load_clearest_overpass(
+    modis_sst, _, modis_valid, modis_hour, _, modis_times = load_clearest_overpass(
         adir("modis"), aid, days, H, W, trust_valid=True)
 
-    airtemp = load_daily_sensor(adir("met"), aid, days, H, W, "airtemp")
-    wind_u = load_daily_sensor(adir("met"), aid, days, H, W, "wind_u")
-    wind_v = load_daily_sensor(adir("met"), aid, days, H, W, "wind_v")
-    wind_speed = load_daily_sensor(adir("met"), aid, days, H, W, "wind_speed")
-    swrad = load_daily_sensor(adir("met"), aid, days, H, W, "swrad")
-    cloud_cover = load_daily_sensor(adir("met"), aid, days, H, W, "cloud_cover")
+    # Met: one snapshot per day at the REFERENCE time of day (default 10:30 local solar,
+    # Landsat's overpass) rather than a daily mean, which would smear the diurnal cycle.
+    mprefix, mlabel = met_prefix(adir("met"), aid, days, eff["met_time"])
+
+    def met(var):
+        return load_daily_sensor(adir("met"), aid, days, H, W, var, prefix=mprefix)
+
+    airtemp, wind_u, wind_v = met("airtemp"), met("wind_u"), met("wind_v")
+    wind_speed, swrad, cloud_cover = met("wind_speed"), met("swrad"), met("cloud_cover")
     tide, tide_range = load_tide_daily(adir("tide"), aid, days)
+
+    # ...and, per sensor, the forcing at that sensor's own overpass, so a pre-dawn
+    # ECOSTRESS scene and a mid-morning Landsat scene on the same day do not share one
+    # value. Keyed on the CHOSEN scene's timestamp, not merely its day.
+    sensor_times = {"eco": eco_times, "lst": lst_times, "modis": modis_times}
+    op_met = {}
+    for pre, tt in sensor_times.items():
+        for var in eff["overpass_met"]:
+            op_met[f"{pre}_{var}"] = (("time", "y", "x"),
+                                      load_at_times(adir("met"), aid, tt, H, W, var))
 
     # Water/land mask: land-cover is authoritative where known; elsewhere fall back
     # to the sensor water union + sea-level bathymetry (no tunable thresholds).
@@ -341,7 +418,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     ds = xr.Dataset(
         {
-            **wl,
+            **wl, **op_met,
             "mur_sst": (T, mur_sst), "mur_valid": (T, mur_valid),
             "eco_sst": (T, eco_sst), "eco_cloud": (T, eco_cloud), "eco_valid": (T, eco_valid),
             "lst_sst": (T, lst_sst), "lst_cloud": (T, lst_cloud), "lst_valid": (T, lst_valid),
@@ -359,7 +436,10 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
         },
         coords={"time": days, "y": ys, "x": xs},
     )
-    ds.attrs.update(aoi_id=aid, crs=g.target_crs)
+    ds.attrs.update(aoi_id=aid, crs=g.target_crs, met_time=mlabel)
+    for name in op_met:
+        ds[name].attrs["long_name"] = (
+            f"{name.split('_', 1)[1]} at the {name.split('_', 1)[0]} overpass")
     # Datum provenance is a GLOBAL cube attr, not just a per-variable one: a cube whose
     # offset could not be resolved is complete and plausible-looking, so the only thing
     # that tells a downstream user it is biased is `datum_status` travelling with it.
@@ -460,6 +540,8 @@ def _build_eff(project: Project) -> dict:
         "chunks": dict(dc.chunks),
         "fill_mur_water": bool(dc.fill_mur_water),
         "water_level": bool(dc.water_level),
+        "met_time": str(dc.met_time),
+        "overpass_met": list(dc.overpass_met),
         # Needed to resolve the datum offset per AoI (region override + sidecar lookup).
         "project": project,
         "compression": dc.compression,

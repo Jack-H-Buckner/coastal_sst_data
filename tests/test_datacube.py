@@ -83,6 +83,18 @@ def write_ecostress_two_scenes(project, g, day):
         _write(project, "ECOSTRESS", f"{AOI}_{stamp}.nc", ds)
 
 
+def write_landsat(project, g, day, hour, temp=288.0):
+    """One Landsat scene. Landsat polarity: water = 1 (unlike ECOSTRESS), cloud reliable."""
+    H, W, xs, ys = _grid_hw(g)
+    ds = xr.Dataset({
+        "sst": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
+        "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+        "water": (("time", "y", "x"), np.ones((1, H, W), "float32")),
+    }, coords={"time": [day], "y": ys, "x": xs})
+    stamp = day.strftime("%Y%m%d") + f"T{hour:02d}0000"
+    _write(project, "LANDSAT", f"{AOI}_{stamp}.nc", ds)
+
+
 def write_modis(project, g, day, temp=287.0):
     H, W, xs, ys = _grid_hw(g)
     ds = xr.Dataset({"sst": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
@@ -255,3 +267,109 @@ def test_assemble_skips_existing_without_overwrite(project, grids, days, caplog)
 def test_assemble_unknown_aoi_errors(project, grids):
     with pytest.raises(SystemExit, match="not found"):
         datacube.assemble(project, grids=grids, aois=["nope"])
+
+
+# --------------------------------------------------------------------------- #
+# Met: reference time of day, and forcing at each sensor's own overpass
+# --------------------------------------------------------------------------- #
+def write_met_daily(project, g, days, *, temp=280.0, prefix=""):
+    """Met daily-mean (prefix='') or reference-time (prefix='ref_') files."""
+    H, W, xs, ys = _grid_hw(g)
+    for day in days:
+        ds = xr.Dataset(
+            {"airtemp": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
+             "wind_speed": (("time", "y", "x"), np.full((1, H, W), 3.0, "float32")),
+             "swrad": (("time", "y", "x"), np.full((1, H, W), 500.0, "float32")),
+             "cloud_cover": (("time", "y", "x"), np.full((1, H, W), 10.0, "float32"))},
+            coords={"time": [day], "y": ys, "x": xs})
+        _write(project, "MET", f"{AOI}_{prefix}{day.strftime('%Y%m%d')}.nc", ds)
+
+
+def write_met_snapshot(project, g, day, hour, *, temp):
+    """A met snapshot at one overpass instant."""
+    H, W, xs, ys = _grid_hw(g)
+    stamp = day.strftime("%Y%m%d") + f"T{hour:02d}0000"
+    ds = xr.Dataset(
+        {"airtemp": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
+         "wind_speed": (("time", "y", "x"), np.full((1, H, W), 7.0, "float32")),
+         "swrad": (("time", "y", "x"), np.full((1, H, W), 800.0, "float32")),
+         "cloud_cover": (("time", "y", "x"), np.full((1, H, W), 20.0, "float32"))},
+        coords={"time": [day], "y": ys, "x": xs})
+    _write(project, "MET", f"{AOI}_{stamp}.nc", ds)
+
+
+def test_met_comes_from_the_reference_snapshot_not_the_daily_mean(project, grids, days):
+    g = grids[AOI]
+    write_met_daily(project, g, days, temp=280.0)                 # daily mean
+    write_met_daily(project, g, days, temp=291.0, prefix="ref_")  # 10:30 reference
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(291.0)
+    assert ds.attrs["met_time"] == "reference"
+
+
+def test_daily_mean_can_still_be_selected(project, grids, days):
+    g = grids[AOI]
+    write_met_daily(project, g, days, temp=280.0)
+    write_met_daily(project, g, days, temp=291.0, prefix="ref_")
+    eff = datacube._build_eff(project)
+    eff["met_time"] = "daily_mean"
+    ds = datacube.assemble_aoi(g, eff, days)
+    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(280.0)
+    assert ds.attrs["met_time"] == "daily_mean"
+
+
+def test_met_falls_back_when_no_reference_files_exist(project, grids, days, caplog):
+    """An older MET tree has no reference snapshots -- use the daily mean rather than
+    emitting an all-NaN forcing channel."""
+    g = grids[AOI]
+    write_met_daily(project, g, days, temp=280.0)
+    with caplog.at_level("WARNING"):
+        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(280.0)
+    assert ds.attrs["met_time"] == "daily_mean"
+
+
+def test_each_sensor_gets_the_forcing_from_its_own_overpass(project, grids, days):
+    """Two sensors, hours apart on one day, must not share one met value."""
+    g = grids[AOI]
+    write_met_daily(project, g, days, temp=291.0, prefix="ref_")
+    write_ecostress_two_scenes(project, g, days[0])           # clearest scene is 20:00
+    write_landsat(project, g, days[0], hour=18)
+    write_met_snapshot(project, g, days[0], 20, temp=286.0)   # the ECOSTRESS instant
+    write_met_snapshot(project, g, days[0], 18, temp=299.0)   # the Landsat instant
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert np.nanmean(ds["eco_airtemp"].isel(time=0).values) == pytest.approx(286.0)
+    assert np.nanmean(ds["lst_airtemp"].isel(time=0).values) == pytest.approx(299.0)
+    # ...and the daily channel is still the reference time, independent of both.
+    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(291.0)
+    # a day with no scene has no overpass forcing (not a stale value)
+    assert np.isnan(ds["eco_airtemp"].isel(time=1).values).all()
+
+
+def test_overpass_met_follows_the_scene_the_cube_actually_kept(project, grids, days):
+    """ECOSTRESS flies twice; the cube keeps the CLEAREST (20:00). The forcing must come
+    from that scene's instant, not from the discarded 18:00 one."""
+    g = grids[AOI]
+    write_ecostress_two_scenes(project, g, days[0])           # 18:00 (half NaN), 20:00 (clear)
+    write_met_snapshot(project, g, days[0], 18, temp=270.0)   # discarded scene
+    write_met_snapshot(project, g, days[0], 20, temp=295.0)   # kept scene
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert ds["eco_hour"].isel(time=0).item() == pytest.approx(20.0)
+    assert np.nanmean(ds["eco_airtemp"].isel(time=0).values) == pytest.approx(295.0)
+
+
+def test_overpass_met_is_configurable(project, grids, days):
+    g = grids[AOI]
+    write_ecostress_two_scenes(project, g, days[0])
+    write_met_snapshot(project, g, days[0], 20, temp=295.0)
+
+    eff = datacube._build_eff(project)
+    eff["overpass_met"] = ["airtemp"]                         # only this one
+    ds = datacube.assemble_aoi(g, eff, days)
+    assert "eco_airtemp" in ds.data_vars
+    assert "eco_swrad" not in ds.data_vars
+
+    eff["overpass_met"] = []                                  # disabled entirely
+    ds = datacube.assemble_aoi(g, eff, days)
+    assert not [v for v in ds.data_vars if v.startswith("eco_") and "airtemp" in v]

@@ -7,11 +7,20 @@ shared per-AoI grids (coastal_sst_data.grid.AoiGrid), exactly like the SST
 stages. For each AoI it pulls 2 m air temperature, 10 m wind (u/v + speed),
 downward shortwave and total cloud cover, regrids onto the AoI grid, and writes:
 
+  * a REFERENCE-time file per day:       <output_dir>/MET/aligned/<aoi>/<aoi>_ref_<YYYYMMDD>.nc
   * a daily-mean file per day:           <output_dir>/MET/aligned/<aoi>/<aoi>_<YYYYMMDD>.nc
   * an instantaneous file per overpass:  <output_dir>/MET/aligned/<aoi>/<aoi>_<YYYYMMDDThhmmss>.nc
 
+The REFERENCE file is one snapshot per day at a fixed time of day -- by default 10:30
+LOCAL SOLAR time, Landsat's overpass. It is the datacube's default met channel: a daily
+mean smears the diurnal cycle (dawn and mid-afternoon forcing averaged together), which
+is the wrong forcing to hand a model of a sensor that flew at one instant. The basis is
+solar rather than UTC because a fixed UTC hour is a different time of day in every AoI,
+so cross-AoI comparisons would not be like-for-like. Set `reference_time: null` to skip.
+
 Overpass times are discovered from the ECOSTRESS/Landsat aligned dirs so the
-forcing can be matched to each thermal scene (for the skin->bulk correction).
+forcing can be matched to each thermal scene (for the skin->bulk correction); the
+datacube reads those snapshots into per-sensor channels (`eco_airtemp`, ...).
 
 Two sources, tried in order (the "source chain"):
   * hrrr -- NOAA HRRR 3 km surface fields via Herbie. CONUS uses the 'hrrr'
@@ -60,7 +69,14 @@ _DT_RE = re.compile(r"(\d{8}T\d{6})")     # aligned-scene filename stamp
 DEFAULT_SOURCE = "auto"                   # auto (hrrr->era5) | hrrr | era5
 DEFAULT_FALLBACK = "era5"                 # era5 | none
 DEFAULT_VARIABLES = ["airtemp", "wind", "swrad", "cloud"]
-DEFAULT_MEAN_HOURS = [0, 6, 12, 18]       # UTC hours averaged for the daily field
+DEFAULT_MEAN_HOURS = [0, 6, 12, 18]       # UTC hours averaged for the daily field ([] = skip)
+# The daily REFERENCE time: one snapshot per day, the same time of day everywhere, so a
+# cross-AoI comparison is like-for-like. The default is Landsat's ~10:30 local overpass,
+# which is why the basis is LOCAL SOLAR time (converted per AoI from its longitude) --
+# a fixed UTC hour would be a different time of day in every AoI, which is exactly what
+# a "reference time of day" must not be.
+DEFAULT_REFERENCE_TIME = "10:30"          # HH:MM; None/"" to skip the reference snapshot
+DEFAULT_REFERENCE_BASIS = "solar"         # solar (local, per-AoI longitude) | utc
 DEFAULT_RADIUS_M = 6000.0                 # pyresample search radius (HRRR ~3 km px)
 DEFAULT_PAD_DEG = 0.25                    # ERA5 window pad (>= one 0.25 deg cell)
 DEFAULT_FXX = 0                           # HRRR forecast hour (0 = analysis)
@@ -307,6 +323,30 @@ def to_dataset(grids: dict, g: AoiGrid, t, to_celsius: bool) -> xr.Dataset:
     return ds
 
 
+def parse_hhmm(value) -> float | None:
+    """'10:30' -> 10.5 (hours). None/'' -> None (no reference snapshot)."""
+    if value in (None, "", False):
+        return None
+    s = str(value).strip()
+    if ":" in s:
+        hh, mm = s.split(":", 1)
+        return int(hh) + int(mm) / 60.0
+    return float(s)
+
+
+def reference_time_utc(day, lon: float, ref_hours: float, basis: str) -> pd.Timestamp:
+    """The UTC instant of the reference time-of-day for one AoI on one day.
+
+    With basis='solar' the reference is LOCAL SOLAR time, so 10:30 means 10:30 by the
+    sun wherever the AoI is: UTC = local - lon/15 (each 15 deg of longitude is an hour).
+    Rounded to the hour, because both HRRR and ERA5 are hourly; the day rolls over on
+    its own where the conversion crosses midnight.
+    """
+    base = pd.Timestamp(day).normalize()
+    hours = ref_hours if basis == "utc" else ref_hours - lon / 15.0
+    return (base + pd.Timedelta(hours=hours)).round("1h")
+
+
 def overpass_times_for_day(overpass_dirs, aoi_id: str, day) -> list[datetime]:
     """Datetimes (UTC, naive) of thermal scenes for this AoI on `day`."""
     daystr = day.strftime("%Y%m%d")
@@ -347,6 +387,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     to_celsius = grid_cfg.get("to_celsius", False)
     chain = ds_cfg["chain"]
     mean_hours = ds_cfg["daily_mean_hours"]
+    ref_time = ds_cfg["reference_time"]
+    ref_basis = ds_cfg["reference_basis"]
+    ref_hours = parse_hhmm(ref_time)
     overpass_dirs = eff["overpass_dirs"]
     start = pd.Timestamp(eff["time"]["start_date"])
     end = pd.Timestamp(eff["time"]["end_date"])
@@ -365,15 +408,33 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s ===",
                  name, g.target_crs, g.width, g.height, "->".join(chain))
         if dry_run:
-            log.info("  [dry-run] %d day(s); daily hours=%s + overpass snapshots",
-                     len(days), mean_hours)
+            log.info("  [dry-run] %d day(s); reference=%s (%s) + daily hours=%s "
+                     "+ overpass snapshots", len(days), ref_time or "off", ref_basis,
+                     mean_hours or "off")
             continue
         aoi_out = out_root / name
 
+        lon = 0.5 * (g.search_bbox[0] + g.search_bbox[2])
+
         for day in days:
             dstr = day.strftime("%Y%m%d")
-            # ---- daily mean over mean_hours ----
-            if overwrite or not (aoi_out / f"{name}_{dstr}.nc").exists():
+
+            # ---- reference-time snapshot (the cube's default met channel) ----
+            if ref_hours is not None and (
+                    overwrite or not (aoi_out / f"{name}_ref_{dstr}.nc").exists()):
+                rt = reference_time_utc(day, lon, ref_hours, ref_basis)
+                got, src = _fetch_at(chain, g, rt.to_pydatetime(), ds_cfg)
+                if got:
+                    ds = to_dataset(got, g, rt, to_celsius)
+                    ds.attrs.update(aoi_id=name, source=f"{src} @reference",
+                                    reference_time=str(ref_time), reference_basis=ref_basis,
+                                    reference_time_utc=rt.isoformat())
+                    log.info("  %s reference (%s %s -> %s UTC) -> %s", dstr, ref_time,
+                             ref_basis, rt.strftime("%H:%M"),
+                             write_output(ds, aoi_out, name, fmt, f"{name}_ref_{dstr}"))
+
+            # ---- daily mean over mean_hours (skipped when daily_mean_hours: []) ----
+            if mean_hours and (overwrite or not (aoi_out / f"{name}_{dstr}.nc").exists()):
                 stack, srcs = {}, set()
                 for hh in mean_hours:
                     dt = day.to_pydatetime().replace(hour=int(hh))
@@ -428,6 +489,8 @@ def _build_eff(project: Project) -> dict:
         "chain": chain,
         "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
         "daily_mean_hours": list(_opt(opts, "daily_mean_hours", DEFAULT_MEAN_HOURS)),
+        "reference_time": _opt(opts, "reference_time", DEFAULT_REFERENCE_TIME),
+        "reference_basis": _opt(opts, "reference_basis", DEFAULT_REFERENCE_BASIS),
         "regrid_radius_m": float(_opt(opts, "regrid_radius_m", DEFAULT_RADIUS_M)),
         "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
         "fxx": int(_opt(opts, "fxx", DEFAULT_FXX)),
