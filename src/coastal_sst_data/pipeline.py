@@ -33,8 +33,8 @@ from . import auth
 from .config import DataProduct, Project, load_config
 from .grid import AoiGrid, compute_aoi_grid
 from .processes import (
-    bathymetry, datacube, datum, ecostress, landcover_esa, landsat_pc, met, modis, mur,
-    tides,
+    bathymetry, cmems, datacube, datum, ecostress, landcover_esa, landsat_pc, met, modis,
+    mur, tides,
 )
 
 log = logging.getLogger(__name__)
@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 PROCESSES = {
     DataProduct.bathymetry: bathymetry,
     DataProduct.mur: mur,
+    DataProduct.cmems: cmems,
     DataProduct.ecostress: ecostress,
     DataProduct.met: met,
     DataProduct.modis: modis,
@@ -61,6 +62,7 @@ LANDCOVER_SOURCES = {"esa": landcover_esa, "worldcover": landcover_esa}
 PROCESS_ORDER = [
     DataProduct.bathymetry,
     DataProduct.mur,
+    DataProduct.cmems,
     DataProduct.ecostress,
     DataProduct.landsat,
     DataProduct.modis,

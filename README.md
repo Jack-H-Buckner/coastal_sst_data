@@ -88,6 +88,7 @@ pip install .                 # from a clone (copy)
 | `modis` | swath→grid resampling (`pyresample`) |
 | `met` | HRRR + ERA5 forcing (`herbie-data`, `gcsfs`, `pyresample`) |
 | `tides` | NOAA CO-OPS backend (`pytides2`) |
+| `cmems` | Copernicus Marine global physics (`copernicusmarine`) |
 | `tides-global` | global tide-model backup (`eo-tides`) |
 | `plot` | `grids --plot` maps (`matplotlib`, `cartopy`) |
 | `all` | every feature backend at once |
@@ -134,15 +135,18 @@ dependencies:
   - xarray
   - pyproj
   - shapely
+  - affine
   - rasterio
   - rioxarray
   - zarr
   - numcodecs
   - scipy
+  - h5netcdf
   - earthaccess
   - pyresample        # modis / met
   - herbie-data       # met (HRRR)
   - gcsfs             # met (ERA5 fallback)
+  - copernicusmarine  # cmems (Copernicus Marine global physics)
   # ... pystac-client, planetary-computer, eo-tides, matplotlib, cartopy as needed
 
   - pip
@@ -374,6 +378,7 @@ Auth requirements are declared **per product — and per source** where a produc
 | Backend | Required by | Credentials |
 | --- | --- | --- |
 | `earthdata` | ECOSTRESS, MODIS, MUR | free NASA Earthdata account |
+| `copernicus` | CMEMS | free [Copernicus Marine](https://data.marine.copernicus.eu) account |
 | `gee` | Landsat / landcover with `source: gee` | Google Earth Engine |
 | *(none)* | Landsat (`pc`), landcover (`esa`), bathymetry, met, tides | — |
 
@@ -383,6 +388,8 @@ Auth requirements are declared **per product — and per source** where a produc
 auth:
   earthdata:
     auth_strategy: netrc      # netrc | environment | interactive
+  copernicus:
+    auth_strategy: netrc      # only if you select the cmems product
   gee:
     project: my-gcp-project   # only if you use a gee source
 ```
@@ -505,6 +512,42 @@ MUR is the always-present, gap-free SST backbone the high-resolution products ad
 - `pad_deg`: degrees of padding added around the AOI lat/lon window before subsetting (default `0.05`).
 
 **Region-level options**: none.
+
+### CMEMS (Copernicus Marine global physics)
+CMEMS supplies the **offshore ocean state at depth** — the water column the nearshore exchanges with. Where MUR gives one skin temperature at the surface, this gives temperature (and optionally salinity and currents) *through the water column*, so a model can see the stratification and the offshore water mass that upwelling and tidal exchange draw into an estuary.
+
+- **Where it comes from**: the Copernicus Marine global physics models (1/12°, daily means, ~50 depth levels), streamed with the `copernicusmarine` toolbox. `open_dataset` subsets the AOI window **server-side and lazily**, so the global model is never downloaded. Two products form a **source chain**, like met's HRRR→ERA5:
+    - **`my`** (default) — `cmems_mod_glo_phy_my_0.083deg_P1D-m`, the **GLORYS12 reanalysis** (hindcast). Best quality, but it stops a year or two behind the present.
+    - **`anfc`** — `cmems_mod_glo_phy_anfc_0.083deg_P1D-m`, the **analysis/forecast** product, which reaches the present and backfills whatever days the reanalysis cannot cover. Each output file records which product produced it in its `source` / `cmems_source` attrs, so a reanalysis day and a forecast day are never silently conflated.
+- **What it measures**: whichever `variables` you select (default `thetao`, sea-water potential temperature; also `so` salinity, `uo`/`vo` currents, and the 2D `zos` / `mlotst`), emitted **once per requested depth**.
+
+**Depths.** The model has ~50 *fixed* levels (0.494, 1.541, 2.646, 5.078 m …), so a requested depth is snapped to the **nearest level** — never interpolated. Every value is therefore one the model actually computed. The channel is named for what you asked for; the level actually used is recorded in the variable's `model_depth_m` attr:
+
+```yaml
+products:
+  cmems:
+    depths: [0, 10, 30]     # metres
+```
+gives `thetao_0m` (level 0.494 m), `thetao_10m` (level **9.573** m), `thetao_30m` (level **29.445** m). A requested depth more than 5 m from any level logs a warning.
+
+**Project-level options** (`products.cmems`):
+
+- `source`: primary product, `my` (default) or `anfc`.
+- `fallback`: product used for days the primary does not cover, `anfc` (default) or `none` to disable the chain.
+- `dataset_id`: an explicit CMEMS dataset id, which **overrides the chain entirely** — the escape hatch for any other Copernicus physics product.
+- `variables`: which fields to acquire (default `[thetao]`).
+- `depths`: depths in metres, each snapped to the nearest model level (default `[0]`).
+- `pad_deg`: padding around the AOI window (default `0.15`, ≥ one 1/12° cell).
+
+**Region-level options**: none.
+
+**In the cube** the channels arrive prefixed — `cmems_thetao_0m`, `cmems_thetao_30m` — and, like MUR, are **nearest-neighbour filled over land-cover water** (`datacube.fill_cmems_water`, default `true`). This matters more here than for MUR: at ~9 km the model's land mask can swallow an entire estuary, and the nearest resolved water column is the honest value for a cell the model never resolved. Real land is left NaN.
+
+**Credentials**: a free [Copernicus Marine](https://data.marine.copernicus.eu) account, declared as `auth.copernicus`. The toolbox reads `~/.netrc` natively, so the secret lives there like every other one:
+
+```
+machine auth.marine.copernicus.eu login <username> password <password>
+```
 
 ### Bathymetry
 Bathymetry is a static (time-invariant) covariate: one file per AOI describing water depth, used both as a model input and to build the land mask.

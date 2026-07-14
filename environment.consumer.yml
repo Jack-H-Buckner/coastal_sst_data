@@ -32,13 +32,14 @@ dependencies:
   - pyyaml
   - pyproj
   - shapely
+  - affine
   - rasterio
   - rioxarray
   - requests
   - earthaccess
   - zarr
   - numcodecs
-  - scipy
+  - scipy               # NN water fill of the MUR + CMEMS channels (datacube.py)
   - h5netcdf            # xarray engine for the MUR SST backbone (mur.py)
 
   # ---- coastal_sst_data backend deps: keep only the products you use ----
@@ -48,6 +49,7 @@ dependencies:
   - netcdf4             # modis (reads MODIS L2P swaths, modis.py)
   - herbie-data         # met (HRRR)
   - gcsfs               # met (ERA5 fallback)
+  - copernicusmarine    # cmems (Copernicus Marine global physics; needs a free account)
   - eo-tides            # global tide-model backup
   - matplotlib          # grids --plot maps
   - cartopy             # grids --plot coastlines (optional)

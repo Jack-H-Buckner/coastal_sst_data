@@ -77,7 +77,7 @@ _D_RE = re.compile(r"_(\d{8})\.nc$")      # per-day filename stamp
 PRODUCT_DIRS = {
     "mur": "MUR", "ecostress": "ECOSTRESS", "landsat": "LANDSAT", "modis": "MODIS",
     "met": "MET", "bathymetry": "BATHYMETRY", "tide": "TIDE", "landcover": "LANDCOVER",
-    "datum": "DATUM",
+    "datum": "DATUM", "cmems": "CMEMS",
 }
 
 
@@ -284,6 +284,20 @@ def load_bathy(d: Path, aoi_id, H, W):
     return elev, depth, dp25, dp75
 
 
+def cmems_channels(d: Path, aoi_id) -> list[str]:
+    """The CMEMS variables actually on disk (thetao_0m, thetao_10m, zos, ...).
+
+    Discovered from the files rather than re-derived from config, so the cube carries
+    exactly the variables x depths that were acquired -- no second list to keep in sync.
+    """
+    if not d.exists():
+        return []
+    for f in sorted(d.glob(f"{aoi_id}_*.nc")):
+        with xr.open_dataset(f) as ds:
+            return [v for v in ds.data_vars if v != "valid"]
+    return []
+
+
 def load_bathy_attrs(d: Path, aoi_id) -> dict:
     """The bathymetry file's global attrs (its `source` is the DEM fingerprint)."""
     f = d / f"{aoi_id}.nc"
@@ -392,6 +406,18 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
         mur_sst = fill_water_nn(mur_sst, water)
     mur_valid = np.isfinite(mur_sst).astype("uint8")
 
+    # CMEMS is a ~9 km ocean model, so its land mask is far coarser than the AoI grid:
+    # an entire estuary can fall in its land cells. NN-fill over land-cover water for the
+    # same reason MUR is filled -- the nearest offshore water column is the honest value
+    # for a cell the model never resolved. Channels are discovered from the files, so
+    # whatever variables/depths were acquired come through without a second config list.
+    cmems_vars = {}
+    for var in cmems_channels(adir("cmems"), aid):
+        arr = load_daily_sensor(adir("cmems"), aid, days, H, W, var)
+        if eff["fill_cmems_water"]:
+            arr = fill_water_nn(arr, water)
+        cmems_vars[f"cmems_{var}"] = (("time", "y", "x"), arr)
+
     doy = days.dayofyear.values.astype("float32")
     doy_sin = np.sin(2 * np.pi * doy / 365.25).astype("float32")
     doy_cos = np.cos(2 * np.pi * doy / 365.25).astype("float32")
@@ -418,7 +444,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     ds = xr.Dataset(
         {
-            **wl, **op_met,
+            **wl, **op_met, **cmems_vars,
             "mur_sst": (T, mur_sst), "mur_valid": (T, mur_valid),
             "eco_sst": (T, eco_sst), "eco_cloud": (T, eco_cloud), "eco_valid": (T, eco_valid),
             "lst_sst": (T, lst_sst), "lst_cloud": (T, lst_cloud), "lst_valid": (T, lst_valid),
@@ -539,6 +565,7 @@ def _build_eff(project: Project) -> dict:
         "out_dir": root / dc.output_subdir,
         "chunks": dict(dc.chunks),
         "fill_mur_water": bool(dc.fill_mur_water),
+        "fill_cmems_water": bool(dc.fill_cmems_water),
         "water_level": bool(dc.water_level),
         "met_time": str(dc.met_time),
         "overpass_met": list(dc.overpass_met),

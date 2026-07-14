@@ -56,10 +56,29 @@ def _login_gee(settings) -> None:
     ee.Number(1).getInfo()   # round-trip confirms the backend actually responds
 
 
+def _login_copernicus(settings) -> None:
+    """Copernicus Marine (CMEMS). The toolbox reads ~/.netrc natively, so `netrc` needs
+    no credentials file of its own -- the secret stays where every other one does."""
+    import copernicusmarine
+    from pathlib import Path
+
+    kw = {"check_credentials_valid": True}
+    if settings.auth_strategy == "netrc":
+        kw["credentials_file"] = Path.home() / ".netrc"
+    # environment -> COPERNICUSMARINE_SERVICE_USERNAME/PASSWORD, read by the toolbox.
+    # interactive -> its own ~/.copernicusmarine file, or a prompt.
+    if not copernicusmarine.login(**kw):
+        raise RuntimeError(
+            f"Copernicus Marine login (strategy={settings.auth_strategy!r}) did not "
+            "authenticate; check ~/.netrc (machine auth.marine.copernicus.eu) or "
+            "COPERNICUSMARINE_SERVICE_USERNAME/PASSWORD.")
+
+
 # backend name -> login handler. Add a new service with one entry here.
 AUTH_HANDLERS = {
     "earthdata": _login_earthdata,
     "gee": _login_gee,
+    "copernicus": _login_copernicus,
 }
 
 

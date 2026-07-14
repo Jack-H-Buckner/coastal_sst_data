@@ -41,12 +41,13 @@ landcover = ["planetary-computer", "pystac-client"]      # landcover_esa source
 modis = ["pyresample", "netcdf4"]                         # swath -> grid resampling (netcdf4 reads MODIS L2P)
 met = ["herbie-data", "gcsfs", "pyresample"]              # HRRR + ARCO-ERA5 forcing
 tides = ["pytides2"]                                      # NOAA CO-OPS harmonic synthesis
+cmems = ["copernicusmarine>=2"]                            # Copernicus Marine global physics
 tides-global = ["eo-tides"]                               # global tide-model backup
 plot = ["matplotlib", "cartopy"]                          # `grids --plot` maps
 # Convenience bundles.
 all = [
     "planetary-computer", "pystac-client", "pyresample", "netcdf4",
-    "herbie-data", "gcsfs", "pytides2", "eo-tides",
+    "herbie-data", "gcsfs", "pytides2", "eo-tides", "copernicusmarine>=2",
     "matplotlib", "cartopy",
 ]
 dev = ["pytest"]

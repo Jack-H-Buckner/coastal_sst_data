@@ -23,6 +23,7 @@ dependencies:
   - pyyaml
   - pyproj
   - shapely
+  - affine
   - rasterio
   - rioxarray
   - requests
@@ -38,13 +39,17 @@ dependencies:
   - planetary-computer
   # MODIS swath -> grid resampling (modis.py) and HRRR regridding (met.py).
   - pyresample
-  # datacube.py assembler: nearest-neighbour water fill of the MUR backbone.
+  # datacube.py assembler: nearest-neighbour water fill of the MUR + CMEMS channels.
   - scipy
   # met.py forcing: HRRR via Herbie; ERA5 fallback streamed from the public
   # ARCO-ERA5 Zarr on GCS (zarr reader + anonymous GCS filesystem).
   - herbie-data
   - zarr
   - gcsfs
+  # cmems.py: Copernicus Marine global physics (GLORYS12 reanalysis + analysis/forecast).
+  # Needs a free Copernicus Marine account; the secret lives in ~/.netrc under
+  # `machine auth.marine.copernicus.eu` (see auth.copernicus in the config).
+  - copernicusmarine
   # tides.py global backup: eo-tides (pyTMD) samples a global ocean-tide model
   # (EOT20 etc.) where NOAA CO-OPS has no nearby gauge. Needs a downloaded
   # tide-model directory (see the eo-tides "Setting up tide models" docs).
