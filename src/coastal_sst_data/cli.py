@@ -61,6 +61,43 @@ def _cmd_assemble(args):
                       overwrite=args.overwrite)
 
 
+def _cmd_provenance(args):
+    """Print an assembled cube's provenance: config, sources, access dates."""
+    import json
+    import xarray as xr
+    from .processes import datacube
+
+    project = load_config(args.config)
+    out_dir = project.output_dir / project.datacube.output_subdir
+    names = args.aois or [a.name for a in project.all_areas]
+    for name in names:
+        zpath = out_dir / f"{name}.zarr"
+        if not zpath.exists():
+            print(f"{name}: no cube at {zpath}")
+            continue
+        ds = xr.open_zarr(zpath)
+        a = ds.attrs
+        print(f"\n=== {name} ===")
+        print(f"  built    : {a.get('created_at')}  (coastal_sst_data {a.get('package_version')})")
+        print(f"  config   : {a.get('config_path') or '(from a dict)'}")
+        print(f"  sha256   : {a.get('config_sha256')}")
+        cur = project.config_sha256
+        if a.get("config_sha256") and a["config_sha256"] != cur:
+            print(f"  !! the config has CHANGED since this cube was built (now {cur[:12]}...)")
+        prods = json.loads(a.get("provenance_products", "{}"))
+        if prods:
+            print("  sources:")
+            for prod, r in sorted(prods.items()):
+                flag = "" if r["basis"] == "stamped" else "   [date from file mtime, not recorded]"
+                print(f"    {prod:12s} {', '.join(r['sources'])[:52]:54s} "
+                      f"{(r['accessed_last'] or '')[:19]}  n={r['n_files']}{flag}")
+        if args.fields:
+            print("  fields:")
+            for f, r in sorted(json.loads(a.get("provenance", "{}")).items()):
+                print(f"    {f:24s} <- {', '.join(r['inputs']) or '(computed)'}")
+        ds.close()
+
+
 def _cmd_datum(args):
     from .processes import datum
     project = load_config(args.config)
@@ -187,6 +224,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Re-resolve offsets that are already on disk.")
     p_dat.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
     p_dat.set_defaults(func=_cmd_datum)
+
+    p_prov = sub.add_parser(
+        "provenance",
+        help="Print an assembled cube's provenance: the config that built it, each "
+             "field's sources, and when they were accessed.")
+    add_common(p_prov)
+    p_prov.add_argument("--aoi", nargs="+", dest="aois", help="Only these AoI name(s).")
+    p_prov.add_argument("--fields", action="store_true",
+                        help="Also list every field and the product(s) it came from.")
+    p_prov.set_defaults(func=_cmd_provenance)
 
     return ap
 

@@ -1,6 +1,6 @@
 # Coastal SST data loader
 
-This library is desinged to obtain data for coastal and nearshore ocean ecosystem and combine them in to a gridded data format for down stream modeling tasks. The primary goal of this code base is to load thermal remote sensing images and covarites that drive nearshore ocean temperatures to feed into high reolution sea surface temperature models. 
+This library is desinged to obtain data for coastal and nearshore ocean ecosystem and combine them in to a gridded data format for down stream modeling tasks. The primary goal of this code base is to load thermal remote sensing images and covarites that drive nearshore ocean temperatures to feed into high reolution sea surface temperature models. The package also loads in situ observations form monitoring networks like the IOOS network for model validation with ground truth measurments. 
 
 ## Project structure. 
 
@@ -251,6 +251,7 @@ There are five subcommands:
 | `run` | Run the pipeline: compute the shared grid once, then acquire each selected product in order | yes |
 | `datum` | Resolve each AOI's DEM→MSL vertical-datum offset (runs inside `run`; standalone for backfill) | yes (small) |
 | `assemble` | Knit the aligned per-product outputs into one analysis-ready datacube (`.zarr`) per AOI | no |
+| `provenance` | Print a built cube's provenance: the config that made it, each field's sources, access dates | no |
 
 **A typical workflow** builds up from cheap, offline checks to the full run:
 
@@ -296,6 +297,39 @@ Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `m
 - `--dry-run` — report what would be assembled; write nothing.
 
 Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `fill_mur_water`, `water_level`, `met_time`, `overpass_met`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision.
+
+#### Provenance: what produced each field, and when
+
+Every cube is **self-describing**. Assembly embeds, in the Zarr's own attributes, the config that built it and — for every field — the source(s) it came from and when those data were accessed. Nothing lives in a sidecar that can be separated from the data: copy the cube, keep the record.
+
+| Attribute | Contents |
+| --- | --- |
+| `config_yaml` | the **full text** of the config that built the cube, verbatim (comments and all) |
+| `config_sha256`, `config_path` | its hash and where it lived, so drift is detectable |
+| `created_at`, `package_version` | when the cube was assembled, and by which version |
+| `provenance` | per **field**: its inputs, their sources, when accessed, and on what basis |
+| `provenance_products` | per **product**: source, file count, access window |
+
+Read it with `coastal-sst-data provenance --config config.yaml` (add `--fields` to list every channel and the products behind it):
+
+```
+=== tillamook_bay ===
+  built    : 2026-07-14T15:32:00Z  (coastal_sst_data 0.0.1)
+  config   : /path/to/config.yaml
+  sha256   : 0eadc006…
+  sources:
+    cmems        cmems_mod_glo_phy_my_0.083deg_P1D-m    2026-07-14T15:31:58  n=2
+    insitu       IOOS Sensors ERDDAP                    2026-07-14T15:32:00  n=1
+    mur          GHRSST MUR-JPL-L4-GLOB-v4.1            2026-07-14T15:32:00  n=2   [date from file mtime, not recorded]
+```
+
+Two things this is careful about:
+
+**A guessed date is never passed off as a recorded one.** Acquisition stamps `acquired_at` into every file it writes. Data acquired *before* this existed has no stamp, so the access date falls back to the file's **mtime** — and every record says which basis it used. An mtime is wrong the moment a tree is rsynced or restored from backup, so that has to be legible rather than silent. Re-acquire (or `--overwrite`) to replace a guessed date with a recorded one.
+
+**Derived fields list all of their inputs.** `eco_water_elev` is bathymetry *and* tides *and* the datum resolution tying them together *and* the ECOSTRESS overpass that set the instant. Picking one to report would be tidy and wrong. A channel with no mapping is logged loudly rather than shipping blank.
+
+Because the config is embedded, `provenance` also **detects drift**: if the config on disk has changed since the cube was built, it says so and prints both hashes. That matters here because several products switch source underneath you — CMEMS falls back reanalysis→forecast, met falls back HRRR→ERA5, bathymetry falls back CUDEM→GMRT — so "which source produced this number" has a real, per-run answer.
 
 #### Met in the cube: reference time, and per-overpass
 

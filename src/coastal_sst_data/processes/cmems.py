@@ -62,6 +62,7 @@ from rasterio.enums import Resampling
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 
@@ -288,7 +289,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                     still.append(day)
                     continue
                 ds.attrs.update(aoi_id=name, source=DATASET_IDS[src], cmems_source=src,
-                                processing="subset + bilinear reproject to AOI grid")
+                                processing="subset + bilinear reproject to AOI grid",
+                                **provenance.stamp(eff))
                 log.info("  [%s] %s -> %s", src, day.strftime("%Y%m%d"),
                          write_output(ds, aoi_out, name, fmt).name)
             remaining = still
@@ -336,6 +338,7 @@ def _build_eff(project: Project) -> dict:
     creds = {"credentials_file": str(Path.home() / ".netrc")} if strategy == "netrc" else {}
 
     return {
+        "config_sha256": project.config_sha256,
         "ds": ds_cfg,
         "grid": grid_cfg,
         "creds": creds,

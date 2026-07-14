@@ -2,10 +2,12 @@
 maps a validated Project into the flat dict the acquisition code consumes.
 No network: they never call earthaccess, only the pure mapping."""
 
+import copy
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import xarray as xr
 import pytest
 import rasterio
 import rioxarray  # noqa: F401  (registers the .rio accessor)
@@ -187,11 +189,17 @@ def test_read_window_reproject(tmp_path, aoi_grid):
 
 
     
-def test_process_granule(tmp_path, aoi_grid,base_project):
+def test_process_granule(tmp_path, aoi_grid, base_project):
     """tests the proces_granual file against a sunthetic dataset and check that
     misisng observations align with the values baked into in the synthetic data"""
-    parsed = parse_config(base_project)
-    parsed.products[ "ecostress"] = {"variables": { "cloud", "water" , "sst"}}
+    # Select ecostress in the config BEFORE validating it. Assigning into
+    # `parsed.products` afterwards would insert a raw str key and a raw dict where the
+    # model expects a DataProduct and a ProductOptions -- pydantic does not validate an
+    # in-place dict mutation, so the model would be left in an invalid state (and the
+    # options bag, being a plain dict, would silently read back as defaults anyway).
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["ecostress"] = {"version": "002"}
+    parsed = parse_config(cfg)
     eff = ecostress._build_eff(parsed)
     role_to_file  = make_granule_cogs(tmp_path, aoi_grid)
     target_crs = aoi_grid.target_crs
@@ -256,8 +264,10 @@ def run_stubs(monkeypatch):
                         lambda ds_cfg, bbox, start, end: (calls["search"].append(bbox) or calls["granules"]))
     monkeypatch.setattr(ecostress.earthaccess, "open",
                         lambda urls: (calls["open"].append(list(urls)) or [None] * len(list(urls))))
+    # A bare object() would do, except run() now stamps provenance onto the Dataset it
+    # gets back -- so the stub has to look like one.
     monkeypatch.setattr(ecostress, "process_granule",
-                        lambda *a, **k: (calls["process"].append(True) or object()))
+                        lambda *a, **k: (calls["process"].append(True) or xr.Dataset()))
     monkeypatch.setattr(ecostress, "write_output",
                         lambda ds, out_dir, name, fmt: calls["write"].append((out_dir, name, fmt)))
     return calls

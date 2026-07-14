@@ -54,6 +54,7 @@ import xarray as xr
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 
@@ -309,7 +310,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
         ds = build_dataset(records)
         ds.attrs.update(aoi_id=name, source="IOOS Sensors ERDDAP", erddap=ERDDAP,
-                        qc_flags=str(ds_cfg["qc_flags"]))
+                        qc_flags=str(ds_cfg["qc_flags"]), **provenance.stamp(eff))
         log.info("  wrote %s  (%d station(s), %d timestep(s))",
                  write_output(ds, out_root / name, name).name,
                  ds.sizes["station"], ds.sizes["time"])
@@ -337,6 +338,7 @@ def _build_eff(project: Project) -> dict:
         "exclude_stations": list(_opt(opts, "exclude_stations", []) or []),
     }
     return {
+        "config_sha256": project.config_sha256,
         "ds": ds_cfg,
         "out_dir": Path(project.output_dir) / "INSITU" / "aligned",
         "overwrite": bool(_opt(opts, "overwrite", False)),

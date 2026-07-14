@@ -49,6 +49,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
+from .. import provenance
 
 log = logging.getLogger(__name__)
 
@@ -269,6 +270,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 log.info("  %s: no valid MODIS pixels over AOI, skipping", tstr)
                 continue
             ds = _scene_dataset(sst_g, fp_g, g, t, name, to_celsius)
+            ds.attrs.update(**provenance.stamp(eff))
             log.info("  wrote %s", write_output(ds, aoi_out, name, fmt))
     log.info("Done.")
 
@@ -310,6 +312,7 @@ def _build_eff(project: Project) -> dict:
 
     root = Path(project.output_dir)
     return {
+        "config_sha256": project.config_sha256,
         "ds": ds_cfg,
         "grid": grid_cfg,
         "out_dir": root / "MODIS" / "aligned",
