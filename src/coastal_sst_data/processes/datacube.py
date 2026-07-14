@@ -678,6 +678,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     rec = provenance.build(eff["project"], list(ds.data_vars), prod)
     ds.attrs.update(
         created_at=rec["created_at"], package_version=rec["package_version"],
+        code_version=rec["code_version"],
         config_sha256=rec["config_sha256"] or "", config_path=rec["config_path"] or "",
         config_yaml=rec["config_yaml"] or "",
         provenance=json.dumps(rec["fields"], sort_keys=True),

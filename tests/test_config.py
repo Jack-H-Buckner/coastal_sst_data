@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import pytest
@@ -515,3 +516,62 @@ def test_duplicate_aoi_names_across_project_rejected(base_project):
     })
     with pytest.raises(ValidationError, match="AoI names must be unique"):
         parse_config(base_project)
+
+
+# --------------------------------------------------------------------------- #
+# Unknown option keys. A key nothing reads is not harmless: it is a config that LIES --
+# it states an intent, the run ignores it, and the provenance honestly records what the
+# run did, so nothing anywhere contradicts the config file.
+# --------------------------------------------------------------------------- #
+def _cfg(base_project, product, opts):
+    cfg = copy.deepcopy(base_project)
+    cfg["products"][product] = opts
+    return cfg
+
+
+def test_unknown_product_option_is_rejected(base_project):
+    with pytest.raises(ValidationError, match="SILENTLY IGNORED"):
+        parse_config(_cfg(base_project, "bathymetry", {"not_a_real_key": 1}))
+
+
+def test_a_typo_gets_a_suggestion(base_project):
+    with pytest.raises(ValidationError, match="did you mean 'stats_subgrid_m'"):
+        parse_config(_cfg(base_project, "bathymetry", {"stats_subgrid": 10}))
+
+
+def test_bathymetry_source_is_now_a_recognised_option(base_project):
+    """It was documented, settable, and silently discarded -- the module read
+    `default_source`, so `source: cudem` quietly produced ~100 m GMRT."""
+    p = parse_config(_cfg(base_project, "bathymetry", {"source": "cudem"}))
+    assert p.products[DataProduct.bathymetry].source == "cudem"
+
+
+def test_source_wins_over_default_source(base_project):
+    from coastal_sst_data.processes import bathymetry
+    p = parse_config(_cfg(base_project, "bathymetry", {"source": "cudem"}))
+    assert bathymetry._build_eff(p)["default_source"] == "cudem"    # the config is OBEYED
+
+
+def test_default_source_still_works(base_project):
+    from coastal_sst_data.processes import bathymetry
+    p = parse_config(_cfg(base_project, "bathymetry", {"default_source": "cudem"}))
+    assert bathymetry._build_eff(p)["default_source"] == "cudem"
+
+
+def test_unknown_region_source_key_is_rejected(base_project):
+    cfg = copy.deepcopy(base_project)
+    cfg["regions"][0]["sources"] = {"bathymetry": {"dem_sauce": "cudem"}}
+    with pytest.raises(ValidationError, match="did you mean 'dem_source'"):
+        parse_config(cfg)
+
+
+def test_known_region_source_key_is_accepted(base_project):
+    cfg = copy.deepcopy(base_project)
+    cfg["regions"][0]["sources"] = {"bathymetry": {"dem_source": "cudem",
+                                                   "datum_offset_m": 1.3}}
+    parse_config(cfg)          # must not raise
+
+
+def test_the_working_example_config_still_loads():
+    """The registry must describe what real configs actually use."""
+    load_config(Path(__file__).parents[1] / "examples" / "config.test.yaml")

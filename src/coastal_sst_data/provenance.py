@@ -34,6 +34,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import xarray as xr
@@ -57,10 +58,48 @@ def package_version() -> str:
     return __version__
 
 
+@lru_cache(maxsize=1)
+def code_version() -> str:
+    """Which CODE built this -- the git commit, not the package version.
+
+    `package_version` is pinned in pyproject and does not move: every cube ever built is
+    stamped "0.0.1" whatever commit produced it. That is fine for a release artifact and
+    useless for provenance, because the code is exactly what changes between two cubes
+    built from the same config. And it changes MEANINGFULLY: `mur_valid` used to include
+    NN-filled pixels and now does not; `depth` used to be fabricated zeros where the DEM
+    was missing and is now NaN. Two cubes with identical `config_sha256` and identical
+    `package_version` can therefore hold different numbers, and nothing in either says so.
+
+    A DIRTY tree is reported as such. A cube built from uncommitted edits is not
+    reproducible from any commit, and claiming a bare SHA for it would be a lie -- the
+    most dangerous kind here, because it is the one a reader would trust.
+
+    Degrades to "unknown" outside a git checkout (an installed wheel, a container), which
+    is honest: we would rather say we do not know than guess.
+    """
+    import subprocess
+    repo = Path(__file__).resolve().parent
+
+    def git(*args) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(repo), *args],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    sha = git("rev-parse", "HEAD")
+    if not sha:
+        return "unknown"
+    dirty = git("status", "--porcelain")
+    return f"{sha}-dirty" if dirty else sha
+
+
 def stamp(eff: dict | None = None) -> dict:
     """The attrs every acquisition write adds. `acquired_at` is evaluated HERE -- at write
     time -- so a long run dates each file honestly rather than all of them at start-up."""
-    out = {"acquired_at": now_utc(), "package_version": package_version()}
+    out = {"acquired_at": now_utc(), "package_version": package_version(),
+           "code_version": code_version()}
     sha = (eff or {}).get("config_sha256")
     if sha:
         out["config_sha256"] = sha
@@ -273,6 +312,7 @@ def build(project, fields, products: dict) -> dict:
     return {
         "created_at": now_utc(),
         "package_version": package_version(),
+        "code_version": code_version(),
         "config_path": str(getattr(project, "config_path", None) or "") or None,
         "config_sha256": getattr(project, "config_sha256", None),
         "config_yaml": getattr(project, "config_text", None),

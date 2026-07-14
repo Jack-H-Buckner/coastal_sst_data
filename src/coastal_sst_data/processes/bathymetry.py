@@ -386,7 +386,10 @@ def _build_eff(project: Project) -> dict:
         "out_dir": out_root,
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
-        "default_source": _opt(opts, "default_source", "gmrt"),
+        # `source` is what the docs (and every user) call it; `default_source` is what the
+        # code originally read. Both work, `source` wins. They diverged silently for a long
+        # time: a config that said `source: cudem` got the `default_source` DEFAULT -- gmrt.
+        "default_source": _opt(opts, "source", None) or _opt(opts, "default_source", "gmrt"),
         "fallback": _opt(opts, "fallback", "gmrt"),
     }
 
