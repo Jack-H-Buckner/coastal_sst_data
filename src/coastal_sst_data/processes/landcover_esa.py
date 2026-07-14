@@ -49,7 +49,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -84,8 +84,11 @@ def search_items(collection, stac_url, bbox, year):
     import planetary_computer
     from pystac_client import Client
 
-    cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-    items = list(cat.search(collections=[collection], bbox=list(bbox)).items())
+    def _search():
+        cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+        return list(cat.search(collections=[collection], bbox=list(bbox)).items())
+
+    items = net.retry(_search, what="WorldCover STAC search")
     matched = [it for it in items if _item_year(it) == year]
     if items and not matched:
         log.warning("  no WorldCover tiles labelled year=%d; using all %d returned",
@@ -243,6 +246,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
+    net.setup_gdal_env()      # windowed COG reads: deadline + retries
     return run(eff, grids, aois, dry_run)
 
 

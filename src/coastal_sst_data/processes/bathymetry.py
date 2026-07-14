@@ -29,6 +29,7 @@ import argparse
 import logging
 import math
 import re
+import time
 import warnings
 from pathlib import Path
 
@@ -42,7 +43,7 @@ from rasterio.transform import from_origin
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 SOURCE = "bathymetry"
@@ -81,12 +82,20 @@ def fetch_gmrt(bbox_ll, pad, layer, resolution, tmp_path: Path) -> Path:
     w, s, e, n = bbox_ll
     params = {"west": w - pad, "east": e + pad, "south": s - pad, "north": n + pad,
               "format": "geotiff", "layer": layer, "resolution": resolution}
-    r = requests.get(GMRT_URL, params=params, timeout=180)
-    r.raise_for_status()
-    if r.content[:2] not in (b"II", b"MM"):
-        raise RuntimeError(f"GMRT did not return a GeoTIFF (got {r.content[:80]!r})")
+    def _get():
+        r = requests.get(GMRT_URL, params=params, timeout=180)
+        r.raise_for_status()
+        if r.content[:2] not in (b"II", b"MM"):     # an error page is not a GeoTIFF
+            raise RuntimeError(f"GMRT did not return a GeoTIFF (got {r.content[:80]!r})")
+        return r.content
+
+    content = net.retry(_get, what=f"GMRT grid {bbox_ll}")
+    # r.content is fully materialised before we write, and the magic bytes are checked
+    # above, so this cannot leave a truncated GeoTIFF -- but write it atomically anyway,
+    # because two AoIs sharing a tmp name must not tear each other's file.
     tmp_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path.write_bytes(r.content)
+    with store.atomic(tmp_path) as tmp:
+        tmp.write_bytes(content)
     return tmp_path
 
 
@@ -98,11 +107,74 @@ _TILE_RE = re.compile(r"ncei19_n(\d+)x(\d+)_w(\d+)x(\d+)_", re.IGNORECASE)
 CUDEM_NATIVE_M = 3.0
 
 
-def _fetch_index(urllist, cache: Path):
+INDEX_MAX_AGE_S = 30 * 86400        # NCEI adds tiles; a year-old index quietly misses them
+
+
+class TileReadError(RuntimeError):
+    """A CUDEM tile could not be READ -- distinct from CUDEM not COVERING the AoI.
+
+    The difference decides whether falling back to GMRT is right. No coverage is a fact
+    about the world and GMRT is the correct answer. A failed read is a fact about the
+    network, and answering it with a permanent ~100 m DEM (which also flips the vertical
+    datum from NAVD88 to MSL, and which no later run will ever re-attempt, because the
+    output then exists and is complete) turns a transient blip into a permanent downgrade.
+    """
+
+
+def _tif_urls(text: str) -> list[str]:
+    return [u.strip() for u in text.splitlines() if u.strip().endswith(".tif")]
+
+
+def _download_index(urllist: str) -> str:
+    """Fetch the CUDEM tile index and PROVE it is a tile index before anyone caches it."""
+    def _get():
+        r = requests.get(urllist, timeout=60)
+        r.raise_for_status()            # was missing: a 500 HTML page has a .text too
+        return r.text
+
+    text = net.retry(_get, what="CUDEM tile index")
+    if not _tif_urls(text):
+        # An error page, a redirect notice, or an empty body. Every one of them is a
+        # perfectly good string, and the old code cached it verbatim.
+        raise RuntimeError(
+            f"CUDEM index at {urllist} contained no .tif entries "
+            f"(got {text[:120]!r}) -- refusing to cache it")
+    return text
+
+
+def _fetch_index(urllist, cache: Path) -> list[str]:
+    """The CUDEM tile list, cached on disk.
+
+    This cache was the nastiest failure in the module, because every way it broke was
+    STICKY and every way it broke ended in a SILENT DOWNGRADE. There was no
+    raise_for_status, so a 500 HTML error page was written to the cache as if it were data;
+    no validation, so an empty body was cached too; no atomicity, so an interrupted write
+    left a truncated list; and no expiry, so any of those survived forever. In each case
+    `_tif_urls` then returned [] or a short list, `_source_cudem` found no overlapping
+    tiles, and `_fetch_with_fallback` quietly served ~100 m GMRT instead of 3 m CUDEM --
+    for the life of the cache file, with nothing in the log to say why.
+
+    So now: validate BEFORE caching, write atomically, expire, and treat a cache that
+    yields no tiles as poisoned rather than as an answer.
+    """
+    cache = Path(cache)
+    if cache.exists():
+        age = time.time() - cache.stat().st_mtime
+        if age > INDEX_MAX_AGE_S:
+            log.info("  CUDEM index is %.0f days old; refreshing", age / 86400)
+            cache.unlink()
+        elif not _tif_urls(cache.read_text()):
+            log.warning("  cached CUDEM index holds no .tif entries (an error page, or a "
+                        "truncated write); discarding it and re-fetching")
+            cache.unlink()
+
     if not cache.exists():
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(requests.get(urllist, timeout=60).text)
-    return [u.strip() for u in cache.read_text().splitlines() if u.strip().endswith(".tif")]
+        store.write_text(cache, _download_index(urllist))   # atomic; validated above
+
+    urls = _tif_urls(cache.read_text())
+    if not urls:                        # cannot happen now -- but never downgrade silently
+        raise RuntimeError(f"CUDEM index {cache} yielded no tiles")
+    return urls
 
 
 def _tile_bounds(name):
@@ -136,28 +208,42 @@ def read_cudem(bbox_ll, target_crs, ftransform, Wf, Hf, geom_proj, urllist, cach
         raise RuntimeError(f"no CUDEM tiles overlap bbox "
                            f"{tuple(round(b, 3) for b in bbox_ll)} ({len(urls)} in index)")
     ovr = _choose_overview(target_res_m)
-    arrays = []
+    arrays, unread = [], []
     for u in sel:
-        da = None
-        for lvl in dict.fromkeys([ovr, None]):           # requested overview, else full-res
-            try:
-                da = rioxarray.open_rasterio("/vsicurl/" + u, masked=True, overview_level=lvl)
-                break
-            except Exception:
-                da = None
-        if da is None:
-            continue
-        if "band" in da.dims:
-            da = da.squeeze("band", drop=True)
-        tb = _tile_bounds(u)
-        clip = (max(bbox_ll[0], tb[0]), max(bbox_ll[1], tb[1]),
-                min(bbox_ll[2], tb[2]), min(bbox_ll[3], tb[3]))
+        def _read(url=u):
+            for lvl in dict.fromkeys([ovr, None]):       # requested overview, else full-res
+                try:
+                    return rioxarray.open_rasterio("/vsicurl/" + url, masked=True,
+                                                   overview_level=lvl)
+                except Exception:
+                    continue                             # this overview is absent; try full-res
+            raise RuntimeError("no readable overview level")
+
         try:
+            da = net.retry(_read, what=f"CUDEM tile {u.rsplit('/', 1)[-1]}")
+            if "band" in da.dims:
+                da = da.squeeze("band", drop=True)
+            tb = _tile_bounds(u)
+            clip = (max(bbox_ll[0], tb[0]), max(bbox_ll[1], tb[1]),
+                    min(bbox_ll[2], tb[2]), min(bbox_ll[3], tb[3]))
             arrays.append(da.rio.clip_box(*clip))        # windowed read of the AOI portion
-        except Exception:
-            continue
+        except Exception as exc:
+            unread.append((u.rsplit("/", 1)[-1], str(exc)))
+
+    # A tile we could not READ is not a tile that does not EXIST, and conflating the two is
+    # how a network blip used to become permanent. The dropped tiles left a hole in the
+    # mosaic; `cover` was then computed from the SURVIVORS, so 6 of 10 tiles reading gave
+    # cover=60% > the 50% threshold and the DEM was written -- correct-looking, labelled
+    # "60% cover", with a network-shaped hole in it that propagated into landmask, depth and
+    # every water-level channel. Refuse: an incomplete tile set is a failed read, not a
+    # low-coverage area, and the caller must not paper over it with GMRT.
+    if unread:
+        raise TileReadError(
+            f"{len(unread)} of {len(sel)} CUDEM tile(s) could not be read after retries "
+            f"({', '.join(n for n, _ in unread[:3])}{'...' if len(unread) > 3 else ''}); "
+            "refusing to build a DEM with a network-shaped hole in it")
     if not arrays:
-        raise RuntimeError("all overlapping CUDEM tiles failed to read")
+        raise TileReadError("all overlapping CUDEM tiles failed to read")
     mosaic = merge_arrays(arrays) if len(arrays) > 1 else arrays[0]
     fine = mosaic.rio.reproject(dst_crs=target_crs, shape=(Hf, Wf), transform=ftransform,
                                 resampling=Resampling.nearest, nodata=np.nan)
@@ -227,14 +313,24 @@ SOURCES = {"cudem": _source_cudem, "gmrt": _source_gmrt}
 
 
 def _fetch_with_fallback(source, g: AoiGrid, params, fallback):
-    """Run the resolved source's fetcher; on None/error, try `fallback` if set."""
+    """Run the resolved source's fetcher; on NO-COVERAGE, try `fallback` if set.
+
+    A NETWORK failure is deliberately NOT fallback-worthy. Falling back on one would swap a
+    3 m NAVD88 DEM for a ~100 m MSL one because a CDN hiccuped -- and nothing would ever
+    put it back, since the next run finds a complete bathymetry file and skips the AoI. So
+    a TileReadError propagates: the AoI fails, it is named in the run report, and the next
+    run retries CUDEM properly. Only genuine absence of coverage falls back.
+    """
     try:
         res = SOURCES[source](g, params)
+    except TileReadError:
+        raise                                   # transient: fail loudly, retry next run
     except Exception as exc:
         log.warning("  %s: %s read failed (%s)", g.name, source, exc)
         res = None
     if res is None and fallback and fallback != source:
-        log.info("  %s: falling back to %s", g.name, fallback)
+        log.warning("  %s: %s has no coverage here; FALLING BACK to %s "
+                    "(coarser, and a different vertical datum)", g.name, source, fallback)
         try:
             res = SOURCES[fallback](g, params)
         except Exception as exc:
@@ -373,6 +469,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         bad = ", ".join(f"{n}:{s}" for n, s in unknown)
         raise ValueError(f"bathymetry dem_source not recognized ({bad}); "
                          f"choose from {sorted(SOURCES)}.")
+    net.setup_gdal_env()      # /vsicurl CUDEM tile reads: deadline + retries
     return run(eff, grids, aoi_sources, aois, dry_run)
 
 

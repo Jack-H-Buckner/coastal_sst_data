@@ -35,7 +35,7 @@ from rasterio.enums import Resampling
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -119,9 +119,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
                  name, g.target_crs, g.width, g.height, g.resolution_m)
 
-        granules = earthaccess.search_data(
-            short_name=ds_cfg["short_name"], temporal=(start, end),
-            bounding_box=tuple(g.search_bbox))
+        granules = net.retry(
+            lambda: earthaccess.search_data(
+                short_name=ds_cfg["short_name"], temporal=(start, end),
+                bounding_box=tuple(g.search_bbox)),
+            what=f"MUR search {name}")
         log.info("  %d daily MUR granule(s)", len(granules))
         rep.expect(len(granules))
         if not granules:
@@ -133,7 +135,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         aoi_out = out_root / name
         for gi, granule in enumerate(granules, 1):
             try:
-                fobj = earthaccess.open([granule])[0]
+                fobj = net.retry(lambda: earthaccess.open([granule])[0],
+                                 what=f"MUR open granule {gi}")
                 da, t = subset_and_reproject(fobj, variable, g.search_bbox, pad,
                                              g.target_crs, g.transform, g.width,
                                              g.height, g.geom_proj, grid_cfg)

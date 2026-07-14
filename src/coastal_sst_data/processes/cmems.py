@@ -62,7 +62,7 @@ from rasterio.enums import Resampling
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -132,9 +132,20 @@ def open_window(dataset_id, variables, bbox_ll, pad, start, end, depths, creds):
         kw["credentials_file"] = creds["credentials_file"]
 
     try:
-        return copernicusmarine.open_dataset(**kw)
+        return net.retry(lambda: copernicusmarine.open_dataset(**kw),
+                         what=f"CMEMS open {dataset_id}")
     except Exception as exc:
-        log.info("  %s: no usable window (%s)", dataset_id, exc)
+        # This returns None, which the chain reads as "this product has no such day" and
+        # falls through to the NEXT product. That is right for a genuine coverage gap and
+        # WRONG for an expired credential -- which used to look identical, at INFO. Say
+        # which one this is, loudly, because the fallback silently serves different data.
+        if net.is_transient(exc):
+            log.warning("  %s: unreachable after retries (%s); treating as no data",
+                        dataset_id, exc)
+        else:
+            log.warning("  %s: open FAILED (%s). If this is a credential/permission error, "
+                        "the fallback will now quietly serve a DIFFERENT product.",
+                        dataset_id, exc)
         return None
 
 

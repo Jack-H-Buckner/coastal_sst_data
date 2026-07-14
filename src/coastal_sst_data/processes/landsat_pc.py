@@ -48,7 +48,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -78,15 +78,18 @@ def search_scenes(collection, stac_url, bbox, start, end, platforms, cloud_max):
     import planetary_computer
     from pystac_client import Client
 
-    cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-    search = cat.search(
-        collections=[collection],
-        bbox=list(bbox),
-        datetime=f"{start}/{end}",
-        query={"eo:cloud_cover": {"lt": cloud_max * 100.0},
-               "platform": {"in": [_pc_platform(p) for p in platforms]}},
-    )
-    return list(search.items())
+    def _search():
+        cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+        search = cat.search(
+            collections=[collection],
+            bbox=list(bbox),
+            datetime=f"{start}/{end}",
+            query={"eo:cloud_cover": {"lt": cloud_max * 100.0},
+                   "platform": {"in": [_pc_platform(p) for p in platforms]}},
+        )
+        return list(search.items())      # inside the retry: paging is where it fails
+
+    return net.retry(_search, what="Landsat STAC search")
 
 
 # --------------------------------------------------------------------------- #
@@ -284,6 +287,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
+    net.setup_gdal_env()      # windowed COG reads: deadline + retries
     return run(eff, grids, aois, dry_run)
 
 

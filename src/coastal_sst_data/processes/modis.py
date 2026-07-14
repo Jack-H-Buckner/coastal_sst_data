@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -49,7 +50,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -93,9 +94,20 @@ def _is_night(granule) -> bool:
 # Fetch backends: granule -> local NetCDF path. Swappable via `access`.
 # --------------------------------------------------------------------------- #
 def _fetch_download(granule, bbox, tmp_dir: Path) -> Path:
-    """Download the full granule to disk (cropped in memory afterwards)."""
+    """Download the full granule into a SCRATCH dir the caller will delete.
+
+    `earthaccess.download` skips a file that already exists BY NAME. That is a caching
+    feature and, combined with the old lifecycle (unlink inside the try, so a killed run
+    left the partial granule behind), it was a corruption vector: the truncated granule
+    survived, the next run saw the name already present, skipped the download, and handed
+    the truncated file straight to read_swath. Hence the per-granule scratch dir, deleted
+    in a `finally` -- a granule directory that outlives its attempt cannot be reused.
+    """
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    paths = earthaccess.download([granule], local_path=str(tmp_dir))
+    paths = net.retry(lambda: earthaccess.download([granule], local_path=str(tmp_dir)),
+                      what="MODIS granule download")
+    if not paths:
+        raise RuntimeError("earthaccess.download returned no path")
     return Path(paths[0])
 
 
@@ -239,9 +251,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                         "run Landsat first (or set match_landsat: false)", name, landsat_dir / name)
             continue
 
-        granules = earthaccess.search_data(
-            short_name=ds_cfg["short_name"], temporal=(start, end),
-            bounding_box=tuple(g.search_bbox))
+        granules = net.retry(
+            lambda: earthaccess.search_data(
+                short_name=ds_cfg["short_name"], temporal=(start, end),
+                bounding_box=tuple(g.search_bbox)),
+            what=f"MODIS search {name}")
         kept = _select_granules(granules, ls_times, match_landsat, max_dt, daytime_only)
         log.info("  %d granule(s) over AOI -> %d after daytime/coincidence filter",
                  len(granules), len(kept))
@@ -258,16 +272,20 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                           shape=(g.height, g.width), overwrite=overwrite):
                 log.info("  %s already processed, skipping", tstr)
                 continue
+            # One scratch dir per granule, removed in `finally`. A partial download can
+            # therefore never survive to be mistaken for a complete one by the next run.
+            gran_tmp = tmp_dir / f"g_{name}_{tstr}"
             try:
-                path = fetch(gr, g.search_bbox, tmp_dir)
+                path = fetch(gr, g.search_bbox, gran_tmp)
                 sst, lat, lon = read_swath(path, variable, quality_min, to_celsius)
                 fp = np.arange(sst.size, dtype="int32").reshape(sst.shape) if do_footprint else None
                 sst_g, fp_g = resample_to_grid(sst, lat, lon, g, radius, fp)
-                Path(path).unlink(missing_ok=True)
             except Exception as exc:
                 log.warning("  FAILED %s (%s)", tstr, exc)
                 rep.fail(f"{name} {tstr}", exc)
                 continue
+            finally:
+                shutil.rmtree(gran_tmp, ignore_errors=True)
             if not np.isfinite(sst_g).any():
                 log.info("  %s: no valid MODIS pixels over AOI, skipping", tstr)
                 continue

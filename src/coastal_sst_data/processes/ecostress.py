@@ -42,7 +42,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -90,12 +90,14 @@ def login(strategy: str):
 
 
 def search_granules(ds_cfg: dict, bbox, start: str, end: str):
-    results = earthaccess.search_data(
-        short_name=ds_cfg["short_name"],
-        version=ds_cfg["version"],
-        temporal=(start, end),
-        bounding_box=tuple(bbox),
-    )
+    results = net.retry(
+        lambda: earthaccess.search_data(
+            short_name=ds_cfg["short_name"],
+            version=ds_cfg["version"],
+            temporal=(start, end),
+            bounding_box=tuple(bbox),
+        ),
+        what=f"ECOSTRESS search {ds_cfg['short_name']}")
     log.info("  found %d granule(s)", len(results))
     return results
 
@@ -305,7 +307,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
             log.info("  [%d/%d] streaming %d layer(s) for %s",
                      gi, len(granules), len(role_to_url), tstr)
             try:
-                fobjs = earthaccess.open(list(role_to_url.values()))
+                fobjs = net.retry(lambda: earthaccess.open(list(role_to_url.values())),
+                                  what=f"ECOSTRESS open {tstr}")
             except Exception as exc:
                 log.warning("    FAILED to open %s (%s)", tstr, exc)
                 rep.fail(f"{name} {tstr}", exc)
@@ -374,10 +377,12 @@ def _build_eff(project: Project) -> dict:
 
 
 def _setup_gdal_env():
-    """Make GDAL/curl efficient for remote COG range reads."""
-    os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
-    os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
-    os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif")
+    """Efficiency AND a deadline for remote COG range reads (see net.setup_gdal_env).
+
+    This used to set only the efficiency knobs, so a stalled connection could hang the run
+    indefinitely and one transient 503 permanently lost the scene.
+    """
+    net.setup_gdal_env()
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
