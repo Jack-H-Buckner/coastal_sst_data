@@ -33,8 +33,8 @@ from . import auth
 from .config import DataProduct, Project, load_config
 from .grid import AoiGrid, compute_aoi_grid
 from .processes import (
-    bathymetry, cmems, datacube, datum, ecostress, landcover_esa, landsat_pc, met, modis,
-    mur, tides,
+    bathymetry, cmems, datacube, datum, ecostress, insitu_ioos, landcover_esa, landsat_pc,
+    met, modis, mur, tides,
 )
 
 log = logging.getLogger(__name__)
@@ -57,6 +57,10 @@ LANDSAT_SOURCES = {"pc": landsat_pc, "planetary_computer": landsat_pc}
 # the 'gee' source (JRC + NDWI water mask) is a future landcover_gee module.
 LANDCOVER_SOURCES = {"esa": landcover_esa, "worldcover": landcover_esa}
 
+# In-situ network -> module. IOOS (ERDDAP) covers most of North America; other networks
+# register here and honour the same output contract.
+INSITU_SOURCES = {"ioos": insitu_ioos}
+
 # Execution order: statics + backbone first; Landsat BEFORE MODIS (coincidence);
 # not-yet-implemented products last. Every DataProduct appears exactly once.
 PROCESS_ORDER = [
@@ -69,6 +73,7 @@ PROCESS_ORDER = [
     DataProduct.met,
     DataProduct.tides,
     DataProduct.landcover,
+    DataProduct.insitu,
 ]
 
 
@@ -80,6 +85,9 @@ def _module_for(project: Project, product: DataProduct):
     if product == DataProduct.landcover:
         source = getattr(project.products[product], "source", "esa")
         return LANDCOVER_SOURCES.get(source)
+    if product == DataProduct.insitu:
+        source = getattr(project.products[product], "source", "ioos")
+        return INSITU_SOURCES.get(source)
     return PROCESSES.get(product)
 
 

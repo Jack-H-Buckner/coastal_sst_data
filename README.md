@@ -549,6 +549,38 @@ gives `thetao_0m` (level 0.494 m), `thetao_10m` (level **9.573** m), `thetao_30m
 machine auth.marine.copernicus.eu login <username> password <password>
 ```
 
+### In-situ (IOOS)
+In-situ observations are the cube's **only ground truth**. Every other channel is modelled (met, CMEMS, tides) or remotely sensed (ECOSTRESS, Landsat, MODIS, MUR); this is what a thermometer in the water actually read. The assembler writes each station's value into **the grid cell the station sits in**, and — the point of the exercise — **at the instant each satellite flew**, so a scene can be validated against a buoy pixel-for-pixel and minute-for-minute.
+
+- **Where it comes from**: the [IOOS Sensors ERDDAP](https://erddap.sensors.ioos.us/erddap) — one server aggregating **NDBC, NOAA CO-OPS, CDIP and the IOOS regional associations**, so most of North America is a single query. Stations are auto-discovered inside each AOI's bounding box. **No credentials.** It is a `source`-selector product (`source: ioos`), so another network is a new module behind the same contract.
+- **What it measures**: water temperature (`sea_water_temperature`, falling back per station to `sea_surface_temperature` — providers do not agree on the name), quality-flagged with QARTOD. The native sampling interval is kept (6 min for CO-OPS gauges), because matching an overpass needs the sub-hourly series.
+
+**Quality control.** QARTOD flags are `1` pass, `2` not-evaluated, `3` suspect, `4` fail, `9` missing. The default keeps **`[1, 2]`**: flag 2 is what stations that don't run QARTOD emit, and demanding flag 1 would discard much of the network.
+
+**Stations that report nothing are dropped — loudly.** A station can *advertise* a temperature variable and never report it (NDBC 46120 exposes both temperature names and returns all-NaN for a whole month; it is a wave buoy with no thermometer). Those are logged by name, because an empty in-situ channel that reads as "no buoys here" is the one failure this product cannot afford.
+
+**Project-level options** (`products.insitu`):
+
+- `source`: the network (default `ioos`).
+- `variables`: preference order of ERDDAP variable names (default `[sea_water_temperature]`; `sea_surface_temperature` is tried as a fallback).
+- `qc_flags`: QARTOD flags to keep (default `[1, 2]`).
+- `max_sensor_depth_m`: ignore sensors deeper than this on profiling moorings (default `5`).
+- `stations` / `exclude_stations`: an explicit allow-list (else auto-discovery) and a deny-list for a known-bad mooring.
+
+**In the cube** (`datacube.insitu`, default `true`):
+
+| Channel | Dims | Meaning |
+| --- | --- | --- |
+| `insitu_sst` | (time,y,x) | the observation nearest the **reference time** (10:30 local solar), so it is contemporaneous with the met channels |
+| `{eco,lst,modis}_insitu_sst` | (time,y,x) | the observation nearest **that sensor's overpass** — the satellite-vs-buoy matchup |
+| `{eco,lst,modis}_insitu_dt_min` | (time,y,x) | signed minutes between the observation and the overpass, so matchup quality is auditable |
+| `insitu_n` | (time,y,x) | stations contributing to the cell (two buoys in one cell are averaged) |
+| `insitu_station` | (y,x) | `0` = none, `k` = station #k, indexing the `insitu_stations` cube attribute |
+
+All are sparse — NaN everywhere except station cells — which costs almost nothing under the cube's Blosc/zstd encoding. Beyond `datacube.insitu_max_dt_min` (default 60) a matchup is **NaN rather than a stale value**: a buoy reading two hours off an overpass is not truth for that scene, and pretending otherwise is how a validation set quietly acquires a bias.
+
+**The land-pixel problem.** A station near shore can land in a cell the cube calls *land* (coarse water mask, or a gauge on a pier), where it would be masked out of every downstream loss. Such a station is **snapped to the nearest water pixel**, and the snap distance is recorded; a snap beyond 500 m warns, because that means the station is probably not where we think it is.
+
 ### Bathymetry
 Bathymetry is a static (time-invariant) covariate: one file per AOI describing water depth, used both as a model input and to build the land mask.
 

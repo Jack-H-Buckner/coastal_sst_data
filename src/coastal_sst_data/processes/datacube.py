@@ -33,13 +33,24 @@ Design (locked with the maintainer):
     additionally carries the forcing at ITS OWN overpass (datacube.overpass_met), so
     two sensors that flew hours apart on one day do not share one value.
 
+  * CMEMS gives the offshore water column at the requested depths, NN-filled over water
+    like MUR (its ~9 km land mask can swallow a whole estuary).
+
+  * IN-SITU is the cube's only ground truth: each station's value is written into the
+    grid cell it sits in, at the INSTANT each satellite flew, so a scene can be validated
+    against a buoy pixel-for-pixel and minute-for-minute (see processes.insitu).
+
 Channel layout in each <aoi>.zarr:
   3D (time,y,x): mur_sst, mur_valid, eco_sst, eco_cloud, eco_valid,
                  lst_sst, lst_cloud, lst_valid, modis_sst, modis_valid,
                  airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover,
                  {eco,lst,modis}_water_elev, {eco,lst,modis}_water_class,
-                 {eco,lst,modis}_{airtemp,wind_speed,swrad,cloud_cover}
-  2D (y,x) static: depth, depth_p25, depth_p75, landmask, landcover_water
+                 {eco,lst,modis}_{airtemp,wind_speed,swrad,cloud_cover},
+                 cmems_<var>_<depth>m,
+                 insitu_sst, insitu_n, {eco,lst,modis}_insitu_sst,
+                 {eco,lst,modis}_insitu_dt_min
+  2D (y,x) static: depth, depth_p25, depth_p75, landmask, landcover_water,
+                   insitu_station (index into the insitu_stations attr)
   1D (time): tide, tide_range, eco_hour, lst_hour, modis_hour, doy_sin, doy_cos,
              {eco,lst,modis}_tide
 
@@ -51,6 +62,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -64,9 +76,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from ..config import CompressionSpec, Project, load_config
+from ..config import CompressionSpec, DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from . import water_level
+from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +89,7 @@ _D_RE = re.compile(r"_(\d{8})\.nc$")      # per-day filename stamp
 PRODUCT_DIRS = {
     "mur": "MUR", "ecostress": "ECOSTRESS", "landsat": "LANDSAT", "modis": "MODIS",
     "met": "MET", "bathymetry": "BATHYMETRY", "tide": "TIDE", "landcover": "LANDCOVER",
-    "datum": "DATUM", "cmems": "CMEMS",
+    "datum": "DATUM", "cmems": "CMEMS", "insitu": "INSITU",
 }
 
 
@@ -284,6 +296,77 @@ def load_bathy(d: Path, aoi_id, H, W):
     return elev, depth, dp25, dp75
 
 
+def load_insitu(d: Path, aoi_id):
+    """The AoI's in-situ station series, or None. Dims (station, time)."""
+    f = d / f"{aoi_id}_insitu.nc"
+    if not f.exists():
+        return None
+    return xr.open_dataset(f)
+
+
+def build_insitu(ids: xr.Dataset, g: AoiGrid, days, water, targets: dict, max_dt_min):
+    """In-situ channels: the station's value at each target time, in the station's pixel.
+
+    `targets` maps a channel prefix to one target datetime per day -- 'insitu' (the daily
+    reference time) and one per sensor ('eco', 'lst', 'modis') at that sensor's chosen
+    overpass. Each becomes a sparse (T,H,W) channel: NaN everywhere except the cells where
+    stations sit. A satellite pixel and a buoy pixel then line up exactly, at the same
+    instant, which is the whole point of carrying in-situ at all.
+
+    Returns (channels, station_table, station_map).
+    """
+    H, W = g.height, g.width
+    lons = np.asarray(ids["lon"].values, dtype="float64")
+    lats = np.asarray(ids["lat"].values, dtype="float64")
+    placed = insitu.station_pixels(lons, lats, g, water)
+
+    times = pd.DatetimeIndex(ids["time"].values)
+    sst = ids["sst"].values                         # (station, time)
+
+    chans = {k: _empty3d(days, H, W) for k in targets}
+    dts = {k: _empty3d(days, H, W) for k in targets if k != "insitu"}
+    counts = np.zeros((len(days), H, W), dtype="float32")   # stations sharing a cell
+    station_map = np.zeros((H, W), dtype="uint16")          # 0 = no station
+    table = []
+
+    for s, place in enumerate(placed):
+        sid = str(ids["station_id"].values[s])
+        if not place["inside"]:
+            log.warning("  in-situ station %s falls outside the AoI grid; dropped", sid)
+            continue
+        r, c = place["row"], place["col"]
+        if place["snap_m"] and place["snap_m"] > insitu.SNAP_WARN_M:
+            log.warning("  in-situ station %s sits on a land pixel; snapped %.0f m to the "
+                        "nearest water cell -- check its coordinates", sid, place["snap_m"])
+
+        table.append({"index": len(table) + 1, "id": sid,
+                      "name": str(ids["station_name"].values[s]),
+                      "lat": float(lats[s]), "lon": float(lons[s]),
+                      "row": r, "col": c, "snap_m": round(float(place["snap_m"] or 0.0), 1)})
+        station_map[r, c] = len(table)
+
+        for i in range(len(days)):
+            for key, tgt in targets.items():
+                v, dt = insitu.value_at(times, sst[s], tgt[i], max_dt_min)
+                if not np.isfinite(v):
+                    continue
+                # Two stations in one cell: average them, and count the contributors.
+                prev = chans[key][i, r, c]
+                chans[key][i, r, c] = v if not np.isfinite(prev) else (prev + v) / 2.0
+                if key in dts:
+                    dts[key][i, r, c] = dt
+            counts[i, r, c] += 1
+
+    out = {}
+    for key in targets:
+        name = "insitu_sst" if key == "insitu" else f"{key}_insitu_sst"
+        out[name] = (("time", "y", "x"), chans[key])
+        if key in dts:
+            out[f"{key}_insitu_dt_min"] = (("time", "y", "x"), dts[key])
+    out["insitu_n"] = (("time", "y", "x"), counts)
+    return out, table, station_map
+
+
 def cmems_channels(d: Path, aoi_id) -> list[str]:
     """The CMEMS variables actually on disk (thetao_0m, thetao_10m, zos, ...).
 
@@ -368,6 +451,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     # Met: one snapshot per day at the REFERENCE time of day (default 10:30 local solar,
     # Landsat's overpass) rather than a daily mean, which would smear the diurnal cycle.
+    lon_c = 0.5 * (g.search_bbox[0] + g.search_bbox[2])
     mprefix, mlabel = met_prefix(adir("met"), aid, days, eff["met_time"])
 
     def met(var):
@@ -418,6 +502,22 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
             arr = fill_water_nn(arr, water)
         cmems_vars[f"cmems_{var}"] = (("time", "y", "x"), arr)
 
+    # In-situ: the cube's only ground truth. The value goes in the cell the station sits
+    # in, sampled at the SAME INSTANT each satellite flew -- so a scene can be validated
+    # against a buoy pixel-for-pixel and minute-for-minute -- plus one at the daily
+    # reference time, contemporaneous with the met channels.
+    insitu_vars, station_table, station_map = {}, [], None
+    ids = load_insitu(adir("insitu"), aid) if eff["insitu"] else None
+    if ids is not None:
+        ref_utc = [met_mod.reference_time_utc(d, lon_c, eff["ref_hours"], eff["ref_basis"])
+                   if eff["ref_hours"] is not None else None for d in days]
+        targets = {"insitu": ref_utc, "eco": eco_times, "lst": lst_times,
+                   "modis": modis_times}
+        insitu_vars, station_table, station_map = build_insitu(
+            ids, g, days, water, targets, eff["insitu_max_dt_min"])
+        ids.close()
+        log.info("  in-situ: %d station(s) placed", len(station_table))
+
     doy = days.dayofyear.values.astype("float32")
     doy_sin = np.sin(2 * np.pi * doy / 365.25).astype("float32")
     doy_cos = np.cos(2 * np.pi * doy / 365.25).astype("float32")
@@ -444,7 +544,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     ds = xr.Dataset(
         {
-            **wl, **op_met, **cmems_vars,
+            **wl, **op_met, **cmems_vars, **insitu_vars,
             "mur_sst": (T, mur_sst), "mur_valid": (T, mur_valid),
             "eco_sst": (T, eco_sst), "eco_cloud": (T, eco_cloud), "eco_valid": (T, eco_valid),
             "lst_sst": (T, lst_sst), "lst_cloud": (T, lst_cloud), "lst_valid": (T, lst_valid),
@@ -454,6 +554,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
             "depth": (("y", "x"), depth),
             "depth_p25": (("y", "x"), depth_p25), "depth_p75": (("y", "x"), depth_p75),
             "landmask": (("y", "x"), landmask),
+            **({"insitu_station": (("y", "x"), station_map)} if station_map is not None else {}),
             "landcover_water": (("y", "x"), landcover_water),
             "tide": (("time",), tide), "tide_range": (("time",), tide_range),
             "eco_hour": (("time",), eco_hour), "lst_hour": (("time",), lst_hour),
@@ -463,6 +564,11 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
         coords={"time": days, "y": ys, "x": xs},
     )
     ds.attrs.update(aoi_id=aid, crs=g.target_crs, met_time=mlabel)
+    if station_table:
+        # The station map is an index INTO this table, so the table must travel with the
+        # cube -- a pixel that says "station 3" is useless without it.
+        ds.attrs["insitu_stations"] = json.dumps(station_table)
+        ds["insitu_station"].attrs["long_name"] = "index into the insitu_stations attr (0 = none)"
     for name in op_met:
         ds[name].attrs["long_name"] = (
             f"{name.split('_', 1)[1]} at the {name.split('_', 1)[0]} overpass")
@@ -569,6 +675,17 @@ def _build_eff(project: Project) -> dict:
         "water_level": bool(dc.water_level),
         "met_time": str(dc.met_time),
         "overpass_met": list(dc.overpass_met),
+        "insitu": bool(dc.insitu),
+        "insitu_max_dt_min": float(dc.insitu_max_dt_min),
+        # The in-situ reference-time channel is sampled at the same instant as met.
+        "ref_hours": met_mod.parse_hhmm(
+            getattr(project.products.get(DataProduct.met), "reference_time",
+                    met_mod.DEFAULT_REFERENCE_TIME)
+            if DataProduct.met in project.products else met_mod.DEFAULT_REFERENCE_TIME),
+        "ref_basis": (getattr(project.products.get(DataProduct.met), "reference_basis",
+                              met_mod.DEFAULT_REFERENCE_BASIS)
+                      if DataProduct.met in project.products
+                      else met_mod.DEFAULT_REFERENCE_BASIS),
         # Needed to resolve the datum offset per AoI (region override + sidecar lookup).
         "project": project,
         "compression": dc.compression,
