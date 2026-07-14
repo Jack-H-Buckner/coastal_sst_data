@@ -11,6 +11,7 @@ import xarray as xr
 import pytest
 import rasterio
 import rioxarray  # noqa: F401  (registers the .rio accessor)
+from rasterio.enums import Resampling
 from rasterio.transform import from_origin
 
 from coastal_sst_data.config import (
@@ -18,8 +19,18 @@ from coastal_sst_data.config import (
 )
 from coastal_sst_data import grid
 from coastal_sst_data.processes import ecostress
+from .conftest import UniformDs
 
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.test.yaml"
+
+
+def _ds(eff):
+    """The settings ONE AoI runs with. `eff["ds"]` is keyed by AoI, because every product
+    resolves its options per AoI (region override -> project default). ECOSTRESS is a
+    global product with no region-varying options, so every AoI resolves alike -- take any."""
+    return next(iter(eff["ds"].values()))
+
+
 
 # A realistic ECOSTRESS granule id (without the trailing _<LAYER>.tif).
 GRANULE_STEM = "ECOv002_L2T_LSTE_25520_009_10UEU_20230105T123623_0710_01"
@@ -45,10 +56,10 @@ def test_build_eff_maps_example_config():
     eff = ecostress._build_eff(load_config(EXAMPLE))
 
     # product constants (module defaults) + config overrides
-    assert eff["ds"]["short_name"] == "ECO_L2T_LSTE"
-    assert eff["ds"]["version"] == "002"              # from ecostress options
-    assert eff["ds"]["layers"] == ecostress.LAYERS
-    assert eff["ds"]["categorical"] == ecostress.CATEGORICAL
+    assert _ds(eff)["short_name"] == "ECO_L2T_LSTE"
+    assert _ds(eff)["version"] == "002"              # from ecostress options
+    assert _ds(eff)["layers"] == ecostress.LAYERS
+    assert _ds(eff)["categorical"] == ecostress.CATEGORICAL
 
     # shared project settings flow through
     assert eff["earthdata"]["auth_strategy"] == "netrc"
@@ -168,16 +179,13 @@ def test_synthetic_cogs_are_readable_and_cover_aoi(tmp_path, aoi_grid):
     assert left <= minx and bottom <= miny and right >= maxx and top >= maxy
 
 
-def test_read_window_reproject(tmp_path, aoi_grid):
+def test_read_cog_window(tmp_path, aoi_grid):
+    """The shared windowed COG reader (grid.read_cog_window), which ECOSTRESS, Landsat,
+    land-cover and bathymetry all read their rasters through."""
     paths = make_granule_cogs(tmp_path, aoi_grid)
     assert set(paths) == {"sst", "water", "cloud"}
-    target_crs = aoi_grid.target_crs
-    geom_target = aoi_grid.geom_proj
-    transform = aoi_grid.transform
-    width = aoi_grid.width
-    height = aoi_grid.height
-    out = ecostress.read_window_reproject(paths["sst"], geom_target, target_crs, transform, width,
-                          height, "bilinear")
+    out = grid.read_cog_window(paths["sst"], aoi_grid, resampling=Resampling.bilinear,
+                               pad_m=ecostress.ECO_PAD_M)
     assert out.rio.shape == (aoi_grid.height, aoi_grid.width)      # exact target dimensions
     assert str(out.rio.crs) == aoi_grid.target_crs          # reprojected to the target CRS
     assert out.rio.transform() == aoi_grid.transform        # pixel-for-pixel alignment
@@ -188,7 +196,6 @@ def test_read_window_reproject(tmp_path, aoi_grid):
     assert finite.max() == pytest.approx(290.0, abs=1e-3)
 
 
-    
 def test_process_granule(tmp_path, aoi_grid, base_project):
     """tests the proces_granual file against a sunthetic dataset and check that
     misisng observations align with the values baked into in the synthetic data"""
@@ -199,18 +206,10 @@ def test_process_granule(tmp_path, aoi_grid, base_project):
     # options bag, being a plain dict, would silently read back as defaults anyway).
     cfg = copy.deepcopy(base_project)
     cfg["products"]["ecostress"] = {"version": "002"}
-    parsed = parse_config(cfg)
-    eff = ecostress._build_eff(parsed)
-    role_to_file  = make_granule_cogs(tmp_path, aoi_grid)
-    target_crs = aoi_grid.target_crs
-    geom_target = aoi_grid.geom_proj
-    transform = aoi_grid.transform
-    width = aoi_grid.width
-    height = aoi_grid.height
-    ds_cfg = eff["ds"]
-    grid_cfg = eff["grid"]
-    out = ecostress.process_granule(role_to_file, ds_cfg, grid_cfg, target_crs, transform,
-                    width, height, geom_target, "test-aoi", "12:00pm")
+    eff = ecostress._build_eff(parse_config(cfg))
+    role_to_file = make_granule_cogs(tmp_path, aoi_grid)
+    out = ecostress.process_granule(role_to_file, _ds(eff), eff["grid"], aoi_grid,
+                                    "test-aoi", "12:00pm")
     v = out["valid"].isel(time=0).values          # (y, x), uint8
     assert out["valid"].dtype == "uint8"
     assert v[:, : v.shape[1] // 4].sum() == 0     # deep west: cloudy -> all invalid
@@ -224,8 +223,7 @@ def _granule_args(tmp_path, aoi_grid, base_project):
     cfg = copy.deepcopy(base_project)
     cfg["products"]["ecostress"] = {"version": "002"}
     eff = ecostress._build_eff(parse_config(cfg))
-    return (eff["ds"], eff["grid"], aoi_grid.target_crs, aoi_grid.transform,
-            aoi_grid.width, aoi_grid.height, aoi_grid.geom_proj, "test-aoi", "12:00pm")
+    return (_ds(eff), eff["grid"], aoi_grid, "test-aoi", "12:00pm")
 
 
 @pytest.mark.parametrize("lost", ["cloud", "water"])
@@ -281,8 +279,9 @@ _GRANULE_TSTR = "20230105T123623"
 def _eff(tmp_path, *, overwrite=False, fmt="netcdf"):
     """A minimal `eff` dict for run(); out_dir points at a temp dir."""
     return {
-        "ds": {"short_name": "ECO_L2T_LSTE", "version": "002",
-               "layers": ecostress.LAYERS, "categorical": ecostress.CATEGORICAL},
+        "ds": UniformDs({"short_name": "ECO_L2T_LSTE", "version": "002",
+                         "layers": ecostress.LAYERS,
+                         "categorical": ecostress.CATEGORICAL}),
         "grid": {"resampling_continuous": "bilinear",
                  "resampling_categorical": "nearest", "to_celsius": False},
         "out_dir": tmp_path,
@@ -315,8 +314,11 @@ def run_stubs(monkeypatch):
     # gets back -- so the stub has to look like one.
     monkeypatch.setattr(ecostress, "process_granule",
                         lambda *a, **k: (calls["process"].append(True) or xr.Dataset()))
-    monkeypatch.setattr(ecostress, "write_output",
-                        lambda ds, out_dir, name, fmt: calls["write"].append((out_dir, name, fmt)))
+    # The writer now lives in `store` (one implementation for every product), so the spy
+    # goes there. `stem` is the filename without an extension -- `<aoi>_<stamp>`.
+    monkeypatch.setattr(ecostress.store, "write_output",
+                        lambda ds, out_dir, stem, fmt, **k: calls["write"].append(
+                            (out_dir, stem, fmt)))
     return calls
 
 

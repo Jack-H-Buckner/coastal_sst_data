@@ -45,9 +45,8 @@ Usage (run AFTER the SST stages so overpass times exist):
 
 from __future__ import annotations
 
-import argparse
 import logging
-import re
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -57,14 +56,13 @@ import xarray as xr
 
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 
-from ..config import Project, DataProduct, load_config
-from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, naming, provenance, report, store
 
 log = logging.getLogger(__name__)
 
 SOURCE = "met"
-_DT_RE = re.compile(r"(\d{8}T\d{6})")     # aligned-scene filename stamp
 
 # --- met product defaults (overridable via the met product options block) ---- #
 DEFAULT_SOURCE = "auto"                   # auto (hrrr->era5) | hrrr | era5
@@ -285,7 +283,8 @@ def _resolve_chain(source: str, fallback: str) -> list[str]:
     return chain
 
 
-def _fetch_at(chain, g: AoiGrid, dt: datetime, cfg: dict, tally: dict | None = None):
+def _fetch_at(chain, g: AoiGrid, dt: datetime, cfg: dict, tally: dict | None = None,
+              fallbacks: list | None = None):
     """Walk the source chain; return (grids, source_name) of the first hit.
 
     EVERY fall-through is logged. This was the quietest failure in the package: the three
@@ -297,6 +296,10 @@ def _fetch_at(chain, g: AoiGrid, dt: datetime, cfg: dict, tally: dict | None = N
     INSTANTANEOUS flux under HRRR but an hourly MEAN under ERA5.
 
     `tally` accumulates {source: n} so the run can report what actually served it.
+    `fallbacks` records (primary_abandoned, source_that_won) for each fetch that fell
+    through -- recorded HERE, at the moment it happens, because the chain is now resolved
+    PER AoI (a project may run hrrr->era5 in Oregon and era5-only in the Mediterranean),
+    so no single project-wide `chain[0]` exists to compare against afterwards.
     """
     for i, name in enumerate(chain):
         try:
@@ -308,6 +311,8 @@ def _fetch_at(chain, g: AoiGrid, dt: datetime, cfg: dict, tally: dict | None = N
             if i:                      # a later link won -> we fell back, silently until now
                 log.info("    met: FELL BACK to %s @ %s (%s had no data)",
                          name, dt, " -> ".join(chain[:i]))
+                if fallbacks is not None:
+                    fallbacks.append((chain[0], name))
             if tally is not None:
                 tally[name] = tally.get(name, 0) + 1
             return grids, name
@@ -370,28 +375,23 @@ def reference_time_utc(day, lon: float, ref_hours: float, basis: str) -> pd.Time
 
 
 def overpass_times_for_day(overpass_dirs, aoi_id: str, day) -> list[datetime]:
-    """Datetimes (UTC, naive) of thermal scenes for this AoI on `day`."""
-    daystr = day.strftime("%Y%m%d")
+    """Datetimes (UTC, naive) of thermal scenes for this AoI on `day`.
+
+    Reads the stamp the SENSOR stages wrote, via the shared convention
+    (coastal_sst_data.naming) -- this is the seam where met discovers what to snapshot
+    forcing against, so its parse must be the sensors' format by construction.
+    """
+    daystr = naming.day_stamp(day)
     times = []
     for d in overpass_dirs:
         adir = Path(d) / aoi_id
         if not adir.exists():
             continue
         for f in adir.glob(f"{aoi_id}_{daystr}T*.nc"):
-            m = _DT_RE.search(f.name)
-            if m:
-                times.append(datetime.strptime(m.group(1), "%Y%m%dT%H%M%S"))
+            t = naming.parse_time(f.name)
+            if t is not None:
+                times.append(t)
     return sorted(set(times))
-
-
-def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str, stem: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if fmt == "netcdf":
-        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
-    if fmt == "geotiff":
-        return store.write_rasters(ds, out_dir / stem,
-                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
-    raise ValueError(f"Unknown output format: {fmt}")
 
 
 # --------------------------------------------------------------------------- #
@@ -399,32 +399,32 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str, stem: str
 # --------------------------------------------------------------------------- #
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     """Acquire met forcing onto the pre-computed per-AoI grids."""
-    ds_cfg, grid_cfg = eff["ds"], eff["grid"]
+    grid_cfg = eff["grid"]
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
     to_celsius = grid_cfg.get("to_celsius", False)
-    chain = ds_cfg["chain"]
-    mean_hours = ds_cfg["daily_mean_hours"]
-    ref_time = ds_cfg["reference_time"]
-    ref_basis = ds_cfg["reference_basis"]
-    ref_hours = parse_hhmm(ref_time)
     overpass_dirs = eff["overpass_dirs"]
     start = pd.Timestamp(eff["time"]["start_date"])
     end = pd.Timestamp(eff["time"]["end_date"])
     days = pd.date_range(start, end, freq="D")
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("met")
     tally: dict[str, int] = {}     # {source: n fetches} -- folded into `rep` at the end
+    fallbacks: list[tuple[str, str]] = []   # (primary abandoned, source that won)
 
     for name in names:
         g = grids[name]
+        # Resolved PER AoI. HRRR is NORTH AMERICA ONLY, so an AoI outside it must start the
+        # chain at ERA5 -- and a project that spans both cannot name one chain and be
+        # telling the truth. The region says which; the project default covers the rest.
+        ds_cfg = eff["ds"][name]
+        chain = ds_cfg["chain"]
+        mean_hours = ds_cfg["daily_mean_hours"]
+        ref_time = ds_cfg["reference_time"]
+        ref_basis = ds_cfg["reference_basis"]
+        ref_hours = parse_hhmm(ref_time)
+
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s ===",
                  name, g.target_crs, g.width, g.height, "->".join(chain))
         if dry_run:
@@ -437,14 +437,16 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         lon = 0.5 * (g.search_bbox[0] + g.search_bbox[2])
 
         for day in days:
-            dstr = day.strftime("%Y%m%d")
+            dstr = naming.day_stamp(day)
+            ref_stem = naming.day_stem(name, day, prefix="ref_")
+            mean_stem = naming.day_stem(name, day)
 
             # ---- reference-time snapshot (the cube's default met channel) ----
             if ref_hours is not None and not store.done(
-                    aoi_out / f"{name}_ref_{dstr}.nc", store.REQUIRED_VARS["MET"],
+                    aoi_out / f"{ref_stem}.nc", store.REQUIRED_VARS["MET"],
                     shape=(g.height, g.width), overwrite=overwrite):
                 rt = reference_time_utc(day, lon, ref_hours, ref_basis)
-                got, src = _fetch_at(chain, g, rt.to_pydatetime(), ds_cfg, tally)
+                got, src = _fetch_at(chain, g, rt.to_pydatetime(), ds_cfg, tally, fallbacks)
                 if got:
                     ds = to_dataset(got, g, rt, to_celsius)
                     ds.attrs.update(aoi_id=name, source=f"{src} @reference",
@@ -453,19 +455,19 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                                     **provenance.stamp(eff))
                     log.info("  %s reference [%s] (%s %s -> %s UTC) -> %s", dstr, src,
                              ref_time, ref_basis, rt.strftime("%H:%M"),
-                             write_output(ds, aoi_out, name, fmt, f"{name}_ref_{dstr}"))
+                             store.write_output(ds, aoi_out, ref_stem, fmt))
                     rep.wrote(source=src)
                 else:
                     rep.fail(f"{name} ref {dstr}", "no source in the chain had data")
 
             # ---- daily mean over mean_hours (skipped when daily_mean_hours: []) ----
             if mean_hours and not store.done(
-                    aoi_out / f"{name}_{dstr}.nc", store.REQUIRED_VARS["MET"],
+                    aoi_out / f"{mean_stem}.nc", store.REQUIRED_VARS["MET"],
                     shape=(g.height, g.width), overwrite=overwrite):
                 stack, srcs, used_hours = {}, set(), []
                 for hh in mean_hours:
                     dt = day.to_pydatetime().replace(hour=int(hh))
-                    got, src = _fetch_at(chain, g, dt, ds_cfg, tally)
+                    got, src = _fetch_at(chain, g, dt, ds_cfg, tally, fallbacks)
                     if not got:
                         continue
                     used_hours.append(int(hh))
@@ -491,35 +493,43 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                                     **provenance.stamp(eff))
                     log.info("  %s daily [%s, %dh] -> %s", dstr, "+".join(sorted(srcs)),
                              len(used_hours),
-                             write_output(ds, aoi_out, name, fmt, f"{name}_{dstr}"))
+                             store.write_output(ds, aoi_out, mean_stem, fmt))
                     rep.wrote(source="+".join(sorted(srcs)) + " daily mean")
                 else:
                     rep.fail(f"{name} daily {dstr}", "no source had data at any hour")
 
             # ---- overpass snapshots ----
             for op in overpass_times_for_day(overpass_dirs, name, day):
-                tstr = op.strftime("%Y%m%dT%H%M%S")
-                if store.done(aoi_out / f"{name}_{tstr}.nc", store.REQUIRED_VARS["MET"],
+                tstr = naming.time_stamp(op)
+                op_stem = naming.time_stem(name, op)
+                if store.done(aoi_out / f"{op_stem}.nc", store.REQUIRED_VARS["MET"],
                               shape=(g.height, g.width), overwrite=overwrite):
                     continue
-                got, src = _fetch_at(chain, g, op, ds_cfg, tally)
+                got, src = _fetch_at(chain, g, op, ds_cfg, tally, fallbacks)
                 if not got:
                     rep.fail(f"{name} overpass {tstr}", "no source in the chain had data")
                     continue
                 ds = to_dataset(got, g, op, to_celsius)
                 ds.attrs.update(aoi_id=name, source=f"{src} @overpass", **provenance.stamp(eff))
                 log.info("  overpass %s [%s] -> %s", tstr, src,
-                         write_output(ds, aoi_out, name, fmt, f"{name}_{tstr}"))
+                         store.write_output(ds, aoi_out, op_stem, fmt))
                 rep.wrote(source=src)
 
     # Which source actually SERVED this run -- not which was configured. The per-file
     # `source` attr is the truth, but nobody reads 3,000 attrs, so the run says it once.
-    fell_back = [k for k in tally if k not in ("<none>", chain[0])]
-    if fell_back:
-        n = sum(tally[k] for k in fell_back)
-        rep.note = (f"FELL BACK from {chain[0]} for {n} fetch(es) -> "
-                    f"{', '.join(sorted(fell_back))} (different resolution; swrad means "
-                    "something different)")
+    #
+    # Counted from the fall-throughs RECORDED AS THEY HAPPENED, not inferred afterwards by
+    # comparing the tally to `chain[0]`: with the chain resolved per AoI there is no single
+    # project-wide primary to compare against. A project running hrrr->era5 in Oregon and
+    # era5-only in the Mediterranean would, under the old test, have seen era5 as "the
+    # primary" and reported no fallback at all -- concealing every Oregon day that dropped
+    # from 3 km HRRR to 28 km ERA5, which is exactly the downgrade this note exists to
+    # announce.
+    if fallbacks:
+        pairs = Counter(fallbacks)
+        detail = ", ".join(f"{lost}->{won} x{n}" for (lost, won), n in pairs.most_common())
+        rep.note = (f"FELL BACK for {len(fallbacks)} fetch(es): {detail} "
+                    "(different resolution; swrad means something different)")
         log.warning("met: %s", rep.note)
     rep.log_summary()
     return rep
@@ -528,23 +538,21 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    """Read an optional override off a product-options bag (extra='allow')."""
-    return getattr(opts, name, default) if opts is not None else default
+def _ds_cfg(opts) -> dict:
+    """One AoI's met settings, from its region-resolved options bag.
 
-
-def _build_eff(project: Project) -> dict:
-    """Map a validated Project into the flat `eff` dict `run()` consumes."""
-    opts = project.products.get(DataProduct.met)
-    if opts is None:
-        raise ValueError("met is not a selected product in this config")
-
-    chain = _resolve_chain(_opt(opts, "source", DEFAULT_SOURCE),
-                           _opt(opts, "fallback", DEFAULT_FALLBACK))
-    overpass_from = list(_opt(opts, "overpass_from", []))
-
-    ds_cfg = {
-        "chain": chain,
+    `source`/`fallback`/`model` are region-overridable -- HRRR is North America only, so an
+    AoI outside it must start its chain at ERA5, and a project spanning both continents
+    cannot name one chain truthfully. Everything else (the variable set, the reference time
+    and its basis, the daily-mean hours) stays project-global: those decide the cube's met
+    CHANNELS and what they mean, and the assembler names airtemp/wind_*/swrad/cloud_cover
+    explicitly -- so a region that dropped one would ship an all-NaN channel indistinguishable
+    from a forcing that was fetched and came back empty.
+    """
+    return {
+        "chain": _resolve_chain(_opt(opts, "source", DEFAULT_SOURCE),
+                                _opt(opts, "fallback", DEFAULT_FALLBACK)),
+        "model": _opt(opts, "model", "auto"),
         "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
         "daily_mean_hours": list(_opt(opts, "daily_mean_hours", DEFAULT_MEAN_HOURS)),
         "reference_time": _opt(opts, "reference_time", DEFAULT_REFERENCE_TIME),
@@ -553,16 +561,26 @@ def _build_eff(project: Project) -> dict:
         "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
         "fxx": int(_opt(opts, "fxx", DEFAULT_FXX)),
         "product": _opt(opts, "product", DEFAULT_PRODUCT),
-        "model": _opt(opts, "model", "auto"),
         "era5_zarr": _opt(opts, "era5_zarr", ARCO_ERA5_URI),
     }
+
+
+def _build_eff(project: Project) -> dict:
+    """Map a validated Project into the flat `eff` dict `run()` consumes."""
+    opts = project.products.get(DataProduct.met)
+    if opts is None:
+        raise ValueError("met is not a selected product in this config")
+
+    overpass_from = list(_opt(opts, "overpass_from", []))
+
     grid_cfg = project.grid.model_dump()
     grid_cfg.setdefault("to_celsius", False)          # GridSpec has no such field yet
 
     root = Path(project.output_dir)
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.met))
+               for a in project.all_areas},
         "grid": grid_cfg,
         "out_dir": root / "MET" / "aligned",
         # thermal-scene dirs to snapshot forcing at (e.g. ECOSTRESS, LANDSAT).
@@ -601,22 +619,8 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="coastal_sst_data meteorological forcing acquisition (HRRR/ERA5).")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="reprocess days even if the aligned file exists")
-    ap.add_argument("--dry-run", action="store_true", help="Report only; no fetch.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    entry.process_main(
+        acquire, "coastal_sst_data meteorological forcing acquisition (HRRR/ERA5).")
 
 
 if __name__ == "__main__":

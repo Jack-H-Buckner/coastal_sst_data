@@ -9,6 +9,15 @@ from coastal_sst_data.processes import mur
 from coastal_sst_data import grid
 
 
+def _ds(eff):
+    """The settings ONE AoI runs with. `eff["ds"]` is keyed by AoI, because every product
+    now resolves its options per AoI (region override -> project default). This is a global
+    product with no region-varying options, so every AoI resolves alike -- take any."""
+    return next(iter(eff["ds"].values()))
+
+
+
+
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.test.yaml"
 
 
@@ -16,9 +25,9 @@ def test_build_eff_maps_example_config():
     """The example config maps to the expected MUR acquisition parameters."""
     eff = mur._build_eff(load_config(EXAMPLE))
     # product constants (module defaults) + config overrides
-    assert eff["ds"]["short_name"] == "MUR-JPL-L4-GLOB-v4.1"
-    assert eff["ds"]["variable"] == "analysed_sst"     # from the mur options
-    assert eff["ds"]["pad_deg"] == 0.05                # default
+    assert _ds(eff)["short_name"] == "MUR-JPL-L4-GLOB-v4.1"
+    assert _ds(eff)["variable"] == "analysed_sst"     # from the mur options
+    assert _ds(eff)["pad_deg"] == 0.05                # default
     # shared project settings flow through
     assert eff["earthdata"]["auth_strategy"] == "netrc"
     assert eff["fmt"] == "netcdf"                       # default output format
@@ -40,9 +49,9 @@ def test_build_eff_defaults_when_options_omitted(base_project):
     """A bare `mur:` (no options) falls back to product defaults."""
     base_project["products"]["mur"] = None             # bare -> default options
     eff = mur._build_eff(parse_config(base_project))
-    assert eff["ds"]["variable"] == mur.DEFAULT_VARIABLE       # "analysed_sst"
-    assert eff["ds"]["pad_deg"] == mur.DEFAULT_PAD_DEG         # 0.05
-    assert eff["ds"]["short_name"] == mur.SHORT_NAME
+    assert _ds(eff)["variable"] == mur.DEFAULT_VARIABLE       # "analysed_sst"
+    assert _ds(eff)["pad_deg"] == mur.DEFAULT_PAD_DEG         # 0.05
+    assert _ds(eff)["short_name"] == mur.SHORT_NAME
     assert eff["fmt"] == "netcdf"
     assert eff["overwrite"] is False
 
@@ -54,8 +63,8 @@ def test_build_eff_applies_option_overrides(base_project):
         "output_format": "geotiff", "overwrite": True,
     }
     eff = mur._build_eff(parse_config(base_project))
-    assert eff["ds"]["variable"] == "analysed_sst_anomaly"
-    assert eff["ds"]["pad_deg"] == 0.2
+    assert _ds(eff)["variable"] == "analysed_sst_anomaly"
+    assert _ds(eff)["pad_deg"] == 0.2
     assert eff["fmt"] == "geotiff"
     assert eff["overwrite"] is True
 

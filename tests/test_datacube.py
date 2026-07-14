@@ -274,6 +274,110 @@ def test_modis_trusts_valid_layer(project, grids, days):
 
 
 # --------------------------------------------------------------------------- #
+# The per-sensor VALIDITY RULES.
+#
+# Each thermal sensor decides `valid` differently, and the differences are not cosmetic --
+# they are corrections for how each instrument's own masks misbehave:
+#
+#   ECOSTRESS  water layer has INVERTED polarity (<0.5 means water), and its cloud mask
+#              over-masks cold water -- so validity gates on the QC mandatory-QA bits
+#              instead of on cloud.
+#   Landsat    water = 1, and its QA_PIXEL-derived cloud mask IS reliable -> gate on cloud.
+#   MODIS      already quality-filtered upstream -> trust its own `valid` layer; it carries
+#              no water or cloud layer to recompute from.
+#
+# Until now those three rules lived only as arguments at three hardcoded call sites, and
+# NOTHING asserted them: the happy-path tests above pass just as well with the polarity
+# reversed or the QC gate removed. They are about to become DATA (products.SensorSpec), so
+# pin the behaviour first -- a mis-wired spec would silently change what counts as an
+# observation, which is exactly the kind of degradation that leaves no trace in the cube.
+# --------------------------------------------------------------------------- #
+def write_ecostress(project, g, day, hour=20, *, sst=286.0, water=0.0, cloud=0.0, quality=0):
+    """One ECOSTRESS scene with every mask settable. Defaults are the all-clear case:
+    water=0 (eco polarity: <0.5 IS water), no cloud, QC bits 0-1 = 0 (good)."""
+    H, W, xs, ys = _grid_hw(g)
+    full = lambda v, dt: (("time", "y", "x"), np.full((1, H, W), v, dt))   # noqa: E731
+    ds = xr.Dataset({
+        "sst": full(sst, "float32"),
+        "cloud": full(cloud, "float32"),
+        "water": full(water, "float32"),
+        "quality": full(quality, "float32"),
+    }, coords={"time": [day], "y": ys, "x": xs})
+    _write(project, "ECOSTRESS", f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc", ds)
+
+
+def _bare_cube(project, g, days):
+    """Assemble with only the statics written, so a sensor's channels are what is under test."""
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    return datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+
+def test_ecostress_water_layer_is_read_with_INVERTED_polarity(project, grids, days):
+    """eco `water` >= 0.5 means LAND. Read with Landsat's polarity, a land pixel would be
+    counted as a valid sea-surface observation -- and the cube gives no hint that it was."""
+    g = grids[AOI]
+    write_ecostress(project, g, days[0], water=1.0)         # eco polarity: 1 == LAND
+    ds = _bare_cube(project, g, days)
+    assert int(ds["eco_valid"].isel(time=0).values.sum()) == 0
+
+
+def test_ecostress_validity_gates_on_QC_not_cloud(project, grids, days):
+    """Two halves of the same rule, and they pull in opposite directions:
+
+    * a BAD QC scene must be rejected even though it is cloud-free, and
+    * a CLOUDY scene must NOT be rejected, because eco's cloud mask over-masks cold water
+      (that is the entire reason this sensor gates on QC instead).
+
+    Drop the QC gate and the first scene silently becomes valid data. Add a cloud gate and
+    the second silently disappears. Neither would raise.
+    """
+    g = grids[AOI]
+    # quality=3 -> mandatory-QA bits 0-1 == 0b11, which is not in the accepted {0, 1}
+    write_ecostress(project, g, days[0], quality=3, cloud=0.0)
+    # cloudy, but QC-good: eco must keep it
+    write_ecostress(project, g, days[1], quality=0, cloud=1.0)
+    ds = _bare_cube(project, g, days)
+
+    assert int(ds["eco_valid"].isel(time=0).values.sum()) == 0                    # bad QC -> out
+    assert int(ds["eco_valid"].isel(time=1).values.sum()) == g.height * g.width   # cloudy -> KEPT
+
+
+def test_landsat_validity_gates_on_CLOUD(project, grids, days):
+    """The asymmetry with ECOSTRESS above: Landsat's QA_PIXEL cloud mask is reliable, so a
+    cloudy Landsat pixel IS invalid -- where the identical eco pixel is kept."""
+    g = grids[AOI]
+    write_landsat(project, g, days[0], hour=19)                     # clear
+    H, W, xs, ys = _grid_hw(g)
+    cloudy = xr.Dataset({
+        "sst": (("time", "y", "x"), np.full((1, H, W), 288.0, "float32")),
+        "cloud": (("time", "y", "x"), np.ones((1, H, W), "float32")),   # fully cloudy
+        "water": (("time", "y", "x"), np.ones((1, H, W), "float32")),   # lst polarity: 1 == water
+    }, coords={"time": [days[1]], "y": ys, "x": xs})
+    _write(project, "LANDSAT", f"{AOI}_{days[1].strftime('%Y%m%d')}T190000.nc", cloudy)
+
+    ds = _bare_cube(project, g, days)
+    assert int(ds["lst_valid"].isel(time=0).values.sum()) == g.height * g.width   # clear -> valid
+    assert int(ds["lst_valid"].isel(time=1).values.sum()) == 0                    # cloudy -> out
+
+
+def test_landsat_water_layer_is_read_with_NORMAL_polarity(project, grids, days):
+    """lst `water` == 1 means water -- the opposite of ECOSTRESS. A pixel the classifier
+    calls land is not a sea-surface observation."""
+    g = grids[AOI]
+    H, W, xs, ys = _grid_hw(g)
+    land = xr.Dataset({
+        "sst": (("time", "y", "x"), np.full((1, H, W), 288.0, "float32")),
+        "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+        "water": (("time", "y", "x"), np.zeros((1, H, W), "float32")),  # 0 == LAND for Landsat
+    }, coords={"time": [days[0]], "y": ys, "x": xs})
+    _write(project, "LANDSAT", f"{AOI}_{days[0].strftime('%Y%m%d')}T190000.nc", land)
+
+    ds = _bare_cube(project, g, days)
+    assert int(ds["lst_valid"].isel(time=0).values.sum()) == 0
+
+
+# --------------------------------------------------------------------------- #
 # Encoding
 # --------------------------------------------------------------------------- #
 def test_build_encoding_shuffle_and_chunks():

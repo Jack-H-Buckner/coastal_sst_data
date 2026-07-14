@@ -44,31 +44,29 @@ from pathlib import Path
 
 import xarray as xr
 
+from .products import REGISTRY
+
 log = logging.getLogger(__name__)
 
 PART_SUFFIX = ".part-"     # a write in progress; junk if the run dies
 OLD_SUFFIX = ".old-"       # the previous output, kept only until the swap succeeds
 
-# The variables a finished file of each product MUST carry. A file missing one of these is
-# not "a file with a gap" -- it is a file whose write or whose source layers did not
-# complete, and it must be re-fetched rather than skipped.
+# The variables a finished file of each product MUST carry, keyed by its ALLCAPS output
+# directory. A file missing one of these is not "a file with a gap" -- it is a file whose
+# write, or whose source layers, did not complete, and it must be re-fetched rather than
+# skipped.
+#
+# DERIVED from the product registry (products.ProductSpec.required_vars), so a new product
+# cannot be added with its completeness check forgotten -- which was a silent failure, not a
+# loud one: without an entry here the skip guard falls back to "the file opens and holds at
+# least one variable", so a truncated download would be taken for done on every subsequent
+# run.
 #
 # Products whose channel set is CONFIG-DEPENDENT (met's variable list, CMEMS's requested
-# variables + depths) cannot name their columns up front, so they assert the invariant they
-# do have: the file opens and carries at least one data variable. Truncated payloads in
-# those are caught by the deep pass, not the metadata check.
-REQUIRED_VARS: dict[str, tuple[str, ...]] = {
-    "MUR": ("sst", "valid"),
-    "MODIS": ("sst", "valid"),
-    "ECOSTRESS": ("sst", "water", "cloud", "valid"),
-    "LANDSAT": ("sst", "water", "cloud", "valid"),
-    "BATHYMETRY": ("elevation", "depth", "depth_p25", "depth_p75"),
-    "LANDCOVER": ("landcover", "water"),
-    "TIDE": ("tide",),
-    "INSITU": ("sst", "qc"),
-    "CMEMS": ("valid",),          # + >=1 configured variable, asserted by the >=1 rule
-    "MET": (),                    # config-dependent channel set
-}
+# variables x depths) cannot name their columns up front, so they declare `()` and assert
+# only the invariant they do have: the file opens and carries at least one data variable.
+# Truncated payloads in those are caught by the deep `check` pass, not the metadata check.
+REQUIRED_VARS: dict[str, tuple[str, ...]] = {s.dir: s.required_vars for s in REGISTRY}
 
 
 def _tag() -> str:
@@ -179,6 +177,32 @@ def write_text(path: Path, text: str) -> Path:
     with atomic(path) as tmp:
         tmp.write_text(text)
     return path
+
+
+def write_output(ds: xr.Dataset, out_dir: Path, stem: str, fmt: str = "netcdf",
+                 *, encoding: dict | None = None) -> Path:
+    """Write one aligned output in the configured format -> the path written.
+
+    `stem` is the filename without an extension (see coastal_sst_data.naming, which owns
+    the stamp convention it encodes). NetCDF gets `<stem>.nc`; GeoTIFF gets a DIRECTORY
+    `<stem>/` holding one .tif per variable -- staged and swapped whole, because a
+    directory carrying three of four bands is exactly the half-output the skip guard would
+    take for done.
+
+    This was ten near-identical `write_output`s, one per process, differing only in how
+    they built the stem -- so the stem is now the caller's business and the writing is
+    ours. Products whose output has no time dimension (bathymetry, land-cover) fall out of
+    the same code path: a variable is squeezed only if it HAS a time dim.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if fmt == "netcdf":
+        return write_netcdf(ds, out_dir / f"{stem}.nc", encoding=encoding)
+    if fmt == "geotiff":
+        layers = [(v, ds[v].isel(time=0) if "time" in ds[v].dims else ds[v])
+                  for v in ds.data_vars]
+        return write_rasters(ds, out_dir / stem, layers)
+    raise ValueError(f"Unknown output format: {fmt!r}; choose 'netcdf' or 'geotiff'.")
 
 
 # --------------------------------------------------------------------------- #

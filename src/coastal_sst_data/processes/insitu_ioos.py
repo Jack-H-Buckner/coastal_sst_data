@@ -41,7 +41,6 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import io
 import logging
 import time
@@ -52,9 +51,9 @@ import pandas as pd
 import requests
 import xarray as xr
 
-from ..config import DataProduct, Project, load_config
-from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from ..config import DataProduct, Project, opt as _opt, resolve_opts
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -239,6 +238,8 @@ def build_dataset(records: list[dict]) -> xr.Dataset:
 
 
 def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str) -> Path:
+    """In-situ is a (station, time) table, not a raster: it does NOT go through
+    store.write_output -- there is no y/x for a GeoTIFF to hold."""
     out_dir.mkdir(parents=True, exist_ok=True)
     return store.write_netcdf(ds, out_dir / f"{aoi_id}_insitu.nc",
                               encoding={"sst": {"zlib": True, "complevel": 4},
@@ -249,22 +250,21 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str) -> Path:
 # Main loop
 # --------------------------------------------------------------------------- #
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    ds_cfg = eff["ds"]
     out_root, overwrite = eff["out_dir"], eff["overwrite"]
-    variables = ds_cfg["variables"]
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
-    names = list(grids)
-    if only_aoi:
-        missing = set(only_aoi) - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in only_aoi]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("insitu")
 
     for name in names:
         g = grids[name]
+        # Resolved PER AoI: station lists are inherently local, and `variables` is a
+        # per-NETWORK naming preference (sea_water_temperature vs sea_surface_temperature)
+        # -- every network still yields the one `insitu_sst` channel, so varying it by
+        # region does not change what the cube means.
+        ds_cfg = eff["ds"][name]
+        variables = ds_cfg["variables"]
         out_path = out_root / name / f"{name}_insitu.nc"
         if store.done(out_path, store.REQUIRED_VARS["INSITU"], overwrite=overwrite):
             log.info("=== %s: %s exists, skipping ===", name, out_path.name)
@@ -325,16 +325,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    return getattr(opts, name, default) if opts is not None else default
-
-
-def _build_eff(project: Project) -> dict:
-    opts = project.products.get(DataProduct.insitu)
-    if opts is None:
-        raise ValueError("insitu is not a selected product in this config")
-
-    ds_cfg = {
+def _ds_cfg(opts) -> dict:
+    """One AoI's in-situ settings, from its region-resolved options bag."""
+    return {
         "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
         "qc_flags": [int(f) for f in _opt(opts, "qc_flags", DEFAULT_QC_FLAGS)],
         "max_sensor_depth_m": _opt(opts, "max_sensor_depth_m", DEFAULT_MAX_SENSOR_DEPTH_M),
@@ -342,9 +335,17 @@ def _build_eff(project: Project) -> dict:
         "stations": list(_opt(opts, "stations", []) or []),
         "exclude_stations": list(_opt(opts, "exclude_stations", []) or []),
     }
+
+
+def _build_eff(project: Project) -> dict:
+    opts = project.products.get(DataProduct.insitu)
+    if opts is None:
+        raise ValueError("insitu is not a selected product in this config")
+
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.insitu))
+               for a in project.all_areas},
         "out_dir": Path(project.output_dir) / "INSITU" / "aligned",
         "overwrite": bool(_opt(opts, "overwrite", False)),
         "time": {
@@ -366,20 +367,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="coastal_sst_data IOOS in-situ acquisition.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true", help="refetch existing outputs")
-    ap.add_argument("--dry-run", action="store_true", help="List stations only.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    entry.process_main(acquire, "coastal_sst_data IOOS in-situ acquisition.")
 
 
 if __name__ == "__main__":

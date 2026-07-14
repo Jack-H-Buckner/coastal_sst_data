@@ -43,7 +43,6 @@ without re-downloading a single DEM tile:
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import re
@@ -54,9 +53,9 @@ import numpy as np
 import requests
 import xarray as xr
 
-from ..config import DataProduct, Project, load_config
-from ..grid import AoiGrid, project_grids
-from .. import report, store
+from ..config import DataProduct, Project, opt, resolve_opts
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, report, store
 from . import tides
 
 log = logging.getLogger(__name__)
@@ -540,12 +539,7 @@ def _read_bathy(root: Path, aoi_id: str, shape) -> tuple[np.ndarray, str, str]:
 def run(project: Project, grids: dict[str, AoiGrid], only_aoi, dry_run, overwrite):
     """Resolve + write the datum sidecar for each AoI."""
     root = Path(project.output_dir)
-    names = list(grids)
-    if only_aoi:
-        missing = set(only_aoi) - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in only_aoi]
+    names = select_aois(grids, only_aoi)
 
     stations = None                       # fetched lazily, once, and reused across AoIs
     rep = report.ProductReport("datum")
@@ -599,11 +593,11 @@ def run(project: Project, grids: dict[str, AoiGrid], only_aoi, dry_run, overwrit
 def resolve_override(project: Project, aoi_name: str) -> float | None:
     """The optional region-level `sources.bathymetry.datum_offset_m`, or None.
 
-    Region-level ONLY: the offset follows the DEM, and which DEM wins is decided per AoI
-    at runtime, so a project-wide constant can never be right across a study area.
+    Region-level ONLY (it is in config.REGION_ONLY_OPTIONS, so it has no project-level
+    counterpart): the offset follows the DEM, and which DEM wins is decided per AoI at
+    runtime, so a project-wide constant can never be right across a study area.
     """
-    src = project.region_of(aoi_name).sources.get(DataProduct.bathymetry)
-    val = getattr(src, "datum_offset_m", None) if src is not None else None
+    val = opt(resolve_opts(project, aoi_name, DataProduct.bathymetry), "datum_offset_m")
     return None if val is None else float(val)
 
 
@@ -616,20 +610,10 @@ def resolve(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="coastal_sst_data DEM datum-offset resolver.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Resolve only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true", help="re-resolve existing sidecars")
-    ap.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    resolve(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    # A derived stage, so its entry point is `resolve` rather than `acquire` -- but it
+    # takes the same (project, aois, dry_run, overwrite) arguments, so the shared parser
+    # drives it unchanged.
+    entry.process_main(resolve, "coastal_sst_data DEM datum-offset resolver.")
 
 
 if __name__ == "__main__":

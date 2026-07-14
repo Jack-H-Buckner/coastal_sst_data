@@ -44,19 +44,22 @@ Design (locked with the maintainer):
     `*_filled` means it was invented by the NN fill and is plausible, not observed. A
     model told that a fabricated pixel is valid has no way to learn otherwise.
 
-Channel layout in each <aoi>.zarr:
-  3D (time,y,x): mur_sst, mur_valid, mur_filled, eco_sst, eco_cloud, eco_valid,
-                 lst_sst, lst_cloud, lst_valid, modis_sst, modis_valid,
+Channel layout in each <aoi>.zarr. `<s>` ranges over the per-overpass thermal SENSORS, which
+are not a fixed list: they are every product declaring a SensorSpec in the registry
+(coastal_sst_data.products), today {eco, lst, modis}. Every `<s>_*` channel below is
+generated from that spec, so registering a fourth sensor produces its full set without an
+edit here.
+
+  3D (time,y,x): mur_sst, mur_valid, mur_filled,
+                 <s>_sst, <s>_valid, <s>_cloud (where the sensor publishes a cloud layer),
                  airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover,
-                 {eco,lst,modis}_water_elev, {eco,lst,modis}_water_class,
-                 {eco,lst,modis}_{airtemp,wind_speed,swrad,cloud_cover},
+                 <s>_water_elev, <s>_water_class,
+                 <s>_{airtemp,wind_speed,swrad,cloud_cover},
                  cmems_<var>_<depth>m, cmems_<var>_<depth>m_filled,
-                 insitu_sst, insitu_n, {eco,lst,modis}_insitu_sst,
-                 {eco,lst,modis}_insitu_dt_min
+                 insitu_sst, insitu_n, <s>_insitu_sst, <s>_insitu_dt_min
   2D (y,x) static: depth, depth_p25, depth_p75, landmask, landcover_water,
                    insitu_station (index into the insitu_stations attr)
-  1D (time): tide, tide_range, eco_hour, lst_hour, modis_hour, doy_sin, doy_cos,
-             {eco,lst,modis}_tide,
+  1D (time): tide, tide_range, <s>_hour, <s>_tide, doy_sin, doy_cos,
              met_source, cmems_source -- which source served that DAY (uint8 code; the
              `legend` attr names each code). These exist because met and CMEMS fall back
              per-day, and a set-of-sources cannot say which day came from which.
@@ -68,37 +71,28 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
-import os
-import re
-import shutil
-import time
 import warnings
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from ..config import CompressionSpec, DataProduct, Project, load_config
-from ..grid import AoiGrid, project_grids
-from .. import provenance, report, store
+from ..config import CompressionSpec, DataProduct, Project
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, naming, products, provenance, report, store
 from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
 
-_DT_RE = re.compile(r"(\d{8}T\d{6})")     # per-overpass filename stamp
-_D_RE = re.compile(r"_(\d{8})\.nc$")      # per-day filename stamp
-
-# source -> the ALLCAPS "<DIR>/aligned/<aoi>/" folder each acquisition stage wrote.
-PRODUCT_DIRS = {
-    "mur": "MUR", "ecostress": "ECOSTRESS", "landsat": "LANDSAT", "modis": "MODIS",
-    "met": "MET", "bathymetry": "BATHYMETRY", "tide": "TIDE", "landcover": "LANDCOVER",
-    "datum": "DATUM", "cmems": "CMEMS", "insitu": "INSITU",
-}
+# product -> the ALLCAPS "<DIR>/aligned/<aoi>/" folder its acquisition stage wrote.
+# DERIVED from the product registry, and keyed by the PRODUCT's own name throughout -- so
+# the tide product is `tides` here, in provenance, and in the coverage report, even though
+# it writes to TIDE/. Two alias tables used to exist solely because this dict said `tide`
+# and the others said `tides`.
+PRODUCT_DIRS = products.product_dirs()
 
 
 # --------------------------------------------------------------------------- #
@@ -119,8 +113,8 @@ def load_daily_sensor(d: Path, aoi_id, days, H, W, var, *, prefix=""):
     out = _empty3d(days, H, W)
     if not d.exists():
         return out
-    pat = re.compile(rf"^{re.escape(aoi_id)}_{re.escape(prefix)}(\d{{8}})\.nc$")
-    didx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
+    pat = naming.day_pattern(aoi_id, prefix)
+    didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
     for f in d.glob(f"{aoi_id}_{prefix}*.nc"):
         m = pat.match(f.name)
         if not m or m.group(1) not in didx:
@@ -147,7 +141,7 @@ def load_at_times(d: Path, aoi_id, times, H, W, var):
     for i, t in enumerate(times):
         if t is None:
             continue
-        f = d / f"{aoi_id}_{t.strftime('%Y%m%dT%H%M%S')}.nc"
+        f = d / f"{naming.time_stem(aoi_id, t)}.nc"
         if not f.exists():
             continue
         ds = xr.open_dataset(f)
@@ -167,7 +161,7 @@ def met_prefix(d: Path, aoi_id, days, want: str) -> tuple[str, str]:
     than silently emitting an all-NaN forcing channel.
     """
     def has(prefix):
-        return any((d / f"{aoi_id}_{prefix}{dd.strftime('%Y%m%d')}.nc").exists()
+        return any((d / f"{naming.day_stem(aoi_id, dd, prefix)}.nc").exists()
                    for dd in days)
 
     want_prefix = "ref_" if want == "reference" else ""
@@ -206,14 +200,13 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
     if not d.exists():
         return sst, cloud, valid, hour, water_union, times
     qset = list(qc_levels) if qc_levels is not None else None
-    didx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
+    didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
     best = {}  # day -> (valid_count, sst, cloud, valid, datetime)
     for f in d.glob(f"{aoi_id}_*T*.nc"):
-        m = _DT_RE.search(f.name)
-        if not m:
+        dt = naming.parse_time(f.name)
+        if dt is None:
             continue
-        dt = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S")
-        day = dt.strftime("%Y%m%d")
+        day = naming.day_stamp(dt)
         if day not in didx:
             continue
         ds = xr.open_dataset(f)
@@ -269,10 +262,10 @@ def load_tide_daily(d: Path, aoi_id, days):
     t = ds["tide"]
     dm = t.resample(time="1D").mean()
     dr = t.resample(time="1D").max() - t.resample(time="1D").min()
-    lut_m = dict(zip(dm["time"].dt.strftime("%Y%m%d").values, dm.values))
-    lut_r = dict(zip(dr["time"].dt.strftime("%Y%m%d").values, dr.values))
+    lut_m = dict(zip(dm["time"].dt.strftime(naming.DAY_FMT).values, dm.values))
+    lut_r = dict(zip(dr["time"].dt.strftime(naming.DAY_FMT).values, dr.values))
     for i, dd in enumerate(days):
-        k = dd.strftime("%Y%m%d")
+        k = naming.day_stamp(dd)
         if k in lut_m:
             mean[i] = lut_m[k]
             rng[i] = lut_r[k]
@@ -464,16 +457,27 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     elev, depth, depth_p25, depth_p75 = load_bathy(adir("bathymetry"), aid, H, W)
 
     mur_sst = load_daily_sensor(adir("mur"), aid, days, H, W, "sst")
-    # ECOSTRESS: water + QC-produced (its cloud over-masks cold water; gate on QC).
-    eco_sst, eco_cloud, eco_valid, eco_hour, eco_wu, eco_times = load_clearest_overpass(
-        adir("ecostress"), aid, days, H, W, water_is_land=True, use_cloud=False,
-        qc_levels=[0, 1])
-    # Landsat: water + cloud (its QA_PIXEL-based cloud is reliable).
-    lst_sst, lst_cloud, lst_valid, lst_hour, lst_wu, lst_times = load_clearest_overpass(
-        adir("landsat"), aid, days, H, W, water_is_land=False, use_cloud=True)
-    # MODIS: already quality-filtered upstream -> trust its `valid` layer.
-    modis_sst, _, modis_valid, modis_hour, _, modis_times = load_clearest_overpass(
-        adir("modis"), aid, days, H, W, trust_valid=True)
+
+    # THE PER-OVERPASS THERMAL SENSORS -- one loop over the registry.
+    #
+    # This used to be three hardcoded `load_clearest_overpass` calls, and the tuple
+    # ("eco", "lst", "modis") written out by hand in three more places below. Each sensor's
+    # validity rules (inverted water polarity, gate-on-QC-not-cloud, trust-the-valid-layer)
+    # now live on its ProductSpec.sensor, so a fourth sensor gets every channel below --
+    # `_sst`, `_cloud`, `_valid`, `_hour`, `_tide`, `_water_elev`, `_water_class`, its
+    # overpass-met snapshots and its in-situ matchups -- from its spec alone.
+    sensors: dict[str, dict] = {}
+    for s in products.sensors():
+        sp = s.sensor
+        sst, cloud, valid, hour, water_union, times = load_clearest_overpass(
+            adir(s.product.value), aid, days, H, W,
+            water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
+            qc_levels=list(sp.qc_levels) if sp.qc_levels is not None else None,
+            trust_valid=sp.trust_valid)
+        sensors[sp.prefix] = {
+            "spec": sp, "sst": sst, "cloud": cloud, "valid": valid, "hour": hour,
+            "water_union": water_union, "times": times,
+        }
 
     # Met: one snapshot per day at the REFERENCE time of day (default 10:30 local solar,
     # Landsat's overpass) rather than a daily mean, which would smear the diurnal cycle.
@@ -485,12 +489,12 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     airtemp, wind_u, wind_v = met("airtemp"), met("wind_u"), met("wind_v")
     wind_speed, swrad, cloud_cover = met("wind_speed"), met("swrad"), met("cloud_cover")
-    tide, tide_range = load_tide_daily(adir("tide"), aid, days)
+    tide, tide_range = load_tide_daily(adir("tides"), aid, days)
 
     # ...and, per sensor, the forcing at that sensor's own overpass, so a pre-dawn
     # ECOSTRESS scene and a mid-morning Landsat scene on the same day do not share one
     # value. Keyed on the CHOSEN scene's timestamp, not merely its day.
-    sensor_times = {"eco": eco_times, "lst": lst_times, "modis": modis_times}
+    sensor_times = {pre: v["times"] for pre, v in sensors.items()}
     op_met = {}
     for pre, tt in sensor_times.items():
         for var in eff["overpass_met"]:
@@ -501,7 +505,10 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     # to the sensor water union + sea-level bathymetry (no tunable thresholds).
     lc_raw = load_landcover(adir("landcover"), aid, H, W)     # 1=water,0=land,NaN=unknown
     lc_known = np.isfinite(lc_raw)
-    fallback = eco_wu | lst_wu | (np.isfinite(elev) & (elev < 0))
+    water_union = np.zeros((H, W), dtype=bool)
+    for v in sensors.values():
+        water_union |= v["water_union"]          # a sensor with no water layer contributes none
+    fallback = water_union | (np.isfinite(elev) & (elev < 0))
     water = np.where(lc_known, lc_raw > 0.5, fallback)
     landmask = (~water).astype("uint8")                       # 1 = land
     # Raw land-cover water as a loss-filter channel (unknown -> water, a no-op filter).
@@ -564,8 +571,8 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     if ids is not None:
         ref_utc = [met_mod.reference_time_utc(d, lon_c, eff["ref_hours"], eff["ref_basis"])
                    if eff["ref_hours"] is not None else None for d in days]
-        targets = {"insitu": ref_utc, "eco": eco_times, "lst": lst_times,
-                   "modis": modis_times}
+        # The daily reference time, plus one target per sensor at its own chosen overpass.
+        targets = {"insitu": ref_utc, **sensor_times}
         insitu_vars, station_table, station_map = build_insitu(
             ids, g, days, water, targets, eff["insitu_max_dt_min"])
         ids.close()
@@ -582,27 +589,36 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     # all-UNKNOWN when bathymetry or tide is absent.
     wl = {}
     datum_attrs = {}
+    offset = None
     if eff["water_level"]:
-        series = water_level.load_tide_series(adir("tide"), aid)
+        series = water_level.load_tide_series(adir("tides"), aid)
         # The offset follows the DEM that actually ran, so it is resolved against that
         # file's fingerprint (see water_level.resolve_datum_offset / processes.datum).
         offset, datum_attrs = water_level.resolve_datum_offset(
             eff["project"], aid, bathy_attrs=load_bathy_attrs(adir("bathymetry"), aid))
-        for pre, hours in (("eco", eco_hour), ("lst", lst_hour), ("modis", modis_hour)):
-            th = water_level.tide_at_overpass(series, days, hours)
+        for pre, v in sensors.items():
+            th = water_level.tide_at_overpass(series, days, v["hour"])
             elev_rel, cls = water_level.water_level_fields(elev, th, datum_offset_m=offset)
             wl[f"{pre}_tide"] = (("time",), th)
             wl[f"{pre}_water_elev"] = (T, elev_rel)
             wl[f"{pre}_water_class"] = (T, cls)
 
+    # Each sensor's own channels. `<pre>_cloud` only where the sensor actually publishes a
+    # cloud layer: MODIS arrives pre-filtered with none, and an all-zero cloud channel would
+    # read as "this scene was never cloudy" -- a claim its files do not make.
+    sensor_vars: dict = {}
+    for pre, v in sensors.items():
+        sensor_vars[f"{pre}_sst"] = (T, v["sst"])
+        if v["spec"].has_cloud:
+            sensor_vars[f"{pre}_cloud"] = (T, v["cloud"])
+        sensor_vars[f"{pre}_valid"] = (T, v["valid"])
+        sensor_vars[f"{pre}_hour"] = (("time",), v["hour"])
+
     ds = xr.Dataset(
         {
-            **wl, **op_met, **cmems_vars, **insitu_vars, **src_channels,
+            **wl, **op_met, **cmems_vars, **insitu_vars, **src_channels, **sensor_vars,
             "mur_sst": (T, mur_sst), "mur_valid": (T, mur_valid),
             "mur_filled": (T, mur_filled),
-            "eco_sst": (T, eco_sst), "eco_cloud": (T, eco_cloud), "eco_valid": (T, eco_valid),
-            "lst_sst": (T, lst_sst), "lst_cloud": (T, lst_cloud), "lst_valid": (T, lst_valid),
-            "modis_sst": (T, modis_sst), "modis_valid": (T, modis_valid),
             "airtemp": (T, airtemp), "wind_u": (T, wind_u), "wind_v": (T, wind_v),
             "wind_speed": (T, wind_speed), "swrad": (T, swrad), "cloud_cover": (T, cloud_cover),
             "depth": (("y", "x"), depth),
@@ -611,8 +627,6 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
             **({"insitu_station": (("y", "x"), station_map)} if station_map is not None else {}),
             "landcover_water": (("y", "x"), landcover_water),
             "tide": (("time",), tide), "tide_range": (("time",), tide_range),
-            "eco_hour": (("time",), eco_hour), "lst_hour": (("time",), lst_hour),
-            "modis_hour": (("time",), modis_hour),
             "doy_sin": (("time",), doy_sin), "doy_cos": (("time",), doy_cos),
         },
         coords={"time": days, "y": ys, "x": xs},
@@ -692,7 +706,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     # offset could not be resolved is complete and plausible-looking, so the only thing
     # that tells a downstream user it is biased is `datum_status` travelling with it.
     ds.attrs.update({k: v for k, v in datum_attrs.items() if v is not None})
-    for pre in ("eco", "lst", "modis"):
+    for pre in sensors:
         if f"{pre}_water_elev" not in ds:
             continue
         ds[f"{pre}_tide"].attrs.update(
@@ -715,15 +729,16 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 # --------------------------------------------------------------------------- #
 COVERAGE_WARN = 0.95      # below this fraction of days, a daily product is reported thin
 
-# Products that SHOULD have a value every day, and the channel that proves it. Only these
-# can be judged on coverage: ECOSTRESS/Landsat/MODIS are overpass sensors, so a day with no
-# scene is normal and not a defect -- warning on those would train the user to ignore the
-# warning. `cmems` is matched by prefix because its channels are config-dependent.
-DAILY_CHANNELS = {"mur": "mur_sst", "met": "airtemp", "tide": "tide"}
-
-
-# provenance names the tide product in the plural; the cube's channel is singular.
-_COVERAGE_ALIASES = {"tide": "tides"}
+# Products that SHOULD have a value every day, and the channel that proves it. DERIVED from
+# the registry (products.ProductSpec.coverage_channel).
+#
+# Only daily products can be judged this way: ECOSTRESS/Landsat/MODIS are OVERPASS sensors,
+# so a day with no scene is normal and not a defect -- warning on those would train the user
+# to ignore the warning. They declare no coverage_channel, so they are not listed here.
+# `cmems` is matched by prefix below, because its channels are config-dependent and so
+# cannot be named up front.
+DAILY_CHANNELS = {s.product.value: s.coverage_channel
+                  for s in products.REGISTRY if s.coverage_channel}
 
 
 def coverage(ds: xr.Dataset, days, present=None) -> dict:
@@ -744,7 +759,9 @@ def coverage(ds: xr.Dataset, days, present=None) -> dict:
         channels["cmems"] = sorted(cm)[0]
 
     for product, var in channels.items():
-        if present is not None and _COVERAGE_ALIASES.get(product, product) not in present:
+        # `present` is keyed by the product's own name, and so is `channels` -- one registry,
+        # one name. The alias table that used to reconcile `tide` with `tides` is gone.
+        if present is not None and product not in present:
             continue
         if var not in ds:
             continue
@@ -861,13 +878,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     overwrite = eff["overwrite"]
     days = pd.date_range(eff["time"]["start_date"], eff["time"]["end_date"], freq="D")
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("datacube")
 
@@ -923,20 +934,9 @@ def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="coastal_sst_data datacube assembler.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Assemble only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true", help="rebuild existing .zarr cubes")
-    ap.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    assemble(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    # The terminal stage's entry point is `assemble`, not `acquire`, but it takes the same
+    # (project, aois, dry_run, overwrite) arguments -- so it rides the shared parser too.
+    entry.process_main(assemble, "coastal_sst_data datacube assembler.")
 
 
 if __name__ == "__main__":

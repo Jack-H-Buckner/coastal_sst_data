@@ -121,3 +121,27 @@ def landsat_scene(tmp_path, aoi_grid):
     props = {"platform": "landsat-9", "datetime": "2023-08-15T19:02:00Z",
              "eo:cloud_cover": 10.0}
     return FakeStacItem(paths, props, dt)
+
+
+class UniformDs(dict):
+    """A stand-in for `eff["ds"]`, which is keyed by AoI.
+
+    Every product resolves its options PER AoI now (region override -> project default), so
+    `run()` reads `eff["ds"][aoi_name]`. Most tests build an `eff` by hand and don't care
+    about regions at all -- they want one uniform config for whatever AoIs they happen to
+    pass -- so this hands back the same cfg for any key.
+
+    A test that DOES exercise a region override builds a real `{aoi: cfg}` dict, which is
+    the point: the difference between "regions are irrelevant here" and "regions are the
+    thing under test" should be visible in the test's own setup.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self._cfg = cfg
+
+    def __missing__(self, key):
+        return self._cfg
+
+    def values(self):                      # e.g. modis.acquire(full_series=True)
+        return [self._cfg]

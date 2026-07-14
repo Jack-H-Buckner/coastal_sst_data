@@ -72,17 +72,19 @@ def fake_source(days, g, *, temp_at_depth=None, variables=("thetao",)):
 # --------------------------------------------------------------------------- #
 # Config -> acquisition params
 # --------------------------------------------------------------------------- #
+# `eff["ds"]` is keyed by AoI: which CMEMS model covers an AoI is region-dependent, so the
+# chain is resolved per AoI (region override -> project default) rather than once per run.
 def test_default_chain_is_reanalysis_then_forecast(project):
     eff = cmems._build_eff(project)
-    assert eff["ds"]["chain"] == ["my", "anfc"]
+    assert eff["ds"][AOI]["chain"] == ["my", "anfc"]
     assert cmems.DATASET_IDS["my"] == "cmems_mod_glo_phy_my_0.083deg_P1D-m"
-    assert eff["ds"]["depths"] == [0.0, 10.0, 30.0]
-    assert eff["ds"]["variables"] == ["thetao"]
+    assert eff["ds"][AOI]["depths"] == [0.0, 10.0, 30.0]
+    assert eff["ds"][AOI]["variables"] == ["thetao"]
 
 
 def test_fallback_can_be_disabled(tmp_path):
     eff = cmems._build_eff(_project(tmp_path, fallback="none"))
-    assert eff["ds"]["chain"] == ["my"]
+    assert eff["ds"][AOI]["chain"] == ["my"]
 
 
 def test_an_unknown_source_fails_loudly(tmp_path):

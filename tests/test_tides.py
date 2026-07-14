@@ -15,15 +15,27 @@ from coastal_sst_data import grid
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.test.yaml"
 
 
+def _ds(eff):
+    """The tide settings ONE AoI runs with.
+
+    `eff["ds"]` is keyed by AoI: CO-OPS gauges exist only in U.S. waters, so which tide
+    source serves an AoI is region-dependent. The configs below set no region override, so
+    every AoI resolves alike -- take any. (The per-region cases are tested separately.)
+    """
+    return next(iter(eff["ds"].values()))
+
+
+
+
 # --------------------------------------------------------------------------- #
 # _build_eff: config -> acquisition params
 # --------------------------------------------------------------------------- #
 def test_build_eff_maps_example_config():
     """The example config maps to the expected tides acquisition parameters."""
     eff = tides._build_eff(load_config(EXAMPLE))
-    assert eff["ds"]["interval"] == "h"
-    assert eff["ds"]["stations"] == {}                     # no overrides in example
-    assert eff["ds"]["warn_distance_km"] == tides.DEFAULT_WARN_KM
+    assert _ds(eff)["interval"] == "h"
+    assert _ds(eff)["stations"] == {}                     # no overrides in example
+    assert _ds(eff)["warn_distance_km"] == tides.DEFAULT_WARN_KM
     assert eff["fmt"] == "netcdf"
     assert eff["time"] == {"start_date": "2026-06-01", "end_date": "2026-06-30"}
     assert eff["out_dir"] == Path("path/to/data") / "TIDE" / "aligned"
@@ -41,8 +53,8 @@ def test_build_eff_defaults_when_options_omitted(base_project):
     """A bare `tides:` (no options) falls back to product defaults."""
     base_project["products"]["tides"] = None               # bare -> default options
     eff = tides._build_eff(parse_config(base_project))
-    assert eff["ds"]["interval"] == tides.DEFAULT_INTERVAL
-    assert eff["ds"]["stations"] == {}
+    assert _ds(eff)["interval"] == tides.DEFAULT_INTERVAL
+    assert _ds(eff)["stations"] == {}
     assert eff["overwrite"] is False
 
 
@@ -56,9 +68,9 @@ def test_build_eff_reads_station_overrides(base_project):
         "overwrite": True,
     }
     eff = tides._build_eff(parse_config(base_project))
-    assert eff["ds"]["interval"] == "6"
-    assert eff["ds"]["stations"] == {"a1": "9445133"}
-    assert eff["ds"]["warn_distance_km"] == 50.0
+    assert _ds(eff)["interval"] == "6"
+    assert _ds(eff)["stations"] == {"a1": "9445133"}
+    assert _ds(eff)["warn_distance_km"] == 50.0
     # tide is always NetCDF, but the option is still carried through
     assert eff["fmt"] == "geotiff"
     assert eff["overwrite"] is True
@@ -98,18 +110,18 @@ def test_build_eff_source_defaults(base_project):
     """A bare `tides:` gets the coops-primary / eo_tides-backup defaults."""
     base_project["products"]["tides"] = None
     eff = tides._build_eff(parse_config(base_project))
-    assert eff["ds"]["default_source"] == tides.DEFAULT_SOURCE == "coops"
-    assert eff["ds"]["fallback"] == tides.DEFAULT_FALLBACK == "eo_tides"
-    assert eff["ds"]["fallback_distance_km"] == tides.DEFAULT_FALLBACK_KM
-    assert eff["ds"]["model"] == tides.DEFAULT_MODEL == "EOT20"
-    assert eff["ds"]["model_directory"] is None
+    assert _ds(eff)["source"] == tides.DEFAULT_SOURCE == "coops"
+    assert _ds(eff)["fallback"] == tides.DEFAULT_FALLBACK == "eo_tides"
+    assert _ds(eff)["fallback_distance_km"] == tides.DEFAULT_FALLBACK_KM
+    assert _ds(eff)["model"] == tides.DEFAULT_MODEL == "EOT20"
+    assert _ds(eff)["model_directory"] is None
 
 
 def test_build_eff_fallback_none_disables_backup(base_project):
     """`fallback: none` normalizes to a disabled (None) fallback."""
     base_project["products"]["tides"] = {"fallback": "none"}
     eff = tides._build_eff(parse_config(base_project))
-    assert eff["ds"]["fallback"] is None
+    assert _ds(eff)["fallback"] is None
 
 
 def test_build_eff_reads_source_options(base_project):
@@ -120,25 +132,30 @@ def test_build_eff_reads_source_options(base_project):
         "model_directory": "/data/tide_models",
     }
     eff = tides._build_eff(parse_config(base_project))
-    assert eff["ds"]["default_source"] == "eo_tides"
-    assert eff["ds"]["fallback"] == "coops"
-    assert eff["ds"]["fallback_distance_km"] == 200.0
-    assert eff["ds"]["model"] == "FES2022"
-    assert eff["ds"]["model_directory"] == "/data/tide_models"
+    assert _ds(eff)["source"] == "eo_tides"
+    assert _ds(eff)["fallback"] == "coops"
+    assert _ds(eff)["fallback_distance_km"] == 200.0
+    assert _ds(eff)["model"] == "FES2022"
+    assert _ds(eff)["model_directory"] == "/data/tide_models"
 
 
-def test_resolve_source_region_override(base_project):
-    """A region's `sources.tides.source` overrides the project default."""
+def test_source_region_override(base_project):
+    """A region's `sources.tides.source` overrides the project default.
+
+    The two-level lookup lives in config.resolve_opts now and lands in eff["ds"][<aoi>],
+    like every other product's per-AoI settings -- tides no longer carries its own.
+    """
     base_project["products"]["tides"] = None
     base_project["regions"][0]["sources"]["tides"] = {"source": "eo_tides"}
-    proj = parse_config(base_project)
-    assert tides._resolve_source(proj, "a1", "coops") == "eo_tides"
+    eff = tides._build_eff(parse_config(base_project))
+    assert eff["ds"]["a1"]["source"] == "eo_tides"
 
 
-def test_resolve_source_falls_back_to_default(base_project):
+def test_source_falls_back_to_project_default(base_project):
     """With no region override, the project default source is used."""
-    proj = parse_config(base_project)                      # no tides source set
-    assert tides._resolve_source(proj, "a1", "coops") == "coops"
+    base_project["products"]["tides"] = None               # selected, default options
+    eff = tides._build_eff(parse_config(base_project))     # no region tides source set
+    assert eff["ds"]["a1"]["source"] == "coops"
 
 
 def test_acquire_rejects_unknown_source(base_project):

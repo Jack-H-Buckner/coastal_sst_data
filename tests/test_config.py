@@ -549,13 +549,13 @@ def test_bathymetry_source_is_now_a_recognised_option(base_project):
 def test_source_wins_over_default_source(base_project):
     from coastal_sst_data.processes import bathymetry
     p = parse_config(_cfg(base_project, "bathymetry", {"source": "cudem"}))
-    assert bathymetry._build_eff(p)["default_source"] == "cudem"    # the config is OBEYED
+    assert bathymetry._build_eff(p)["ds"]["a1"]["source"] == "cudem"    # the config is OBEYED
 
 
 def test_default_source_still_works(base_project):
     from coastal_sst_data.processes import bathymetry
     p = parse_config(_cfg(base_project, "bathymetry", {"default_source": "cudem"}))
-    assert bathymetry._build_eff(p)["default_source"] == "cudem"
+    assert bathymetry._build_eff(p)["ds"]["a1"]["source"] == "cudem"
 
 
 def test_unknown_region_source_key_is_rejected(base_project):

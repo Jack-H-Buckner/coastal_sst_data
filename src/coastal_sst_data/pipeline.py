@@ -27,68 +27,120 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import logging
 
-from . import auth, report
-from .config import DataProduct, Project, load_config
+from . import auth, products, report
+from .config import (DataProduct, DEFAULT_SOURCE, Project, load_config, opt, resolve_opts)
 from .grid import AoiGrid, compute_aoi_grid
-from .processes import (
-    bathymetry, cmems, datacube, datum, ecostress, insitu_ioos, landcover_esa, landsat_pc,
-    met, modis, mur, tides,
-)
+from .processes import datacube, datum
 
 log = logging.getLogger(__name__)
 
-# product -> acquisition module. Landsat is special (source selector, below).
-PROCESSES = {
-    DataProduct.bathymetry: bathymetry,
-    DataProduct.mur: mur,
-    DataProduct.cmems: cmems,
-    DataProduct.ecostress: ecostress,
-    DataProduct.met: met,
-    DataProduct.modis: modis,
-    DataProduct.tides: tides,
+# --------------------------------------------------------------------------- #
+# Dispatch tables -- DERIVED from the product registry (coastal_sst_data.products)
+#
+# These used to be four hand-maintained dicts plus a hand-ordered list, and every one of
+# them had to be edited to add a product. They are now views of the registry: a product
+# declares its module (or its {source: module} map) once, in its ProductSpec.
+#
+# Modules are named as DOTTED STRINGS and imported LAZILY -- see the import-cycle note in
+# products.py. A value may also be an already-imported module object, which is what lets a
+# test register a stub source without touching the filesystem.
+# --------------------------------------------------------------------------- #
+PROCESS_MODULES: dict[DataProduct, object] = {
+    s.product: s.module for s in products.REGISTRY if s.module
 }
 
-# Landsat source -> module. Only Planetary Computer is implemented so far.
-LANDSAT_SOURCES = {"pc": landsat_pc, "planetary_computer": landsat_pc}
-
-# Landcover source -> module. Only ESA WorldCover (via PC) is implemented so far;
-# the 'gee' source (JRC + NDWI water mask) is a future landcover_gee module.
-LANDCOVER_SOURCES = {"esa": landcover_esa, "worldcover": landcover_esa}
-
-# In-situ network -> module. IOOS (ERDDAP) covers most of North America; other networks
-# register here and honour the same output contract.
-INSITU_SOURCES = {"ioos": insitu_ioos}
-
-# Execution order: statics + backbone first; Landsat BEFORE MODIS (coincidence);
-# not-yet-implemented products last. Every DataProduct appears exactly once.
-PROCESS_ORDER = [
-    DataProduct.bathymetry,
-    DataProduct.mur,
-    DataProduct.cmems,
-    DataProduct.ecostress,
-    DataProduct.landsat,
-    DataProduct.modis,
-    DataProduct.met,
-    DataProduct.tides,
-    DataProduct.landcover,
-    DataProduct.insitu,
-]
+# product -> {source name: module}. A product listed here picks its module from its
+# RESOLVED source, which is per-AoI (see _modules_for). A value of None is a recognised
+# source with no implementation yet (Landsat via aws/gee, landcover via gee).
+SOURCE_MODULES: dict[DataProduct, dict[str, object]] = {
+    s.product: dict(s.sources) for s in products.REGISTRY if s.sources
+}
 
 
-def _module_for(project: Project, product: DataProduct):
-    """The module implementing a product, or None if not implemented yet."""
-    if product == DataProduct.landsat:
-        source = getattr(project.products[product], "source", "pc")
-        return LANDSAT_SOURCES.get(source)
-    if product == DataProduct.landcover:
-        source = getattr(project.products[product], "source", "esa")
-        return LANDCOVER_SOURCES.get(source)
-    if product == DataProduct.insitu:
-        source = getattr(project.products[product], "source", "ioos")
-        return INSITU_SOURCES.get(source)
-    return PROCESSES.get(product)
+def _resolve(target):
+    """A dotted module path -> the imported module. None and module objects pass through."""
+    if target is None:
+        return None
+    if isinstance(target, str):
+        return importlib.import_module(target)
+    return target                       # already a module (or a test double)
+
+
+def process_order() -> list[DataProduct]:
+    """Every product, in an order that honours its declared dependencies.
+
+    This replaces a hand-ordered list whose two real constraints lived only in a comment:
+    Landsat must precede MODIS (MODIS's coincidence filter reads Landsat's aligned files),
+    and the sensors must precede met (met's overpass snapshots are taken at times read from
+    their directories). Both are now `depends_on` edges on the specs, so a new product
+    declares what it needs and is placed correctly -- rather than the author having to
+    reason about a global ordering and get it right by hand.
+
+    A stable topological sort: registry declaration order is preserved wherever the
+    dependencies allow, so the result still reads as "statics and backbone first".
+    """
+    order: list[DataProduct] = []
+    placed: set[DataProduct] = set()
+    remaining = [s.product for s in products.REGISTRY]
+
+    while remaining:
+        ready = [p for p in remaining
+                 if all(d in placed for d in products.spec(p).depends_on)]
+        if not ready:
+            # Only reachable if a spec declares a dependency cycle; products.py cannot catch
+            # that (it validates each spec alone), so say so loudly rather than loop forever.
+            raise RuntimeError(
+                f"product dependency cycle among {[p.value for p in remaining]}")
+        nxt = ready[0]                  # stable: first in declaration order among the ready
+        order.append(nxt)
+        placed.add(nxt)
+        remaining.remove(nxt)
+    return order
+
+
+PROCESS_ORDER = process_order()
+
+
+def _source_for(project: Project, product: DataProduct, aoi: str) -> str:
+    """The `source` ONE AoI runs a source-selectable product with (region -> global)."""
+    return opt(resolve_opts(project, aoi, product), "source",
+               DEFAULT_SOURCE.get(product))
+
+
+def _module_for(project: Project, product: DataProduct, aoi: str | None = None):
+    """The module implementing a product FOR ONE AoI, or None if not implemented yet.
+
+    `aoi=None` answers for the project as a whole (the first AoI's module) -- used by
+    `validate`, which is summarising rather than dispatching.
+    """
+    sources = SOURCE_MODULES.get(product)
+    if sources is None:
+        return _resolve(PROCESS_MODULES.get(product))
+    if aoi is None:
+        aoi = project.all_areas[0].name
+    return _resolve(sources.get(_source_for(project, product, aoi)))
+
+
+def _modules_for(project: Project, product: DataProduct, aoi_names):
+    """Group AoIs by the module that will serve them: [(module|None, [aoi, ...]), ...].
+
+    The source SELECTOR is region-dependent, not project-wide, and this is where that
+    finally bites: a project whose Pacific Northwest region uses the IOOS in-situ network
+    and whose Mediterranean region uses another resolves `insitu` to TWO modules in one
+    run. Dispatch used to read `project.products[product].source` -- one answer for the
+    whole project -- so such a config was simply impossible to express, whatever the region
+    block said.
+
+    A `None` module means "no implementation for that source"; those AoIs are reported and
+    skipped rather than silently dropped.
+    """
+    groups: dict = {}
+    for name in aoi_names:
+        groups.setdefault(_module_for(project, product, name), []).append(name)
+    return list(groups.items())
 
 
 def compute_grids(project: Project) -> dict[str, AoiGrid]:
@@ -159,31 +211,56 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     outcomes: dict[DataProduct, str] = {}
     run_report = report.RunReport()
 
-    for product in ordered:
-        module = _module_for(project, product)
-        if module is None:
-            detail = ""
-            if product == DataProduct.landsat:
-                detail = f" (source={getattr(project.products[product], 'source', 'pc')})"
-            log.warning("=== %s%s: not implemented yet, skipping ===", product.value, detail)
-            outcomes[product] = "skipped (not implemented)"
-            run_report.add(product.value, None, outcome="not implemented")
-            continue
+    # The AoIs this run touches (a valid --aoi subset, or everything with a usable grid).
+    run_aois = [n for n in grids if not aois or n in set(aois)]
 
+    for product in ordered:
         log.info("=== %s ===", product.value)
-        try:
-            rep = module.acquire(project, grids=grids, aois=aois,
-                                 dry_run=dry_run, overwrite=overwrite)
+        merged: report.ProductReport | None = None
+        ran = False                       # a module was dispatched (even if it returned None)
+        unimplemented: list[str] = []
+
+        # One product may resolve to SEVERAL modules across a project, because the source
+        # selector is region-dependent (see _modules_for). Each module gets only the AoIs
+        # that resolved to it; their reports fold into one row for the product.
+        for module, module_aois in _modules_for(project, product, run_aois):
+            if module is None:
+                srcs = sorted({_source_for(project, product, a) or "?" for a in module_aois})
+                unimplemented.append(f"{', '.join(module_aois)} (source={'/'.join(srcs)})")
+                continue
+            try:
+                rep = module.acquire(project, grids=grids, aois=module_aois,
+                                     dry_run=dry_run, overwrite=overwrite)
+                ran = True
+                if rep is not None:
+                    merged = rep if merged is None else merged.merge(rep)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                log.error("=== %s FAILED: %s ===", product.value, exc)
+                outcomes[product] = f"failed: {exc}"
+                run_report.add(product.value, None, outcome=f"stage raised: {exc}")
+                break
+        else:
+            if unimplemented:
+                # Not silently dropped: an AoI whose source has no module produces NOTHING,
+                # and a cube with a missing product looks exactly like one whose product
+                # found no data.
+                log.warning("=== %s: no implementation for %s; those AoI(s) are SKIPPED ===",
+                            product.value, "; ".join(unimplemented))
+            if not ran:
+                outcomes[product] = "skipped (not implemented)"
+                run_report.add(product.value, None,
+                               outcome=f"not implemented: {'; '.join(unimplemented)}")
+                continue
             # `ok` ONLY when nothing was lost. A stage that dropped 40 of 100 days used to
             # report `ok` here, which is the whole reason a lossy run was invisible.
-            outcomes[product] = rep.outcome if rep is not None else "ok"
-            run_report.add(product.value, rep)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            log.error("=== %s FAILED: %s ===", product.value, exc)
-            outcomes[product] = f"failed: {exc}"
-            run_report.add(product.value, None, outcome=f"stage raised: {exc}")
+            outcomes[product] = merged.outcome if merged is not None else "ok"
+            if unimplemented and merged is not None:
+                merged.note = "; ".join(
+                    n for n in (merged.note, f"no implementation for {'; '.join(unimplemented)}")
+                    if n)
+            run_report.add(product.value, merged)
 
     # Derived stage: resolve each AoI's DEM->MSL datum offset from the bathymetry file
     # that was just written (which DEM won is only known now -- bathymetry falls back

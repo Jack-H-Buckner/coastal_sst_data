@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from enum import Enum
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, Literal
@@ -131,22 +130,18 @@ class AreaOfInterest(BaseModel):
 # ---------------------------------------------------------------------------
 # Data products and their per-process options
 # ---------------------------------------------------------------------------
-class DataProduct(str, Enum):
-    """A data stream the pipeline can acquire and organize onto the AoI grids.
-
-    Values must match the acquisition process names. Unknown names in the config
-    fail validation (a typo like `ecostres` is rejected, not silently skipped).
-    """
-    bathymetry = "bathymetry"
-    ecostress = "ecostress"
-    mur = "mur"
-    cmems = "cmems"
-    landsat = "landsat"
-    modis = "modis"
-    met = "met"
-    tides = "tides"
-    landcover = "landcover"
-    insitu = "insitu"
+# DataProduct and the product REGISTRY live in coastal_sst_data.products, which imports
+# nothing from the package -- see that module's docstring for why (config needs the
+# options/auth tables at validation time, and every process module imports config, so a
+# spec declared inside a process module would close an import cycle).
+#
+# These are re-exported DELIBERATELY: `from ..config import DataProduct` is how every module
+# already reaches them, and a caller should not have to know which of the two files a name
+# lives in. A product's config surface is still config's business to DESCRIBE -- it is just
+# no longer config's business to REMEMBER.
+from .products import (                                         # noqa: E402,F401
+    BY_PRODUCT, DataProduct, ProductSpec, REGISTRY, spec,
+)
 
 
 class ProductOptions(BaseModel):
@@ -159,6 +154,19 @@ class ProductOptions(BaseModel):
     model_config = {"extra": "allow"}
 
 
+def opt(opts, name: str, default=None):
+    """Read an optional override off a product-options bag (extra='allow').
+
+    The bags are open at the pydantic level, so a key that was never set is simply absent
+    and `getattr` needs a default. `opts` itself is None when the product is unselected.
+
+    Every process module used to carry a private copy of this three-line function -- ten
+    byte-identical definitions. It lives here, next to the ProductOptions/SourceOptions it
+    reads, because it is part of how those bags are consumed.
+    """
+    return getattr(opts, name, default) if opts is not None else default
+
+
 class SourceOptions(BaseModel):
     """REGION-DEPENDENT options for one data product's source.
 
@@ -169,51 +177,68 @@ class SourceOptions(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Which options each product actually READS
+# Which options each product READS, and which a REGION may override
 # --------------------------------------------------------------------------- #
-# A key that is not in this registry does NOTHING. It used to be accepted in silence, which
-# is the worst of both worlds: the config says one thing, the run does another, and the
-# provenance faithfully records the run -- so the lie lives in the config file, where nobody
-# looks. `bathymetry.source` was exactly this: documented, set, and never read (the module
-# reads `default_source`), so a config asking for 3 m CUDEM would quietly get ~100 m GMRT.
+# DERIVED from the product registry -- these used to be hand-maintained lists that had to be
+# kept in step with the `_opt(opts, "<key>", ...)` calls in each module, and with each other.
 #
-# Keep these in step with the `_opt(opts, "<key>", ...)` calls in each process module.
-_COMMON = {"output_format", "overwrite"}
-
+# The rules they enforce are unchanged, and both are about the config not LYING:
+#
+#   * An option no module reads does NOTHING. Accepting it in silence is the worst of both
+#     worlds -- the config says one thing, the run does another, and the provenance
+#     faithfully records the run, so the lie lives in the config file where nobody looks.
+#     `bathymetry.source` was exactly this: documented, settable, and silently discarded
+#     (the module read `default_source`), so a config asking for 3 m CUDEM quietly got
+#     ~100 m GMRT.
+#
+#   * A REGION may override only what genuinely varies geographically:
+#         "WHICH SOURCE HAS COVERAGE HERE"  -> yes
+#         "WHAT THE CUBE MEANS"             -> no
+#     The first is a fact about the world and it changes as the project expands (HRRR is
+#     North America only, CO-OPS is U.S. only, CUDEM is CONUS only, IOOS is North America,
+#     CMEMS publishes regional models). The second must stay uniform: `variables`, `depths`,
+#     `qc_flags`, `reference_time` decide the cube's CHANNEL SET, and letting a region
+#     change those makes two AoIs' cubes silently non-comparable. For met it is worse than
+#     non-comparable -- the assembler names airtemp/wind_*/swrad/cloud_cover explicitly, so
+#     a region that dropped one would ship an all-NaN channel indistinguishable from a
+#     forcing that was fetched and came back empty.
+#
+# products.py enforces the second rule at the registry level (a region_option must be an
+# option the module actually reads); this file enforces it against the user's config.
 PRODUCT_OPTIONS: dict[DataProduct, set[str]] = {
-    DataProduct.bathymetry: _COMMON | {
-        "source", "default_source", "fallback", "pad_deg", "layer", "resolution",
-        "stats_subgrid_m", "min_cudem_cover", "cudem_urllist", "cudem_index_cache"},
-    DataProduct.mur: _COMMON | {"short_name", "variable", "pad_deg"},
-    DataProduct.modis: _COMMON | {
-        "short_name", "variable", "quality_min", "regrid_radius_m", "access",
-        "match_landsat", "max_time_diff_minutes", "daytime_only", "footprint_id"},
-    DataProduct.ecostress: _COMMON | {"short_name", "version", "layers", "categorical"},
-    DataProduct.landsat: _COMMON | {
-        "source", "collection", "stac_url", "platforms", "cloud_cover_max", "masking"},
-    DataProduct.cmems: _COMMON | {
-        "source", "fallback", "dataset_id", "variables", "depths", "pad_deg"},
-    DataProduct.met: _COMMON | {
-        "source", "fallback", "variables", "model", "product", "fxx", "era5_zarr",
-        "regrid_radius_m", "pad_deg", "reference_time", "reference_basis",
-        "daily_mean_hours", "overpass_from"},
-    DataProduct.tides: _COMMON | {
-        "source", "default_source", "fallback", "model", "model_directory", "interval",
-        "stations", "warn_distance_km", "fallback_distance_km"},
-    DataProduct.landcover: _COMMON | {
-        "source", "collection", "stac_url", "year", "water_classes"},
-    DataProduct.insitu: _COMMON | {
-        "source", "variables", "stations", "exclude_stations", "qc_flags", "pad_deg",
-        "max_sensor_depth_m"},
+    s.product: set(s.options) for s in REGISTRY
 }
 
-# Region-level overrides, for what genuinely varies geographically. Deliberately narrow: a
-# region-level key nothing reads is a silent no-op, and a datum offset that never reaches
-# the datum stage is exactly the kind of thing that biases a cube by a metre in silence.
 REGION_OPTIONS: dict[DataProduct, set[str]] = {
-    DataProduct.bathymetry: {"dem_source", "datum_offset_m"},
-    DataProduct.tides: {"source", "model", "model_directory", "stations"},
+    s.product: set(s.region_options) for s in REGISTRY if s.region_options
 }
+
+REGION_ONLY_OPTIONS: dict[DataProduct, set[str]] = {
+    s.product: set(s.region_only_options) for s in REGISTRY if s.region_only_options
+}
+
+
+def resolve_opts(project: "Project", aoi_name: str, product: DataProduct):
+    """The options ONE AoI runs `product` with: its region's overrides, over the global bag.
+
+    This is the single two-level lookup every product resolves its options through. It used
+    to exist only inside bathymetry and tides (as their private `_resolve_source`), which is
+    why they were the only two products whose source could vary by region -- every other
+    module read `project.products[...]` directly and was therefore locked to one source for
+    the entire project. A project with a Pacific Northwest region and a Mediterranean one
+    simply could not use different in-situ networks, whatever the config said.
+
+    Returns a merged ProductOptions bag (or None if the product is not selected), so callers
+    read it exactly as they read the global one -- with `config.opt`.
+    """
+    global_opts = project.products.get(product)
+    if global_opts is None:
+        return None
+    merged = dict(global_opts.model_extra or {})
+    region_opts = project.region_of(aoi_name).sources.get(product)
+    if region_opts is not None:
+        merged.update(region_opts.model_extra or {})
+    return ProductOptions(**merged)
 
 
 def _options_by_product(value: Any) -> Any:
@@ -397,38 +422,23 @@ class AuthConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Auth requirements: the SINGLE source of truth for which backend each product
-# needs. One table + one resolver replace the old per-product special-casing.
+# Auth requirements: which backend each product needs. DERIVED from the registry.
 #
 # A value is either:
 #   * a backend name (str)         -- always requires that backend
 #   * None / absent                -- public, needs no auth
 #   * {source: backend | None}     -- source-selectable; backend depends on
 #                                     products.<product>.source
-# Adding a product (or a new source) is a one-line edit here; the validator and
-# the runtime auth layer (coastal_sst_data.auth) both read this table, so nothing
-# else needs to change.
+# The validator here and the runtime auth layer (coastal_sst_data.auth) both read this, so
+# a new product (or a new source for one) declares its auth ONCE, in its ProductSpec.
 # ---------------------------------------------------------------------------
 AUTH_REQUIREMENTS: dict[DataProduct, "str | None | dict[str, str | None]"] = {
-    DataProduct.ecostress: "earthdata",
-    DataProduct.mur: "earthdata",
-    DataProduct.modis: "earthdata",
-    DataProduct.cmems: "copernicus",
-    # Source-selectable: PC/ESA (anonymous) and AWS (env creds) need no config
-    # auth; only the GEE source needs auth.gee.
-    DataProduct.landsat: {"pc": None, "planetary_computer": None, "aws": None, "gee": "gee"},
-    DataProduct.landcover: {"esa": None, "worldcover": None, "gee": "gee"},
-    # In-situ networks are public (IOOS ERDDAP needs no key); a future network that
-    # does need one adds it here as {source: backend}.
-    DataProduct.insitu: {"ioos": None},
-    # bathymetry, met, tides: absent -> public, no auth.
+    s.product: s.auth for s in REGISTRY if s.auth is not None
 }
 
 # Default `source` for source-selectable products (when the config omits it).
 DEFAULT_SOURCE: dict[DataProduct, str] = {
-    DataProduct.landsat: "pc",
-    DataProduct.landcover: "esa",
-    DataProduct.insitu: "ioos",
+    s.product: s.default_source for s in REGISTRY if s.default_source
 }
 
 

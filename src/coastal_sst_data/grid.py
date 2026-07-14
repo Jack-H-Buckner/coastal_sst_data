@@ -151,3 +151,60 @@ def compute_aoi_grid(area: AreaOfInterest, grid: GridSpec) -> AoiGrid:
 def project_grids(project: Project) -> dict[str, AoiGrid]:
     """Compute the shared grid for every AoI in the project, keyed by AoI name."""
     return {a.name: compute_aoi_grid(a, project.grid) for a in project.all_areas}
+
+
+def select_aois(grids: dict[str, AoiGrid], only_aoi=None) -> list[str]:
+    """The AoI names a run should process, in grid order. Fails loudly on an unknown name.
+
+    A typo'd `--aoi` must not quietly process nothing: that looks exactly like a successful
+    run over an AoI with no data. Every process module carried its own copy of this check;
+    they are all this.
+    """
+    names = list(grids)
+    if not only_aoi:
+        return names
+    missing = set(only_aoi) - set(names)
+    if missing:
+        raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
+    want = set(only_aoi)
+    return [n for n in names if n in want]
+
+
+def read_cog_window(src, g: AoiGrid, *, resampling, masked: bool = True,
+                    pad_m: float = 300.0, nodata=None):
+    """Open a remote COG, read ONLY the AoI window, reproject onto the shared grid.
+
+    `src` is anything rioxarray opens: an href (`/vsicurl/...`, an https URL, a signed STAC
+    asset) or an fsspec file object from `earthaccess.open`. The AoI polygon is expressed
+    in the COG's own CRS and used as a clip box, so GDAL issues HTTP range reads for just
+    the windowed blocks -- a 185 km Landsat scene or a 110 km ECOSTRESS tile is never
+    downloaded whole.
+
+    `pad_m` is slack around the window, in the COG's units (metres), so the reprojection
+    has neighbouring pixels to interpolate from at the edges rather than fabricating an
+    edge effect. `masked=False` keeps raw integer values, which is what bit-packed QA
+    layers need -- and there NaN is not representable, so nodata defaults to 0 rather than
+    NaN.
+
+    Callers must have run `net.setup_gdal_env()` first, or these reads have no deadline.
+    Four modules (ecostress, landsat_pc, landcover_esa, bathymetry) each had their own copy
+    of this, differing only in the pad and the nodata.
+    """
+    import rioxarray  # noqa: F401  (registers the .rio accessor)
+    from pyproj import Transformer as _Transformer
+    from shapely.ops import transform as _shp_transform
+
+    da = rioxarray.open_rasterio(src, masked=masked)
+    if "band" in da.dims:
+        da = da.squeeze("band", drop=True)
+
+    cog_crs = da.rio.crs
+    to_cog = _Transformer.from_crs(g.target_crs, cog_crs, always_xy=True).transform
+    minx, miny, maxx, maxy = _shp_transform(to_cog, g.geom_proj).bounds
+    da = da.rio.clip_box(minx - pad_m, miny - pad_m, maxx + pad_m, maxy + pad_m,
+                         crs=cog_crs)
+
+    if nodata is None:
+        nodata = np.nan if masked else 0
+    return da.rio.reproject(dst_crs=g.target_crs, shape=(g.height, g.width),
+                            transform=g.transform, resampling=resampling, nodata=nodata)

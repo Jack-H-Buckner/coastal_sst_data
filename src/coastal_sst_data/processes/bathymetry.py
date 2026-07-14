@@ -25,7 +25,6 @@ Usage (from the project root):
 
 from __future__ import annotations
 
-import argparse
 import logging
 import math
 import re
@@ -41,9 +40,9 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 from rasterio.transform import from_origin
 
-from ..config import Project, DataProduct, load_config
-from ..grid import AoiGrid, project_grids
-from .. import net, provenance, report, store
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
+from ..grid import AoiGrid, project_grids, select_aois
+from .. import entry, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 SOURCE = "bathymetry"
@@ -266,20 +265,6 @@ def from_gmrt(bbox_ll, pad, layer, resolution, target_crs, transform, W, H, geom
 
 
 # --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-def write_output(ds, out_dir, aoi_id, fmt) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if fmt == "netcdf":
-        return store.write_netcdf(ds, out_dir / f"{aoi_id}.nc")
-    if fmt == "geotiff":
-        return store.write_rasters(ds, out_dir / aoi_id,
-                                   [(v, ds[v]) for v in ds.data_vars])
-    raise ValueError(f"Unknown output format: {fmt}")
-    return path
-
-
-# --------------------------------------------------------------------------- #
 # Source registry. Each fetcher: (g: AoiGrid, params) -> (elev, depth, p25, p75,
 # used) on the shared grid, or None to signal "insufficient coverage" (-> the
 # configured fallback source is tried). Extensible: gebco, copernicus_glo30, ...
@@ -342,28 +327,33 @@ def _fetch_with_fallback(source, g: AoiGrid, params, fallback):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _opt(opts, name, default):
-    """Read an optional override off a product-options bag (extra='allow')."""
-    return getattr(opts, name, default) if opts is not None else default
+def _ds_cfg(opts) -> dict:
+    """One AoI's bathymetry settings, from its region-resolved options bag.
 
+    The DEM `source` and its `fallback` are region-overridable -- CUDEM is CONUS-only, so an
+    AoI outside it must name its own DEM. Three spellings resolve to the same thing, in
+    precedence order:
 
-def _resolve_source(project: Project, aoi_name: str, default: str) -> str:
-    """The DEM source for one AoI: its region's `dem_source`, else the default.
+        dem_source     region-only, and the name the region block has always used
+        source         what the docs (and every user) call it
+        default_source what the code originally read
 
-    This is the two-level lookup -- region-level override (region.sources.
-    bathymetry.dem_source) on top of a project-level default_source.
+    They diverged silently for a long time: a config that said `source: cudem` got the
+    `default_source` DEFAULT -- gmrt -- so a project asking for 3 m topobathy quietly got
+    ~100 m GMRT. All three are honoured now, most-specific first.
+
+    The tuning knobs (pad, subgrid, cover threshold, the CUDEM index) are project-global:
+    they decide how a DEM is AGGREGATED, not which DEM has coverage.
     """
-    opts = project.region_of(aoi_name).sources.get(DataProduct.bathymetry)
-    src = getattr(opts, "dem_source", None) if opts is not None else None
-    return src or default
+    return {
+        "source": (_opt(opts, "dem_source", None) or _opt(opts, "source", None)
+                   or _opt(opts, "default_source", "gmrt")),
+        "fallback": _opt(opts, "fallback", "gmrt"),
+    }
 
 
 def _build_eff(project: Project) -> dict:
-    """Map a validated Project into the flat `eff` dict `run()` consumes.
-
-    Only the source-agnostic global params live here; the per-AoI source is
-    resolved separately (see acquire / _resolve_source).
-    """
+    """Map a validated Project into the flat `eff` dict `run()` consumes."""
     opts = project.products.get(DataProduct.bathymetry)
     if opts is None:
         raise ValueError("bathymetry is not a selected product in this config")
@@ -383,36 +373,32 @@ def _build_eff(project: Project) -> dict:
     return {
         "config_sha256": project.config_sha256,
         "params": params,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.bathymetry))
+               for a in project.all_areas},
         "out_dir": out_root,
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
-        # `source` is what the docs (and every user) call it; `default_source` is what the
-        # code originally read. Both work, `source` wins. They diverged silently for a long
-        # time: a config that said `source: cudem` got the `default_source` DEFAULT -- gmrt.
-        "default_source": _opt(opts, "source", None) or _opt(opts, "default_source", "gmrt"),
-        "fallback": _opt(opts, "fallback", "gmrt"),
     }
 
 
-def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, dry_run):
-    """Build one static bathymetry NetCDF per AoI, each from its resolved source."""
+def run(eff, grids: dict[str, AoiGrid], only_aoi, dry_run):
+    """Build one static bathymetry NetCDF per AoI, each from its resolved source.
+
+    The extra `aoi_sources` argument this used to take is gone: the per-AoI source now
+    arrives in `eff["ds"][name]` like every other product's per-AoI settings, so bathymetry
+    honours exactly the same run() contract as the rest.
+    """
     params = eff["params"]
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
-    fallback = eff["fallback"]
 
-    names = list(grids)
-    if only_aoi:
-        req = set(only_aoi)
-        missing = req - set(names)
-        if missing:
-            raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
-        names = [n for n in names if n in req]
+    names = select_aois(grids, only_aoi)
 
     rep = report.ProductReport("bathymetry")
 
     for name in names:
         g = grids[name]
-        source = aoi_sources[name]
+        ds_cfg = eff["ds"][name]
+        source, fallback = ds_cfg["source"], ds_cfg["fallback"]
         log.info("=== AOI: %s | grid=%dx%d @ %.0fm | source=%s ===",
                  name, g.width, g.height, g.resolution_m, source)
 
@@ -444,7 +430,9 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
         ds.attrs.update(aoi_id=name, source=used,
                         processing="aggregated to AOI grid (mean, p25, p75 depth per cell)",
                         **provenance.stamp(eff))
-        log.info("  wrote %s  [%s]", write_output(ds, out_root / name, name, fmt), used)
+        # Static layer: the stem is the bare AoI name -- no time stamp to encode.
+        log.info("  wrote %s  [%s]",
+                 store.write_output(ds, out_root / name, name, fmt), used)
         # `used` is the DEM that actually won -- this is what stops "bathymetry ok" from
         # hiding a silent 3 m CUDEM -> ~100 m GMRT downgrade.
         rep.wrote(source=used)
@@ -456,8 +444,9 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
             overwrite=False) -> None:
     """Acquire bathymetry for a validated Project. Entry point for pipeline.py.
 
-    The DEM source is resolved PER AoI (region override -> project default), then
-    validated against the SOURCES registry, so a typo'd source fails loudly.
+    The DEM source is resolved PER AoI (region override -> project default) by
+    `config.resolve_opts`, then validated against the SOURCES registry, so a typo'd source
+    fails loudly -- before a single tile is fetched.
     """
     eff = _build_eff(project)
     if overwrite:
@@ -465,34 +454,18 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if grids is None:
         grids = project_grids(project)
 
-    aoi_sources = {name: _resolve_source(project, name, eff["default_source"])
-                   for name in grids}
-    unknown = sorted((n, s) for n, s in aoi_sources.items() if s not in SOURCES)
-    if unknown:
-        bad = ", ".join(f"{n}:{s}" for n, s in unknown)
-        raise ValueError(f"bathymetry dem_source not recognized ({bad}); "
+    bad = sorted(f"{n}:{c[k]}" for n, c in eff["ds"].items() for k in ("source", "fallback")
+                 if c[k] and c[k] not in SOURCES)
+    if bad:
+        raise ValueError(f"bathymetry source not recognized ({', '.join(bad)}); "
                          f"choose from {sorted(SOURCES)}.")
     net.setup_gdal_env()      # /vsicurl CUDEM tile reads: deadline + retries
-    return run(eff, grids, aoi_sources, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="coastal_sst_data bathymetry (per-region CUDEM/GMRT) acquisition.")
-    ap.add_argument("--config", required=True, help="Path to a project config YAML.")
-    ap.add_argument("--aoi", nargs="+", help="Process only these AoI name(s).")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="rebuild even if the static file exists")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-
-    project = load_config(args.config)
-    acquire(project, aois=args.aoi, dry_run=args.dry_run, overwrite=args.overwrite)
+    entry.process_main(
+        acquire, "coastal_sst_data bathymetry (per-region CUDEM/GMRT) acquisition.")
 
 
 if __name__ == "__main__":
