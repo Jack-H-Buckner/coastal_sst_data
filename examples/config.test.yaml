@@ -25,7 +25,7 @@ grid:
 
 # Data products to acquire, with GLOBAL (project-wide) options per product.
 products:
-  bathymetry:
+  bathymetry:              # a bare product -> default options
   ecostress:
     version: "002"
   mur:
@@ -47,12 +47,23 @@ products:
     year: 2021                # WorldCover v200 (2021); 2020 -> v100
     water_classes: [80]       # WorldCover: 80 = permanent water bodies
 
+# How the aligned per-product files are knitted into one Zarr cube per AOI.
+# Every field has a default, so the whole block is optional.
+datacube:
+  chunks: {time: 64, y: 128, x: 128}
+  fill_mur_water: true       # NN-fill the MUR backbone over land-cover water
+  water_level: true          # emit the per-sensor water level (needs bathymetry + tides)
+
 regions:
   - name: pnw_estuaries
     # Region-DEPENDENT source options (which source has coverage here, etc.).
     sources:
       bathymetry:
         dem_source: cudem
+        # The DEM->MSL datum offset is resolved automatically (NOAA VDatum, cross-checked
+        # against the nearest CO-OPS gauge) -- it follows the DEM that actually ran, so it
+        # is NOT set per project. Uncomment only to assert a value you trust more:
+        # datum_offset_m: 1.31   # elevation of MSL in the DEM's datum (m)
     # list aois in the region.
     areas:
       - name: tillamook_bay
