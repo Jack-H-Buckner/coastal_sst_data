@@ -39,10 +39,15 @@ def _boom(g, params):
 def test_build_eff_maps_example_config():
     eff = B._build_eff(load_config(EXAMPLE))
     assert eff["out_dir"] == Path("path/to/data") / "BATHYMETRY" / "aligned"
-    assert eff["default_source"] == "gmrt"          # default
-    assert eff["fallback"] == "gmrt"
     assert eff["params"]["stats_subgrid_m"] == 10.0
     assert eff["params"]["min_cudem_cover"] == 0.5
+
+    # `ds` is keyed by AoI, and the example config already exercises the split: the
+    # pnw_estuaries region names `dem_source: cudem`, puget_sound names nothing and takes
+    # the project default. Two AoIs, two DEMs, one config -- which is the entire point.
+    assert eff["ds"]["tillamook_bay"]["source"] == "cudem"   # region override
+    assert eff["ds"]["padilla_bay"]["source"] == "gmrt"      # project default
+    assert eff["ds"]["tillamook_bay"]["fallback"] == "gmrt"
 
 
 def test_build_eff_requires_bathymetry_selected(base_project):
@@ -58,30 +63,31 @@ def test_build_eff_applies_option_overrides(base_project):
         "min_cudem_cover": 0.8, "output_format": "geotiff",
     }
     eff = B._build_eff(parse_config(base_project))
-    assert eff["default_source"] == "cudem"
-    assert eff["fallback"] is None
+    assert eff["ds"]["a1"]["source"] == "cudem"
+    assert eff["ds"]["a1"]["fallback"] is None
     assert eff["params"]["stats_subgrid_m"] == 5.0
     assert eff["fmt"] == "geotiff"
 
 
 # ---------------------------------------------------------------------------
-# _resolve_source: the two-level lookup (region override -> project default).
+# The two-level lookup (region override -> project default), which now lives in
+# config.resolve_opts and lands in eff["ds"][<aoi>] like every other product's settings.
 # ---------------------------------------------------------------------------
-def test_resolve_source_region_override(base_project):
+def test_source_region_override(base_project):
     base_project["products"] = {"bathymetry": None}
     base_project["regions"][0]["sources"] = {"bathymetry": {"dem_source": "cudem"}}
-    proj = parse_config(base_project)
-    assert B._resolve_source(proj, "a1", "gmrt") == "cudem"
+    eff = B._build_eff(parse_config(base_project))
+    assert eff["ds"]["a1"]["source"] == "cudem"
 
 
-def test_resolve_source_falls_back_to_default(base_project):
+def test_source_falls_back_to_project_default(base_project):
     base_project["products"] = {"bathymetry": None}
     base_project["regions"][0]["sources"] = {}      # region names no source
-    proj = parse_config(base_project)
-    assert B._resolve_source(proj, "a1", "gmrt") == "gmrt"
+    eff = B._build_eff(parse_config(base_project))
+    assert eff["ds"]["a1"]["source"] == "gmrt"      # the module default
 
 
-def test_resolve_source_differs_per_region(base_project):
+def test_source_differs_per_region(base_project):
     """The whole point: two regions, two different DEM sources."""
     base_project["products"] = {"bathymetry": None}
     base_project["regions"] = [
@@ -93,9 +99,18 @@ def test_resolve_source_differs_per_region(base_project):
          "areas": [{"name": "a2", "center_lat": 58.0, "center_lon": -135.0,
                     "buffer_ns_km": 10, "buffer_ew_km": 10}]},
     ]
-    proj = parse_config(base_project)
-    assert B._resolve_source(proj, "a1", "gmrt") == "cudem"
-    assert B._resolve_source(proj, "a2", "gmrt") == "gmrt"
+    eff = B._build_eff(parse_config(base_project))
+    assert eff["ds"]["a1"]["source"] == "cudem"
+    assert eff["ds"]["a2"]["source"] == "gmrt"
+
+
+def test_region_source_spelling_also_accepts_plain_source(base_project):
+    """`dem_source` is the historical region spelling; `source` is what the docs call it.
+    Both reach the module, so a region that writes the obvious thing is not silently ignored."""
+    base_project["products"] = {"bathymetry": None}
+    base_project["regions"][0]["sources"] = {"bathymetry": {"source": "cudem"}}
+    eff = B._build_eff(parse_config(base_project))
+    assert eff["ds"]["a1"]["source"] == "cudem"
 
 
 # ---------------------------------------------------------------------------

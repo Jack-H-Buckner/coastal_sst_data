@@ -59,7 +59,7 @@ import xarray as xr
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 
-from ..config import DataProduct, Project, opt as _opt
+from ..config import DataProduct, Project, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, naming, net, provenance, report, store
 
@@ -222,11 +222,9 @@ def day_dataset(src_ds: xr.Dataset, day, g: AoiGrid, variables, level_of, grid_c
 # Main loop
 # --------------------------------------------------------------------------- #
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    ds_cfg, grid_cfg = eff["ds"], eff["grid"]
+    grid_cfg = eff["grid"]
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
     to_celsius = grid_cfg.get("to_celsius", False)
-    chain, variables, depths = ds_cfg["chain"], ds_cfg["variables"], ds_cfg["depths"]
-    pad = float(ds_cfg["pad_deg"])
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
     days = pd.date_range(start, end, freq="D")
 
@@ -236,6 +234,12 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
     for name in names:
         g = grids[name]
+        # Resolved PER AoI: which CMEMS model covers this AoI is a fact about where it is
+        # (the global product, or one of the regional ones), so the chain comes from the
+        # AoI's region where it overrides the project default.
+        ds_cfg = eff["ds"][name]
+        chain, variables, depths = ds_cfg["chain"], ds_cfg["variables"], ds_cfg["depths"]
+        pad = float(ds_cfg["pad_deg"])
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s | vars=%s depths=%s ===",
                  name, g.target_crs, g.width, g.height, "->".join(chain),
                  variables, depths)
@@ -303,6 +307,29 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
+def _ds_cfg(opts) -> dict:
+    """One AoI's CMEMS settings, from its region-resolved options bag.
+
+    `source`/`fallback`/`dataset_id` are region-overridable (which model covers this AoI);
+    `variables`/`depths` are not, so every AoI's cube carries the same CMEMS channels.
+    """
+    chain = _resolve_chain(_opt(opts, "source", DEFAULT_SOURCE),
+                           _opt(opts, "fallback", DEFAULT_FALLBACK))
+    # An explicit dataset_id overrides the chain entirely (an escape hatch for any of
+    # the other CMEMS physics products, and how a region names its regional model).
+    dataset_id = _opt(opts, "dataset_id", None)
+    if dataset_id:
+        DATASET_IDS.setdefault(dataset_id, dataset_id)
+        chain = [dataset_id]
+
+    return {
+        "chain": chain,
+        "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
+        "depths": [float(d) for d in _opt(opts, "depths", DEFAULT_DEPTHS)],
+        "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
+    }
+
+
 def _build_eff(project: Project) -> dict:
     opts = project.products.get(DataProduct.cmems)
     if opts is None:
@@ -310,21 +337,6 @@ def _build_eff(project: Project) -> dict:
     if project.auth.copernicus is None:              # guaranteed by config validation
         raise ValueError("cmems requires an auth.copernicus block")
 
-    chain = _resolve_chain(_opt(opts, "source", DEFAULT_SOURCE),
-                           _opt(opts, "fallback", DEFAULT_FALLBACK))
-    # An explicit dataset_id overrides the chain entirely (an escape hatch for any of
-    # the other CMEMS physics products).
-    dataset_id = _opt(opts, "dataset_id", None)
-    if dataset_id:
-        DATASET_IDS.setdefault(dataset_id, dataset_id)
-        chain = [dataset_id]
-
-    ds_cfg = {
-        "chain": chain,
-        "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
-        "depths": [float(d) for d in _opt(opts, "depths", DEFAULT_DEPTHS)],
-        "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
-    }
     grid_cfg = project.grid.model_dump()
     grid_cfg.setdefault("to_celsius", False)
 
@@ -333,7 +345,8 @@ def _build_eff(project: Project) -> dict:
 
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.cmems))
+               for a in project.all_areas},
         "grid": grid_cfg,
         "creds": creds,
         "out_dir": Path(project.output_dir) / "CMEMS" / "aligned",

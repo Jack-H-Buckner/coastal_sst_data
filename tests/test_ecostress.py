@@ -19,8 +19,18 @@ from coastal_sst_data.config import (
 )
 from coastal_sst_data import grid
 from coastal_sst_data.processes import ecostress
+from .conftest import UniformDs
 
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.test.yaml"
+
+
+def _ds(eff):
+    """The settings ONE AoI runs with. `eff["ds"]` is keyed by AoI, because every product
+    resolves its options per AoI (region override -> project default). ECOSTRESS is a
+    global product with no region-varying options, so every AoI resolves alike -- take any."""
+    return next(iter(eff["ds"].values()))
+
+
 
 # A realistic ECOSTRESS granule id (without the trailing _<LAYER>.tif).
 GRANULE_STEM = "ECOv002_L2T_LSTE_25520_009_10UEU_20230105T123623_0710_01"
@@ -46,10 +56,10 @@ def test_build_eff_maps_example_config():
     eff = ecostress._build_eff(load_config(EXAMPLE))
 
     # product constants (module defaults) + config overrides
-    assert eff["ds"]["short_name"] == "ECO_L2T_LSTE"
-    assert eff["ds"]["version"] == "002"              # from ecostress options
-    assert eff["ds"]["layers"] == ecostress.LAYERS
-    assert eff["ds"]["categorical"] == ecostress.CATEGORICAL
+    assert _ds(eff)["short_name"] == "ECO_L2T_LSTE"
+    assert _ds(eff)["version"] == "002"              # from ecostress options
+    assert _ds(eff)["layers"] == ecostress.LAYERS
+    assert _ds(eff)["categorical"] == ecostress.CATEGORICAL
 
     # shared project settings flow through
     assert eff["earthdata"]["auth_strategy"] == "netrc"
@@ -198,7 +208,7 @@ def test_process_granule(tmp_path, aoi_grid, base_project):
     cfg["products"]["ecostress"] = {"version": "002"}
     eff = ecostress._build_eff(parse_config(cfg))
     role_to_file = make_granule_cogs(tmp_path, aoi_grid)
-    out = ecostress.process_granule(role_to_file, eff["ds"], eff["grid"], aoi_grid,
+    out = ecostress.process_granule(role_to_file, _ds(eff), eff["grid"], aoi_grid,
                                     "test-aoi", "12:00pm")
     v = out["valid"].isel(time=0).values          # (y, x), uint8
     assert out["valid"].dtype == "uint8"
@@ -213,7 +223,7 @@ def _granule_args(tmp_path, aoi_grid, base_project):
     cfg = copy.deepcopy(base_project)
     cfg["products"]["ecostress"] = {"version": "002"}
     eff = ecostress._build_eff(parse_config(cfg))
-    return (eff["ds"], eff["grid"], aoi_grid, "test-aoi", "12:00pm")
+    return (_ds(eff), eff["grid"], aoi_grid, "test-aoi", "12:00pm")
 
 
 @pytest.mark.parametrize("lost", ["cloud", "water"])
@@ -269,8 +279,9 @@ _GRANULE_TSTR = "20230105T123623"
 def _eff(tmp_path, *, overwrite=False, fmt="netcdf"):
     """A minimal `eff` dict for run(); out_dir points at a temp dir."""
     return {
-        "ds": {"short_name": "ECO_L2T_LSTE", "version": "002",
-               "layers": ecostress.LAYERS, "categorical": ecostress.CATEGORICAL},
+        "ds": UniformDs({"short_name": "ECO_L2T_LSTE", "version": "002",
+                         "layers": ecostress.LAYERS,
+                         "categorical": ecostress.CATEGORICAL}),
         "grid": {"resampling_continuous": "bilinear",
                  "resampling_categorical": "nearest", "to_celsius": False},
         "out_dir": tmp_path,

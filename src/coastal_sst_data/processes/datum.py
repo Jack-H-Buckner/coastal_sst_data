@@ -53,7 +53,7 @@ import numpy as np
 import requests
 import xarray as xr
 
-from ..config import DataProduct, Project
+from ..config import DataProduct, Project, opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, report, store
 from . import tides
@@ -593,11 +593,11 @@ def run(project: Project, grids: dict[str, AoiGrid], only_aoi, dry_run, overwrit
 def resolve_override(project: Project, aoi_name: str) -> float | None:
     """The optional region-level `sources.bathymetry.datum_offset_m`, or None.
 
-    Region-level ONLY: the offset follows the DEM, and which DEM wins is decided per AoI
-    at runtime, so a project-wide constant can never be right across a study area.
+    Region-level ONLY (it is in config.REGION_ONLY_OPTIONS, so it has no project-level
+    counterpart): the offset follows the DEM, and which DEM wins is decided per AoI at
+    runtime, so a project-wide constant can never be right across a study area.
     """
-    src = project.region_of(aoi_name).sources.get(DataProduct.bathymetry)
-    val = getattr(src, "datum_offset_m", None) if src is not None else None
+    val = opt(resolve_opts(project, aoi_name, DataProduct.bathymetry), "datum_offset_m")
     return None if val is None else float(val)
 
 

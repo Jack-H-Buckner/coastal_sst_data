@@ -220,13 +220,104 @@ PRODUCT_OPTIONS: dict[DataProduct, set[str]] = {
         "max_sensor_depth_m"},
 }
 
-# Region-level overrides, for what genuinely varies geographically. Deliberately narrow: a
-# region-level key nothing reads is a silent no-op, and a datum offset that never reaches
-# the datum stage is exactly the kind of thing that biases a cube by a metre in silence.
+# --------------------------------------------------------------------------- #
+# Region-level overrides: what genuinely varies GEOGRAPHICALLY
+# --------------------------------------------------------------------------- #
+# The line these draw is deliberate and load-bearing:
+#
+#   "WHICH SOURCE HAS COVERAGE HERE"  is region-varying.   -> allowed below
+#   "WHAT THE CUBE MEANS"             is not.              -> project-global only
+#
+# The first is a fact about the world and it changes as the project expands: HRRR is North
+# America only, CO-OPS gauges are U.S. only, CUDEM is CONUS only, IOOS is North America,
+# and CMEMS publishes distinct regional models. A project spanning two continents CANNOT
+# name one source for those and be telling the truth, which is the whole reason this block
+# exists.
+#
+# The second must stay uniform, and the validator enforces it. `variables`, `depths`,
+# `qc_flags`, `reference_time` and friends decide the cube's CHANNEL SET and what each
+# channel means. Let a region override those and two AoIs' cubes silently stop being
+# comparable -- and for met it is worse than incomparable, because the assembler names
+# airtemp/wind_*/swrad/cloud_cover explicitly, so a region that dropped one would ship an
+# all-NaN channel that looks exactly like a forcing that was fetched and came back empty.
+#
+# So: source selectors, their fallbacks, the dataset/collection/model they resolve to, the
+# station lists, and the datum. Nothing that reshapes a channel.
 REGION_OPTIONS: dict[DataProduct, set[str]] = {
-    DataProduct.bathymetry: {"dem_source", "datum_offset_m"},
+    # CUDEM is CONUS-only -> a region outside it must name its own DEM. `datum_offset_m`
+    # is region-only (it has no project-level counterpart): the offset is a property of the
+    # DEM that WON and of where the AoI is, so no project-wide constant can be right.
+    DataProduct.bathymetry: {"source", "dem_source", "fallback", "datum_offset_m"},
+    # CO-OPS gauges are U.S.-only -> elsewhere, a global model + its downloaded directory.
     DataProduct.tides: {"source", "model", "model_directory", "stations"},
+    # HRRR is North America only. Outside it the chain MUST start at era5, and saying so
+    # per region is the difference between a deliberate choice and a silent fallback.
+    DataProduct.met: {"source", "fallback", "model"},
+    # CMEMS publishes regional models (Baltic, Mediterranean, NW Shelf) alongside the
+    # global one; which is right is a fact about where the AoI is.
+    DataProduct.cmems: {"source", "fallback", "dataset_id"},
+    # IOOS covers North America; another continent needs another network. `variables` is a
+    # per-NETWORK naming preference (sea_water_temperature vs sea_surface_temperature), not
+    # a channel choice -- every network still yields the one `insitu_sst` channel -- so it
+    # is safe here. Station lists are inherently local.
+    DataProduct.insitu: {"source", "stations", "exclude_stations", "variables"},
+    # The source and the catalogue it is served from move together, so they travel together.
+    DataProduct.landsat: {"source", "collection", "stac_url"},
+    DataProduct.landcover: {"source", "collection", "stac_url"},
+    # mur, modis, ecostress: global products with no regional variation. A region key here
+    # would be a no-op, so there is none.
 }
+
+# Keys a region may set that have NO project-level counterpart. Everything else in
+# REGION_OPTIONS must be an option the product actually reads (see the invariant below), so
+# a region cannot override a key the module will never look at.
+REGION_ONLY_OPTIONS: dict[DataProduct, set[str]] = {
+    DataProduct.bathymetry: {"dem_source", "datum_offset_m"},
+}
+
+
+def _check_region_options_invariant() -> None:
+    """A region key must be one the product READS -- or an explicit region-only key.
+
+    Checked at import, because the failure it prevents is invisible at runtime: a region
+    override that no module reads does nothing, the run proceeds, and the config file is
+    left stating an intent the data does not honour. That is the same class of lie
+    `_option_keys_are_known` exists to catch, one level up.
+    """
+    for product, keys in REGION_OPTIONS.items():
+        allowed = PRODUCT_OPTIONS.get(product, set()) | REGION_ONLY_OPTIONS.get(product, set())
+        orphans = keys - allowed
+        if orphans:
+            raise RuntimeError(
+                f"REGION_OPTIONS[{product.value}] names {sorted(orphans)}, which "
+                f"{product.value} does not read. Add them to PRODUCT_OPTIONS (and read them "
+                f"in the module), or to REGION_ONLY_OPTIONS if they are region-only.")
+
+
+_check_region_options_invariant()
+
+
+def resolve_opts(project: "Project", aoi_name: str, product: DataProduct):
+    """The options ONE AoI runs `product` with: its region's overrides, over the global bag.
+
+    This is the single two-level lookup every product resolves its options through. It used
+    to exist only inside bathymetry and tides (as their private `_resolve_source`), which is
+    why they were the only two products whose source could vary by region -- every other
+    module read `project.products[...]` directly and was therefore locked to one source for
+    the entire project. A project with a Pacific Northwest region and a Mediterranean one
+    simply could not use different in-situ networks, whatever the config said.
+
+    Returns a merged ProductOptions bag (or None if the product is not selected), so callers
+    read it exactly as they read the global one -- with `config.opt`.
+    """
+    global_opts = project.products.get(product)
+    if global_opts is None:
+        return None
+    merged = dict(global_opts.model_extra or {})
+    region_opts = project.region_of(aoi_name).sources.get(product)
+    if region_opts is not None:
+        merged.update(region_opts.model_extra or {})
+    return ProductOptions(**merged)
 
 
 def _options_by_product(value: Any) -> Any:

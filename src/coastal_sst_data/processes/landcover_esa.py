@@ -44,7 +44,7 @@ import xarray as xr
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 
-from ..config import Project, DataProduct, opt as _opt
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
 from .. import entry, net, provenance, report, store
 
@@ -133,10 +133,7 @@ def items_to_dataset(items, g: AoiGrid, water_classes, aoi_id: str) -> Optional[
 # --------------------------------------------------------------------------- #
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     """Acquire the WorldCover landcover/water mask onto the pre-computed AoI grids."""
-    ds_cfg = eff["ds"]
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
-    water_classes = ds_cfg["water_classes"]
-    year = ds_cfg["year"]
 
     names = select_aois(grids, only_aoi)
 
@@ -144,6 +141,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
     for name in names:
         g = grids[name]
+        # Resolved PER AoI: `collection`/`stac_url` travel with `source` and are
+        # region-overridable. `water_classes` is NOT -- it decides what the cube's `water`
+        # channel MEANS, and a landmask that means one thing in one region and another
+        # elsewhere is not a landmask.
+        ds_cfg = eff["ds"][name]
+        water_classes = ds_cfg["water_classes"]
+        year = ds_cfg["year"]
         aoi_out = out_root / name
         out_f = aoi_out / f"{name}.nc"
         if store.done(out_f, store.REQUIRED_VARS["LANDCOVER"],
@@ -183,21 +187,26 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
+def _ds_cfg(opts) -> dict:
+    """One AoI's land-cover settings, from its region-resolved options bag."""
+    return {
+        "collection": _opt(opts, "collection", COLLECTION),
+        "stac_url": _opt(opts, "stac_url", STAC_URL),
+        "year": int(_opt(opts, "year", DEFAULT_YEAR)),
+        "water_classes": list(_opt(opts, "water_classes", DEFAULT_WATER_CLASSES)),
+    }
+
+
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     opts = project.products.get(DataProduct.landcover)
     if opts is None:
         raise ValueError("landcover is not a selected product in this config")
 
-    ds_cfg = {
-        "collection": _opt(opts, "collection", COLLECTION),
-        "stac_url": _opt(opts, "stac_url", STAC_URL),
-        "year": int(_opt(opts, "year", DEFAULT_YEAR)),
-        "water_classes": list(_opt(opts, "water_classes", DEFAULT_WATER_CLASSES)),
-    }
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.landcover))
+               for a in project.all_areas},
         "out_dir": Path(project.output_dir) / "LANDCOVER" / "aligned",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),

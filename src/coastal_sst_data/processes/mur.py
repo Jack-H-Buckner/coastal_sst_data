@@ -32,7 +32,7 @@ import earthaccess
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 
-from ..config import Project, DataProduct, opt as _opt
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, naming, net, provenance, report, store
 
@@ -82,10 +82,8 @@ def subset_and_reproject(fobj, variable, bbox_ll, pad, target_crs, transform,
 # --------------------------------------------------------------------------- #
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     """Acquire MUR onto the pre-computed per-AoI grids (shared across products)."""
-    ds_cfg, grid_cfg = eff["ds"], eff["grid"]
+    grid_cfg = eff["grid"]
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
-    variable = ds_cfg["variable"]
-    pad = float(ds_cfg["pad_deg"])
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
     log.info("Authenticating with Earthdata (strategy=%s)", eff["earthdata"]["auth_strategy"])
@@ -97,6 +95,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
     for name in names:
         g = grids[name]
+        # MUR is a GLOBAL product, so it has no region-varying options -- but its settings
+        # are still resolved per AoI, so every product answers to the same contract.
+        ds_cfg = eff["ds"][name]
+        variable = ds_cfg["variable"]
+        pad = float(ds_cfg["pad_deg"])
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
                  name, g.target_crs, g.width, g.height, g.resolution_m)
 
@@ -156,6 +159,15 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
+def _ds_cfg(opts) -> dict:
+    """One AoI's MUR settings. MUR is global, so nothing here is region-overridable."""
+    return {
+        "short_name": _opt(opts, "short_name", SHORT_NAME),
+        "variable": _opt(opts, "variable", DEFAULT_VARIABLE),
+        "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
+    }
+
+
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     opts = project.products.get(DataProduct.mur)
@@ -164,17 +176,13 @@ def _build_eff(project: Project) -> dict:
     if project.auth.earthdata is None:            # guaranteed by config validation
         raise ValueError("mur requires an auth.earthdata block")
 
-    ds_cfg = {
-        "short_name": _opt(opts, "short_name", SHORT_NAME),
-        "variable": _opt(opts, "variable", DEFAULT_VARIABLE),
-        "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
-    }
     grid_cfg = project.grid.model_dump()
     grid_cfg.setdefault("to_celsius", False)      # GridSpec has no such field yet
 
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.mur))
+               for a in project.all_areas},
         "grid": grid_cfg,
         "out_dir": Path(project.output_dir) / "MUR" / "aligned",
         "fmt": _opt(opts, "output_format", "netcdf"),

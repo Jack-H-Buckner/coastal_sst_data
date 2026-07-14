@@ -43,7 +43,7 @@ import xarray as xr
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 
-from ..config import Project, DataProduct, opt as _opt
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
 from .. import entry, naming, net, provenance, report, store
 
@@ -156,11 +156,8 @@ def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
 # --------------------------------------------------------------------------- #
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     """Acquire Landsat (via Planetary Computer) onto the pre-computed AoI grids."""
-    ds_cfg, grid_cfg = eff["ds"], eff["grid"]
+    grid_cfg = eff["grid"]
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
-    mask_cfg = ds_cfg.get("masking", {})
-    platforms = ds_cfg["platforms"]
-    cloud_max = ds_cfg["cloud_cover_max"]
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
     to_celsius = grid_cfg.get("to_celsius", False)
 
@@ -170,6 +167,15 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
     for name in names:
         g = grids[name]
+        # Resolved PER AoI: `collection`/`stac_url` are region-overridable (a region served
+        # by a different catalogue names its own), while the scene-selection knobs
+        # (platforms, cloud_cover_max, masking) stay project-global so every AoI's scenes
+        # are chosen and masked the same way.
+        ds_cfg = eff["ds"][name]
+        mask_cfg = ds_cfg.get("masking", {})
+        platforms = ds_cfg["platforms"]
+        cloud_max = ds_cfg["cloud_cover_max"]
+
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
                  name, g.target_crs, g.width, g.height, g.resolution_m)
 
@@ -208,26 +214,34 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
+def _ds_cfg(opts) -> dict:
+    """One AoI's Landsat settings, from its region-resolved options bag.
+
+    `collection`/`stac_url` travel with `source` and are region-overridable; the
+    scene-selection knobs are not, so every AoI's scenes are chosen and masked alike.
+    """
+    return {
+        "collection": _opt(opts, "collection", COLLECTION),
+        "stac_url": _opt(opts, "stac_url", STAC_URL),
+        "platforms": list(_opt(opts, "platforms", DEFAULT_PLATFORMS)),
+        "cloud_cover_max": float(_opt(opts, "cloud_cover_max", 0.7)),
+        "masking": dict(_opt(opts, "masking", {}) or {}),
+    }
+
+
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     opts = project.products.get(DataProduct.landsat)
     if opts is None:
         raise ValueError("landsat is not a selected product in this config")
-    masking = _opt(opts, "masking", {}) or {}
 
-    ds_cfg = {
-        "collection": _opt(opts, "collection", COLLECTION),
-        "stac_url": _opt(opts, "stac_url", STAC_URL),
-        "platforms": list(_opt(opts, "platforms", DEFAULT_PLATFORMS)),
-        "cloud_cover_max": float(_opt(opts, "cloud_cover_max", 0.7)),
-        "masking": dict(masking),
-    }
     grid_cfg = project.grid.model_dump()
     grid_cfg.setdefault("to_celsius", False)      # GridSpec has no such field yet
 
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.landsat))
+               for a in project.all_areas},
         "grid": grid_cfg,
         "out_dir": Path(project.output_dir) / "LANDSAT" / "aligned",
         "fmt": _opt(opts, "output_format", "netcdf"),

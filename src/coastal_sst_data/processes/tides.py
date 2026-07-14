@@ -46,7 +46,7 @@ import pandas as pd
 import requests
 import xarray as xr
 
-from ..config import Project, DataProduct, opt as _opt
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, provenance, report, store
 
@@ -305,21 +305,23 @@ def _predict_with_fallback(source, fallback, lon, lat, start, end, ds_cfg, stati
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
-def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
-        only_aoi, dry_run):
-    """Acquire a 1D tide series per AoI from its resolved source (+ fallback)."""
-    ds_cfg = eff["ds"]
+def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
+    """Acquire a 1D tide series per AoI from its resolved source (+ fallback).
+
+    The extra `aoi_sources` argument this used to take is gone: the per-AoI source now
+    arrives in `eff["ds"][name]` like every other product's per-AoI settings, so tides
+    honours exactly the same run() contract as the rest.
+    """
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
-    station_overrides = ds_cfg["stations"]
-    warn_km, fallback = ds_cfg["warn_distance_km"], ds_cfg["fallback"]
-    fallback_km = ds_cfg["fallback_distance_km"]
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
     names = select_aois(grids, only_aoi)
 
-    # The CO-OPS station list is only needed if some AoI uses coops (as its
-    # source or as the fallback); load it lazily on first use.
-    coops_in_play = fallback == "coops" or any(aoi_sources[n] == "coops" for n in names)
+    # The CO-OPS station list is only needed if some AoI could be served by coops (as its
+    # source or as its fallback); load it lazily on first use. Both are per-AoI now, so the
+    # question is asked of every AoI rather than of one project-wide fallback.
+    coops_in_play = any(eff["ds"][n]["source"] == "coops"
+                        or eff["ds"][n]["fallback"] == "coops" for n in names)
     stations = None
 
     rep = report.ProductReport("tides")
@@ -327,7 +329,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
     for name in names:
         g = grids[name]
         lon, lat = grid_centroid_lonlat(g)
-        source = aoi_sources[name]
+        ds_cfg = eff["ds"][name]
+        source, fallback = ds_cfg["source"], ds_cfg["fallback"]
+        station_overrides = ds_cfg["stations"]
+        warn_km = ds_cfg["warn_distance_km"]
+        fallback_km = ds_cfg["fallback_distance_km"]
 
         # Resolve a CO-OPS gauge if coops could serve this AoI (source or fallback).
         station = None
@@ -395,12 +401,38 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _resolve_source(project: Project, aoi_name: str, default: str) -> str:
-    """The tide source for one AoI: its region's `sources.tides.source`, else the
-    project default. The two-level lookup mirrors bathymetry's dem_source."""
-    opts = project.region_of(aoi_name).sources.get(DataProduct.tides)
-    src = getattr(opts, "source", None) if opts is not None else None
-    return src or default
+def _ds_cfg(opts) -> dict:
+    """One AoI's tide settings, from its region-resolved options bag.
+
+    `source`, the global `model` and its `model_directory`, and the per-AoI gauge overrides
+    are all region-overridable: CO-OPS gauges exist only in U.S. waters, so elsewhere the
+    AoI must be served from a global ocean-tide model, and which model has been downloaded
+    (and where) is a property of the machine and the region, not of the project.
+
+    The distance thresholds and the prediction interval stay project-global -- they decide
+    how the series is BUILT, not which gauge or model exists here.
+    """
+    # A blank / "none" fallback disables the backup entirely.
+    fallback = _opt(opts, "fallback", DEFAULT_FALLBACK)
+    if fallback in (None, "none", ""):
+        fallback = None
+
+    return {
+        "interval": _opt(opts, "interval", DEFAULT_INTERVAL),
+        # per-AoI gauge overrides: {aoi_name: CO-OPS station id}. Tide gauges are
+        # per-location, so this lives with the product rather than on the AoI.
+        "stations": dict(_opt(opts, "stations", {}) or {}),
+        "warn_distance_km": float(_opt(opts, "warn_distance_km", DEFAULT_WARN_KM)),
+        # Source selection + global backup. `source` is the region-facing spelling;
+        # `default_source` is the project-level one it overrides.
+        "source": (_opt(opts, "source", None)
+                   or _opt(opts, "default_source", DEFAULT_SOURCE)),
+        "fallback": fallback,
+        "fallback_distance_km": float(_opt(opts, "fallback_distance_km", DEFAULT_FALLBACK_KM)),
+        # eo_tides (global model) options.
+        "model": _opt(opts, "model", DEFAULT_MODEL),
+        "model_directory": _opt(opts, "model_directory", None),
+    }
 
 
 def _build_eff(project: Project) -> dict:
@@ -409,30 +441,11 @@ def _build_eff(project: Project) -> dict:
     if opts is None:
         raise ValueError("tides is not a selected product in this config")
 
-    # A blank / "none" fallback disables the backup entirely.
-    fallback = _opt(opts, "fallback", DEFAULT_FALLBACK)
-    if fallback in (None, "none", ""):
-        fallback = None
-
-    ds_cfg = {
-        "interval": _opt(opts, "interval", DEFAULT_INTERVAL),
-        # per-AoI gauge overrides: {aoi_name: CO-OPS station id}. Tide gauges are
-        # per-location, so this lives with the product rather than on the AoI.
-        "stations": dict(_opt(opts, "stations", {}) or {}),
-        "warn_distance_km": float(_opt(opts, "warn_distance_km", DEFAULT_WARN_KM)),
-        # Source selection + global backup.
-        "default_source": _opt(opts, "default_source", DEFAULT_SOURCE),
-        "fallback": fallback,
-        "fallback_distance_km": float(_opt(opts, "fallback_distance_km", DEFAULT_FALLBACK_KM)),
-        # eo_tides (global model) options.
-        "model": _opt(opts, "model", DEFAULT_MODEL),
-        "model_directory": _opt(opts, "model_directory", None),
-    }
-
     root = Path(project.output_dir)
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.tides))
+               for a in project.all_areas},
         "out_dir": root / "TIDE" / "aligned",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
@@ -457,8 +470,9 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     dry_run      resolve the source only, no fetch/predict/write
     overwrite    reprocess AoIs even if the aligned file exists
 
-    The source is resolved PER AoI (region override -> project default), then
-    validated against the SOURCES registry, so a typo'd source fails loudly.
+    The source is resolved PER AoI (region override -> project default) by
+    `config.resolve_opts`, then validated against the SOURCES registry, so a typo'd source
+    fails loudly -- before a single gauge is queried.
     """
     eff = _build_eff(project)
     if overwrite:
@@ -466,16 +480,12 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if grids is None:
         grids = project_grids(project)
 
-    aoi_sources = {name: _resolve_source(project, name, eff["ds"]["default_source"])
-                   for name in grids}
-    bad = sorted(f"{n}:{s}" for n, s in aoi_sources.items() if s not in SOURCES)
-    fb = eff["ds"]["fallback"]
-    if fb is not None and fb not in SOURCES:
-        bad.append(f"fallback:{fb}")
+    bad = sorted(f"{n}:{c[k]}" for n, c in eff["ds"].items() for k in ("source", "fallback")
+                 if c[k] is not None and c[k] not in SOURCES)
     if bad:
         raise ValueError(f"tides source not recognized ({', '.join(bad)}); "
                          f"choose from {sorted(SOURCES)}.")
-    return run(eff, grids, aoi_sources, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

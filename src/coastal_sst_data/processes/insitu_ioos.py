@@ -51,7 +51,7 @@ import pandas as pd
 import requests
 import xarray as xr
 
-from ..config import DataProduct, Project, opt as _opt
+from ..config import DataProduct, Project, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, provenance, report, store
 
@@ -250,9 +250,7 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str) -> Path:
 # Main loop
 # --------------------------------------------------------------------------- #
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    ds_cfg = eff["ds"]
     out_root, overwrite = eff["out_dir"], eff["overwrite"]
-    variables = ds_cfg["variables"]
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
     names = select_aois(grids, only_aoi)
@@ -261,6 +259,12 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
     for name in names:
         g = grids[name]
+        # Resolved PER AoI: station lists are inherently local, and `variables` is a
+        # per-NETWORK naming preference (sea_water_temperature vs sea_surface_temperature)
+        # -- every network still yields the one `insitu_sst` channel, so varying it by
+        # region does not change what the cube means.
+        ds_cfg = eff["ds"][name]
+        variables = ds_cfg["variables"]
         out_path = out_root / name / f"{name}_insitu.nc"
         if store.done(out_path, store.REQUIRED_VARS["INSITU"], overwrite=overwrite):
             log.info("=== %s: %s exists, skipping ===", name, out_path.name)
@@ -321,12 +325,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _build_eff(project: Project) -> dict:
-    opts = project.products.get(DataProduct.insitu)
-    if opts is None:
-        raise ValueError("insitu is not a selected product in this config")
-
-    ds_cfg = {
+def _ds_cfg(opts) -> dict:
+    """One AoI's in-situ settings, from its region-resolved options bag."""
+    return {
         "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
         "qc_flags": [int(f) for f in _opt(opts, "qc_flags", DEFAULT_QC_FLAGS)],
         "max_sensor_depth_m": _opt(opts, "max_sensor_depth_m", DEFAULT_MAX_SENSOR_DEPTH_M),
@@ -334,9 +335,17 @@ def _build_eff(project: Project) -> dict:
         "stations": list(_opt(opts, "stations", []) or []),
         "exclude_stations": list(_opt(opts, "exclude_stations", []) or []),
     }
+
+
+def _build_eff(project: Project) -> dict:
+    opts = project.products.get(DataProduct.insitu)
+    if opts is None:
+        raise ValueError("insitu is not a selected product in this config")
+
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.insitu))
+               for a in project.all_areas},
         "out_dir": Path(project.output_dir) / "INSITU" / "aligned",
         "overwrite": bool(_opt(opts, "overwrite", False)),
         "time": {

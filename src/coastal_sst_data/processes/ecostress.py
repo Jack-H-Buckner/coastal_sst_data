@@ -36,7 +36,7 @@ import earthaccess
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 
-from ..config import Project, DataProduct, opt as _opt
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
 from .. import entry, naming, net, provenance, report, store
 
@@ -220,12 +220,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
     CRS + target grid, so ECOSTRESS lands on exactly the same grid as every
     other product for the AoI.
     """
-    ds_cfg, grid_cfg = eff["ds"], eff["grid"]
+    grid_cfg = eff["grid"]
     out_root = eff["out_dir"]
     fmt, overwrite = eff["fmt"], eff["overwrite"]
 
     login(eff["earthdata"]["auth_strategy"])
-    layers = dict(ds_cfg["layers"])
 
     names = select_aois(grids, only_aoi)
 
@@ -233,6 +232,10 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
 
     for name in names:
         g = grids[name]
+        # ECOSTRESS is a GLOBAL product, so it has no region-varying options -- but its
+        # settings are still resolved per AoI, so every product answers to one contract.
+        ds_cfg = eff["ds"][name]
+        layers = dict(ds_cfg["layers"])
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
                  name, g.target_crs, g.width, g.height, g.resolution_m)
 
@@ -292,6 +295,16 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
+def _ds_cfg(opts) -> dict:
+    """One AoI's ECOSTRESS settings. ECOSTRESS is global -- nothing is region-overridable."""
+    return {
+        "short_name": _opt(opts, "short_name", SHORT_NAME),
+        "version": str(_opt(opts, "version", DEFAULT_VERSION)),
+        "layers": dict(_opt(opts, "layers", LAYERS)),
+        "categorical": list(_opt(opts, "categorical", CATEGORICAL)),
+    }
+
+
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes.
 
@@ -305,12 +318,6 @@ def _build_eff(project: Project) -> dict:
     if project.auth.earthdata is None:            # guaranteed by config validation
         raise ValueError("ecostress requires an auth.earthdata block")
 
-    ds_cfg = {
-        "short_name": _opt(opts, "short_name", SHORT_NAME),
-        "version": str(_opt(opts, "version", DEFAULT_VERSION)),
-        "layers": dict(_opt(opts, "layers", LAYERS)),
-        "categorical": list(_opt(opts, "categorical", CATEGORICAL)),
-    }
     # Only the resampling / to_celsius knobs matter here; the CRS, resolution and
     # snapping are applied by coastal_sst_data.grid, not by this process.
     grid_cfg = project.grid.model_dump()
@@ -318,7 +325,8 @@ def _build_eff(project: Project) -> dict:
 
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.ecostress))
+               for a in project.all_areas},
         "grid": grid_cfg,
         "out_dir": Path(project.output_dir) / "ECOSTRESS" / "aligned",
         "fmt": _opt(opts, "output_format", "netcdf"),

@@ -46,7 +46,7 @@ import xarray as xr
 import earthaccess
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 
-from ..config import Project, DataProduct, opt as _opt
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, naming, net, provenance, report, store
 
@@ -201,17 +201,11 @@ def _select_granules(granules, ls_times, match_landsat, max_dt, daytime_only):
 # Main loop
 # --------------------------------------------------------------------------- #
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    ds_cfg, grid_cfg = eff["ds"], eff["grid"]
+    grid_cfg = eff["grid"]
     out_root, tmp_dir, fmt, overwrite = eff["out_dir"], eff["tmp_dir"], eff["fmt"], eff["overwrite"]
     landsat_dir = eff["landsat_dir"]
     to_celsius = grid_cfg.get("to_celsius", False)
-    variable, quality_min = ds_cfg["variable"], ds_cfg["quality_min"]
-    radius, access = ds_cfg["regrid_radius_m"], ds_cfg["access"]
-    match_landsat = ds_cfg["match_landsat"]
-    max_dt = timedelta(minutes=ds_cfg["max_time_diff_minutes"])
-    daytime_only, do_footprint = ds_cfg["daytime_only"], ds_cfg["footprint_id"]
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
-    fetch = _ACCESS[access]
 
     log.info("Authenticating with Earthdata (strategy=%s)", eff["earthdata"]["auth_strategy"])
     earthaccess.login(strategy=eff["earthdata"]["auth_strategy"])
@@ -222,6 +216,16 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
     for name in names:
         g = grids[name]
+        # MODIS is a GLOBAL product, so it has no region-varying options -- but its settings
+        # are still resolved per AoI, so every product answers to the same contract.
+        ds_cfg = eff["ds"][name]
+        variable, quality_min = ds_cfg["variable"], ds_cfg["quality_min"]
+        radius, access = ds_cfg["regrid_radius_m"], ds_cfg["access"]
+        match_landsat = ds_cfg["match_landsat"]
+        max_dt = timedelta(minutes=ds_cfg["max_time_diff_minutes"])
+        daytime_only, do_footprint = ds_cfg["daytime_only"], ds_cfg["footprint_id"]
+        fetch = _ACCESS[access]
+
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | match_landsat=%s access=%s ===",
                  name, g.target_crs, g.width, g.height, match_landsat, access)
 
@@ -282,20 +286,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _build_eff(project: Project) -> dict:
-    """Map a validated Project into the flat `eff` dict `run()` consumes."""
-    opts = project.products.get(DataProduct.modis)
-    if opts is None:
-        raise ValueError("modis is not a selected product in this config")
-    if project.auth.earthdata is None:            # guaranteed by config validation
-        raise ValueError("modis requires an auth.earthdata block")
-
+def _ds_cfg(opts) -> dict:
+    """One AoI's MODIS settings. MODIS is global, so nothing here is region-overridable."""
     access = _opt(opts, "access", "download")
     if access not in _ACCESS:
         raise ValueError(f"modis access {access!r} not recognized; "
                          f"choose from {sorted(_ACCESS)}.")
-
-    ds_cfg = {
+    return {
         "short_name": _opt(opts, "short_name", SHORT_NAME),
         "variable": _opt(opts, "variable", DEFAULT_VARIABLE),
         "quality_min": int(_opt(opts, "quality_min", DEFAULT_QUALITY_MIN)),
@@ -306,13 +303,24 @@ def _build_eff(project: Project) -> dict:
         "daytime_only": bool(_opt(opts, "daytime_only", True)),
         "footprint_id": bool(_opt(opts, "footprint_id", True)),
     }
+
+
+def _build_eff(project: Project) -> dict:
+    """Map a validated Project into the flat `eff` dict `run()` consumes."""
+    opts = project.products.get(DataProduct.modis)
+    if opts is None:
+        raise ValueError("modis is not a selected product in this config")
+    if project.auth.earthdata is None:            # guaranteed by config validation
+        raise ValueError("modis requires an auth.earthdata block")
+
     grid_cfg = project.grid.model_dump()
     grid_cfg.setdefault("to_celsius", False)      # GridSpec has no such field yet
 
     root = Path(project.output_dir)
     return {
         "config_sha256": project.config_sha256,
-        "ds": ds_cfg,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.modis))
+               for a in project.all_areas},
         "grid": grid_cfg,
         "out_dir": root / "MODIS" / "aligned",
         "landsat_dir": root / "LANDSAT" / "aligned",   # coincidence source
@@ -338,7 +346,8 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if overwrite:
         eff["overwrite"] = True
     if full_series:
-        eff["ds"]["match_landsat"] = False
+        for ds_cfg in eff["ds"].values():     # `ds` is per-AoI now
+            ds_cfg["match_landsat"] = False
     if grids is None:
         grids = project_grids(project)
     return run(eff, grids, aois, dry_run)

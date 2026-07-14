@@ -30,7 +30,7 @@ import argparse
 import logging
 
 from . import auth, report
-from .config import DataProduct, Project, load_config
+from .config import (DataProduct, DEFAULT_SOURCE, Project, load_config, opt, resolve_opts)
 from .grid import AoiGrid, compute_aoi_grid
 from .processes import (
     bathymetry, cmems, datacube, datum, ecostress, insitu_ioos, landcover_esa, landsat_pc,
@@ -77,18 +77,52 @@ PROCESS_ORDER = [
 ]
 
 
-def _module_for(project: Project, product: DataProduct):
-    """The module implementing a product, or None if not implemented yet."""
-    if product == DataProduct.landsat:
-        source = getattr(project.products[product], "source", "pc")
-        return LANDSAT_SOURCES.get(source)
-    if product == DataProduct.landcover:
-        source = getattr(project.products[product], "source", "esa")
-        return LANDCOVER_SOURCES.get(source)
-    if product == DataProduct.insitu:
-        source = getattr(project.products[product], "source", "ioos")
-        return INSITU_SOURCES.get(source)
-    return PROCESSES.get(product)
+# product -> its {source name: module} registry. A product absent here has exactly one
+# implementation (PROCESSES); one listed here picks its module from the resolved `source`.
+SOURCE_REGISTRIES = {
+    DataProduct.landsat: LANDSAT_SOURCES,
+    DataProduct.landcover: LANDCOVER_SOURCES,
+    DataProduct.insitu: INSITU_SOURCES,
+}
+
+
+def _source_for(project: Project, product: DataProduct, aoi: str) -> str:
+    """The `source` ONE AoI runs a source-selectable product with (region -> global)."""
+    return opt(resolve_opts(project, aoi, product), "source",
+               DEFAULT_SOURCE.get(product))
+
+
+def _module_for(project: Project, product: DataProduct, aoi: str | None = None):
+    """The module implementing a product FOR ONE AoI, or None if not implemented yet.
+
+    `aoi=None` answers for the project as a whole (the first AoI's module) -- used by
+    `validate`, which is summarising rather than dispatching.
+    """
+    registry = SOURCE_REGISTRIES.get(product)
+    if registry is None:
+        return PROCESSES.get(product)
+    if aoi is None:
+        aoi = project.all_areas[0].name
+    return registry.get(_source_for(project, product, aoi))
+
+
+def _modules_for(project: Project, product: DataProduct, aoi_names):
+    """Group AoIs by the module that will serve them: [(module|None, [aoi, ...]), ...].
+
+    The source SELECTOR is region-dependent, not project-wide, and this is where that
+    finally bites: a project whose Pacific Northwest region uses the IOOS in-situ network
+    and whose Mediterranean region uses another resolves `insitu` to TWO modules in one
+    run. Dispatch used to read `project.products[product].source` -- one answer for the
+    whole project -- so such a config was simply impossible to express, whatever the region
+    block said.
+
+    A `None` module means "no implementation for that source"; those AoIs are reported and
+    skipped rather than silently dropped.
+    """
+    groups: dict = {}
+    for name in aoi_names:
+        groups.setdefault(_module_for(project, product, name), []).append(name)
+    return list(groups.items())
 
 
 def compute_grids(project: Project) -> dict[str, AoiGrid]:
@@ -159,31 +193,56 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     outcomes: dict[DataProduct, str] = {}
     run_report = report.RunReport()
 
-    for product in ordered:
-        module = _module_for(project, product)
-        if module is None:
-            detail = ""
-            if product == DataProduct.landsat:
-                detail = f" (source={getattr(project.products[product], 'source', 'pc')})"
-            log.warning("=== %s%s: not implemented yet, skipping ===", product.value, detail)
-            outcomes[product] = "skipped (not implemented)"
-            run_report.add(product.value, None, outcome="not implemented")
-            continue
+    # The AoIs this run touches (a valid --aoi subset, or everything with a usable grid).
+    run_aois = [n for n in grids if not aois or n in set(aois)]
 
+    for product in ordered:
         log.info("=== %s ===", product.value)
-        try:
-            rep = module.acquire(project, grids=grids, aois=aois,
-                                 dry_run=dry_run, overwrite=overwrite)
+        merged: report.ProductReport | None = None
+        ran = False                       # a module was dispatched (even if it returned None)
+        unimplemented: list[str] = []
+
+        # One product may resolve to SEVERAL modules across a project, because the source
+        # selector is region-dependent (see _modules_for). Each module gets only the AoIs
+        # that resolved to it; their reports fold into one row for the product.
+        for module, module_aois in _modules_for(project, product, run_aois):
+            if module is None:
+                srcs = sorted({_source_for(project, product, a) or "?" for a in module_aois})
+                unimplemented.append(f"{', '.join(module_aois)} (source={'/'.join(srcs)})")
+                continue
+            try:
+                rep = module.acquire(project, grids=grids, aois=module_aois,
+                                     dry_run=dry_run, overwrite=overwrite)
+                ran = True
+                if rep is not None:
+                    merged = rep if merged is None else merged.merge(rep)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                log.error("=== %s FAILED: %s ===", product.value, exc)
+                outcomes[product] = f"failed: {exc}"
+                run_report.add(product.value, None, outcome=f"stage raised: {exc}")
+                break
+        else:
+            if unimplemented:
+                # Not silently dropped: an AoI whose source has no module produces NOTHING,
+                # and a cube with a missing product looks exactly like one whose product
+                # found no data.
+                log.warning("=== %s: no implementation for %s; those AoI(s) are SKIPPED ===",
+                            product.value, "; ".join(unimplemented))
+            if not ran:
+                outcomes[product] = "skipped (not implemented)"
+                run_report.add(product.value, None,
+                               outcome=f"not implemented: {'; '.join(unimplemented)}")
+                continue
             # `ok` ONLY when nothing was lost. A stage that dropped 40 of 100 days used to
             # report `ok` here, which is the whole reason a lossy run was invisible.
-            outcomes[product] = rep.outcome if rep is not None else "ok"
-            run_report.add(product.value, rep)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            log.error("=== %s FAILED: %s ===", product.value, exc)
-            outcomes[product] = f"failed: {exc}"
-            run_report.add(product.value, None, outcome=f"stage raised: {exc}")
+            outcomes[product] = merged.outcome if merged is not None else "ok"
+            if unimplemented and merged is not None:
+                merged.note = "; ".join(
+                    n for n in (merged.note, f"no implementation for {'; '.join(unimplemented)}")
+                    if n)
+            run_report.add(product.value, merged)
 
     # Derived stage: resolve each AoI's DEM->MSL datum offset from the bathymetry file
     # that was just written (which DEM won is only known now -- bathymetry falls back

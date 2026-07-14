@@ -16,6 +16,16 @@ from coastal_sst_data.processes import landcover_esa
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.test.yaml"
 
 
+def _ds(eff):
+    """The settings ONE AoI runs with. `eff["ds"]` is keyed by AoI, because `collection` /
+    `stac_url` travel with `source` and are region-overridable (a region served by a
+    different catalogue names its own). No config below sets a region override, so every
+    AoI resolves alike -- take any."""
+    return next(iter(eff["ds"].values()))
+
+
+
+
 # --- minimal STAC-item stand-ins (only .assets[k].href / .properties are read) - #
 class _Asset:
     def __init__(self, href):
@@ -50,10 +60,10 @@ def write_worldcover_cog(path, g, *, native_res=30.0, pad_m=1500.0,
 # ---------------------------------------------------------------------------
 def test_build_eff_maps_example_config():
     eff = landcover_esa._build_eff(load_config(EXAMPLE))
-    assert eff["ds"]["collection"] == "esa-worldcover"
-    assert eff["ds"]["stac_url"] == landcover_esa.STAC_URL
-    assert eff["ds"]["year"] == 2021
-    assert eff["ds"]["water_classes"] == [80]
+    assert _ds(eff)["collection"] == "esa-worldcover"
+    assert _ds(eff)["stac_url"] == landcover_esa.STAC_URL
+    assert _ds(eff)["year"] == 2021
+    assert _ds(eff)["water_classes"] == [80]
     assert eff["fmt"] == "netcdf"
     assert eff["out_dir"] == Path("path/to/data") / "LANDCOVER" / "aligned"
     assert "earthdata" not in eff and "gee_project" not in eff   # PC needs no auth
@@ -68,9 +78,9 @@ def test_build_eff_requires_landcover_selected(base_project):
 def test_build_eff_defaults_when_options_omitted(base_project):
     base_project["products"]["landcover"] = None      # bare -> defaults (source esa)
     eff = landcover_esa._build_eff(parse_config(base_project))
-    assert eff["ds"]["collection"] == landcover_esa.COLLECTION
-    assert eff["ds"]["year"] == landcover_esa.DEFAULT_YEAR
-    assert eff["ds"]["water_classes"] == landcover_esa.DEFAULT_WATER_CLASSES
+    assert _ds(eff)["collection"] == landcover_esa.COLLECTION
+    assert _ds(eff)["year"] == landcover_esa.DEFAULT_YEAR
+    assert _ds(eff)["water_classes"] == landcover_esa.DEFAULT_WATER_CLASSES
 
 
 def test_build_eff_applies_option_overrides(base_project):
@@ -79,8 +89,8 @@ def test_build_eff_applies_option_overrides(base_project):
         "overwrite": True,
     }
     eff = landcover_esa._build_eff(parse_config(base_project))
-    assert eff["ds"]["year"] == 2020
-    assert eff["ds"]["water_classes"] == [80, 90]
+    assert _ds(eff)["year"] == 2020
+    assert _ds(eff)["water_classes"] == [80, 90]
     assert eff["fmt"] == "geotiff"
     assert eff["overwrite"] is True
 

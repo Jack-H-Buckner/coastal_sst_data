@@ -13,6 +13,16 @@ import xarray as xr
 
 from coastal_sst_data.config import parse_config
 from coastal_sst_data.processes import modis
+from .conftest import UniformDs
+
+
+def _ds(eff):
+    """The settings ONE AoI runs with. `eff["ds"]` is keyed by AoI, because every product
+    now resolves its options per AoI (region override -> project default). This is a global
+    product with no region-varying options, so every AoI resolves alike -- take any."""
+    return next(iter(eff["ds"].values()))
+
+
 
 
 # --- fake earthaccess granule (dict-like: what _select_granules reads) ------- #
@@ -46,13 +56,13 @@ def write_modis_granule(path, bbox, *, sst_kelvin=290.0, quality=5, res_deg=0.01
 def test_build_eff_maps_defaults(base_project):
     base_project["products"]["modis"] = None       # bare -> defaults
     eff = modis._build_eff(parse_config(base_project))
-    assert eff["ds"]["short_name"] == modis.SHORT_NAME
-    assert eff["ds"]["variable"] == modis.DEFAULT_VARIABLE
-    assert eff["ds"]["quality_min"] == 4
-    assert eff["ds"]["access"] == "download"
-    assert eff["ds"]["match_landsat"] is True
-    assert eff["ds"]["max_time_diff_minutes"] == 360
-    assert eff["ds"]["footprint_id"] is True
+    assert _ds(eff)["short_name"] == modis.SHORT_NAME
+    assert _ds(eff)["variable"] == modis.DEFAULT_VARIABLE
+    assert _ds(eff)["quality_min"] == 4
+    assert _ds(eff)["access"] == "download"
+    assert _ds(eff)["match_landsat"] is True
+    assert _ds(eff)["max_time_diff_minutes"] == 360
+    assert _ds(eff)["footprint_id"] is True
     assert eff["earthdata"]["auth_strategy"] == "netrc"
     assert eff["out_dir"] == Path("path/to/data") / "MODIS" / "aligned"
     assert eff["landsat_dir"] == Path("path/to/data") / "LANDSAT" / "aligned"
@@ -69,11 +79,11 @@ def test_build_eff_applies_overrides(base_project):
         "regrid_radius_m": 1000, "footprint_id": False, "output_format": "geotiff",
     }
     eff = modis._build_eff(parse_config(base_project))
-    assert eff["ds"]["quality_min"] == 5
-    assert eff["ds"]["match_landsat"] is False
-    assert eff["ds"]["max_time_diff_minutes"] == 30
-    assert eff["ds"]["regrid_radius_m"] == 1000
-    assert eff["ds"]["footprint_id"] is False
+    assert _ds(eff)["quality_min"] == 5
+    assert _ds(eff)["match_landsat"] is False
+    assert _ds(eff)["max_time_diff_minutes"] == 30
+    assert _ds(eff)["regrid_radius_m"] == 1000
+    assert _ds(eff)["footprint_id"] is False
     assert eff["fmt"] == "geotiff"
 
 
@@ -207,10 +217,11 @@ class _Gran:
 
 def _modis_eff(tmp_path):
     return {
-        "ds": {"short_name": modis.SHORT_NAME, "variable": modis.DEFAULT_VARIABLE,
-               "quality_min": 4, "regrid_radius_m": 1500.0, "access": "download",
-               "match_landsat": False, "max_time_diff_minutes": 360,
-               "daytime_only": True, "footprint_id": False},
+        "ds": UniformDs({
+            "short_name": modis.SHORT_NAME, "variable": modis.DEFAULT_VARIABLE,
+            "quality_min": 4, "regrid_radius_m": 1500.0, "access": "download",
+            "match_landsat": False, "max_time_diff_minutes": 360,
+            "daytime_only": True, "footprint_id": False}),
         "grid": {"to_celsius": False},
         "out_dir": tmp_path / "out", "tmp_dir": tmp_path / "_tmp",
         "landsat_dir": tmp_path / "LANDSAT",

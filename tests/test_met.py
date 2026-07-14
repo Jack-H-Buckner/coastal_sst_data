@@ -15,16 +15,27 @@ from coastal_sst_data import grid
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.test.yaml"
 
 
+def _ds(eff):
+    """The met settings ONE AoI runs with.
+
+    `eff["ds"]` is keyed by AoI, because met's source chain is region-dependent: HRRR is
+    North America only, so an AoI outside it must start at ERA5. None of the configs below
+    set a region override, so every AoI resolves to the same settings -- take any.
+    (test_region_sources.py covers the case where they genuinely differ.)
+    """
+    return next(iter(eff["ds"].values()))
+
+
 # --------------------------------------------------------------------------- #
 # _build_eff: config -> acquisition params
 # --------------------------------------------------------------------------- #
 def test_build_eff_maps_example_config():
     """The example config maps to the expected met acquisition parameters."""
     eff = met._build_eff(load_config(EXAMPLE))
-    assert eff["ds"]["chain"] == ["hrrr", "era5"]          # source: auto, fallback: era5
-    assert eff["ds"]["variables"] == ["airtemp", "wind", "swrad", "cloud"]
-    assert eff["ds"]["daily_mean_hours"] == [0, 6, 12, 18]
-    assert eff["ds"]["era5_zarr"] == met.ARCO_ERA5_URI     # default ARCO store
+    assert _ds(eff)["chain"] == ["hrrr", "era5"]          # source: auto, fallback: era5
+    assert _ds(eff)["variables"] == ["airtemp", "wind", "swrad", "cloud"]
+    assert _ds(eff)["daily_mean_hours"] == [0, 6, 12, 18]
+    assert _ds(eff)["era5_zarr"] == met.ARCO_ERA5_URI     # default ARCO store
     # shared project settings flow through
     assert eff["fmt"] == "netcdf"
     assert eff["time"] == {"start_date": "2026-06-01", "end_date": "2026-06-30"}
@@ -50,9 +61,9 @@ def test_build_eff_defaults_when_options_omitted(base_project):
     """A bare `met:` (no options) falls back to product defaults."""
     base_project["products"]["met"] = None                 # bare -> default options
     eff = met._build_eff(parse_config(base_project))
-    assert eff["ds"]["chain"] == ["hrrr", "era5"]
-    assert eff["ds"]["variables"] == met.DEFAULT_VARIABLES
-    assert eff["ds"]["daily_mean_hours"] == met.DEFAULT_MEAN_HOURS
+    assert _ds(eff)["chain"] == ["hrrr", "era5"]
+    assert _ds(eff)["variables"] == met.DEFAULT_VARIABLES
+    assert _ds(eff)["daily_mean_hours"] == met.DEFAULT_MEAN_HOURS
     assert eff["overpass_dirs"] == []                       # no overpass_from set
     assert eff["overwrite"] is False
 
@@ -64,9 +75,9 @@ def test_build_eff_applies_option_overrides(base_project):
         "regrid_radius_m": 3000, "output_format": "geotiff", "overwrite": True,
     }
     eff = met._build_eff(parse_config(base_project))
-    assert eff["ds"]["chain"] == ["era5"]                  # era5-only, no fallback dup
-    assert eff["ds"]["variables"] == ["airtemp", "wind"]
-    assert eff["ds"]["regrid_radius_m"] == 3000.0
+    assert _ds(eff)["chain"] == ["era5"]                  # era5-only, no fallback dup
+    assert _ds(eff)["variables"] == ["airtemp", "wind"]
+    assert _ds(eff)["regrid_radius_m"] == 3000.0
     assert eff["fmt"] == "geotiff"
     assert eff["overwrite"] is True
 
@@ -191,8 +202,8 @@ def test_solar_reference_rolls_the_date_across_the_dateline():
 
 def test_reference_defaults_are_the_landsat_overpass():
     eff = met._build_eff(load_config(EXAMPLE))
-    assert eff["ds"]["reference_time"] == "10:30"
-    assert eff["ds"]["reference_basis"] == "solar"
+    assert _ds(eff)["reference_time"] == "10:30"
+    assert _ds(eff)["reference_basis"] == "solar"
 
 
 # --------------------------------------------------------------------------- #
@@ -248,9 +259,12 @@ def test_daily_mean_records_the_hours_that_ACTUALLY_contributed(monkeypatch, tmp
     _stub_sources(monkeypatch, hrrr=only_noon, era5=lambda g, dt, cfg: None)
 
     eff = {
-        "ds": {"chain": ["hrrr", "era5"], "daily_mean_hours": [0, 6, 12, 18],
-               "reference_time": None, "reference_basis": "solar", "variables": ["airtemp"],
-               "model": "auto", "fxx": 0, "product": "sfc", "regrid_radius_m": 6000.0},
+        # `ds` is keyed by AoI -- met's chain is resolved per AoI, since HRRR is North
+        # America only and a region outside it must start at ERA5.
+        "ds": {aoi_grid.name: {
+            "chain": ["hrrr", "era5"], "daily_mean_hours": [0, 6, 12, 18],
+            "reference_time": None, "reference_basis": "solar", "variables": ["airtemp"],
+            "model": "auto", "fxx": 0, "product": "sfc", "regrid_radius_m": 6000.0}},
         "grid": {"to_celsius": False},
         "out_dir": tmp_path, "fmt": "netcdf", "overwrite": False,
         "overpass_dirs": {},

@@ -91,6 +91,31 @@ class ProductReport:
         self.elapsed_s = time.monotonic() - self._t0
         return self
 
+    def merge(self, other: "ProductReport") -> "ProductReport":
+        """Fold another report for the SAME product into this one.
+
+        One product can now be served by more than one module in a single run: a project
+        whose Pacific Northwest region uses the IOOS in-situ network and whose Mediterranean
+        region uses another resolves `insitu` to two source modules, each handed its own
+        AoIs. They are still ONE product to the reader, so their tallies combine into one
+        row -- and the `sources` counter keeps them distinguishable, which is exactly the
+        column that exists to say which source actually served what.
+        """
+        if other is None:
+            return self
+        self.written += other.written
+        self.skipped += other.skipped
+        self.failed += other.failed
+        if other.expected is not None:
+            self.expected = (self.expected or 0) + other.expected
+        self.sources.update(other.sources)
+        room = MAX_FAILURES_KEPT - len(self.failures)
+        self.failures.extend(other.failures[:max(0, room)])
+        self.dropped += other.dropped + max(0, len(other.failures) - max(0, room))
+        self.note = "; ".join(n for n in (self.note, other.note) if n)
+        self.elapsed_s += other.elapsed_s
+        return self
+
     # ---- reading ---------------------------------------------------------- #
     @property
     def attempted(self) -> int:

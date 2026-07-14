@@ -17,15 +17,25 @@ from coastal_sst_data.processes import landsat_pc
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.test.yaml"
 
 
+def _ds(eff):
+    """The settings ONE AoI runs with. `eff["ds"]` is keyed by AoI, because `collection` /
+    `stac_url` travel with `source` and are region-overridable (a region served by a
+    different catalogue names its own). No config below sets a region override, so every
+    AoI resolves alike -- take any."""
+    return next(iter(eff["ds"].values()))
+
+
+
+
 # ---------------------------------------------------------------------------
 # _build_eff: config -> acquisition params. No auth (PC is anonymous).
 # ---------------------------------------------------------------------------
 def test_build_eff_maps_example_config():
     eff = landsat_pc._build_eff(load_config(EXAMPLE))
-    assert eff["ds"]["collection"] == "landsat-c2-l2"
-    assert eff["ds"]["stac_url"] == landsat_pc.STAC_URL
-    assert eff["ds"]["platforms"] == landsat_pc.DEFAULT_PLATFORMS
-    assert eff["ds"]["cloud_cover_max"] == 0.7      # default
+    assert _ds(eff)["collection"] == "landsat-c2-l2"
+    assert _ds(eff)["stac_url"] == landsat_pc.STAC_URL
+    assert _ds(eff)["platforms"] == landsat_pc.DEFAULT_PLATFORMS
+    assert _ds(eff)["cloud_cover_max"] == 0.7      # default
     assert eff["fmt"] == "netcdf"
     assert eff["time"] == {"start_date": "2026-06-01", "end_date": "2026-06-30"}
     assert eff["out_dir"] == Path("path/to/data") / "LANDSAT" / "aligned"
@@ -41,10 +51,10 @@ def test_build_eff_requires_landsat_selected(base_project):
 def test_build_eff_defaults_when_options_omitted(base_project):
     base_project["products"]["landsat"] = None      # bare -> defaults
     eff = landsat_pc._build_eff(parse_config(base_project))
-    assert eff["ds"]["platforms"] == landsat_pc.DEFAULT_PLATFORMS
-    assert eff["ds"]["cloud_cover_max"] == 0.7
-    assert eff["ds"]["collection"] == landsat_pc.COLLECTION
-    assert eff["ds"]["masking"] == {}
+    assert _ds(eff)["platforms"] == landsat_pc.DEFAULT_PLATFORMS
+    assert _ds(eff)["cloud_cover_max"] == 0.7
+    assert _ds(eff)["collection"] == landsat_pc.COLLECTION
+    assert _ds(eff)["masking"] == {}
 
 
 def test_build_eff_applies_option_overrides(base_project):
@@ -53,10 +63,10 @@ def test_build_eff_applies_option_overrides(base_project):
         "output_format": "geotiff", "masking": {"ndwi_threshold": 0.1},
     }
     eff = landsat_pc._build_eff(parse_config(base_project))
-    assert eff["ds"]["platforms"] == ["landsat-8"]
-    assert eff["ds"]["cloud_cover_max"] == 0.3
+    assert _ds(eff)["platforms"] == ["landsat-8"]
+    assert _ds(eff)["cloud_cover_max"] == 0.3
     assert eff["fmt"] == "geotiff"
-    assert eff["ds"]["masking"] == {"ndwi_threshold": 0.1}
+    assert _ds(eff)["masking"] == {"ndwi_threshold": 0.1}
 
 
 # ---------------------------------------------------------------------------

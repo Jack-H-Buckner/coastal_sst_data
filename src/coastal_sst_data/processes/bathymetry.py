@@ -40,7 +40,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
 from rasterio.transform import from_origin
 
-from ..config import Project, DataProduct, opt as _opt
+from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, net, provenance, report, store
 
@@ -327,23 +327,33 @@ def _fetch_with_fallback(source, g: AoiGrid, params, fallback):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _resolve_source(project: Project, aoi_name: str, default: str) -> str:
-    """The DEM source for one AoI: its region's `dem_source`, else the default.
+def _ds_cfg(opts) -> dict:
+    """One AoI's bathymetry settings, from its region-resolved options bag.
 
-    This is the two-level lookup -- region-level override (region.sources.
-    bathymetry.dem_source) on top of a project-level default_source.
+    The DEM `source` and its `fallback` are region-overridable -- CUDEM is CONUS-only, so an
+    AoI outside it must name its own DEM. Three spellings resolve to the same thing, in
+    precedence order:
+
+        dem_source     region-only, and the name the region block has always used
+        source         what the docs (and every user) call it
+        default_source what the code originally read
+
+    They diverged silently for a long time: a config that said `source: cudem` got the
+    `default_source` DEFAULT -- gmrt -- so a project asking for 3 m topobathy quietly got
+    ~100 m GMRT. All three are honoured now, most-specific first.
+
+    The tuning knobs (pad, subgrid, cover threshold, the CUDEM index) are project-global:
+    they decide how a DEM is AGGREGATED, not which DEM has coverage.
     """
-    opts = project.region_of(aoi_name).sources.get(DataProduct.bathymetry)
-    src = getattr(opts, "dem_source", None) if opts is not None else None
-    return src or default
+    return {
+        "source": (_opt(opts, "dem_source", None) or _opt(opts, "source", None)
+                   or _opt(opts, "default_source", "gmrt")),
+        "fallback": _opt(opts, "fallback", "gmrt"),
+    }
 
 
 def _build_eff(project: Project) -> dict:
-    """Map a validated Project into the flat `eff` dict `run()` consumes.
-
-    Only the source-agnostic global params live here; the per-AoI source is
-    resolved separately (see acquire / _resolve_source).
-    """
+    """Map a validated Project into the flat `eff` dict `run()` consumes."""
     opts = project.products.get(DataProduct.bathymetry)
     if opts is None:
         raise ValueError("bathymetry is not a selected product in this config")
@@ -363,22 +373,23 @@ def _build_eff(project: Project) -> dict:
     return {
         "config_sha256": project.config_sha256,
         "params": params,
+        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.bathymetry))
+               for a in project.all_areas},
         "out_dir": out_root,
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
-        # `source` is what the docs (and every user) call it; `default_source` is what the
-        # code originally read. Both work, `source` wins. They diverged silently for a long
-        # time: a config that said `source: cudem` got the `default_source` DEFAULT -- gmrt.
-        "default_source": _opt(opts, "source", None) or _opt(opts, "default_source", "gmrt"),
-        "fallback": _opt(opts, "fallback", "gmrt"),
     }
 
 
-def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, dry_run):
-    """Build one static bathymetry NetCDF per AoI, each from its resolved source."""
+def run(eff, grids: dict[str, AoiGrid], only_aoi, dry_run):
+    """Build one static bathymetry NetCDF per AoI, each from its resolved source.
+
+    The extra `aoi_sources` argument this used to take is gone: the per-AoI source now
+    arrives in `eff["ds"][name]` like every other product's per-AoI settings, so bathymetry
+    honours exactly the same run() contract as the rest.
+    """
     params = eff["params"]
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
-    fallback = eff["fallback"]
 
     names = select_aois(grids, only_aoi)
 
@@ -386,7 +397,8 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
 
     for name in names:
         g = grids[name]
-        source = aoi_sources[name]
+        ds_cfg = eff["ds"][name]
+        source, fallback = ds_cfg["source"], ds_cfg["fallback"]
         log.info("=== AOI: %s | grid=%dx%d @ %.0fm | source=%s ===",
                  name, g.width, g.height, g.resolution_m, source)
 
@@ -432,8 +444,9 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
             overwrite=False) -> None:
     """Acquire bathymetry for a validated Project. Entry point for pipeline.py.
 
-    The DEM source is resolved PER AoI (region override -> project default), then
-    validated against the SOURCES registry, so a typo'd source fails loudly.
+    The DEM source is resolved PER AoI (region override -> project default) by
+    `config.resolve_opts`, then validated against the SOURCES registry, so a typo'd source
+    fails loudly -- before a single tile is fetched.
     """
     eff = _build_eff(project)
     if overwrite:
@@ -441,15 +454,13 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if grids is None:
         grids = project_grids(project)
 
-    aoi_sources = {name: _resolve_source(project, name, eff["default_source"])
-                   for name in grids}
-    unknown = sorted((n, s) for n, s in aoi_sources.items() if s not in SOURCES)
-    if unknown:
-        bad = ", ".join(f"{n}:{s}" for n, s in unknown)
-        raise ValueError(f"bathymetry dem_source not recognized ({bad}); "
+    bad = sorted(f"{n}:{c[k]}" for n, c in eff["ds"].items() for k in ("source", "fallback")
+                 if c[k] and c[k] not in SOURCES)
+    if bad:
+        raise ValueError(f"bathymetry source not recognized ({', '.join(bad)}); "
                          f"choose from {sorted(SOURCES)}.")
     net.setup_gdal_env()      # /vsicurl CUDEM tile reads: deadline + retries
-    return run(eff, grids, aoi_sources, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():
