@@ -299,7 +299,7 @@ def test_write_zarr_safe_leaves_nothing_at_the_final_path_when_the_write_dies(tm
         _write_cube(_cube(), zpath)
 
     assert not zpath.exists()                          # nothing at the final path
-    assert not list(tmp_path.glob("*.tmp-*"))          # and the scratch was cleaned up
+    assert not list(tmp_path.glob("*.part-*"))          # and the scratch was cleaned up
 
 
 def test_write_zarr_safe_keeps_the_previous_cube_when_the_rewrite_dies(tmp_path, monkeypatch):
@@ -326,12 +326,12 @@ def test_write_zarr_safe_overwrites_and_cleans_up(tmp_path):
     _write_cube(_cube() + 100.0, zpath)
 
     assert xr.open_zarr(zpath)["f"].values[0, 0, 0] == 100.0        # new cube won
-    assert not list(tmp_path.glob("*.tmp-*")) and not list(tmp_path.glob("*.old-*"))
+    assert not list(tmp_path.glob("*.part-*")) and not list(tmp_path.glob("*.old-*"))
 
 
 def test_write_zarr_safe_sweeps_scratch_left_by_an_earlier_crash(tmp_path, caplog):
     zpath = tmp_path / "aoi.zarr"
-    stale = tmp_path / "aoi.zarr.tmp-999-1"
+    stale = tmp_path / "aoi.zarr.part-999-1"
     stale.mkdir()
     (stale / "junk").write_text("half a chunk")
 
@@ -339,7 +339,7 @@ def test_write_zarr_safe_sweeps_scratch_left_by_an_earlier_crash(tmp_path, caplo
         _write_cube(_cube(), zpath)
 
     assert not stale.exists()
-    assert "partial cube" in caplog.text            # and the user is TOLD a run had died
+    assert "unfinished run" in caplog.text          # and the user is TOLD a run had died
     assert xr.open_zarr(zpath).sizes["time"] == 4
 
 

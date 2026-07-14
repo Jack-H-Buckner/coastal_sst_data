@@ -56,6 +56,7 @@ import xarray as xr
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
+from .. import store
 from . import tides
 
 log = logging.getLogger(__name__)
@@ -516,9 +517,7 @@ def load_sidecar(root: Path, aoi_id: str) -> dict | None:
 
 def write_sidecar(root: Path, aoi_id: str, rec: dict) -> Path:
     f = sidecar_path(root, aoi_id)
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(json.dumps(rec, indent=2, sort_keys=True) + "\n")
-    return f
+    return store.write_text(f, json.dumps(rec, indent=2, sort_keys=True) + "\n")
 
 
 # --------------------------------------------------------------------------- #

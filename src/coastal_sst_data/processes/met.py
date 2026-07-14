@@ -59,7 +59,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import provenance, store
 
 log = logging.getLogger(__name__)
 
@@ -366,16 +366,11 @@ def overpass_times_for_day(overpass_dirs, aoi_id: str, day) -> list[datetime]:
 def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str, stem: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if fmt == "netcdf":
-        path = out_dir / f"{stem}.nc"
-        ds.to_netcdf(path, encoding={v: {"zlib": True, "complevel": 4} for v in ds.data_vars})
-    elif fmt == "geotiff":
-        path = out_dir / stem
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            ds[v].isel(time=0).rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
-    return path
+        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(ds, out_dir / stem,
+                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
 
 
 # --------------------------------------------------------------------------- #
@@ -421,8 +416,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             dstr = day.strftime("%Y%m%d")
 
             # ---- reference-time snapshot (the cube's default met channel) ----
-            if ref_hours is not None and (
-                    overwrite or not (aoi_out / f"{name}_ref_{dstr}.nc").exists()):
+            if ref_hours is not None and not store.done(
+                    aoi_out / f"{name}_ref_{dstr}.nc", store.REQUIRED_VARS["MET"],
+                    shape=(g.height, g.width), overwrite=overwrite):
                 rt = reference_time_utc(day, lon, ref_hours, ref_basis)
                 got, src = _fetch_at(chain, g, rt.to_pydatetime(), ds_cfg)
                 if got:
@@ -436,7 +432,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                              write_output(ds, aoi_out, name, fmt, f"{name}_ref_{dstr}"))
 
             # ---- daily mean over mean_hours (skipped when daily_mean_hours: []) ----
-            if mean_hours and (overwrite or not (aoi_out / f"{name}_{dstr}.nc").exists()):
+            if mean_hours and not store.done(
+                    aoi_out / f"{name}_{dstr}.nc", store.REQUIRED_VARS["MET"],
+                    shape=(g.height, g.width), overwrite=overwrite):
                 stack, srcs = {}, set()
                 for hh in mean_hours:
                     dt = day.to_pydatetime().replace(hour=int(hh))
@@ -458,7 +456,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             # ---- overpass snapshots ----
             for op in overpass_times_for_day(overpass_dirs, name, day):
                 tstr = op.strftime("%Y%m%dT%H%M%S")
-                if not overwrite and (aoi_out / f"{name}_{tstr}.nc").exists():
+                if store.done(aoi_out / f"{name}_{tstr}.nc", store.REQUIRED_VARS["MET"],
+                              shape=(g.height, g.width), overwrite=overwrite):
                     continue
                 got, src = _fetch_at(chain, g, op, ds_cfg)
                 if not got:

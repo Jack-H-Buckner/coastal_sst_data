@@ -49,7 +49,7 @@ import xarray as xr
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import provenance, store
 
 log = logging.getLogger(__name__)
 
@@ -241,9 +241,8 @@ def write_output(ds, out_dir, aoi_id, fmt) -> Path:
     if fmt != "netcdf":
         # Tide is 1D; geotiff doesn't apply -> always NetCDF.
         log.info("  (tide is a 1D series; writing NetCDF regardless of output_format)")
-    path = out_dir / f"{aoi_id}_tides.nc"
-    ds.to_netcdf(path, encoding={"tide": {"zlib": True, "complevel": 4}})
-    return path
+    return store.write_netcdf(ds, out_dir / f"{aoi_id}_tides.nc",
+                              encoding={"tide": {"zlib": True, "complevel": 4}})
 
 
 # --------------------------------------------------------------------------- #
@@ -364,7 +363,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], aoi_sources: dict[str, str],
             log.info("=== AOI: %s | source=%s ===", name, effective)
 
         out_path = out_root / name / f"{name}_tides.nc"
-        if not overwrite and out_path.exists():
+        if store.done(out_path, store.REQUIRED_VARS["TIDE"], overwrite=overwrite):
             log.info("  already processed, skipping")
             continue
         if dry_run:

@@ -42,7 +42,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import provenance, store
 
 log = logging.getLogger(__name__)
 
@@ -193,17 +193,12 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str):
         if "time" in ds.coords else "unknown"
     stem = f"{aoi_id}_{t}"
     if fmt == "netcdf":
-        path = out_dir / f"{stem}.nc"
-        enc = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
-        ds.to_netcdf(path, encoding=enc)
-    elif fmt == "geotiff":
-        path = out_dir / stem
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            da = ds[v].isel(time=0) if "time" in ds[v].dims else ds[v]
-            da.rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
+        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(
+            ds, out_dir / stem,
+            [(v, ds[v].isel(time=0) if "time" in ds[v].dims else ds[v]) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
     return path
 
 
@@ -259,7 +254,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
                 continue
             t = parse_acq_time(granule_name(granule))
             tstr = t.strftime("%Y%m%dT%H%M%S") if t else f"g{gi}"
-            if not overwrite and (aoi_out / f"{name}_{tstr}.nc").exists():
+            if store.done(aoi_out / f"{name}_{tstr}.nc", store.REQUIRED_VARS["ECOSTRESS"],
+                          shape=(g.height, g.width), overwrite=overwrite):
                 log.info("  [%d/%d] %s already processed, skipping", gi, len(granules), tstr)
                 continue
 

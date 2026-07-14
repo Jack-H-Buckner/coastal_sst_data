@@ -78,7 +78,7 @@ import xarray as xr
 
 from ..config import CompressionSpec, DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import provenance, store
 from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
@@ -651,77 +651,22 @@ def build_encoding(ds: xr.Dataset, compression: CompressionSpec, chunks: dict) -
 # --------------------------------------------------------------------------- #
 # Write (atomic, NFS-safe)
 # --------------------------------------------------------------------------- #
-TMP_SUFFIX = ".tmp-"      # a cube being built; junk if a run dies
-OLD_SUFFIX = ".old-"      # the previous cube, kept until the swap succeeds
-
-
-def _rm(path: Path) -> None:
-    """Best-effort recursive delete. Never raises: failing to clean up scratch must not
-    fail a run that has already written its cube."""
-    if not path.exists():        # to_zarr can fail before creating anything -- not a problem
-        return
-    try:
-        shutil.rmtree(path)
-    except OSError as exc:                     # NFS .nfs* leftovers, etc.
-        log.warning("  could not remove %s (%s); delete it by hand", path.name, exc)
-
-
 def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
-    """Write a Zarr cube ATOMICALLY. The final path only ever holds a COMPLETE cube.
+    """Write a Zarr cube ATOMICALLY: the final path only ever holds a COMPLETE cube.
 
-    Two distinct hazards, handled by one mechanism -- build aside, then swap:
-
-      * A run killed mid-write (dropped connection, Ctrl-C, OOM) must not leave a partial
-        cube AT the final path. `run()` decides a cube is already done by asking whether
-        its path exists, so a truncated cube parked there would be taken for a finished
-        one and silently skipped on every subsequent run. We therefore write into a
-        scratch dir and only os.replace() it into place once `to_zarr` has RETURNED: a
-        crash leaves the scratch dir (clearly named, and swept on the next run) and the
-        previous cube untouched.
-      * Overwriting rmtree's the old dir in place, which fails on networked filesystems
-        when a chunk is still open (silly-renamed to a hidden .nfs*). So the old cube is
-        moved ASIDE by rename -- atomic, and works with open handles -- rather than
-        deleted out from under a reader, and only deleted once the new one is in place.
+    `store.atomic` builds the cube in a scratch dir and swaps it in only once `to_zarr`
+    has RETURNED, so a run killed mid-write (dropped connection, Ctrl-C, OOM) leaves the
+    previous cube intact rather than parking a truncated one where `run()`'s existence
+    check would take it for finished. The swap also moves any existing cube aside by
+    rename rather than rmtree-ing it in place, which is what makes overwriting safe on
+    NFS when a reader still holds a chunk open.
     """
-    zpath = Path(zpath)
-    tag = f"{os.getpid()}-{int(time.time())}"
-
-    # Scratch from a previous crashed run is junk, not data. Sweep it, and say so: a
-    # leftover is the only trace that an earlier run died partway through a write.
-    for stale in sorted(zpath.parent.glob(f"{zpath.name}{TMP_SUFFIX}*")):
-        log.warning("  discarding partial cube %s left by an unfinished run", stale.name)
-        _rm(stale)
-
-    tmp = zpath.with_name(f"{zpath.name}{TMP_SUFFIX}{tag}")
-    try:
+    with store.atomic(Path(zpath)) as tmp:
         with warnings.catch_warnings():
             # Zarr v3 warns that consolidated metadata isn't in the v3 spec; xarray
             # still writes+reads it and it speeds opening a many-variable cube.
             warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
             ds.to_zarr(tmp, mode="w-", consolidated=True, encoding=encoding)
-    except BaseException:
-        # BaseException, not Exception: a Ctrl-C halfway through to_zarr must not leave a
-        # half-cube behind either. Nothing at zpath has been touched, so the previous
-        # cube (if any) survives the failure intact.
-        _rm(tmp)
-        raise
-
-    # The new cube is complete on disk. Swap it in. os.replace() cannot clobber a
-    # non-empty directory, so an existing cube has to move aside first.
-    stash = None
-    if zpath.exists():
-        stash = zpath.with_name(f"{zpath.name}{OLD_SUFFIX}{tag}")
-        zpath.rename(stash)
-    try:
-        os.replace(tmp, zpath)
-    except OSError:
-        if stash is not None:        # put the old cube back: leaving NOTHING is worse
-            stash.rename(zpath)
-        _rm(tmp)
-        raise
-
-    if stash is not None:
-        _rm(stash)
 
 
 # --------------------------------------------------------------------------- #
@@ -785,6 +730,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         if zpath.exists() and not overwrite:
             log.info("=== %s: %s exists, skipping (use overwrite) ===", name, zpath.name)
             continue
+        store.sweep_scratch(zpath)      # clear scratch from a run that died mid-write
         if dry_run:
             log.info("=== %s: [dry-run] would assemble %d day(s) -> %s ===",
                      name, len(days), zpath.name)

@@ -54,7 +54,7 @@ import xarray as xr
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import provenance, store
 
 log = logging.getLogger(__name__)
 
@@ -240,10 +240,9 @@ def build_dataset(records: list[dict]) -> xr.Dataset:
 
 def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{aoi_id}_insitu.nc"
-    ds.to_netcdf(path, encoding={"sst": {"zlib": True, "complevel": 4},
-                                 "qc": {"zlib": True, "complevel": 4}})
-    return path
+    return store.write_netcdf(ds, out_dir / f"{aoi_id}_insitu.nc",
+                              encoding={"sst": {"zlib": True, "complevel": 4},
+                                        "qc": {"zlib": True, "complevel": 4}})
 
 
 # --------------------------------------------------------------------------- #
@@ -265,7 +264,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     for name in names:
         g = grids[name]
         out_path = out_root / name / f"{name}_insitu.nc"
-        if out_path.exists() and not overwrite:
+        if store.done(out_path, store.REQUIRED_VARS["INSITU"], overwrite=overwrite):
             log.info("=== %s: %s exists, skipping ===", name, out_path.name)
             continue
 

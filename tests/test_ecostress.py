@@ -284,24 +284,56 @@ def test_run_dry_run_searches_but_does_not_open(tmp_path, aoi_grid, run_stubs):
 
 
 # --- 2. skip-if-exists vs overwrite ---
-def _touch_aligned_file(tmp_path, name):
+def _aligned_path(tmp_path, name):
     aoi_out = tmp_path / name
     aoi_out.mkdir(parents=True, exist_ok=True)
-    (aoi_out / f"{name}_{_GRANULE_TSTR}.nc").touch()
+    return aoi_out / f"{name}_{_GRANULE_TSTR}.nc"
+
+
+def _write_aligned_file(tmp_path, aoi_grid, *, drop=()):
+    """A COMPLETE aligned granule on disk -- or, with `drop`, one missing a layer, as a
+    granule whose mask COG failed to download would be."""
+    H, W = aoi_grid.height, aoi_grid.width
+    layers = {v: (("y", "x"), np.zeros((H, W), "float32"))
+              for v in ("sst", "water", "cloud") if v not in drop}
+    if "valid" not in drop:
+        layers["valid"] = (("y", "x"), np.zeros((H, W), "uint8"))
+    xr.Dataset(layers).to_netcdf(_aligned_path(tmp_path, aoi_grid.name))
 
 
 def test_run_skips_existing_output(tmp_path, aoi_grid, run_stubs):
     run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
-    _touch_aligned_file(tmp_path, aoi_grid.name)     # output already on disk
+    _write_aligned_file(tmp_path, aoi_grid)          # a COMPLETE output already on disk
     ecostress.run(_eff(tmp_path, overwrite=False), {aoi_grid.name: aoi_grid},
                   None, False, False)
-    assert run_stubs["open"] == []       # existing file -> skipped, never opened
+    assert run_stubs["open"] == []       # complete file -> skipped, never opened
     assert run_stubs["write"] == []
+
+
+def test_run_refetches_a_truncated_output(tmp_path, aoi_grid, run_stubs):
+    """The whole point of the completeness check: an empty/truncated file left by a run
+    that died mid-write must NOT be mistaken for a finished one and skipped forever."""
+    run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
+    _aligned_path(tmp_path, aoi_grid.name).touch()   # 0-byte file, as a killed write leaves
+    ecostress.run(_eff(tmp_path, overwrite=False), {aoi_grid.name: aoi_grid},
+                  None, False, False)
+    assert run_stubs["open"]             # re-fetched, not skipped
+    assert run_stubs["write"]
+
+
+def test_run_refetches_a_granule_missing_its_cloud_mask(tmp_path, aoi_grid, run_stubs):
+    """A COMPLETE write of degraded content: the cloud COG failed, so the granule has sst
+    but no cloud/valid. Atomicity cannot see this -- only the layer check can."""
+    run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
+    _write_aligned_file(tmp_path, aoi_grid, drop=("cloud", "valid"))
+    ecostress.run(_eff(tmp_path, overwrite=False), {aoi_grid.name: aoi_grid},
+                  None, False, False)
+    assert run_stubs["open"]             # re-fetched, not trusted
 
 
 def test_run_overwrite_reprocesses_existing(tmp_path, aoi_grid, run_stubs):
     run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
-    _touch_aligned_file(tmp_path, aoi_grid.name)
+    _write_aligned_file(tmp_path, aoi_grid)
     ecostress.run(_eff(tmp_path, overwrite=True), {aoi_grid.name: aoi_grid},
                   None, False, False)
     assert run_stubs["open"]             # overwrite -> reprocessed

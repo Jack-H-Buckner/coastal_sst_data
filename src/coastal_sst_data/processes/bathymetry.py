@@ -42,7 +42,7 @@ from rasterio.transform import from_origin
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import provenance, store
 
 log = logging.getLogger(__name__)
 SOURCE = "bathymetry"
@@ -185,15 +185,11 @@ def from_gmrt(bbox_ll, pad, layer, resolution, target_crs, transform, W, H, geom
 def write_output(ds, out_dir, aoi_id, fmt) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if fmt == "netcdf":
-        path = out_dir / f"{aoi_id}.nc"
-        ds.to_netcdf(path, encoding={v: {"zlib": True, "complevel": 4} for v in ds.data_vars})
-    elif fmt == "geotiff":
-        path = out_dir / aoi_id
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            ds[v].rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
+        return store.write_netcdf(ds, out_dir / f"{aoi_id}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(ds, out_dir / aoi_id,
+                                   [(v, ds[v]) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
     return path
 
 
@@ -320,7 +316,8 @@ def run(eff, grids: dict[str, AoiGrid], aoi_sources: dict[str, str], only_aoi, d
                  name, g.width, g.height, g.resolution_m, source)
 
         out_path = out_root / name / f"{name}.nc"
-        if not overwrite and out_path.exists():
+        if store.done(out_path, store.REQUIRED_VARS["BATHYMETRY"],
+                      shape=(g.height, g.width), overwrite=overwrite):
             log.info("  already processed, skipping"); continue
         if dry_run:
             log.info("  [dry-run] would build bathymetry (%s) for %s", source, name); continue
