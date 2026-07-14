@@ -62,7 +62,7 @@ from rasterio.enums import Resampling
 
 from ..config import DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -132,9 +132,20 @@ def open_window(dataset_id, variables, bbox_ll, pad, start, end, depths, creds):
         kw["credentials_file"] = creds["credentials_file"]
 
     try:
-        return copernicusmarine.open_dataset(**kw)
+        return net.retry(lambda: copernicusmarine.open_dataset(**kw),
+                         what=f"CMEMS open {dataset_id}")
     except Exception as exc:
-        log.info("  %s: no usable window (%s)", dataset_id, exc)
+        # This returns None, which the chain reads as "this product has no such day" and
+        # falls through to the NEXT product. That is right for a genuine coverage gap and
+        # WRONG for an expired credential -- which used to look identical, at INFO. Say
+        # which one this is, loudly, because the fallback silently serves different data.
+        if net.is_transient(exc):
+            log.warning("  %s: unreachable after retries (%s); treating as no data",
+                        dataset_id, exc)
+        else:
+            log.warning("  %s: open FAILED (%s). If this is a credential/permission error, "
+                        "the fallback will now quietly serve a DIFFERENT product.",
+                        dataset_id, exc)
         return None
 
 
@@ -213,16 +224,11 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str) -> Path:
     d = pd.Timestamp(ds["time"].values[0]).strftime("%Y%m%d")
     stem = f"{aoi_id}_{d}"
     if fmt == "netcdf":
-        path = out_dir / f"{stem}.nc"
-        ds.to_netcdf(path, encoding={v: {"zlib": True, "complevel": 4} for v in ds.data_vars})
-    elif fmt == "geotiff":
-        path = out_dir / stem
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            ds[v].isel(time=0).rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
-    return path
+        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(ds, out_dir / stem,
+                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
 
 
 # --------------------------------------------------------------------------- #
@@ -244,6 +250,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in only_aoi]
 
+    rep = report.ProductReport("cmems")
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s | vars=%s depths=%s ===",
@@ -256,7 +264,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
         aoi_out = out_root / name
         remaining = [d for d in days
-                     if overwrite or not (aoi_out / f"{name}_{d.strftime('%Y%m%d')}.nc").exists()]
+                     if not store.done(aoi_out / f"{name}_{d.strftime('%Y%m%d')}.nc",
+                                       store.REQUIRED_VARS["CMEMS"], shape=(g.height, g.width),
+                                       overwrite=overwrite)]
+        rep.expect(len(days))
+        rep.skip(len(days) - len(remaining))
         if not remaining:
             log.info("  all %d day(s) already processed, skipping", len(days))
             continue
@@ -293,13 +305,17 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                                 **provenance.stamp(eff))
                 log.info("  [%s] %s -> %s", src, day.strftime("%Y%m%d"),
                          write_output(ds, aoi_out, name, fmt).name)
+                rep.wrote(source=DATASET_IDS[src])
             remaining = still
             sds.close()
 
         if remaining:
-            log.warning("  %s: %d day(s) not covered by %s", name, len(remaining),
+            log.warning("  %s: %d day(s) NOT COVERED by %s", name, len(remaining),
                         " or ".join(chain))
-    log.info("Done.")
+            for d in remaining:
+                rep.fail(f"{name} {d.strftime('%Y%m%d')}", f"not covered by {' or '.join(chain)}")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -360,7 +376,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

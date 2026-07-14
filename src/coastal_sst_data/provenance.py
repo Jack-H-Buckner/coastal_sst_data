@@ -34,6 +34,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import xarray as xr
@@ -57,10 +58,48 @@ def package_version() -> str:
     return __version__
 
 
+@lru_cache(maxsize=1)
+def code_version() -> str:
+    """Which CODE built this -- the git commit, not the package version.
+
+    `package_version` is pinned in pyproject and does not move: every cube ever built is
+    stamped "0.0.1" whatever commit produced it. That is fine for a release artifact and
+    useless for provenance, because the code is exactly what changes between two cubes
+    built from the same config. And it changes MEANINGFULLY: `mur_valid` used to include
+    NN-filled pixels and now does not; `depth` used to be fabricated zeros where the DEM
+    was missing and is now NaN. Two cubes with identical `config_sha256` and identical
+    `package_version` can therefore hold different numbers, and nothing in either says so.
+
+    A DIRTY tree is reported as such. A cube built from uncommitted edits is not
+    reproducible from any commit, and claiming a bare SHA for it would be a lie -- the
+    most dangerous kind here, because it is the one a reader would trust.
+
+    Degrades to "unknown" outside a git checkout (an installed wheel, a container), which
+    is honest: we would rather say we do not know than guess.
+    """
+    import subprocess
+    repo = Path(__file__).resolve().parent
+
+    def git(*args) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(repo), *args],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    sha = git("rev-parse", "HEAD")
+    if not sha:
+        return "unknown"
+    dirty = git("status", "--porcelain")
+    return f"{sha}-dirty" if dirty else sha
+
+
 def stamp(eff: dict | None = None) -> dict:
     """The attrs every acquisition write adds. `acquired_at` is evaluated HERE -- at write
     time -- so a long run dates each file honestly rather than all of them at start-up."""
-    out = {"acquired_at": now_utc(), "package_version": package_version()}
+    out = {"acquired_at": now_utc(), "package_version": package_version(),
+           "code_version": code_version()}
     sha = (eff or {}).get("config_sha256")
     if sha:
         out["config_sha256"] = sha
@@ -102,6 +141,9 @@ _EXACT = {
     "tide": ["tides"], "tide_range": ["tides"],
     "airtemp": ["met"], "wind_u": ["met"], "wind_v": ["met"], "wind_speed": ["met"],
     "swrad": ["met"], "cloud_cover": ["met"],
+    # which source served met on each day (see daily_sources); cmems_source is caught by
+    # the cmems_ prefix rule below
+    "met_source": ["met"],
     "depth": ["bathymetry"], "depth_p25": ["bathymetry"], "depth_p75": ["bathymetry"],
     "landmask": ["landcover", "bathymetry"],
     "landcover_water": ["landcover"],
@@ -183,6 +225,39 @@ def collect_product(d: Path, product: str) -> dict | None:
     }
 
 
+def daily_sources(d: Path, aoi_id: str, days, prefix: str = "") -> tuple[list[int], list[str]]:
+    """Per-DAY source code for one product in one AoI, plus the legend naming each code.
+
+    `collect_product` above unions a product's sources into a SET, which answers "which
+    sources appear somewhere in this cube" and destroys the per-day answer this module's
+    docstring promises. That union is exactly wrong for the products that switch source
+    underneath you: a CMEMS product with 300 reanalysis days and 65 forecast days reports
+    `[glorys, forecast]` and tells you nothing about any given day, and a met product that
+    fell back to ERA5 for a fortnight in March looks identical to one that never did.
+
+    So the cube carries the answer per timestep. Code 0 is always "none" (no file that
+    day); legend[i] names code i. `prefix` selects a variant written into the same
+    directory (met writes both `<aoi>_<date>.nc` and `<aoi>_ref_<date>.nc`), matched WHOLE
+    so the two cannot be confused.
+    """
+    codes = [0] * len(days)
+    legend = ["none"]
+    if not d.exists():
+        return codes, legend
+
+    pat = re.compile(rf"^{re.escape(aoi_id)}_{re.escape(prefix)}(\d{{8}})\.nc$")
+    idx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
+    for f in sorted(d.glob(f"{aoi_id}_{prefix}*.nc")):
+        m = pat.match(f.name)
+        if not m or m.group(1) not in idx:
+            continue
+        s = str(source_of(f) or "unknown")
+        if s not in legend:
+            legend.append(s)
+        codes[idx[m.group(1)]] = legend.index(s)
+    return codes, legend
+
+
 # The assembler's directory key for the tide product is singular; the product (and every
 # field mapping) is plural. Normalize, or tide-derived fields would silently find no
 # provenance record at all.
@@ -237,6 +312,7 @@ def build(project, fields, products: dict) -> dict:
     return {
         "created_at": now_utc(),
         "package_version": package_version(),
+        "code_version": code_version(),
         "config_path": str(getattr(project, "config_path", None) or "") or None,
         "config_sha256": getattr(project, "config_sha256", None),
         "config_yaml": getattr(project, "config_text", None),

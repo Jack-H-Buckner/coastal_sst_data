@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -49,7 +50,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -93,9 +94,20 @@ def _is_night(granule) -> bool:
 # Fetch backends: granule -> local NetCDF path. Swappable via `access`.
 # --------------------------------------------------------------------------- #
 def _fetch_download(granule, bbox, tmp_dir: Path) -> Path:
-    """Download the full granule to disk (cropped in memory afterwards)."""
+    """Download the full granule into a SCRATCH dir the caller will delete.
+
+    `earthaccess.download` skips a file that already exists BY NAME. That is a caching
+    feature and, combined with the old lifecycle (unlink inside the try, so a killed run
+    left the partial granule behind), it was a corruption vector: the truncated granule
+    survived, the next run saw the name already present, skipped the download, and handed
+    the truncated file straight to read_swath. Hence the per-granule scratch dir, deleted
+    in a `finally` -- a granule directory that outlives its attempt cannot be reused.
+    """
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    paths = earthaccess.download([granule], local_path=str(tmp_dir))
+    paths = net.retry(lambda: earthaccess.download([granule], local_path=str(tmp_dir)),
+                      what="MODIS granule download")
+    if not paths:
+        raise RuntimeError("earthaccess.download returned no path")
     return Path(paths[0])
 
 
@@ -142,7 +154,8 @@ def resample_to_grid(sst, lat, lon, g: AoiGrid, radius_m, footprint=None):
     return sst_g, fp_g
 
 
-def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius) -> xr.Dataset:
+def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius,
+                   short_name=SHORT_NAME) -> xr.Dataset:
     xs, ys = g.xy_centers()
     data = {
         "sst": (("y", "x"), sst_g.astype("float32")),
@@ -158,7 +171,9 @@ def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius) -> xr.
             "MODIS swath pixel index (for footprint-median matchups); -1 = none")
     ds = ds.expand_dims(time=[pd.Timestamp(acq_time)])
     ds = ds.rio.write_crs(g.target_crs)
-    ds.attrs.update(aoi_id=aoi_id, source=f"GHRSST {SHORT_NAME}",
+    # The short_name we actually SEARCHED, not the module default: configure Aqua and the
+    # old constant still stamped every file "Terra", so the cube misnamed its own sensor.
+    ds.attrs.update(aoi_id=aoi_id, source=f"GHRSST {short_name}",
                     processing="swath -> nearest resample onto AoI grid")
     return ds
 
@@ -168,16 +183,11 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str) -> Path:
     t = pd.Timestamp(ds["time"].values[0]).strftime("%Y%m%dT%H%M%S")
     stem = f"{aoi_id}_{t}"
     if fmt == "netcdf":
-        path = out_dir / f"{stem}.nc"
-        ds.to_netcdf(path, encoding={v: {"zlib": True, "complevel": 4} for v in ds.data_vars})
-    elif fmt == "geotiff":
-        path = out_dir / stem
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            ds[v].isel(time=0).rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
-    return path
+        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(ds, out_dir / stem,
+                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
 
 
 # --------------------------------------------------------------------------- #
@@ -228,6 +238,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("modis")
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | match_landsat=%s access=%s ===",
@@ -239,9 +251,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                         "run Landsat first (or set match_landsat: false)", name, landsat_dir / name)
             continue
 
-        granules = earthaccess.search_data(
-            short_name=ds_cfg["short_name"], temporal=(start, end),
-            bounding_box=tuple(g.search_bbox))
+        granules = net.retry(
+            lambda: earthaccess.search_data(
+                short_name=ds_cfg["short_name"], temporal=(start, end),
+                bounding_box=tuple(g.search_bbox)),
+            what=f"MODIS search {name}")
         kept = _select_granules(granules, ls_times, match_landsat, max_dt, daytime_only)
         log.info("  %d granule(s) over AOI -> %d after daytime/coincidence filter",
                  len(granules), len(kept))
@@ -254,25 +268,34 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         aoi_out = out_root / name
         for gr, t in kept:
             tstr = t.strftime("%Y%m%dT%H%M%S")
-            if not overwrite and (aoi_out / f"{name}_{tstr}.nc").exists():
+            if store.done(aoi_out / f"{name}_{tstr}.nc", store.REQUIRED_VARS["MODIS"],
+                          shape=(g.height, g.width), overwrite=overwrite):
                 log.info("  %s already processed, skipping", tstr)
                 continue
+            # One scratch dir per granule, removed in `finally`. A partial download can
+            # therefore never survive to be mistaken for a complete one by the next run.
+            gran_tmp = tmp_dir / f"g_{name}_{tstr}"
             try:
-                path = fetch(gr, g.search_bbox, tmp_dir)
+                path = fetch(gr, g.search_bbox, gran_tmp)
                 sst, lat, lon = read_swath(path, variable, quality_min, to_celsius)
                 fp = np.arange(sst.size, dtype="int32").reshape(sst.shape) if do_footprint else None
                 sst_g, fp_g = resample_to_grid(sst, lat, lon, g, radius, fp)
-                Path(path).unlink(missing_ok=True)
             except Exception as exc:
-                log.warning("  skipping %s (%s)", tstr, exc)
+                log.warning("  FAILED %s (%s)", tstr, exc)
+                rep.fail(f"{name} {tstr}", exc)
                 continue
+            finally:
+                shutil.rmtree(gran_tmp, ignore_errors=True)
             if not np.isfinite(sst_g).any():
                 log.info("  %s: no valid MODIS pixels over AOI, skipping", tstr)
                 continue
-            ds = _scene_dataset(sst_g, fp_g, g, t, name, to_celsius)
+            ds = _scene_dataset(sst_g, fp_g, g, t, name, to_celsius,
+                                short_name=ds_cfg["short_name"])
             ds.attrs.update(**provenance.stamp(eff))
             log.info("  wrote %s", write_output(ds, aoi_out, name, fmt))
-    log.info("Done.")
+            rep.wrote(source=f"GHRSST {ds_cfg['short_name']}")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -342,7 +365,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["ds"]["match_landsat"] = False
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

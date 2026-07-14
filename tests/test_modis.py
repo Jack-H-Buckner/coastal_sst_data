@@ -175,6 +175,96 @@ def test_scene_dataset_schema(tmp_path, aoi_grid):
     assert ds.sizes["y"] == aoi_grid.height and ds.sizes["x"] == aoi_grid.width
     assert "time" in ds.coords
 
+
+def test_source_attr_names_the_configured_sensor(aoi_grid):
+    """Configure Aqua and every file used to still claim Terra, because the attr was built
+    from the module constant rather than the short_name the search actually used."""
+    g = aoi_grid
+    sst = np.full((g.height, g.width), 290.0, "float32")
+
+    terra = modis._scene_dataset(sst, None, g, datetime(2023, 7, 15, 21, 0), "aoi", False)
+    assert terra.attrs["source"] == f"GHRSST {modis.SHORT_NAME}"          # default
+
+    aqua = modis._scene_dataset(sst, None, g, datetime(2023, 7, 15, 21, 0), "aoi", False,
+                                short_name="MODIS_A-JPL-L2P-v2019.0")
+    assert aqua.attrs["source"] == "GHRSST MODIS_A-JPL-L2P-v2019.0"       # follows config
+    assert "MODIS_T" not in aqua.attrs["source"]                          # NOT Terra
+
+
+# --------------------------------------------------------------------------- #
+# The tmp-granule lifecycle. `earthaccess.download` skips a file that already exists BY
+# NAME, so a truncated granule left by a killed run was handed straight back to the reader.
+# --------------------------------------------------------------------------- #
+class _Gran:
+    def __init__(self, t="2023-07-15T21:00:00.000Z"):
+        self._t = t
+
+    def __getitem__(self, k):
+        if k == "umm":
+            return {"TemporalExtent": {"RangeDateTime": {"BeginningDateTime": self._t}}}
+        return {"native-id": "MODIS-D-granule"}
+
+
+def _modis_eff(tmp_path):
+    return {
+        "ds": {"short_name": modis.SHORT_NAME, "variable": modis.DEFAULT_VARIABLE,
+               "quality_min": 4, "regrid_radius_m": 1500.0, "access": "download",
+               "match_landsat": False, "max_time_diff_minutes": 360,
+               "daytime_only": True, "footprint_id": False},
+        "grid": {"to_celsius": False},
+        "out_dir": tmp_path / "out", "tmp_dir": tmp_path / "_tmp",
+        "landsat_dir": tmp_path / "LANDSAT",
+        "fmt": "netcdf", "overwrite": False,
+        "earthdata": {"auth_strategy": "netrc"},
+        "time": {"start_date": "2023-07-15", "end_date": "2023-07-15"},
+        "config_sha256": "x",
+    }
+
+
+def test_a_failed_granule_leaves_no_tmp_file_behind(monkeypatch, tmp_path, aoi_grid):
+    """A partial download must not survive the attempt: the next run would see the name
+    already present, skip the download, and read the truncated file."""
+    monkeypatch.setattr(modis.earthaccess, "login", lambda **kw: None)
+    monkeypatch.setattr(modis.earthaccess, "search_data", lambda **kw: [_Gran()])
+
+    def fetch_then_die(granule, bbox, tmp_dir):
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        p = tmp_dir / "granule.nc"
+        p.write_bytes(b"half a granule")          # a partial download, as a kill would leave
+        raise ConnectionError("connection reset mid-download")
+
+    monkeypatch.setitem(modis._ACCESS, "download", fetch_then_die)
+
+    eff = _modis_eff(tmp_path)
+    rep = modis.run(eff, {aoi_grid.name: aoi_grid}, None, False)
+
+    assert rep.failed == 1                        # counted as a LOSS, not a silent skip
+    leftovers = list((tmp_path / "_tmp").rglob("*.nc"))
+    assert leftovers == []                        # ...and nothing truncated survives
+
+
+def test_a_successful_granule_also_cleans_up_its_scratch(monkeypatch, tmp_path, aoi_grid):
+    monkeypatch.setattr(modis.earthaccess, "login", lambda **kw: None)
+    monkeypatch.setattr(modis.earthaccess, "search_data", lambda **kw: [_Gran()])
+
+    src = write_modis_granule(tmp_path / "src.nc", aoi_grid.search_bbox,
+                              sst_kelvin=290.0, quality=5)
+
+    def fetch(granule, bbox, tmp_dir):
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        dst = tmp_dir / "granule.nc"
+        dst.write_bytes(Path(src).read_bytes())
+        return dst
+
+    monkeypatch.setitem(modis._ACCESS, "download", fetch)
+
+    eff = _modis_eff(tmp_path)
+    rep = modis.run(eff, {aoi_grid.name: aoi_grid}, None, False)
+
+    assert rep.written == 1 and rep.failed == 0
+    assert list((tmp_path / "_tmp").rglob("*.nc")) == []     # scratch removed on success too
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v", "-s"])
+

@@ -16,22 +16,22 @@ keywords = ["sea-surface-temperature", "remote-sensing", "coastal", "xarray", "z
 # Feature backends with heavier or narrower deps are lazy-imported and live in the
 # optional-dependencies extras below, so the base install stays lean.
 dependencies = [
-    "numpy",
-    "pandas",
-    "xarray",
-    "pydantic>=2",
+    "numpy>=2.0,<3",
+    "pandas>=2.2,<3",
+    "xarray>=2024.7,<2027",
+    "pydantic>=2.7,<3",
     "pyyaml",
-    "pyproj",
-    "shapely",
+    "pyproj>=3.6,<4",
+    "shapely>=2.0,<3",
     "affine",
-    "rasterio",
-    "rioxarray",
+    "rasterio>=1.4,<2",
+    "rioxarray>=0.17,<1",
     "requests",
     "earthaccess",
-    "zarr>=3",
-    "numcodecs",
-    "scipy",
-    "h5netcdf",                # xarray engine for the MUR SST backbone (mur.py)
+    "zarr>=3.0,<4",
+    "numcodecs>=0.13,<1",
+    "scipy>=1.13,<2",
+    "h5netcdf>=1.4,<2",                # xarray engine for the MUR SST backbone (mur.py)
 ]
 
 [project.optional-dependencies]

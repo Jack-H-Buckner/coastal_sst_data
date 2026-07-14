@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 from enum import Enum
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, Literal
 from math import cos, radians
@@ -151,10 +152,9 @@ class DataProduct(str, Enum):
 class ProductOptions(BaseModel):
     """GLOBAL (project-wide) options for one data product.
 
-    Set once under the project `products` block. The concrete fields depend on
-    the final format of each process file, which isn't settled yet -- so extra
-    keys are ALLOWED for now. Tighten to a real schema (and extra='forbid') per
-    product as that process is finalized.
+    Set once under the project `products` block. Keys stay open at the pydantic level (one
+    bag serves every product), but they are CHECKED against PRODUCT_OPTIONS below -- see
+    `Project._option_keys_are_known`.
     """
     model_config = {"extra": "allow"}
 
@@ -162,11 +162,58 @@ class ProductOptions(BaseModel):
 class SourceOptions(BaseModel):
     """REGION-DEPENDENT options for one data product's source.
 
-    Set per region under `sources`, for things that vary geographically (e.g.
-    which DEM or tide model has coverage there). Same 'schema TBD' caveat as
-    ProductOptions -- extra keys allowed for now.
+    Set per region under `sources`, for things that vary geographically (e.g. which DEM or
+    tide model has coverage there). Checked against REGION_OPTIONS below.
     """
     model_config = {"extra": "allow"}
+
+
+# --------------------------------------------------------------------------- #
+# Which options each product actually READS
+# --------------------------------------------------------------------------- #
+# A key that is not in this registry does NOTHING. It used to be accepted in silence, which
+# is the worst of both worlds: the config says one thing, the run does another, and the
+# provenance faithfully records the run -- so the lie lives in the config file, where nobody
+# looks. `bathymetry.source` was exactly this: documented, set, and never read (the module
+# reads `default_source`), so a config asking for 3 m CUDEM would quietly get ~100 m GMRT.
+#
+# Keep these in step with the `_opt(opts, "<key>", ...)` calls in each process module.
+_COMMON = {"output_format", "overwrite"}
+
+PRODUCT_OPTIONS: dict[DataProduct, set[str]] = {
+    DataProduct.bathymetry: _COMMON | {
+        "source", "default_source", "fallback", "pad_deg", "layer", "resolution",
+        "stats_subgrid_m", "min_cudem_cover", "cudem_urllist", "cudem_index_cache"},
+    DataProduct.mur: _COMMON | {"short_name", "variable", "pad_deg"},
+    DataProduct.modis: _COMMON | {
+        "short_name", "variable", "quality_min", "regrid_radius_m", "access",
+        "match_landsat", "max_time_diff_minutes", "daytime_only", "footprint_id"},
+    DataProduct.ecostress: _COMMON | {"short_name", "version", "layers", "categorical"},
+    DataProduct.landsat: _COMMON | {
+        "source", "collection", "stac_url", "platforms", "cloud_cover_max", "masking"},
+    DataProduct.cmems: _COMMON | {
+        "source", "fallback", "dataset_id", "variables", "depths", "pad_deg"},
+    DataProduct.met: _COMMON | {
+        "source", "fallback", "variables", "model", "product", "fxx", "era5_zarr",
+        "regrid_radius_m", "pad_deg", "reference_time", "reference_basis",
+        "daily_mean_hours", "overpass_from"},
+    DataProduct.tides: _COMMON | {
+        "source", "default_source", "fallback", "model", "model_directory", "interval",
+        "stations", "warn_distance_km", "fallback_distance_km"},
+    DataProduct.landcover: _COMMON | {
+        "source", "collection", "stac_url", "year", "water_classes"},
+    DataProduct.insitu: _COMMON | {
+        "source", "variables", "stations", "exclude_stations", "qc_flags", "pad_deg",
+        "max_sensor_depth_m"},
+}
+
+# Region-level overrides, for what genuinely varies geographically. Deliberately narrow: a
+# region-level key nothing reads is a silent no-op, and a datum offset that never reaches
+# the datum stage is exactly the kind of thing that biases a cube by a metre in silence.
+REGION_OPTIONS: dict[DataProduct, set[str]] = {
+    DataProduct.bathymetry: {"dem_source", "datum_offset_m"},
+    DataProduct.tides: {"source", "model", "model_directory", "stations"},
+}
 
 
 def _options_by_product(value: Any) -> Any:
@@ -479,6 +526,43 @@ class Project(BaseModel):
                     f"region {r.name!r} has sources for non-selected product(s): "
                     f"{names}. Add them to `products` or remove the source entries."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _option_keys_are_known(self):
+        """Reject product/source options that no code reads.
+
+        A key nothing reads is not harmless -- it is a config that LIES. It states an
+        intent, the run ignores it, and the provenance honestly records what the run did,
+        so nothing anywhere contradicts the config file. `bathymetry.source: cudem` was
+        documented, settable, and silently discarded (the module reads `default_source`),
+        which means a config asking for 3 m topobathy would quietly produce ~100 m GMRT.
+
+        Failing at load time is the only point at which this is cheap to notice.
+        """
+        problems: list[str] = []
+
+        def check(where: str, product: DataProduct, opts, allowed: set[str]):
+            extra = set(getattr(opts, "model_extra", None) or {})
+            unknown = sorted(extra - allowed)
+            for key in unknown:
+                hint = get_close_matches(key, sorted(allowed), n=1, cutoff=0.6)
+                suggest = f" (did you mean {hint[0]!r}?)" if hint else ""
+                problems.append(
+                    f"{where}.{product.value}.{key} is not a recognised option{suggest}. "
+                    f"Valid: {', '.join(sorted(allowed)) or '(none)'}")
+
+        for product, opts in self.products.items():
+            check("products", product, opts, PRODUCT_OPTIONS.get(product, set()))
+        for r in self.regions:
+            for product, opts in r.sources.items():
+                check(f"regions[{r.name}].sources", product, opts,
+                      REGION_OPTIONS.get(product, set()))
+
+        if problems:
+            raise ValueError(
+                "unrecognised config option(s) -- these would be SILENTLY IGNORED:\n  "
+                + "\n  ".join(problems))
         return self
 
     # What this project was LOADED FROM. Kept so an assembled datacube can embed the

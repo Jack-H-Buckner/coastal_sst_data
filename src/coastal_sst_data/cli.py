@@ -9,6 +9,7 @@ A single entry point over the pieces of the package:
     coastal-sst-data validate --config config.yaml        # load + summarize the config
     coastal-sst-data grids    --config config.yaml        # show each AoI's target grid
     coastal-sst-data assemble --config config.yaml        # knit aligned outputs -> datacubes
+    coastal-sst-data check    --config config.yaml        # find truncated/incomplete outputs
 
 (Equivalent to `python -m coastal_sst_data.cli <command> ...`.) Each subcommand
 just wires argparse to an existing function -- run_pipeline, auth.verify,
@@ -19,8 +20,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 
-from . import auth
+from . import auth, store
 from .config import DataProduct, load_config, required_backend
 from .pipeline import _module_for, compute_grids, run_pipeline
 
@@ -166,6 +168,40 @@ def _cmd_grids(args):
 # --------------------------------------------------------------------------- #
 # Parser
 # --------------------------------------------------------------------------- #
+def _cmd_check(args):
+    """Scan the output tree for files that are not finished outputs.
+
+    Anything written before the writes became atomic may be truncated, and the skip guard
+    has been treating those as done on every run. This reads each file's PAYLOAD -- not
+    just its header, which survives a truncation intact -- and reports what it cannot read.
+    With --repair it deletes them, which IS the repair: the next run finds no output there
+    and re-fetches it, without a full --overwrite of everything that was already fine.
+    """
+    project = load_config(args.config)
+    root = Path(project.output_dir)
+    if not root.exists():
+        raise SystemExit(f"output_dir does not exist: {root}")
+
+    print(f"Scanning {root} ({'metadata only' if args.quick else 'deep read'}) ...")
+    n, bad, leftovers = store.scan(root, aois=args.aois, deep=not args.quick)
+
+    for product, f in bad:
+        print(f"  BAD      {product:<11} {f.relative_to(root)}")
+    for p in leftovers:
+        print(f"  SCRATCH  {'':<11} {p.relative_to(root)}   (a run died mid-write)")
+
+    print(f"\n{n} file(s) checked, {len(bad)} unreadable/incomplete, "
+          f"{len(leftovers)} scratch leftover(s).")
+    if not bad and not leftovers:
+        print("Tree is clean.")
+        return
+    if not args.repair:
+        print("Re-run with --repair to delete these; the next run will then re-fetch them.")
+        return
+    removed = store.repair(bad, leftovers)
+    print(f"Removed {removed} path(s). Re-run the pipeline to re-fetch them.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="coastal-sst-data",
@@ -234,6 +270,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_prov.add_argument("--fields", action="store_true",
                         help="Also list every field and the product(s) it came from.")
     p_prov.set_defaults(func=_cmd_provenance)
+
+    p_chk = sub.add_parser(
+        "check",
+        help="Scan the output tree for truncated or incomplete files and (with --repair) "
+             "delete them so the next run re-fetches them.")
+    add_common(p_chk)
+    p_chk.add_argument("--aoi", nargs="+", dest="aois", help="Only these AoI name(s).")
+    p_chk.add_argument("--quick", action="store_true",
+                       help="Metadata only: check the layers, don't read the payload. "
+                            "Much faster, but cannot see a truncated chunk.")
+    p_chk.add_argument("--repair", action="store_true",
+                       help="Delete the bad files (default: report only).")
+    p_chk.set_defaults(func=_cmd_check)
 
     return ap
 

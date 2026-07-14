@@ -3,6 +3,9 @@ output tree, assembles them, and asserts the knit result: channel layout, the
 clearest-overpass pick, the land-cover water mask + MUR fill, and that the Zarr
 was written with the expected chunking/compressor. No network, no real data."""
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -103,6 +106,19 @@ def write_modis(project, g, day, temp=287.0):
     _write(project, "MODIS", f"{AOI}_{day.strftime('%Y%m%d')}T210000.nc", ds)
 
 
+def write_cmems(project, g, days, *, land_cols):
+    """CMEMS daily files. The ~9 km model's land mask swallows `land_cols` (NaN there)."""
+    H, W, xs, ys = _grid_hw(g)
+    for day in days:
+        arr = np.full((H, W), 284.0, "float32")
+        arr[:, land_cols] = np.nan                     # model never resolved these cells
+        ds = xr.Dataset({"thetao_0m": (("time", "y", "x"), arr[None]),
+                         "valid": (("time", "y", "x"),
+                                   np.isfinite(arr)[None].astype("uint8"))},
+                        coords={"time": [day], "y": ys, "x": xs})
+        _write(project, "CMEMS", f"{AOI}_{day.strftime('%Y%m%d')}.nc", ds)
+
+
 def write_bathymetry(project, g):
     H, W, xs, ys = _grid_hw(g)
     ds = xr.Dataset({"elevation": (("y", "x"), np.full((H, W), -10.0, "float32")),
@@ -166,6 +182,57 @@ def test_mur_filled_over_landcover_water_only(project, grids, days):
     mur0 = ds["mur_sst"].isel(time=0).values
     assert np.isfinite(mur0[:, 5:7]).all()                 # water hole filled
     assert np.isnan(mur0[:, :5]).all()                     # land hole NOT filled
+
+
+def test_nn_filled_mur_is_flagged_filled_and_not_valid(project, grids, days):
+    """`valid` must mean OBSERVED. A filled pixel's value was invented by copying the
+    nearest offshore cell -- flagging it valid tells a model a fabrication is data."""
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 7))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 5))      # cols 5,6 = water hole
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    valid = ds["mur_valid"].isel(time=0).values
+    filled = ds["mur_filled"].isel(time=0).values
+    sst = ds["mur_sst"].isel(time=0).values
+
+    assert (valid[:, 5:7] == 0).all()       # filled water: NOT observed
+    assert (filled[:, 5:7] == 1).all()      # ...and explicitly flagged as filled
+    assert np.isfinite(sst[:, 5:7]).all()   # ...while still carrying a usable value
+    assert (valid[:, 7:] == 1).all()        # genuinely observed water
+    assert (filled[:, 7:] == 0).all()
+    assert (filled[:, :5] == 0).all()       # land was never filled
+    # and the two are disjoint: no pixel is both observed and invented
+    assert not (valid & filled).any()
+
+
+def test_mur_filled_is_all_zero_when_the_fill_is_disabled(project, grids, days):
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 7))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 5))
+    eff = datacube._build_eff(project)
+    eff["fill_mur_water"] = False
+    ds = datacube.assemble_aoi(g, eff, days)
+    assert (ds["mur_filled"].values == 0).all()
+
+
+def test_missing_bathymetry_gives_nan_depth_not_a_fabricated_sea_level(project, grids, days,
+                                                                       caplog):
+    """The worst bug in the audit: with no DEM, `np.where(elev < 0, -elev, 0.0)` took the
+    0.0 branch for every cell (np.nan < 0 is False) and shipped a flawless, NaN-free
+    'everything is exactly at sea level' bathymetry that looked entirely real."""
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_landcover(project, g, land_cols=slice(0, 5))
+    # deliberately NO write_bathymetry(...)
+    with caplog.at_level("WARNING"):
+        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    for v in ("depth", "depth_p25", "depth_p75"):
+        assert np.isnan(ds[v].values).all(), f"{v} was fabricated, not NaN"
+    assert "no bathymetry file" in caplog.text        # and the user is TOLD
 
 
 def test_mur_fill_disabled(project, grids, days):
@@ -267,6 +334,78 @@ def test_assemble_skips_existing_without_overwrite(project, grids, days, caplog)
 def test_assemble_unknown_aoi_errors(project, grids):
     with pytest.raises(SystemExit, match="not found"):
         datacube.assemble(project, grids=grids, aois=["nope"])
+
+
+# --------------------------------------------------------------------------- #
+# write_zarr_safe: a run that dies mid-write must not leave a cube behind
+# --------------------------------------------------------------------------- #
+def _cube(n=4, h=8, w=8):
+    return xr.Dataset(
+        {"f": (("time", "y", "x"), np.arange(n * h * w, dtype="float32").reshape(n, h, w))},
+        coords={"time": range(n), "y": range(h), "x": range(w)})
+
+
+def _write_cube(ds, zpath):
+    datacube.write_zarr_safe(ds, zpath, datacube.build_encoding(ds, CompressionSpec(), {}))
+
+
+def test_write_zarr_safe_leaves_nothing_at_the_final_path_when_the_write_dies(tmp_path, monkeypatch):
+    """The point of the whole exercise: a killed write must not park a partial cube at the
+    final path, where the next run's exists() check would take it for a finished one."""
+    zpath = tmp_path / "aoi.zarr"
+
+    def die(self, store, *a, **kw):
+        Path(store).mkdir()                   # half-write the scratch dir, then drop the wire
+        (Path(store) / "chunk.0.0").write_text("truncated")
+        raise ConnectionError("connection reset mid-write")
+
+    monkeypatch.setattr(xr.Dataset, "to_zarr", die)
+    with pytest.raises(ConnectionError):
+        _write_cube(_cube(), zpath)
+
+    assert not zpath.exists()                          # nothing at the final path
+    assert not list(tmp_path.glob("*.part-*"))          # and the scratch was cleaned up
+
+
+def test_write_zarr_safe_keeps_the_previous_cube_when_the_rewrite_dies(tmp_path, monkeypatch):
+    """An overwrite that fails must leave the OLD cube intact -- losing a good cube to a
+    failed refresh would be a worse outcome than not refreshing it."""
+    zpath = tmp_path / "aoi.zarr"
+    _write_cube(_cube(), zpath)
+    before = xr.open_zarr(zpath)["f"].values.copy()
+
+    def die(self, *a, **kw):
+        raise ConnectionError("connection reset mid-write")
+
+    monkeypatch.setattr(xr.Dataset, "to_zarr", die)
+    with pytest.raises(ConnectionError):
+        _write_cube(_cube() * 99, zpath)
+
+    assert np.array_equal(xr.open_zarr(zpath)["f"].values, before)   # old cube survived
+    assert not list(tmp_path.glob("*.old-*"))                        # not stranded aside
+
+
+def test_write_zarr_safe_overwrites_and_cleans_up(tmp_path):
+    zpath = tmp_path / "aoi.zarr"
+    _write_cube(_cube(), zpath)
+    _write_cube(_cube() + 100.0, zpath)
+
+    assert xr.open_zarr(zpath)["f"].values[0, 0, 0] == 100.0        # new cube won
+    assert not list(tmp_path.glob("*.part-*")) and not list(tmp_path.glob("*.old-*"))
+
+
+def test_write_zarr_safe_sweeps_scratch_left_by_an_earlier_crash(tmp_path, caplog):
+    zpath = tmp_path / "aoi.zarr"
+    stale = tmp_path / "aoi.zarr.part-999-1"
+    stale.mkdir()
+    (stale / "junk").write_text("half a chunk")
+
+    with caplog.at_level("WARNING"):
+        _write_cube(_cube(), zpath)
+
+    assert not stale.exists()
+    assert "unfinished run" in caplog.text          # and the user is TOLD a run had died
+    assert xr.open_zarr(zpath).sizes["time"] == 4
 
 
 # --------------------------------------------------------------------------- #
@@ -373,5 +512,125 @@ def test_overpass_met_is_configurable(project, grids, days):
     eff["overpass_met"] = []                                  # disabled entirely
     ds = datacube.assemble_aoi(g, eff, days)
     assert not [v for v in ds.data_vars if v.startswith("eco_") and "airtemp" in v]
+
+def test_nn_filled_cmems_gets_its_own_filled_flag(project, grids, days):
+    """Each CMEMS variable carries its OWN filled mask -- the model's land mask deepens
+    with depth, so two levels are not filled in the same cells."""
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))          # all water per land-cover
+    write_cmems(project, g, days, land_cols=slice(0, 4))        # model has no data cols 0-3
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "cmems_thetao_0m_filled" in ds.data_vars
+    filled = ds["cmems_thetao_0m_filled"].isel(time=0).values
+    val = ds["cmems_thetao_0m"].isel(time=0).values
+    assert (filled[:, :4] == 1).all()        # cells the model never resolved -> filled
+    assert (filled[:, 4:] == 0).all()        # cells it did resolve -> not filled
+    assert np.isfinite(val).all()            # ...and all cells carry a usable value
+
+
+def _write_cmems_day(project, g, day, source):
+    """One CMEMS day stamped with the source that produced it."""
+    H, W, xs, ys = _grid_hw(g)
+    ds = xr.Dataset({"thetao_0m": (("time", "y", "x"), np.full((1, H, W), 284.0, "float32")),
+                     "valid": (("time", "y", "x"), np.ones((1, H, W), "uint8"))},
+                    coords={"time": [day], "y": ys, "x": xs})
+    ds.attrs["source"] = source
+    _write(project, "CMEMS", f"{AOI}_{day.strftime('%Y%m%d')}.nc", ds)
+
+
+def test_cmems_source_is_recorded_PER_DAY_not_unioned(project, grids, days, caplog):
+    """A CMEMS product with reanalysis days and forecast days used to report `[both]` as a
+    set, which says nothing about the day you are actually looking at."""
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    # day 0 + 1 from the reanalysis; day 2 fell back to the forecast
+    _write_cmems_day(project, g, days[0], "cmems_mod_glo_phy_my_0.083deg_P1D-m")
+    _write_cmems_day(project, g, days[1], "cmems_mod_glo_phy_my_0.083deg_P1D-m")
+    _write_cmems_day(project, g, days[2], "cmems_mod_glo_phy_anfc_0.083deg_P1D-m")
+
+    with caplog.at_level("WARNING"):
+        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "cmems_source" in ds.data_vars
+    codes = ds["cmems_source"].values
+    legend = json.loads(ds["cmems_source"].attrs["legend"])
+
+    assert legend[0] == "none"                       # code 0 always means "no file"
+    assert codes[0] == codes[1] != codes[2]          # the switch is visible per DAY
+    assert "my" in legend[codes[0]] and "anfc" in legend[codes[2]]
+    assert "changed source mid-series" in caplog.text   # ...and the user is told
+
+
+def test_source_channel_is_absent_when_the_product_never_ran(project, grids, days):
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert "cmems_source" not in ds.data_vars    # no CMEMS files -> no channel to explain
+
+
+# --------------------------------------------------------------------------- #
+# Coverage: the cube's time axis is built from the CONFIG, so a lost day is a NaN
+# slice that looks exactly like a cloudy day. Count what actually landed.
+# --------------------------------------------------------------------------- #
+def test_coverage_counts_the_days_that_actually_landed(project, grids, days):
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    # drop one of the three MUR days, as a failed download would
+    (project.output_dir / "MUR" / "aligned" / AOI /
+     f"{AOI}_{days[1].strftime('%Y%m%d')}.nc").unlink()
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    cov = json.loads(ds.attrs["coverage"])
+
+    assert cov["mur"]["days_expected"] == 3
+    assert cov["mur"]["days_with_data"] == 2      # the lost day is COUNTED, not hidden
+    assert cov["mur"]["fraction"] == 2 / 3
+    assert ds.sizes["time"] == 3                  # ...while the axis is still full-length
+
+
+def test_thin_coverage_is_warned_about(project, grids, days, caplog):
+    g = grids[AOI]
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    write_mur(project, g, [days[0]], water_hole_cols=slice(0, 0))   # 1 of 3 days only
+
+    with caplog.at_level("WARNING"):
+        datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "covers only 1 of 3" in caplog.text
+    assert "look exactly like cloudy days" in caplog.text
+
+
+def test_full_coverage_does_not_warn(project, grids, days, caplog):
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    with caplog.at_level("WARNING"):
+        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert json.loads(ds.attrs["coverage"])["mur"]["fraction"] == 1.0
+    assert "covers only" not in caplog.text
+
+
+def test_overpass_sensors_are_not_judged_on_daily_coverage(project, grids, days):
+    """ECOSTRESS/Landsat/MODIS are overpass sensors: a day with no scene is NORMAL. Warning
+    on those would train the user to ignore the warning."""
+    g = grids[AOI]
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    write_ecostress_two_scenes(project, g, days[0])          # a scene on ONE day of three
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert "ecostress" not in json.loads(ds.attrs["coverage"])
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

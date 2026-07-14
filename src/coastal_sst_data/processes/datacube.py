@@ -40,19 +40,26 @@ Design (locked with the maintainer):
     grid cell it sits in, at the INSTANT each satellite flew, so a scene can be validated
     against a buoy pixel-for-pixel and minute-for-minute (see processes.insitu).
 
+  * OBSERVED vs FILLED are different channels. `*_valid` means the value was MEASURED;
+    `*_filled` means it was invented by the NN fill and is plausible, not observed. A
+    model told that a fabricated pixel is valid has no way to learn otherwise.
+
 Channel layout in each <aoi>.zarr:
-  3D (time,y,x): mur_sst, mur_valid, eco_sst, eco_cloud, eco_valid,
+  3D (time,y,x): mur_sst, mur_valid, mur_filled, eco_sst, eco_cloud, eco_valid,
                  lst_sst, lst_cloud, lst_valid, modis_sst, modis_valid,
                  airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover,
                  {eco,lst,modis}_water_elev, {eco,lst,modis}_water_class,
                  {eco,lst,modis}_{airtemp,wind_speed,swrad,cloud_cover},
-                 cmems_<var>_<depth>m,
+                 cmems_<var>_<depth>m, cmems_<var>_<depth>m_filled,
                  insitu_sst, insitu_n, {eco,lst,modis}_insitu_sst,
                  {eco,lst,modis}_insitu_dt_min
   2D (y,x) static: depth, depth_p25, depth_p75, landmask, landcover_water,
                    insitu_station (index into the insitu_stations attr)
   1D (time): tide, tide_range, eco_hour, lst_hour, modis_hour, doy_sin, doy_cos,
-             {eco,lst,modis}_tide
+             {eco,lst,modis}_tide,
+             met_source, cmems_source -- which source served that DAY (uint8 code; the
+             `legend` attr names each code). These exist because met and CMEMS fall back
+             per-day, and a set-of-sources cannot say which day came from which.
 
 Usage:
     python -m coastal_sst_data.processes.datacube --config config.yaml
@@ -78,7 +85,7 @@ import xarray as xr
 
 from ..config import CompressionSpec, DataProduct, Project, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import provenance, report, store
 from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
@@ -274,11 +281,24 @@ def load_tide_daily(d: Path, aoi_id, days):
 
 
 def load_bathy(d: Path, aoi_id, H, W):
-    """Static bathymetry: (elevation, depth, depth_p25, depth_p75), NaN where absent."""
+    """Static bathymetry: (elevation, depth, depth_p25, depth_p75), NaN where absent.
+
+    An ABSENT DEM must produce NaN, never zeros. The obvious derivation --
+    `np.where(elev < 0, -elev, 0.0)` -- looks right and is catastrophically wrong when the
+    file is missing: `elev` is then all-NaN, `np.nan < 0` is False, so every cell takes the
+    0.0 branch and the cube ships a flawless, NaN-free "everything is exactly at sea level"
+    bathymetry. That is fabricated data wearing the costume of real data, and it feeds
+    landmask and every *_water_elev channel. Depth is therefore derived only where the
+    elevation is actually KNOWN.
+    """
     elev = np.full((H, W), np.nan, "float32")
     depth = dp25 = dp75 = None
     f = d / f"{aoi_id}.nc"
-    if f.exists():
+    if not f.exists():
+        log.warning("  %s: no bathymetry file (%s); depth/depth_p25/depth_p75 will be NaN "
+                    "and the land mask falls back to the sensor water union",
+                    aoi_id, f.name)
+    else:
         ds = xr.open_dataset(f)
 
         def g(name):
@@ -286,10 +306,15 @@ def load_bathy(d: Path, aoi_id, H, W):
                     if name in ds and ds[name].shape == (H, W) else None)
         if g("elevation") is not None:
             elev = g("elevation")
+        else:
+            log.warning("  %s: bathymetry file has no usable `elevation` on this grid; "
+                        "depth fields will be NaN", aoi_id)
         depth, dp25, dp75 = g("depth"), g("depth_p25"), g("depth_p75")
         ds.close()
-    if depth is None:                                    # derive mean depth from elevation
-        depth = np.where(elev < 0, -elev, 0.0).astype("float32")
+
+    known = np.isfinite(elev)
+    if depth is None:      # derive mean depth from elevation -- ONLY where it is known
+        depth = np.where(known, np.where(elev < 0, -elev, 0.0), np.nan).astype("float32")
     if dp25 is None:
         dp25 = depth.copy()
     if dp75 is None:
@@ -487,21 +512,48 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     # MUR is 1 km upsampled: NN-fill it over land-cover water so the backbone has
     # no holes in narrow estuaries.
+    #
+    # `valid` is computed BEFORE the fill, and this ordering is the whole point: a filled
+    # pixel's value was INVENTED by copying the nearest offshore cell, and flagging it
+    # valid would tell a model that a fabricated number is an observation. So `valid` means
+    # OBSERVED, `filled` means INVENTED-BUT-USABLE, and a consumer can choose. (There is no
+    # distance cap on the fill, so a filled pixel can be far from the cell it copied --
+    # another reason the two must be distinguishable.)
+    mur_observed = np.isfinite(mur_sst)
     if eff["fill_mur_water"]:
         mur_sst = fill_water_nn(mur_sst, water)
-    mur_valid = np.isfinite(mur_sst).astype("uint8")
+    mur_valid = mur_observed.astype("uint8")
+    mur_filled = (np.isfinite(mur_sst) & ~mur_observed).astype("uint8")
+
+    # PER-DAY SOURCE. The products that fall back do so a DAY AT A TIME -- CMEMS can serve
+    # reanalysis in March and forecast in April, met can drop from HRRR to ERA5 for a
+    # fortnight -- and the per-product provenance record unions those into a set, which
+    # says "both" and tells you nothing about the day you are looking at. These channels
+    # carry the answer on the time axis, so a row of the cube can be traced to the file
+    # that made it. (mur/modis have one source each, so a channel would be a constant.)
+    src_channels, src_legends = {}, {}
+    for product, prefix in (("met", mprefix), ("cmems", "")):
+        codes, legend = provenance.daily_sources(adir(product), aid, days, prefix=prefix)
+        if len(legend) > 1:                       # >1 means at least one file was found
+            src_channels[f"{product}_source"] = (("time",), np.array(codes, "uint8"))
+            src_legends[f"{product}_source"] = legend
 
     # CMEMS is a ~9 km ocean model, so its land mask is far coarser than the AoI grid:
     # an entire estuary can fall in its land cells. NN-fill over land-cover water for the
     # same reason MUR is filled -- the nearest offshore water column is the honest value
     # for a cell the model never resolved. Channels are discovered from the files, so
     # whatever variables/depths were acquired come through without a second config list.
+    # Each variable carries its OWN filled mask: the model's land mask deepens with depth,
+    # so thetao_0m and thetao_50m are not filled in the same cells.
     cmems_vars = {}
     for var in cmems_channels(adir("cmems"), aid):
         arr = load_daily_sensor(adir("cmems"), aid, days, H, W, var)
+        observed = np.isfinite(arr)
         if eff["fill_cmems_water"]:
             arr = fill_water_nn(arr, water)
         cmems_vars[f"cmems_{var}"] = (("time", "y", "x"), arr)
+        cmems_vars[f"cmems_{var}_filled"] = (
+            ("time", "y", "x"), (np.isfinite(arr) & ~observed).astype("uint8"))
 
     # In-situ: the cube's only ground truth. The value goes in the cell the station sits
     # in, sampled at the SAME INSTANT each satellite flew -- so a scene can be validated
@@ -545,8 +597,9 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     ds = xr.Dataset(
         {
-            **wl, **op_met, **cmems_vars, **insitu_vars,
+            **wl, **op_met, **cmems_vars, **insitu_vars, **src_channels,
             "mur_sst": (T, mur_sst), "mur_valid": (T, mur_valid),
+            "mur_filled": (T, mur_filled),
             "eco_sst": (T, eco_sst), "eco_cloud": (T, eco_cloud), "eco_valid": (T, eco_valid),
             "lst_sst": (T, lst_sst), "lst_cloud": (T, lst_cloud), "lst_valid": (T, lst_valid),
             "modis_sst": (T, modis_sst), "modis_valid": (T, modis_valid),
@@ -565,6 +618,51 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
         coords={"time": days, "y": ys, "x": xs},
     )
     ds.attrs.update(aoi_id=aid, crs=g.target_crs, met_time=mlabel)
+
+    # COVERAGE. The time axis is built from the CONFIG (start..end), not from the data, and
+    # every loader defaults a missing day to NaN. So a run that lost 40 of 100 days to a
+    # flaky network still yields a 100-step cube whose gaps are indistinguishable from
+    # cloudy days -- and the old log line printed `t=100` either way. Count what actually
+    # landed, stamp it on the cube, and say so when a product is thin.
+    # Which products actually wrote files for this AoI -- needed to tell a product that is
+    # THIN (ran, lost days) from one that is ABSENT (never ran). Also feeds the provenance
+    # record below, so it is collected once.
+    prod = provenance.collect(eff["aligned_root"], aid, PRODUCT_DIRS)
+    cov = coverage(ds, days, present=set(prod))
+    ds.attrs["coverage"] = json.dumps(cov, sort_keys=True)
+    for product, c in sorted(cov.items()):
+        if c["fraction"] < COVERAGE_WARN:
+            log.warning("  %s: %s covers only %d of %d day(s) (%.0f%%) -- the rest are NaN "
+                        "slices, which look exactly like cloudy days. Check the run report "
+                        "for what failed.",
+                        aid, product, c["days_with_data"], c["days_expected"],
+                        100 * c["fraction"])
+
+    # The valid/filled distinction has to travel WITH the cube: a downstream reader who
+    # trains on `mur_sst` without knowing which cells were invented has no way to find out.
+    ds["mur_valid"].attrs["long_name"] = "MUR SST was OBSERVED in this cell (not filled)"
+    ds["mur_filled"].attrs["long_name"] = (
+        "MUR SST was nearest-neighbour filled from the closest observed water cell "
+        "(a plausible value, NOT an observation; no distance cap)")
+    # The legend has to travel WITH the cube: a `met_source` of 2 is meaningless without
+    # the list that says 2 == era5. flag_meanings cannot hold it (source names contain
+    # spaces), so it goes as JSON alongside the numeric flag_values.
+    for cname, legend in src_legends.items():
+        ds[cname].attrs.update(
+            long_name=f"which source produced {cname[:-len('_source')]} on this day",
+            flag_values=np.arange(len(legend), dtype="uint8"),
+            legend=json.dumps(legend))
+        if len(legend) > 2:      # more than "none" + one source -> the source CHANGED
+            log.warning("  %s: %s changed source mid-series (%s); see the `%s` channel "
+                        "for which day came from which",
+                        aid, cname[:-len("_source")], ", ".join(legend[1:]), cname)
+
+    for name in cmems_vars:
+        if name.endswith("_filled"):
+            ds[name].attrs["long_name"] = (
+                f"{name[:-len('_filled')]} was nearest-neighbour filled over water the "
+                "~9 km model did not resolve (NOT an observation)")
+
     if station_table:
         # The station map is an index INTO this table, so the table must travel with the
         # cube -- a pixel that says "station 3" is useless without it.
@@ -577,10 +675,10 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     # PROVENANCE: the config that built this cube, and for every field the source(s) it
     # came from and when they were accessed. Zarr attrs must be JSON-serialisable, so the
     # structured parts are JSON strings.
-    prod = provenance.collect(eff["aligned_root"], aid, PRODUCT_DIRS)
     rec = provenance.build(eff["project"], list(ds.data_vars), prod)
     ds.attrs.update(
         created_at=rec["created_at"], package_version=rec["package_version"],
+        code_version=rec["code_version"],
         config_sha256=rec["config_sha256"] or "", config_path=rec["config_path"] or "",
         config_yaml=rec["config_yaml"] or "",
         provenance=json.dumps(rec["fields"], sort_keys=True),
@@ -610,6 +708,56 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
                                   water_level.UNKNOWN], dtype="uint8"),
             flag_meanings="submerged exposed unknown")
     return ds
+
+
+# --------------------------------------------------------------------------- #
+# Coverage
+# --------------------------------------------------------------------------- #
+COVERAGE_WARN = 0.95      # below this fraction of days, a daily product is reported thin
+
+# Products that SHOULD have a value every day, and the channel that proves it. Only these
+# can be judged on coverage: ECOSTRESS/Landsat/MODIS are overpass sensors, so a day with no
+# scene is normal and not a defect -- warning on those would train the user to ignore the
+# warning. `cmems` is matched by prefix because its channels are config-dependent.
+DAILY_CHANNELS = {"mur": "mur_sst", "met": "airtemp", "tide": "tide"}
+
+
+# provenance names the tide product in the plural; the cube's channel is singular.
+_COVERAGE_ALIASES = {"tide": "tides"}
+
+
+def coverage(ds: xr.Dataset, days, present=None) -> dict:
+    """{product: {days_with_data, days_expected, fraction}} for the daily products.
+
+    A day "has data" if its slice holds at least one finite value. This is the check that
+    makes a network-shaped hole visible: the cube's time axis is always len(days) long, so
+    the ONLY evidence a day was lost is that its slice is entirely NaN.
+
+    `present` is the set of products that actually wrote files for this AoI. A product that
+    was never run is ABSENT, not thin -- reporting it at 0% would bury the products that
+    really are thin under noise about products nobody asked for.
+    """
+    out = {}
+    channels = dict(DAILY_CHANNELS)
+    cm = [v for v in ds.data_vars if v.startswith("cmems_") and not v.endswith("_filled")]
+    if cm:
+        channels["cmems"] = sorted(cm)[0]
+
+    for product, var in channels.items():
+        if present is not None and _COVERAGE_ALIASES.get(product, product) not in present:
+            continue
+        if var not in ds:
+            continue
+        da = ds[var]
+        if "time" not in da.dims:
+            continue
+        finite = np.isfinite(da.values)
+        axes = tuple(range(1, finite.ndim))          # everything but time
+        has = finite.any(axis=axes) if axes else finite
+        n = int(has.sum())
+        out[product] = {"days_with_data": n, "days_expected": len(days),
+                        "fraction": (n / len(days)) if len(days) else 0.0}
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -649,32 +797,24 @@ def build_encoding(ds: xr.Dataset, compression: CompressionSpec, chunks: dict) -
 
 
 # --------------------------------------------------------------------------- #
-# Write (NFS-safe overwrite)
+# Write (atomic, NFS-safe)
 # --------------------------------------------------------------------------- #
 def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
-    """Write a Zarr cube, tolerating NFS 'Directory not empty' on overwrite.
+    """Write a Zarr cube ATOMICALLY: the final path only ever holds a COMPLETE cube.
 
-    Overwriting rmtree's the old dir in place, which fails on networked
-    filesystems when a chunk is still open (silly-renamed to a hidden .nfs*). So
-    move any existing cube ASIDE (atomic rename, works with open handles), write
-    fresh, then best-effort delete the stash.
+    `store.atomic` builds the cube in a scratch dir and swaps it in only once `to_zarr`
+    has RETURNED, so a run killed mid-write (dropped connection, Ctrl-C, OOM) leaves the
+    previous cube intact rather than parking a truncated one where `run()`'s existence
+    check would take it for finished. The swap also moves any existing cube aside by
+    rename rather than rmtree-ing it in place, which is what makes overwriting safe on
+    NFS when a reader still holds a chunk open.
     """
-    zpath = Path(zpath)
-    stash = None
-    if zpath.exists():
-        stash = zpath.with_name(f"{zpath.name}.old-{os.getpid()}-{int(time.time())}")
-        zpath.rename(stash)
-    with warnings.catch_warnings():
-        # Zarr v3 warns that consolidated metadata isn't in the v3 spec; xarray
-        # still writes+reads it and it speeds opening a many-variable cube.
-        warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
-        ds.to_zarr(zpath, mode="w-", consolidated=True, encoding=encoding)
-    if stash is not None:
-        try:
-            shutil.rmtree(stash)
-        except OSError as exc:                 # NFS .nfs* leftovers -> non-fatal
-            log.warning("  wrote %s but could not remove old cube %s (%s); delete it later",
-                        zpath.name, stash.name, exc)
+    with store.atomic(Path(zpath)) as tmp:
+        with warnings.catch_warnings():
+            # Zarr v3 warns that consolidated metadata isn't in the v3 spec; xarray
+            # still writes+reads it and it speeds opening a many-variable cube.
+            warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
+            ds.to_zarr(tmp, mode="w-", consolidated=True, encoding=encoding)
 
 
 # --------------------------------------------------------------------------- #
@@ -729,6 +869,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("datacube")
+
     if not dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -737,7 +879,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         zpath = out_dir / f"{name}.zarr"
         if zpath.exists() and not overwrite:
             log.info("=== %s: %s exists, skipping (use overwrite) ===", name, zpath.name)
+            rep.skip()
             continue
+        store.sweep_scratch(zpath)      # clear scratch from a run that died mid-write
         if dry_run:
             log.info("=== %s: [dry-run] would assemble %d day(s) -> %s ===",
                      name, len(days), zpath.name)
@@ -746,9 +890,21 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         log.info("=== assembling %s (%d days, grid=%dx%d) ===", name, len(days), g.width, g.height)
         ds = assemble_aoi(g, eff, days)
         write_zarr_safe(ds, zpath, build_encoding(ds, eff["compression"], eff["chunks"]))
-        log.info("  wrote %s  vars=%d shape=(t=%d,y=%d,x=%d)", zpath.name,
-                 len(ds.data_vars), ds.sizes["time"], ds.sizes["y"], ds.sizes["x"])
-    log.info("Done.")
+
+        # `t=%d` was always len(days) -- it said nothing about how much of the cube is real.
+        # Report the coverage the cube actually has, so a thin product is visible here.
+        cov = json.loads(ds.attrs.get("coverage", "{}"))
+        cov_str = ", ".join(f"{p} {100 * c['fraction']:.0f}%" for p, c in sorted(cov.items()))
+        log.info("  wrote %s  vars=%d shape=(t=%d,y=%d,x=%d)  coverage: %s", zpath.name,
+                 len(ds.data_vars), ds.sizes["time"], ds.sizes["y"], ds.sizes["x"],
+                 cov_str or "n/a")
+        rep.wrote()
+        thin = [p for p, c in cov.items() if c["fraction"] < COVERAGE_WARN]
+        if thin:
+            rep.note = f"thin coverage: {', '.join(sorted(thin))} (see the cube's `coverage` attr)"
+
+    rep.log_summary()
+    return rep
 
 
 def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
@@ -763,7 +919,7 @@ def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

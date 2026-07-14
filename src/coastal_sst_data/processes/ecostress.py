@@ -42,7 +42,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +59,22 @@ DEFAULT_VERSION = "002"
 # over water); cloud/water/quality are categorical masks.
 LAYERS = {"sst": "LST", "lst": "LST", "cloud": "cloud", "water": "water", "quality": "QC"}
 CATEGORICAL = ["cloud", "water", "quality"]
+# The layers a granule CANNOT be written without: they are what `valid` is built from, and
+# a granule lacking one reads downstream as a scene with nothing valid in it -- a silent
+# total cloud-out rather than a visible failure. (`lst`/`quality` are optional extras.)
+CORE_ROLES = ("sst", "water", "cloud")
+
+
+def expected_vars(ds_cfg: dict) -> tuple[str, ...]:
+    """The variables a COMPLETE aligned granule carries under this config's `layers`.
+
+    Derived from config rather than hardcoded, because `layers` is overridable: demanding a
+    layer the user never asked for would make every granule look incomplete and re-fetch on
+    every run, forever.
+    """
+    roles = set(ds_cfg.get("layers", LAYERS))
+    core = tuple(r for r in CORE_ROLES if r in roles)
+    return core + (("valid",) if set(CORE_ROLES) <= roles else ())
 
 
 # The per-AoI target CRS + grid now come from coastal_sst_data.grid (the single
@@ -74,12 +90,14 @@ def login(strategy: str):
 
 
 def search_granules(ds_cfg: dict, bbox, start: str, end: str):
-    results = earthaccess.search_data(
-        short_name=ds_cfg["short_name"],
-        version=ds_cfg["version"],
-        temporal=(start, end),
-        bounding_box=tuple(bbox),
-    )
+    results = net.retry(
+        lambda: earthaccess.search_data(
+            short_name=ds_cfg["short_name"],
+            version=ds_cfg["version"],
+            temporal=(start, end),
+            bounding_box=tuple(bbox),
+        ),
+        what=f"ECOSTRESS search {ds_cfg['short_name']}")
     log.info("  found %d granule(s)", len(results))
     return results
 
@@ -147,20 +165,39 @@ def process_granule(role_to_file, ds_cfg, grid_cfg, target_crs, transform,
     rs_cont = Resampling[grid_cfg.get("resampling_continuous", "bilinear")]
     rs_cat = Resampling[grid_cfg.get("resampling_categorical", "nearest")]
 
-    data_vars = {}
+    data_vars, failed = {}, []
     for role, fobj in role_to_file.items():
         resampling = rs_cat if ds_cfg["layers"][role] in categorical else rs_cont
         try:
             da = read_window_reproject(fobj, geom_proj, target_crs, transform,
                                        width, height, resampling)
             da = da.rio.clip([geom_proj], target_crs, drop=False)
-        except Exception as exc:  # window outside this tile, etc.
-            log.warning("    skipping layer %s (%s)", role, exc)
+        except Exception as exc:  # window outside this tile, transient COG read failure...
+            log.warning("    layer %s failed to read (%s)", role, exc)
+            failed.append(role)
             continue
         data_vars[role] = da
 
     if "sst" not in data_vars and "lst" not in data_vars:
         log.warning("    no SST/LST after processing; dropping granule")
+        return None
+
+    # A granule missing a CORE layer is degraded, not merely partial -- and a degraded
+    # granule is worse than none at all. Without `water`/`cloud` the `valid` mask below is
+    # never built, and the assembler reads a missing water layer as "claim nothing", so the
+    # scene silently becomes an all-zero valid mask: a total cloud-out, indistinguishable
+    # from a genuinely overcast day. Drop it and let a later run re-fetch it.
+    #
+    # This catches BOTH ways a layer goes missing: a read that failed (`failed`, e.g. a
+    # transient COG error) and an asset the granule never published (dropped upstream by
+    # filter_links_for_granule). Only layers this config actually ASKED for are required,
+    # so a custom `layers` list cannot make every granule look degraded.
+    missing = [r for r in CORE_ROLES if r in ds_cfg["layers"] and r not in data_vars]
+    if missing:
+        log.warning("    dropping granule: core layer(s) %s missing (%s); a granule with "
+                    "no mask reads as a total cloud-out downstream",
+                    ", ".join(missing),
+                    "read failed" if failed else "not published by the granule")
         return None
 
     ds = xr.Dataset(data_vars)
@@ -182,7 +219,12 @@ def process_granule(role_to_file, ds_cfg, grid_cfg, target_crs, transform,
 
     if acq_time is not None:
         ds = ds.expand_dims(time=[pd.Timestamp(acq_time)])
-    ds.attrs.update(aoi_id=aoi_id, source="ECOSTRESS ECO_L2T_LSTE v003",
+    # Built from what we ACTUALLY searched, never a literal: this attr is what
+    # provenance.source_of() reads and what every eco_* field in every cube is stamped
+    # with, so a hardcoded string here is a lie the cube then repeats. (It used to say
+    # "v003" while DEFAULT_VERSION -- and the search -- was "002".)
+    ds.attrs.update(aoi_id=aoi_id,
+                    source=f"ECOSTRESS {ds_cfg['short_name']} v{ds_cfg['version']}",
                     processing="reprojected+clipped to AOI grid")
     return ds
 
@@ -193,17 +235,12 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str):
         if "time" in ds.coords else "unknown"
     stem = f"{aoi_id}_{t}"
     if fmt == "netcdf":
-        path = out_dir / f"{stem}.nc"
-        enc = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
-        ds.to_netcdf(path, encoding=enc)
-    elif fmt == "geotiff":
-        path = out_dir / stem
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            da = ds[v].isel(time=0) if "time" in ds[v].dims else ds[v]
-            da.rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
+        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(
+            ds, out_dir / stem,
+            [(v, ds[v].isel(time=0) if "time" in ds[v].dims else ds[v]) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
     return path
 
 
@@ -232,6 +269,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("ecostress")
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
@@ -259,27 +298,35 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
                 continue
             t = parse_acq_time(granule_name(granule))
             tstr = t.strftime("%Y%m%dT%H%M%S") if t else f"g{gi}"
-            if not overwrite and (aoi_out / f"{name}_{tstr}.nc").exists():
+            if store.done(aoi_out / f"{name}_{tstr}.nc", expected_vars(ds_cfg),
+                          shape=(g.height, g.width), overwrite=overwrite):
                 log.info("  [%d/%d] %s already processed, skipping", gi, len(granules), tstr)
+                rep.skip()
                 continue
 
             log.info("  [%d/%d] streaming %d layer(s) for %s",
                      gi, len(granules), len(role_to_url), tstr)
             try:
-                fobjs = earthaccess.open(list(role_to_url.values()))
+                fobjs = net.retry(lambda: earthaccess.open(list(role_to_url.values())),
+                                  what=f"ECOSTRESS open {tstr}")
             except Exception as exc:
-                log.warning("    open failed (%s); skipping", exc)
+                log.warning("    FAILED to open %s (%s)", tstr, exc)
+                rep.fail(f"{name} {tstr}", exc)
                 continue
             role_to_file = dict(zip(role_to_url.keys(), fobjs))
 
             ds = process_granule(role_to_file, ds_cfg, grid_cfg, g.target_crs,
                                  g.transform, g.width, g.height, g.geom_proj, name, t)
             if ds is None:
+                # dropped as degraded (a mask layer was missing) -- a LOSS, not a no-op
+                rep.fail(f"{name} {tstr}", "granule dropped (missing core layer)")
                 continue
             ds.attrs.update(**provenance.stamp(eff))
             log.info("      wrote %s", write_output(ds, aoi_out, name, fmt))
+            rep.wrote(source=ds.attrs.get("source"))
 
-    log.info("Done.")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -330,10 +377,12 @@ def _build_eff(project: Project) -> dict:
 
 
 def _setup_gdal_env():
-    """Make GDAL/curl efficient for remote COG range reads."""
-    os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
-    os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
-    os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif")
+    """Efficiency AND a deadline for remote COG range reads (see net.setup_gdal_env).
+
+    This used to set only the efficiency knobs, so a stalled connection could hang the run
+    indefinitely and one transient 503 permanently lost the scene.
+    """
+    net.setup_gdal_env()
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
@@ -357,7 +406,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if grids is None:
         grids = project_grids(project)
     _setup_gdal_env()
-    run(eff, grids, aois, dry_run, list_layers)
+    return run(eff, grids, aois, dry_run, list_layers)
 
 
 def main():

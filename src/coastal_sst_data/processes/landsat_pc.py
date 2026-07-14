@@ -48,7 +48,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -78,15 +78,18 @@ def search_scenes(collection, stac_url, bbox, start, end, platforms, cloud_max):
     import planetary_computer
     from pystac_client import Client
 
-    cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-    search = cat.search(
-        collections=[collection],
-        bbox=list(bbox),
-        datetime=f"{start}/{end}",
-        query={"eo:cloud_cover": {"lt": cloud_max * 100.0},
-               "platform": {"in": [_pc_platform(p) for p in platforms]}},
-    )
-    return list(search.items())
+    def _search():
+        cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+        search = cat.search(
+            collections=[collection],
+            bbox=list(bbox),
+            datetime=f"{start}/{end}",
+            query={"eo:cloud_cover": {"lt": cloud_max * 100.0},
+                   "platform": {"in": [_pc_platform(p) for p in platforms]}},
+        )
+        return list(search.items())      # inside the retry: paging is where it fails
+
+    return net.retry(_search, what="Landsat STAC search")
 
 
 # --------------------------------------------------------------------------- #
@@ -166,16 +169,11 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str) -> Path:
     t = pd.Timestamp(ds["time"].values[0]).strftime("%Y%m%dT%H%M%S")
     stem = f"{aoi_id}_{t}"
     if fmt == "netcdf":
-        path = out_dir / f"{stem}.nc"
-        ds.to_netcdf(path, encoding={v: {"zlib": True, "complevel": 4} for v in ds.data_vars})
-    elif fmt == "geotiff":
-        path = out_dir / stem
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            ds[v].isel(time=0).rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
-    return path
+        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(ds, out_dir / stem,
+                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +197,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("landsat")
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
@@ -217,19 +217,23 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         for it in sorted(items, key=lambda i: i.properties["datetime"]):
             acq = pd.Timestamp(it.datetime.astimezone(timezone.utc).replace(tzinfo=None))
             tstr = acq.strftime("%Y%m%dT%H%M%S")
-            if not overwrite and (aoi_out / f"{name}_{tstr}.nc").exists():
+            if store.done(aoi_out / f"{name}_{tstr}.nc", store.REQUIRED_VARS["LANDSAT"],
+                          shape=(g.height, g.width), overwrite=overwrite):
                 log.info("  %s already processed, skipping", tstr)
                 continue
             try:
                 ds = scene_to_dataset(it, g, mask_cfg, to_celsius, acq, name)
             except Exception as exc:
-                log.warning("    skipping %s (%s)", it.id, exc)
+                log.warning("    FAILED %s (%s)", it.id, exc)
+                rep.fail(f"{name} {it.id}", exc)
                 continue
             if ds is None:
                 continue
             ds.attrs.update(**provenance.stamp(eff))
             log.info("      wrote %s", write_output(ds, aoi_out, name, fmt))
-    log.info("Done.")
+            rep.wrote(source="Landsat C2 L2 (Planetary Computer)")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -283,7 +287,8 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    net.setup_gdal_env()      # windowed COG reads: deadline + retries
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

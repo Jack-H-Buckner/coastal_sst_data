@@ -1,6 +1,9 @@
 
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
+import xarray as xr
 import pytest
 from pathlib import Path
 
@@ -190,5 +193,80 @@ def test_reference_defaults_are_the_landsat_overpass():
     eff = met._build_eff(load_config(EXAMPLE))
     assert eff["ds"]["reference_time"] == "10:30"
     assert eff["ds"]["reference_basis"] == "solar"
+
+
+# --------------------------------------------------------------------------- #
+# The fallback must be LOUD. This was the quietest failure in the package: a run whose
+# entire met forcing came from 28 km ERA5 instead of 3 km HRRR produced a log in which
+# the string "era5" never appeared.
+# --------------------------------------------------------------------------- #
+def _stub_sources(monkeypatch, **by_name):
+    """Replace the source registry: {name: callable(g, dt, cfg) -> grids or None}."""
+    monkeypatch.setattr(met, "_SOURCES", by_name)
+
+
+def test_fetch_at_logs_every_fall_through(monkeypatch, caplog, aoi_grid):
+    _stub_sources(monkeypatch,
+                  hrrr=lambda g, dt, cfg: None,                  # a CLEAN None -- was silent
+                  era5=lambda g, dt, cfg: {"airtemp": np.zeros((2, 2), "float32")})
+    with caplog.at_level("INFO"):
+        got, src = met._fetch_at(["hrrr", "era5"], aoi_grid, datetime(2023, 7, 15, 18), {})
+
+    assert src == "era5" and got is not None
+    assert "hrrr has no data" in caplog.text        # the fall-through is now stated
+    assert "FELL BACK to era5" in caplog.text       # ...and named as a fallback
+
+
+def test_fetch_at_tallies_which_source_served(monkeypatch, aoi_grid):
+    _stub_sources(monkeypatch,
+                  hrrr=lambda g, dt, cfg: None,
+                  era5=lambda g, dt, cfg: {"airtemp": np.zeros((2, 2), "float32")})
+    tally = {}
+    for h in (0, 6, 12):
+        met._fetch_at(["hrrr", "era5"], aoi_grid, datetime(2023, 7, 15, h), {}, tally)
+    assert tally == {"era5": 3}          # -> the run can say what actually served it
+
+
+def test_fetch_at_warns_when_no_source_has_data(monkeypatch, caplog, aoi_grid):
+    _stub_sources(monkeypatch, hrrr=lambda g, dt, cfg: None, era5=lambda g, dt, cfg: None)
+    with caplog.at_level("INFO"):
+        got, src = met._fetch_at(["hrrr", "era5"], aoi_grid, datetime(2023, 7, 15, 18), {})
+    assert got is None and src is None
+    assert "NO source" in caplog.text
+
+
+def test_daily_mean_records_the_hours_that_ACTUALLY_contributed(monkeypatch, tmp_path,
+                                                                aoi_grid, caplog):
+    """The attr used to echo the REQUESTED hours regardless, so a 'daily mean' built from
+    1 of 4 hours claimed all 4 -- a mean over a quarter of the diurnal cycle, wearing the
+    label of a full-day mean."""
+    def only_noon(g, dt, cfg):                       # 00/06/18 UTC unavailable; 12 works
+        if dt.hour != 12:
+            return None
+        return {"airtemp": np.full((aoi_grid.height, aoi_grid.width), 290.0, "float32")}
+
+    _stub_sources(monkeypatch, hrrr=only_noon, era5=lambda g, dt, cfg: None)
+
+    eff = {
+        "ds": {"chain": ["hrrr", "era5"], "daily_mean_hours": [0, 6, 12, 18],
+               "reference_time": None, "reference_basis": "solar", "variables": ["airtemp"],
+               "model": "auto", "fxx": 0, "product": "sfc", "regrid_radius_m": 6000.0},
+        "grid": {"to_celsius": False},
+        "out_dir": tmp_path, "fmt": "netcdf", "overwrite": False,
+        "overpass_dirs": {},
+        "time": {"start_date": "2023-07-15", "end_date": "2023-07-15"},
+        "config_sha256": "x",
+    }
+    with caplog.at_level("WARNING"):
+        met.run(eff, {aoi_grid.name: aoi_grid}, None, False)
+
+    f = tmp_path / aoi_grid.name / f"{aoi_grid.name}_20230715.nc"
+    with xr.open_dataset(f) as ds:
+        assert ds.attrs["daily_mean_hours"] == "[12]"                  # what we GOT
+        assert ds.attrs["daily_mean_hours_requested"] == "[0, 6, 12, 18]"   # what we asked
+    assert "built from 1 of 4 hours" in caplog.text
+    assert "NOT a full-day mean" in caplog.text
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
+

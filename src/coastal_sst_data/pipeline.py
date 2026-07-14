@@ -29,7 +29,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-from . import auth
+from . import auth, report
 from .config import DataProduct, Project, load_config
 from .grid import AoiGrid, compute_aoi_grid
 from .processes import (
@@ -157,6 +157,8 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
              len(grids), len(ordered), [p.value for p in ordered])
 
     outcomes: dict[DataProduct, str] = {}
+    run_report = report.RunReport()
+
     for product in ordered:
         module = _module_for(project, product)
         if module is None:
@@ -165,18 +167,23 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
                 detail = f" (source={getattr(project.products[product], 'source', 'pc')})"
             log.warning("=== %s%s: not implemented yet, skipping ===", product.value, detail)
             outcomes[product] = "skipped (not implemented)"
+            run_report.add(product.value, None, outcome="not implemented")
             continue
 
         log.info("=== %s ===", product.value)
         try:
-            module.acquire(project, grids=grids, aois=aois,
-                           dry_run=dry_run, overwrite=overwrite)
-            outcomes[product] = "ok"
+            rep = module.acquire(project, grids=grids, aois=aois,
+                                 dry_run=dry_run, overwrite=overwrite)
+            # `ok` ONLY when nothing was lost. A stage that dropped 40 of 100 days used to
+            # report `ok` here, which is the whole reason a lossy run was invisible.
+            outcomes[product] = rep.outcome if rep is not None else "ok"
+            run_report.add(product.value, rep)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
             log.error("=== %s FAILED: %s ===", product.value, exc)
             outcomes[product] = f"failed: {exc}"
+            run_report.add(product.value, None, outcome=f"stage raised: {exc}")
 
     # Derived stage: resolve each AoI's DEM->MSL datum offset from the bathymetry file
     # that was just written (which DEM won is only known now -- bathymetry falls back
@@ -185,34 +192,41 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     if DataProduct.bathymetry in selected and project.datacube.water_level:
         log.info("=== datum (DEM->MSL offset) ===")
         try:
-            datum.resolve(project, grids=grids, aois=aois,
-                          dry_run=dry_run, overwrite=overwrite)
-            outcomes["datum"] = "ok"
+            rep = datum.resolve(project, grids=grids, aois=aois,
+                                dry_run=dry_run, overwrite=overwrite)
+            outcomes["datum"] = rep.outcome if rep is not None else "ok"
+            run_report.add("datum", rep)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
             log.error("=== datum FAILED: %s ===", exc)
             outcomes["datum"] = f"failed: {exc}"
+            run_report.add("datum", None, outcome=f"stage raised: {exc}")
 
     # Terminal stage: knit the aligned outputs into per-AoI datacubes.
     if assemble:
         log.info("=== datacube (assemble) ===")
         try:
-            datacube.assemble(project, grids=grids, aois=aois,
-                              dry_run=dry_run, overwrite=overwrite)
-            outcomes["datacube"] = "ok"
+            rep = datacube.assemble(project, grids=grids, aois=aois,
+                                    dry_run=dry_run, overwrite=overwrite)
+            outcomes["datacube"] = rep.outcome if rep is not None else "ok"
+            run_report.add("datacube", rep)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
             log.error("=== datacube FAILED: %s ===", exc)
             outcomes["datacube"] = f"failed: {exc}"
+            run_report.add("datacube", None, outcome=f"stage raised: {exc}")
 
-    log.info("Pipeline done. Summary:")
-    for product in ordered:
-        log.info("  %-12s %s", product.value, outcomes[product])
-    for stage in ("datum", "datacube"):
-        if stage in outcomes:
-            log.info("  %-12s %s", stage, outcomes[stage])
+    # The run report: what was loaded, from which source, how long it took, and -- the part
+    # that did not exist before -- what was ATTEMPTED AND LOST.
+    log.info("")
+    run_report.log()
+    if run_report.any_failures:
+        log.warning("")
+        log.warning("Some items were attempted and lost; the cube will have gaps where they "
+                    "should be. Re-run to retry them (completed outputs are skipped), or "
+                    "`coastal-sst-data check --repair` first if a run died mid-write.")
     return outcomes
 
 

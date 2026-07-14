@@ -17,6 +17,12 @@ name: my_project           # <-- rename to your project
 channels:
   - conda-forge
 dependencies:
+# REPRODUCIBILITY: the packages below are PINNED because they can change what a cube
+# CONTAINS, not merely how it is built. zarr in particular is branched on directly
+# (processes/datacube.py picks BloscCodec vs numcodecs.Blosc, and 'compressors' vs
+# 'compressor', off the major version), so the same config on the same data produced a
+# differently-encoded cube depending on when the env happened to be created. Floors and
+# ceilings rather than exact pins: reproducible where it matters, still installable.
   - python=3.11
 
   # ---- your project's own dependencies go here ----
@@ -25,20 +31,20 @@ dependencies:
   # - ...
 
   # ---- coastal_sst_data's core deps (always needed) ----
-  - numpy
-  - pandas
-  - xarray
-  - pydantic
+  - numpy>=2.0,<3
+  - pandas>=2.2,<3
+  - xarray>=2024.7,<2027
+  - pydantic>=2.7,<3
   - pyyaml
-  - pyproj
-  - shapely
+  - pyproj>=3.6,<4
+  - shapely>=2.0,<3
   - affine
-  - rasterio
-  - rioxarray
+  - rasterio>=1.4,<2
+  - rioxarray>=0.17,<1
   - requests
   - earthaccess
-  - zarr
-  - numcodecs
+  - zarr>=3.0,<4
+  - numcodecs>=0.13,<1
   - scipy               # NN water fill of the MUR + CMEMS channels (datacube.py)
   - h5netcdf            # xarray engine for the MUR SST backbone (mur.py)
 

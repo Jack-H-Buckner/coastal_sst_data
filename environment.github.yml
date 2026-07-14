@@ -12,39 +12,44 @@ name: coastal_sst_data
 channels:
   - conda-forge
 dependencies:
+# REPRODUCIBILITY: the packages below are PINNED because they can change what a cube
+# CONTAINS, not merely how it is built. zarr in particular is branched on directly
+# (processes/datacube.py picks BloscCodec vs numcodecs.Blosc, and 'compressors' vs
+# 'compressor', off the major version), so the same config on the same data produced a
+# differently-encoded cube depending on when the env happened to be created. Floors and
+# ceilings rather than exact pins: reproducible where it matters, still installable.
   - python=3.11
   - pytest
   # Core stack (also declared in pyproject.toml [project.dependencies]); pinned
   # here via conda so the compiled GDAL/PROJ libs come from conda-forge, not pip.
-  - numpy
-  - pandas
-  - xarray
-  - pydantic
+  - numpy>=2.0,<3
+  - pandas>=2.2,<3
+  - xarray>=2024.7,<2027
+  - pydantic>=2.7,<3
   - pyyaml
-  - pyproj
-  - shapely
+  - pyproj>=3.6,<4
+  - shapely>=2.0,<3
   - affine
-  - rasterio
-  - rioxarray
+  - rasterio>=1.4,<2
+  - rioxarray>=0.17,<1
   - requests
   - earthaccess
-  - zarr
-  - numcodecs
+  - zarr>=3.0,<4
+  - numcodecs>=0.13,<1
   # xarray file-reader engines: h5netcdf reads the MUR SST backbone (mur.py);
   # netcdf4 reads MODIS L2P swaths (modis.py).
-  - h5netcdf
-  - netcdf4
+  - h5netcdf>=1.4,<2
+  - netcdf4>=1.7,<2
   # Landsat via Planetary Computer (landsat_pc.py): STAC search + COG reads.
   - pystac-client
   - planetary-computer
   # MODIS swath -> grid resampling (modis.py) and HRRR regridding (met.py).
-  - pyresample
+  - pyresample>=1.28,<2
   # datacube.py assembler: nearest-neighbour water fill of the MUR + CMEMS channels.
-  - scipy
+  - scipy>=1.13,<2
   # met.py forcing: HRRR via Herbie; ERA5 fallback streamed from the public
   # ARCO-ERA5 Zarr on GCS (zarr reader + anonymous GCS filesystem).
   - herbie-data
-  - zarr
   - gcsfs
   # cmems.py: Copernicus Marine global physics (GLORYS12 reanalysis + analysis/forecast).
   # Needs a free Copernicus Marine account; the secret lives in ~/.netrc under

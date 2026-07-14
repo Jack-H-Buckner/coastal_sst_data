@@ -59,7 +59,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -285,16 +285,37 @@ def _resolve_chain(source: str, fallback: str) -> list[str]:
     return chain
 
 
-def _fetch_at(chain, g: AoiGrid, dt: datetime, cfg: dict):
-    """Walk the source chain; return (grids, source_name) of the first hit."""
-    for name in chain:
+def _fetch_at(chain, g: AoiGrid, dt: datetime, cfg: dict, tally: dict | None = None):
+    """Walk the source chain; return (grids, source_name) of the first hit.
+
+    EVERY fall-through is logged. This was the quietest failure in the package: the three
+    clean `None` returns on the HRRR path (AoI outside the HRRR box, no fields returned, no
+    cycle available) said nothing at all, and the success lines never named the source that
+    won -- so a run whose entire met forcing silently came from 28 km ERA5 instead of 3 km
+    HRRR produced a log in which the string "era5" never appeared. The two are not
+    interchangeable: different resolution, different regridding, and `swrad` is an
+    INSTANTANEOUS flux under HRRR but an hourly MEAN under ERA5.
+
+    `tally` accumulates {source: n} so the run can report what actually served it.
+    """
+    for i, name in enumerate(chain):
         try:
             grids = _SOURCES[name](g, dt, cfg)
         except Exception as exc:
-            log.warning("    %s fetch failed @ %s (%s)", name, dt, exc)
+            log.warning("    met: %s failed @ %s (%s)", name, dt, exc)
             grids = None
         if grids:
+            if i:                      # a later link won -> we fell back, silently until now
+                log.info("    met: FELL BACK to %s @ %s (%s had no data)",
+                         name, dt, " -> ".join(chain[:i]))
+            if tally is not None:
+                tally[name] = tally.get(name, 0) + 1
             return grids, name
+        log.info("    met: %s has no data @ %s; trying the next source in the chain",
+                 name, dt)
+    log.warning("    met: NO source in %s returned data @ %s", " -> ".join(chain), dt)
+    if tally is not None:
+        tally["<none>"] = tally.get("<none>", 0) + 1
     return None, None
 
 
@@ -366,16 +387,11 @@ def overpass_times_for_day(overpass_dirs, aoi_id: str, day) -> list[datetime]:
 def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str, stem: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if fmt == "netcdf":
-        path = out_dir / f"{stem}.nc"
-        ds.to_netcdf(path, encoding={v: {"zlib": True, "complevel": 4} for v in ds.data_vars})
-    elif fmt == "geotiff":
-        path = out_dir / stem
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            ds[v].isel(time=0).rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
-    return path
+        return store.write_netcdf(ds, out_dir / f"{stem}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(ds, out_dir / stem,
+                                   [(v, ds[v].isel(time=0)) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
 
 
 # --------------------------------------------------------------------------- #
@@ -404,6 +420,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("met")
+    tally: dict[str, int] = {}     # {source: n fetches} -- folded into `rep` at the end
+
     for name in names:
         g = grids[name]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s ===",
@@ -421,53 +440,89 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             dstr = day.strftime("%Y%m%d")
 
             # ---- reference-time snapshot (the cube's default met channel) ----
-            if ref_hours is not None and (
-                    overwrite or not (aoi_out / f"{name}_ref_{dstr}.nc").exists()):
+            if ref_hours is not None and not store.done(
+                    aoi_out / f"{name}_ref_{dstr}.nc", store.REQUIRED_VARS["MET"],
+                    shape=(g.height, g.width), overwrite=overwrite):
                 rt = reference_time_utc(day, lon, ref_hours, ref_basis)
-                got, src = _fetch_at(chain, g, rt.to_pydatetime(), ds_cfg)
+                got, src = _fetch_at(chain, g, rt.to_pydatetime(), ds_cfg, tally)
                 if got:
                     ds = to_dataset(got, g, rt, to_celsius)
                     ds.attrs.update(aoi_id=name, source=f"{src} @reference",
                                     reference_time=str(ref_time), reference_basis=ref_basis,
                                     reference_time_utc=rt.isoformat(),
                                     **provenance.stamp(eff))
-                    log.info("  %s reference (%s %s -> %s UTC) -> %s", dstr, ref_time,
-                             ref_basis, rt.strftime("%H:%M"),
+                    log.info("  %s reference [%s] (%s %s -> %s UTC) -> %s", dstr, src,
+                             ref_time, ref_basis, rt.strftime("%H:%M"),
                              write_output(ds, aoi_out, name, fmt, f"{name}_ref_{dstr}"))
+                    rep.wrote(source=src)
+                else:
+                    rep.fail(f"{name} ref {dstr}", "no source in the chain had data")
 
             # ---- daily mean over mean_hours (skipped when daily_mean_hours: []) ----
-            if mean_hours and (overwrite or not (aoi_out / f"{name}_{dstr}.nc").exists()):
-                stack, srcs = {}, set()
+            if mean_hours and not store.done(
+                    aoi_out / f"{name}_{dstr}.nc", store.REQUIRED_VARS["MET"],
+                    shape=(g.height, g.width), overwrite=overwrite):
+                stack, srcs, used_hours = {}, set(), []
                 for hh in mean_hours:
                     dt = day.to_pydatetime().replace(hour=int(hh))
-                    got, src = _fetch_at(chain, g, dt, ds_cfg)
+                    got, src = _fetch_at(chain, g, dt, ds_cfg, tally)
                     if not got:
                         continue
+                    used_hours.append(int(hh))
                     srcs.add(src)
                     for k, v in got.items():
                         stack.setdefault(k, []).append(v)
                 if stack:
                     mean_grids = {k: np.nanmean(np.stack(v), axis=0) for k, v in stack.items()}
                     ds = to_dataset(mean_grids, g, day, to_celsius)
+                    # The hours that ACTUALLY contributed, not the ones we asked for. The
+                    # attr used to echo `mean_hours` regardless, so a "daily mean" built
+                    # from 1 of 4 hours claimed all 4 -- a mean over a quarter of the
+                    # diurnal cycle, indistinguishable from the real thing.
+                    if len(used_hours) < len(mean_hours):
+                        missing = [int(h) for h in mean_hours if int(h) not in used_hours]
+                        log.warning("  %s: daily mean built from %d of %d hours "
+                                    "(no data at %s UTC); it is NOT a full-day mean",
+                                    dstr, len(used_hours), len(mean_hours),
+                                    ", ".join(f"{h:02d}h" for h in missing))
                     ds.attrs.update(aoi_id=name, source=f"{'+'.join(sorted(srcs))} daily mean",
-                                    daily_mean_hours=str(mean_hours),
+                                    daily_mean_hours=str(used_hours),
+                                    daily_mean_hours_requested=str([int(h) for h in mean_hours]),
                                     **provenance.stamp(eff))
-                    log.info("  %s daily -> %s", dstr,
+                    log.info("  %s daily [%s, %dh] -> %s", dstr, "+".join(sorted(srcs)),
+                             len(used_hours),
                              write_output(ds, aoi_out, name, fmt, f"{name}_{dstr}"))
+                    rep.wrote(source="+".join(sorted(srcs)) + " daily mean")
+                else:
+                    rep.fail(f"{name} daily {dstr}", "no source had data at any hour")
 
             # ---- overpass snapshots ----
             for op in overpass_times_for_day(overpass_dirs, name, day):
                 tstr = op.strftime("%Y%m%dT%H%M%S")
-                if not overwrite and (aoi_out / f"{name}_{tstr}.nc").exists():
+                if store.done(aoi_out / f"{name}_{tstr}.nc", store.REQUIRED_VARS["MET"],
+                              shape=(g.height, g.width), overwrite=overwrite):
                     continue
-                got, src = _fetch_at(chain, g, op, ds_cfg)
+                got, src = _fetch_at(chain, g, op, ds_cfg, tally)
                 if not got:
+                    rep.fail(f"{name} overpass {tstr}", "no source in the chain had data")
                     continue
                 ds = to_dataset(got, g, op, to_celsius)
                 ds.attrs.update(aoi_id=name, source=f"{src} @overpass", **provenance.stamp(eff))
-                log.info("  overpass %s -> %s", tstr,
+                log.info("  overpass %s [%s] -> %s", tstr, src,
                          write_output(ds, aoi_out, name, fmt, f"{name}_{tstr}"))
-    log.info("Done.")
+                rep.wrote(source=src)
+
+    # Which source actually SERVED this run -- not which was configured. The per-file
+    # `source` attr is the truth, but nobody reads 3,000 attrs, so the run says it once.
+    fell_back = [k for k in tally if k not in ("<none>", chain[0])]
+    if fell_back:
+        n = sum(tally[k] for k in fell_back)
+        rep.note = (f"FELL BACK from {chain[0]} for {n} fetch(es) -> "
+                    f"{', '.join(sorted(fell_back))} (different resolution; swrad means "
+                    "something different)")
+        log.warning("met: %s", rep.note)
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -542,7 +597,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

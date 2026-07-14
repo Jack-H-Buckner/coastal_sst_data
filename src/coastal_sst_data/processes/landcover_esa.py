@@ -49,7 +49,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import Project, DataProduct, load_config
 from ..grid import AoiGrid, project_grids
-from .. import provenance
+from .. import net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -84,8 +84,11 @@ def search_items(collection, stac_url, bbox, year):
     import planetary_computer
     from pystac_client import Client
 
-    cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
-    items = list(cat.search(collections=[collection], bbox=list(bbox)).items())
+    def _search():
+        cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+        return list(cat.search(collections=[collection], bbox=list(bbox)).items())
+
+    items = net.retry(_search, what="WorldCover STAC search")
     matched = [it for it in items if _item_year(it) == year]
     if items and not matched:
         log.warning("  no WorldCover tiles labelled year=%d; using all %d returned",
@@ -138,16 +141,11 @@ def items_to_dataset(items, g: AoiGrid, water_classes, aoi_id: str) -> Optional[
 def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str, fmt: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if fmt == "netcdf":
-        path = out_dir / f"{aoi_id}.nc"
-        ds.to_netcdf(path, encoding={v: {"zlib": True, "complevel": 4} for v in ds.data_vars})
-    elif fmt == "geotiff":
-        path = out_dir / aoi_id
-        path.mkdir(exist_ok=True)
-        for v in ds.data_vars:
-            ds[v].rio.to_raster(path / f"{v}.tif")
-    else:
-        raise ValueError(f"Unknown output format: {fmt}")
-    return path
+        return store.write_netcdf(ds, out_dir / f"{aoi_id}.nc")
+    if fmt == "geotiff":
+        return store.write_rasters(ds, out_dir / aoi_id,
+                                   [(v, ds[v]) for v in ds.data_vars])
+    raise ValueError(f"Unknown output format: {fmt}")
 
 
 # --------------------------------------------------------------------------- #
@@ -168,11 +166,14 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             raise SystemExit(f"AOI(s) not found in config: {sorted(missing)}")
         names = [n for n in names if n in req]
 
+    rep = report.ProductReport("landcover")
+
     for name in names:
         g = grids[name]
         aoi_out = out_root / name
         out_f = aoi_out / f"{name}.nc"
-        if not overwrite and out_f.exists():
+        if store.done(out_f, store.REQUIRED_VARS["LANDCOVER"],
+                      shape=(g.height, g.width), overwrite=overwrite):
             log.info("=== %s: %s exists, skipping (use overwrite) ===", name, out_f.name)
             continue
 
@@ -189,7 +190,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 continue
             ds = items_to_dataset(items, g, water_classes, name)
         except Exception as exc:
-            log.warning("  skipping %s (%s)", name, exc)
+            log.warning("  FAILED %s (%s)", name, exc)
+            rep.fail(name, exc)
             continue
         if ds is None:
             continue
@@ -197,7 +199,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         wf = float((ds["water"].values == 1).mean())
         ds.attrs.update(**provenance.stamp(eff))
         log.info("  wrote %s  (water=%.0f%% of grid)", write_output(ds, aoi_out, name, fmt), 100 * wf)
-    log.info("Done.")
+        rep.wrote(source="ESA WorldCover (Planetary Computer)")
+    rep.log_summary()
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -242,7 +246,8 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    run(eff, grids, aois, dry_run)
+    net.setup_gdal_env()      # windowed COG reads: deadline + retries
+    return run(eff, grids, aois, dry_run)
 
 
 def main():

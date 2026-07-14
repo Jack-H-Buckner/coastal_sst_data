@@ -220,6 +220,53 @@ def test_process_granule(tmp_path, aoi_grid, base_project):
     assert str(out["sst"].rio.crs) == aoi_grid.target_crs
 
 
+def _granule_args(tmp_path, aoi_grid, base_project):
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["ecostress"] = {"version": "002"}
+    eff = ecostress._build_eff(parse_config(cfg))
+    return (eff["ds"], eff["grid"], aoi_grid.target_crs, aoi_grid.transform,
+            aoi_grid.width, aoi_grid.height, aoi_grid.geom_proj, "test-aoi", "12:00pm")
+
+
+@pytest.mark.parametrize("lost", ["cloud", "water"])
+def test_granule_is_dropped_when_a_mask_layer_fails_to_read(tmp_path, aoi_grid,
+                                                            base_project, caplog, lost):
+    """A granule whose mask COG failed is WORSE than no granule: without `water`/`cloud`
+    the `valid` mask is never built, and the assembler reads that as a scene with nothing
+    valid in it -- a silent total cloud-out, indistinguishable from a real overcast day."""
+    roles = make_granule_cogs(tmp_path, aoi_grid)
+    roles[lost] = str(tmp_path / "does_not_exist.tif")     # the COG read will fail
+
+    with caplog.at_level("WARNING"):
+        out = ecostress.process_granule(roles, *_granule_args(tmp_path, aoi_grid, base_project))
+
+    assert out is None                                     # dropped, not written degraded
+    assert "dropping granule" in caplog.text and lost in caplog.text
+
+
+def test_granule_is_dropped_when_the_mask_asset_was_never_published(tmp_path, aoi_grid,
+                                                                    base_project, caplog):
+    """The other way a layer goes missing: the granule simply has no cloud asset, so it is
+    filtered out upstream and never even attempted. Same outcome required."""
+    roles = make_granule_cogs(tmp_path, aoi_grid)
+    roles.pop("cloud")                                     # as filter_links_for_granule leaves it
+
+    with caplog.at_level("WARNING"):
+        out = ecostress.process_granule(roles, *_granule_args(tmp_path, aoi_grid, base_project))
+
+    assert out is None
+    assert "dropping granule" in caplog.text
+
+
+def test_expected_vars_follows_the_configured_layers(tmp_path, aoi_grid, base_project):
+    """The skip guard's completeness check is derived from config, not hardcoded: demanding
+    a layer the user never asked for would re-fetch every granule forever."""
+    assert set(ecostress.expected_vars({"layers": ecostress.LAYERS})) == {
+        "sst", "water", "cloud", "valid"}
+    # a config that never asks for the masks cannot be required to have them
+    assert ecostress.expected_vars({"layers": {"sst": "LST"}}) == ("sst",)
+
+
 # ---------------------------------------------------------------------------
 # run() orchestration: control flow around the (expensive) network + raster
 # work. The boundary calls are stubbed with spies, so these are offline and
@@ -284,24 +331,56 @@ def test_run_dry_run_searches_but_does_not_open(tmp_path, aoi_grid, run_stubs):
 
 
 # --- 2. skip-if-exists vs overwrite ---
-def _touch_aligned_file(tmp_path, name):
+def _aligned_path(tmp_path, name):
     aoi_out = tmp_path / name
     aoi_out.mkdir(parents=True, exist_ok=True)
-    (aoi_out / f"{name}_{_GRANULE_TSTR}.nc").touch()
+    return aoi_out / f"{name}_{_GRANULE_TSTR}.nc"
+
+
+def _write_aligned_file(tmp_path, aoi_grid, *, drop=()):
+    """A COMPLETE aligned granule on disk -- or, with `drop`, one missing a layer, as a
+    granule whose mask COG failed to download would be."""
+    H, W = aoi_grid.height, aoi_grid.width
+    layers = {v: (("y", "x"), np.zeros((H, W), "float32"))
+              for v in ("sst", "water", "cloud") if v not in drop}
+    if "valid" not in drop:
+        layers["valid"] = (("y", "x"), np.zeros((H, W), "uint8"))
+    xr.Dataset(layers).to_netcdf(_aligned_path(tmp_path, aoi_grid.name))
 
 
 def test_run_skips_existing_output(tmp_path, aoi_grid, run_stubs):
     run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
-    _touch_aligned_file(tmp_path, aoi_grid.name)     # output already on disk
+    _write_aligned_file(tmp_path, aoi_grid)          # a COMPLETE output already on disk
     ecostress.run(_eff(tmp_path, overwrite=False), {aoi_grid.name: aoi_grid},
                   None, False, False)
-    assert run_stubs["open"] == []       # existing file -> skipped, never opened
+    assert run_stubs["open"] == []       # complete file -> skipped, never opened
     assert run_stubs["write"] == []
+
+
+def test_run_refetches_a_truncated_output(tmp_path, aoi_grid, run_stubs):
+    """The whole point of the completeness check: an empty/truncated file left by a run
+    that died mid-write must NOT be mistaken for a finished one and skipped forever."""
+    run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
+    _aligned_path(tmp_path, aoi_grid.name).touch()   # 0-byte file, as a killed write leaves
+    ecostress.run(_eff(tmp_path, overwrite=False), {aoi_grid.name: aoi_grid},
+                  None, False, False)
+    assert run_stubs["open"]             # re-fetched, not skipped
+    assert run_stubs["write"]
+
+
+def test_run_refetches_a_granule_missing_its_cloud_mask(tmp_path, aoi_grid, run_stubs):
+    """A COMPLETE write of degraded content: the cloud COG failed, so the granule has sst
+    but no cloud/valid. Atomicity cannot see this -- only the layer check can."""
+    run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
+    _write_aligned_file(tmp_path, aoi_grid, drop=("cloud", "valid"))
+    ecostress.run(_eff(tmp_path, overwrite=False), {aoi_grid.name: aoi_grid},
+                  None, False, False)
+    assert run_stubs["open"]             # re-fetched, not trusted
 
 
 def test_run_overwrite_reprocesses_existing(tmp_path, aoi_grid, run_stubs):
     run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
-    _touch_aligned_file(tmp_path, aoi_grid.name)
+    _write_aligned_file(tmp_path, aoi_grid)
     ecostress.run(_eff(tmp_path, overwrite=True), {aoi_grid.name: aoi_grid},
                   None, False, False)
     assert run_stubs["open"]             # overwrite -> reprocessed
@@ -334,3 +413,20 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
 
 
+
+
+def test_source_attr_names_the_version_actually_searched(tmp_path, aoi_grid, base_project):
+    """The attr provenance.source_of() reads, and that every eco_* field in every cube is
+    stamped with. It used to be the literal "v003" while the search ran v002."""
+    roles = make_granule_cogs(tmp_path, aoi_grid)
+    args = list(_granule_args(tmp_path, aoi_grid, base_project))
+    ds_cfg = dict(args[0])
+    ds_cfg.update(short_name="ECO_L2T_LSTE", version="002")
+    args[0] = ds_cfg
+    out = ecostress.process_granule(roles, *args)
+    assert out.attrs["source"] == "ECOSTRESS ECO_L2T_LSTE v002"
+
+    ds_cfg = dict(ds_cfg); ds_cfg["version"] = "003"      # a config asking for v003
+    args[0] = ds_cfg
+    out = ecostress.process_granule(roles, *args)
+    assert out.attrs["source"] == "ECOSTRESS ECO_L2T_LSTE v003"   # follows config, not a literal
