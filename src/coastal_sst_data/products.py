@@ -95,6 +95,11 @@ class SensorSpec:
     use_cloud: bool = True                       # Landsat's cloud mask is reliable...
     qc_levels: tuple[int, ...] | None = None     # ...ECOSTRESS's over-masks cold water: gate on QC
     trust_valid: bool = False                    # MODIS is quality-filtered upstream already
+    # Whether this sensor's aligned files carry a cloud LAYER to publish as a cube channel.
+    # MODIS does not (it arrives pre-filtered, with only sst + valid), so it emits no
+    # `modis_cloud` -- an all-zero cloud channel would read as "this scene was never cloudy",
+    # which is a claim its files do not make.
+    has_cloud: bool = True
 
 
 @dataclass(frozen=True)
@@ -291,8 +296,8 @@ REGISTRY: tuple[ProductSpec, ...] = (
         # it is a constraint the sort enforces rather than a comment on a hand-kept list.
         depends_on=(DataProduct.landsat,),
         # Already quality-filtered upstream -> trust the file's own `valid` layer; it has no
-        # water or cloud layer to recompute from.
-        sensor=SensorSpec(prefix="modis", trust_valid=True),
+        # water or cloud layer to recompute from, and so publishes no `modis_cloud` channel.
+        sensor=SensorSpec(prefix="modis", trust_valid=True, has_cloud=False),
         provenance_inputs=("modis",),
     ),
 
