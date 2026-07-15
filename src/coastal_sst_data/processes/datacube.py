@@ -446,7 +446,15 @@ def fill_water_nn(arr, water):
 # Assemble one AoI onto its shared grid
 # --------------------------------------------------------------------------- #
 def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
-    """Build the analysis-ready Dataset for one AoI from its aligned files."""
+    """Build the analysis-ready Dataset for one AoI from its aligned files.
+
+    NOTE FOR EXTENDERS: the per-overpass SENSOR family is registry-driven (the loop below
+    over `products.sensors()`), so a new sensor needs no edit here. Every OTHER product is
+    read by a HAND-WRITTEN block -- MUR, met, CMEMS, tides, bathymetry, land-cover, in-situ
+    each have their own `load_*` call and their own entry in the final `xr.Dataset` literal.
+    A brand-new non-sensor covariate acquires to disk from its ProductSpec alone but will NOT
+    appear in any cube until it is wired in here. See docs/DEVELOPMENT.md section 3c.
+    """
     H, W = g.height, g.width
     xs, ys = g.xy_centers()
     aid = g.name

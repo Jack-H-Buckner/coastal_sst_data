@@ -704,3 +704,7 @@ Landcover is a static (time-invariant) covariate: one file per AOI giving a land
 
 **Region-level options**: none.
 
+## Extending the package (for developers)
+
+Everything above is for *using* the package. If you want to **add a data product, add a new source to an existing product, or change how the datacube is assembled**, see the **[developer & contributor guide](docs/DEVELOPMENT.md)**. It covers the architecture, the product registry (`ProductSpec`), the `acquire()` contract every process module implements, and the one asymmetry to watch for: adding a thermal *sensor* is a single registry declaration, but a new *non-sensor* covariate also needs to be wired into the datacube assembler by hand. An architecture diagram lives at [`wireframes/main_wire_frame_claude.drawio`](wireframes/main_wire_frame_claude.drawio).
+

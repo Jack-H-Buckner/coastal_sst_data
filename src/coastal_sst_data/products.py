@@ -38,7 +38,13 @@ internal; a spec names its module as a dotted STRING, resolved lazily at dispatc
          v
     pipeline / datacube    resolve spec.module by dotted path
 
-Adding a product is now: write the module, add a ProductSpec here.
+Adding a product is now: write the module, add a ProductSpec here -- and every registry in
+the ladder above is derived, so acquisition, dispatch, ordering, auth and the skip guard all
+pick it up for free. ONE ASYMMETRY REMAINS: the datacube ASSEMBLER is registry-driven only
+for the per-overpass sensor family (it loops over `sensors()`); every other product is read
+by a hand-written block in `datacube.assemble_aoi`. So a new SENSOR is one declaration, but a
+new non-sensor covariate also needs an assembler block (and a provenance mapping). The full
+walkthrough -- including that asymmetry and the acquire() contract -- is docs/DEVELOPMENT.md.
 """
 
 from __future__ import annotations
