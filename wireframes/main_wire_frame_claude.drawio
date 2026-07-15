@@ -1,0 +1,202 @@
+<mxfile host="Electron">
+  <diagram name="architecture" id="claude-arch-1">
+    <mxGraphModel dx="1984" dy="2533" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1969" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=20;fontStyle=1;" value="coastal_sst_data — data pipeline architecture" vertex="1">
+          <mxGeometry height="36" width="900" x="40" y="-40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=2;" value="config → orchestrate → acquire (one module per product, common acquire() contract) → align on a shared per-AoI grid → assemble into a Zarr datacube" vertex="1">
+          <mxGeometry height="22" width="1200" x="40" y="-4" as="geometry" />
+        </mxCell>
+        <mxCell id="colA" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=center;fontStyle=1;fontSize=14;container=1;collapsible=0;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="1 · Entry &amp; user inputs" vertex="1">
+          <mxGeometry height="640" width="230" x="40" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="cA_cli" parent="colA" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#6c8ebf;" value="&lt;b&gt;cli.py&lt;/b&gt;: command line — run / verify / validate / check" vertex="1">
+          <mxGeometry height="70" width="190" x="20" y="48" as="geometry" />
+        </mxCell>
+        <mxCell id="cA_entry" parent="colA" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#6c8ebf;" value="&lt;b&gt;entry.py&lt;/b&gt;: run one process on its own (python -m …processes.&lt;product&gt;)" vertex="1">
+          <mxGeometry height="70" width="190" x="20" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="cA_config" parent="colA" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#6c8ebf;strokeWidth=2;" value="&lt;b&gt;config file (YAML)&lt;/b&gt;: AoIs, selected products, per-region source choices" vertex="1">
+          <mxGeometry height="70" width="190" x="20" y="212" as="geometry" />
+        </mxCell>
+        <mxCell id="cA_creds" parent="colA" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#6c8ebf;strokeWidth=2;" value="&lt;b&gt;credentials&lt;/b&gt;: API logins (.netrc / keys)" vertex="1">
+          <mxGeometry height="60" width="190" x="20" y="294" as="geometry" />
+        </mxCell>
+        <mxCell id="colB" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=center;fontStyle=1;fontSize=14;container=1;collapsible=0;fillColor=#d5e8d4;strokeColor=#82b366;" value="2 · Config &amp; orchestration" vertex="1">
+          <mxGeometry height="640" width="240" x="310" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="cB_products" parent="colB" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#82b366;strokeWidth=2;" value="&lt;b&gt;products.py&lt;/b&gt;: the product REGISTRY — one ProductSpec per product. The contract every other table is derived from (dir, kind, sources, auth, ordering)." vertex="1">
+          <mxGeometry height="110" width="200" x="20" y="48" as="geometry" />
+        </mxCell>
+        <mxCell id="cB_config" parent="colB" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#82b366;" value="&lt;b&gt;config.py&lt;/b&gt;: parse &amp; validate config; derive options / auth from the registry" vertex="1">
+          <mxGeometry height="70" width="200" x="20" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="cB_auth" parent="colB" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#82b366;" value="&lt;b&gt;auth.py&lt;/b&gt;: credential preflight (auth.verify) before any download" vertex="1">
+          <mxGeometry height="64" width="200" x="20" y="252" as="geometry" />
+        </mxCell>
+        <mxCell id="cB_grid" parent="colB" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#82b366;" value="&lt;b&gt;grid.py&lt;/b&gt;: one shared grid per AoI (computed ONCE, passed to every stage)" vertex="1">
+          <mxGeometry height="64" width="200" x="20" y="328" as="geometry" />
+        </mxCell>
+        <mxCell id="cB_pipeline" parent="colB" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;" value="&lt;b&gt;pipeline.py&lt;/b&gt;: orchestrator — compute grids, topo-sort products by depends_on, dispatch each to its module via acquire()" vertex="1">
+          <mxGeometry height="104" width="200" x="20" y="404" as="geometry" />
+        </mxCell>
+        <mxCell id="cB_order" parent="colB" style="rounded=0;whiteSpace=wrap;html=1;align=left;dashed=1;fillColor=none;strokeColor=#82b366;fontSize=10;" value="Order: statics/backbone first · landsat → modis · sensors → met" vertex="1">
+          <mxGeometry height="60" width="200" x="20" y="520" as="geometry" />
+        </mxCell>
+        <mxCell id="colC" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=center;fontStyle=1;fontSize=14;container=1;collapsible=0;fillColor=#ffe6cc;strokeColor=#d79b00;" value="3 · External data sources (library · auth)" vertex="1">
+          <mxGeometry height="800" width="260" x="590" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_cmems" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;Copernicus Marine Toolbox&lt;/b&gt;: ocean physics reanalysis · copernicusmarine · .netrc" vertex="1">
+          <mxGeometry height="64" width="230" x="15" y="48" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_nasa" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;NASA Earthdata&lt;/b&gt;: MUR L4 SST, ECOSTRESS &amp; MODIS TIR · earthaccess · .netrc" vertex="1">
+          <mxGeometry height="64" width="230" x="15" y="120" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_pc" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;Microsoft Planetary Computer&lt;/b&gt;: Landsat TIR, ESA WorldCover mask · pystac_client · anon" vertex="1">
+          <mxGeometry height="64" width="230" x="15" y="192" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_herbie" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;Herbie&lt;/b&gt;: HRRR weather forecast / reanalysis · herbie" vertex="1">
+          <mxGeometry height="56" width="230" x="15" y="264" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_gcs" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;Google Cloud Storage&lt;/b&gt;: ARCO-ERA5 weather · gcsfs" vertex="1">
+          <mxGeometry height="56" width="230" x="15" y="328" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_cudem" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;NOAA CUDEM / GMRT&lt;/b&gt;: bathymetry DEMs (cudem→gmrt fallback)" vertex="1">
+          <mxGeometry height="56" width="230" x="15" y="392" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_vdatum" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;NOAA VDatum&lt;/b&gt;: DEM ↔ MSL vertical-datum offset" vertex="1">
+          <mxGeometry height="48" width="230" x="15" y="456" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_coops" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;NOAA CO-OPS&lt;/b&gt;: tide gauges · pytides2" vertex="1">
+          <mxGeometry height="48" width="230" x="15" y="512" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_eotides" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;EO Tides&lt;/b&gt;: global tide models · eotides" vertex="1">
+          <mxGeometry height="48" width="230" x="15" y="568" as="geometry" />
+        </mxCell>
+        <mxCell id="cC_ioos" parent="colC" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#d79b00;fontSize=11;" value="&lt;b&gt;IOOS ERDDAP&lt;/b&gt;: in-situ SST — the cube&#39;s only ground truth" vertex="1">
+          <mxGeometry height="56" width="230" x="15" y="624" as="geometry" />
+        </mxCell>
+        <mxCell id="colD" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=center;fontStyle=1;fontSize=14;container=1;collapsible=0;fillColor=#e1d5e7;strokeColor=#9673a6;" value="4 · Acquisition — processes/  (each: acquire() → aligned files)" vertex="1">
+          <mxGeometry height="800" width="280" x="890" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_bathy" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;bathymetry.py&lt;/b&gt;: DEM / depth — static raster" vertex="1">
+          <mxGeometry height="48" width="240" x="20" y="48" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_mur" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;mur.py&lt;/b&gt;: MUR L4 SST — daily raster" vertex="1">
+          <mxGeometry height="48" width="240" x="20" y="104" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_cmems" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;cmems.py&lt;/b&gt;: ocean physics reanalysis — daily raster" vertex="1">
+          <mxGeometry height="48" width="240" x="20" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_eco" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;ecostress.py&lt;/b&gt;: ECOSTRESS TIR — overpass sensor" vertex="1">
+          <mxGeometry height="48" width="240" x="20" y="216" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_landsat" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;landsat_pc.py&lt;/b&gt;: Landsat TIR (source=pc) — overpass sensor" vertex="1">
+          <mxGeometry height="48" width="240" x="20" y="272" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_modis" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;modis.py&lt;/b&gt;: MODIS granules matched to Landsat — overpass sensor" vertex="1">
+          <mxGeometry height="56" width="240" x="20" y="328" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_met" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;met.py&lt;/b&gt;: atmospheric forcing at overpass times — daily raster" vertex="1">
+          <mxGeometry height="56" width="240" x="20" y="392" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_tides" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;tides.py&lt;/b&gt;: tide height from harmonics — 1D series" vertex="1">
+          <mxGeometry height="48" width="240" x="20" y="456" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_landcover" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;landcover_esa.py&lt;/b&gt;: ESA WorldCover land/water mask (source=esa) — static raster" vertex="1">
+          <mxGeometry height="56" width="240" x="20" y="512" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_insitu_ioos" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" value="&lt;b&gt;insitu_ioos.py&lt;/b&gt;: in-situ SST from IOOS/ERDDAP (source=ioos) — station table" vertex="1">
+          <mxGeometry height="56" width="240" x="20" y="576" as="geometry" />
+        </mxCell>
+        <mxCell id="cD_note" parent="colD" style="rounded=0;whiteSpace=wrap;html=1;align=left;dashed=1;fillColor=none;strokeColor=#9673a6;fontSize=10;" value="Source-selectable products (landsat, landcover, insitu) pick their module from the resolved per-region source." vertex="1">
+          <mxGeometry height="56" width="240" x="20" y="640" as="geometry" />
+        </mxCell>
+        <mxCell id="colE" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=center;fontStyle=1;fontSize=14;container=1;collapsible=0;fillColor=#f8cecc;strokeColor=#b85450;" value="5 · Aligned outputs (per AoI)" vertex="1">
+          <mxGeometry height="640" width="240" x="1210" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="cE_main" parent="colE" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#b85450;strokeWidth=2;" value="&lt;b&gt;&lt;output_dir&gt;/&lt;DIR&gt;/aligned/&lt;aoi&gt;/&lt;/b&gt;&lt;br&gt;Timestamped NetCDF per product, resampled onto the common grid." vertex="1">
+          <mxGeometry height="90" width="200" x="20" y="48" as="geometry" />
+        </mxCell>
+        <mxCell id="cE_legend" parent="colE" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=none;strokeColor=#b85450;fontSize=11;" value="Filename by output kind:&lt;br&gt;• daily: &lt;aoi&gt;_YYYYMMDD.nc&lt;br&gt;• overpass: &lt;aoi&gt;_…T….nc&lt;br&gt;• static: &lt;aoi&gt;.nc&lt;br&gt;• tides: &lt;aoi&gt;_tides.nc&lt;br&gt;• in-situ: &lt;aoi&gt;_insitu.nc" vertex="1">
+          <mxGeometry height="150" width="200" x="20" y="152" as="geometry" />
+        </mxCell>
+        <mxCell id="cE_standalone" parent="colE" style="rounded=0;whiteSpace=wrap;html=1;align=left;dashed=1;fillColor=none;strokeColor=#b85450;fontSize=10;" value="entry.py can produce these standalone, one product at a time." vertex="1">
+          <mxGeometry height="56" width="200" x="20" y="316" as="geometry" />
+        </mxCell>
+        <mxCell id="colF" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=center;fontStyle=1;fontSize=14;container=1;collapsible=0;fillColor=#d5e8d4;strokeColor=#82b366;" value="6 · Derived stages &amp; assembly" vertex="1">
+          <mxGeometry height="640" width="240" x="1490" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="cF_datum" parent="colF" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#82b366;fontSize=11;" value="&lt;b&gt;datum.py&lt;/b&gt;: DEM → MSL vertical-datum offset (derived; runs after bathymetry)" vertex="1">
+          <mxGeometry height="70" width="200" x="20" y="48" as="geometry" />
+        </mxCell>
+        <mxCell id="cF_wl" parent="colF" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#82b366;fontSize=11;" value="&lt;b&gt;water_level.py&lt;/b&gt;: DEM + tide → waterline at each overpass (inside the assembler)" vertex="1">
+          <mxGeometry height="70" width="200" x="20" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="cF_insitu" parent="colF" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#82b366;fontSize=11;" value="&lt;b&gt;insitu.py&lt;/b&gt;: place point obs in a grid cell &amp; match to overpass time (source-agnostic)" vertex="1">
+          <mxGeometry height="70" width="200" x="20" y="212" as="geometry" />
+        </mxCell>
+        <mxCell id="cF_datacube" parent="colF" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=2;fontSize=11;" value="&lt;b&gt;datacube.py&lt;/b&gt;: knit every aligned output into ONE Zarr cube per AoI, on a common daily axis" vertex="1">
+          <mxGeometry height="90" width="200" x="20" y="294" as="geometry" />
+        </mxCell>
+        <mxCell id="colG" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=center;fontStyle=1;fontSize=14;container=1;collapsible=0;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="7 · Final artifacts (per AoI)" vertex="1">
+          <mxGeometry height="640" width="230" x="1770" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="cG_zarr" parent="colG" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#6c8ebf;strokeWidth=3;" value="&lt;b&gt;&lt;aoi&gt;.zarr&lt;/b&gt;: analysis-ready datacube, chunked + compressed" vertex="1">
+          <mxGeometry height="90" width="190" x="20" y="48" as="geometry" />
+        </mxCell>
+        <mxCell id="cG_prov" parent="colG" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#6c8ebf;strokeWidth=2;" value="&lt;b&gt;metadata / provenance&lt;/b&gt;: which source &amp; when built each field (provenance.py)" vertex="1">
+          <mxGeometry height="90" width="190" x="20" y="152" as="geometry" />
+        </mxCell>
+        <mxCell id="cG_report" parent="colG" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#6c8ebf;strokeWidth=2;" value="&lt;b&gt;run report&lt;/b&gt;: what was loaded, from where, and what was attempted-and-LOST (report.py)" vertex="1">
+          <mxGeometry height="90" width="190" x="20" y="256" as="geometry" />
+        </mxCell>
+        <mxCell id="band" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=center;fontStyle=1;fontSize=14;container=1;collapsible=0;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;" value="Cross-cutting helpers — used by every stage" vertex="1">
+          <mxGeometry height="140" width="1960" x="40" y="880" as="geometry" />
+        </mxCell>
+        <mxCell id="bd_store" parent="band" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#666666;fontSize=11;" value="&lt;b&gt;store.py&lt;/b&gt;: atomic writes; completeness-aware skip guard (checks required_vars, not just path.exists)" vertex="1">
+          <mxGeometry height="80" width="360" x="20" y="44" as="geometry" />
+        </mxCell>
+        <mxCell id="bd_net" parent="band" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#666666;fontSize=11;" value="&lt;b&gt;net.py&lt;/b&gt;: bounded timeouts &amp; retries for everything that moves data" vertex="1">
+          <mxGeometry height="80" width="360" x="404" y="44" as="geometry" />
+        </mxCell>
+        <mxCell id="bd_naming" parent="band" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#666666;fontSize=11;" value="&lt;b&gt;naming.py&lt;/b&gt;: the aligned-file naming contract (encode/decode timestamps)" vertex="1">
+          <mxGeometry height="80" width="360" x="788" y="44" as="geometry" />
+        </mxCell>
+        <mxCell id="bd_prov" parent="band" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#666666;fontSize=11;" value="&lt;b&gt;provenance.py&lt;/b&gt;: per-field source + fetch-time record for the cube" vertex="1">
+          <mxGeometry height="80" width="360" x="1172" y="44" as="geometry" />
+        </mxCell>
+        <mxCell id="bd_report" parent="band" style="rounded=0;whiteSpace=wrap;html=1;align=left;fillColor=#ffffff;strokeColor=#666666;fontSize=11;" value="&lt;b&gt;report.py&lt;/b&gt;: run accounting — loaded vs attempted-and-lost" vertex="1">
+          <mxGeometry height="80" width="380" x="1556" y="44" as="geometry" />
+        </mxCell>
+        <mxCell id="e_A_B" edge="1" parent="1" source="colA" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="colB">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_B_D" edge="1" parent="1" source="cB_pipeline" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;endArrow=block;" target="colD" value="dispatch acquire()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_C_D" edge="1" parent="1" source="colC" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="colD" value="download">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_D_E" edge="1" parent="1" source="colD" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="colE" value="write aligned files">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_E_F" edge="1" parent="1" source="colE" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;endArrow=block;exitX=1;exitY=0.5;" target="cF_datacube" value="assemble">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_F_G" edge="1" parent="1" source="colF" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;endArrow=block;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="colG">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_band_D" edge="1" parent="1" source="band" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;endArrow=open;strokeColor=#999999;" target="colD">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_band_E" edge="1" parent="1" source="band" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;endArrow=open;strokeColor=#999999;" target="colE">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
