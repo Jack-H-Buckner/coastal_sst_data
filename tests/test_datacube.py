@@ -3,7 +3,9 @@ output tree, assembles them, and asserts the knit result: channel layout, the
 clearest-overpass pick, the land-cover water mask + MUR fill, and that the Zarr
 was written with the expected chunking/compressor. No network, no real data."""
 
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -735,6 +737,190 @@ def test_overpass_sensors_are_not_judged_on_daily_coverage(project, grids, days)
     write_ecostress_two_scenes(project, g, days[0])          # a scene on ONE day of three
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
     assert "ecostress" not in json.loads(ds.attrs["coverage"])
+
+# --------------------------------------------------------------------------- #
+# GOLDEN CUBE (refactor safety net, plan stage S0)
+#
+# Assemble ONE richly-populated AoI -- every product written -- and snapshot every
+# channel's values + attrs into a committed JSON golden. The whole assembler refactor
+# (docs/refactor-plan-assembler-and-sources.md) is gated on this: the contributor-protocol
+# migration (S2) must keep it BYTE-IDENTICAL, and the deletions (S1) / per-source emission
+# (S3-S4) regenerate it as a REVIEWED diff -- the git diff of the golden IS the review
+# artifact (channel set + attrs are human-readable; bulk float values are fingerprinted).
+#
+# The comparator EXCLUDES the run-stamp attrs, because any working-tree edit flips
+# `code_version` to `...-dirty` and rewrites `created_at`, so a naive full-attr snapshot
+# would fail on every phase for reasons unrelated to the cube's data.
+# --------------------------------------------------------------------------- #
+GOLDEN = Path(__file__).parent / "golden" / "datacube_golden.json"
+
+# provenance / run-stamp attrs: excluded from the snapshot (they change on every tree edit).
+RUNSTAMP_ATTRS = ("created_at", "code_version", "package_version",
+                  "config_yaml", "config_sha256", "config_path",
+                  "provenance", "provenance_products")
+
+
+def write_tides(project, g, days, *, amplitude=1.0):
+    """Hourly tide over the window: a 12 h sinusoid, 0 m at each day's midnight."""
+    hours = pd.date_range(days[0], periods=24 * len(days), freq="h")
+    tide = amplitude * np.sin(2 * np.pi * np.arange(len(hours)) / 12.0)
+    ds = xr.Dataset({"tide": (("time",), tide.astype("float32"))}, coords={"time": hours})
+    _write(project, "TIDE", f"{AOI}_tides.nc", ds)
+
+
+def write_insitu(project, g, times, values):
+    """One in-situ station at the AoI centre, with a value at each of `times`."""
+    ds = xr.Dataset(
+        {"sst": (("station", "time"), np.array([values], "float32")),
+         "qc": (("station", "time"), np.ones((1, len(times)), "uint8"))},
+        coords={"station": [0], "time": pd.DatetimeIndex(times),
+                "station_id": ("station", ["s1"]), "station_name": ("station", ["Test Station"]),
+                "lat": ("station", [45.5]), "lon": ("station", [-123.9])})
+    _write(project, "INSITU", f"{AOI}_insitu.nc", ds)
+
+
+def _write_full_fixture(project, g, days):
+    """Every product written, chosen so as many channels as possible carry real values:
+    MUR (+ a water hole to fill), bathymetry, land-cover (a land strip), all three thermal
+    sensors, CMEMS (+ a model-land hole), met (daily + reference + per-overpass snapshots),
+    tides, and one in-situ station. Deterministic: all synthetic values are constants and
+    dates are fixed, so every derived channel (fills, water level, coverage, doy) is stable.
+    """
+    write_mur(project, g, days, water_hole_cols=slice(0, 3))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 5))
+    write_ecostress_two_scenes(project, g, days[0])      # clearest scene 20:00
+    write_landsat(project, g, days[0], hour=18)
+    write_modis(project, g, days[1], temp=287.0)         # overpass 21:00
+    write_cmems(project, g, days, land_cols=slice(0, 4))
+    write_met_daily(project, g, days, temp=280.0)                 # daily mean
+    write_met_daily(project, g, days, temp=291.0, prefix="ref_")  # reference snapshot
+    write_met_snapshot(project, g, days[0], 20, temp=286.0)       # eco overpass
+    write_met_snapshot(project, g, days[0], 18, temp=299.0)       # lst overpass
+    write_met_snapshot(project, g, days[1], 21, temp=285.0)       # modis overpass
+    write_insitu(project, g, ["2026-06-01T18:00", "2026-06-01T20:00", "2026-06-02T21:00"],
+                 [12.5, 13.0, 14.0])
+    write_tides(project, g, days)
+
+
+def _fingerprint(arr) -> str:
+    """A NaN-aware content hash of an array: value-level, not bit-payload-level.
+
+    NaN positions are hashed separately from the (NaN-zeroed) values, so two arrays that
+    agree on which cells are missing and on every finite value fingerprint identically --
+    regardless of the particular NaN bit pattern a given code path happened to produce.
+    """
+    b = np.ascontiguousarray(np.asarray(arr))
+    if b.dtype.kind == "M":                    # datetime64 -> integer ns
+        b = b.astype("int64")
+    h = hashlib.sha256()
+    h.update(str(b.dtype).encode()); h.update(str(b.shape).encode())
+    if b.dtype.kind == "f":
+        b = b.copy()
+        nan = np.isnan(b)
+        b[nan] = 0.0
+        h.update(nan.tobytes())
+    h.update(b.tobytes())
+    return h.hexdigest()
+
+
+def _stats(arr) -> dict:
+    """Human-readable summary (finite count + range) so the golden diff is legible."""
+    a = np.asarray(arr)
+    if a.dtype.kind not in "fiu":
+        return {}
+    af = a.astype("float64")
+    finite = np.isfinite(af)
+    n = int(finite.sum())
+    if not n:
+        return {"n_finite": 0}
+    return {"n_finite": n, "min": round(float(np.nanmin(af)), 6),
+            "max": round(float(np.nanmax(af)), 6), "mean": round(float(np.nanmean(af)), 6)}
+
+
+def _jsonify(obj):
+    """Make attrs JSON-comparable: numpy scalars -> python, numpy arrays -> lists."""
+    if isinstance(obj, dict):
+        return {k: _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_jsonify(v) for v in obj.tolist()]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+def _snapshot(ds: xr.Dataset) -> dict:
+    """Snapshot a cube: dims, stripped global attrs, and per coord/channel dtype + shape +
+    attrs + stats + value fingerprint. Everything here is deterministic for a fixed fixture."""
+    attrs = {k: v for k, v in ds.attrs.items() if k not in RUNSTAMP_ATTRS}
+    snap = {"dims": {k: int(v) for k, v in ds.sizes.items()},
+            "global_attrs": _jsonify(attrs), "coords": {}, "data_vars": {}}
+    for name, c in ds.coords.items():
+        snap["coords"][str(name)] = {"dtype": str(c.dtype), "shape": list(c.shape),
+                                     "fingerprint": _fingerprint(c.values)}
+    for name in ds.data_vars:
+        da = ds[name]
+        snap["data_vars"][str(name)] = {
+            "dims": list(da.dims), "dtype": str(da.dtype), "shape": list(da.shape),
+            "attrs": _jsonify(dict(da.attrs)), "stats": _stats(da.values),
+            "fingerprint": _fingerprint(da.values)}
+    return snap
+
+
+def _diff_snapshots(golden: dict, actual: dict) -> list[str]:
+    """A human-readable list of every way `actual` drifts from `golden` (empty == identical)."""
+    out = []
+    if golden["dims"] != actual["dims"]:
+        out.append(f"dims: {golden['dims']} -> {actual['dims']}")
+    ga, aa = golden["global_attrs"], actual["global_attrs"]
+    for k in sorted(set(ga) - set(aa)):
+        out.append(f"global attr REMOVED: {k}")
+    for k in sorted(set(aa) - set(ga)):
+        out.append(f"global attr ADDED: {k} = {aa[k]!r}")
+    for k in sorted(set(ga) & set(aa)):
+        if ga[k] != aa[k]:
+            out.append(f"global attr CHANGED {k}: {ga[k]!r} -> {aa[k]!r}")
+    for sect in ("coords", "data_vars"):
+        gs, as_ = golden[sect], actual[sect]
+        for k in sorted(set(gs) - set(as_)):
+            out.append(f"{sect}: channel REMOVED: {k}")
+        for k in sorted(set(as_) - set(gs)):
+            out.append(f"{sect}: channel ADDED: {k}")
+        for k in sorted(set(gs) & set(as_)):
+            gk, ak = gs[k], as_[k]
+            for field in ("dtype", "shape", "dims"):
+                if gk.get(field) != ak.get(field):
+                    out.append(f"{sect}[{k}].{field}: {gk.get(field)} -> {ak.get(field)}")
+            if gk.get("attrs") != ak.get("attrs"):
+                out.append(f"{sect}[{k}].attrs: {gk.get('attrs')} -> {ak.get('attrs')}")
+            if gk.get("fingerprint") != ak.get("fingerprint"):
+                out.append(f"{sect}[{k}] VALUES changed: stats {gk.get('stats')} -> {ak.get('stats')}")
+    return out
+
+
+def test_golden_cube_is_unchanged(project, grids, days):
+    """The refactor safety net. Assemble the full fixture and assert the cube matches the
+    committed golden, channel for channel (run-stamp attrs excluded). Set UPDATE_GOLDEN=1 to
+    regenerate after an INTENDED change, then review the golden's git diff."""
+    g = grids[AOI]
+    _write_full_fixture(project, g, days)
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    actual = _snapshot(ds)
+
+    existed = GOLDEN.exists()
+    if os.environ.get("UPDATE_GOLDEN") or not existed:
+        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
+        GOLDEN.write_text(json.dumps(actual, indent=2, sort_keys=True) + "\n")
+        pytest.skip(f"golden {'regenerated' if existed else 'created'} at {GOLDEN}; "
+                    "review its git diff and re-run")
+
+    problems = _diff_snapshots(json.loads(GOLDEN.read_text()), actual)
+    assert not problems, (
+        "datacube drifted from the golden snapshot:\n  " + "\n  ".join(problems) +
+        "\n\nIf this change is intended, regenerate with UPDATE_GOLDEN=1 and review the diff.")
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

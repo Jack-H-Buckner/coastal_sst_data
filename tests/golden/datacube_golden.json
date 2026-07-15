@@ -1,0 +1,1390 @@
+{
+  "coords": {
+    "time": {
+      "dtype": "datetime64[ns]",
+      "fingerprint": "e563e9cda4f8aa2fa0d90b8447b357302a8358e24f9fb1cbc1a3ac646a008ab4",
+      "shape": [
+        3
+      ]
+    },
+    "x": {
+      "dtype": "float64",
+      "fingerprint": "6f74b0ea4d7122dfb3b3ce3e298e7a32ac5d054ffa44c0675bc40dc6eb3369d5",
+      "shape": [
+        42
+      ]
+    },
+    "y": {
+      "dtype": "float64",
+      "fingerprint": "73c81911d2ec89fc754d41911e1e18d0c1616d3980d0e82bfa28e066e3df7bdd",
+      "shape": [
+        42
+      ]
+    }
+  },
+  "data_vars": {
+    "airtemp": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "3867054104777a985d528e8a8b4502d0a7f74ce570e640790c206ded706cc36c",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 291.0,
+        "mean": 291.0,
+        "min": 291.0,
+        "n_finite": 5292
+      }
+    },
+    "cloud_cover": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "9d85c0b06e21170bc468801c221b6fede2feb55543bd62db85c8157bddee0f76",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 10.0,
+        "mean": 10.0,
+        "min": 10.0,
+        "n_finite": 5292
+      }
+    },
+    "cmems_source": {
+      "attrs": {
+        "flag_values": [
+          0,
+          1
+        ],
+        "legend": "[\"none\", \"unknown\"]",
+        "long_name": "which source produced cmems on this day"
+      },
+      "dims": [
+        "time"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "d82e10da4a3d980debf2e7ecd0b4a4a90f2384ee054da9ebb3cf0ce5a138884f",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 1.0,
+        "min": 1.0,
+        "n_finite": 3
+      }
+    },
+    "cmems_thetao_0m": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "d46e7a8730f0dd1148aa75aaa8c1dae1e879171c3caf934ed0c79ee92633a696",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 284.0,
+        "mean": 284.0,
+        "min": 284.0,
+        "n_finite": 4788
+      }
+    },
+    "cmems_thetao_0m_filled": {
+      "attrs": {
+        "long_name": "cmems_thetao_0m was nearest-neighbour filled over water the ~9 km model did not resolve (NOT an observation)"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "8ed4cd2c2acbb6cb4e1590eedf4f31c8d2395f6323e9283212f6096705a2ce3a",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "depth": {
+      "attrs": {},
+      "dims": [
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "cadb04c4a4f5b5d8c077dfa2462354e602df8d9eb853fe705473a62cc3493f0b",
+      "shape": [
+        42,
+        42
+      ],
+      "stats": {
+        "max": 10.0,
+        "mean": 10.0,
+        "min": 10.0,
+        "n_finite": 1764
+      }
+    },
+    "depth_p25": {
+      "attrs": {},
+      "dims": [
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "da1235b5cd2b3b4568c5ff5c197d6b78bc34511bb83217c27a7c33fba5c9cde2",
+      "shape": [
+        42,
+        42
+      ],
+      "stats": {
+        "max": 8.0,
+        "mean": 8.0,
+        "min": 8.0,
+        "n_finite": 1764
+      }
+    },
+    "depth_p75": {
+      "attrs": {},
+      "dims": [
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "398f632523415eb83d3c97de8db727984789c8b6f48d23e43013b24906e984d3",
+      "shape": [
+        42,
+        42
+      ],
+      "stats": {
+        "max": 12.0,
+        "mean": 12.0,
+        "min": 12.0,
+        "n_finite": 1764
+      }
+    },
+    "doy_cos": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "4716b77fc9403bfcd2844fa7bcbc0469a217819acbe6ffe2e4c416fbf888277c",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": -0.864408,
+        "mean": -0.872843,
+        "min": -0.881192,
+        "n_finite": 3
+      }
+    },
+    "doy_sin": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "887a78d9165cdce9d6f0f563192dad0f69a4bb1e4f6e4cb115be04801188240c",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 0.502791,
+        "mean": 0.487799,
+        "min": 0.472759,
+        "n_finite": 3
+      }
+    },
+    "eco_airtemp": {
+      "attrs": {
+        "long_name": "airtemp at the eco overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "ca3778d576ced2de3e8010fcc0eb895e03f23541eea46370246c39316aeb8ef0",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 286.0,
+        "mean": 286.0,
+        "min": 286.0,
+        "n_finite": 1764
+      }
+    },
+    "eco_cloud": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "95f4e7bdcf925c0e0e50cd44f1c13117f8cecaba554ecee5da3d60af781cc0b0",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1764
+      }
+    },
+    "eco_cloud_cover": {
+      "attrs": {
+        "long_name": "cloud_cover at the eco overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "51533c931ff5d1ce4ebe4f18667c128a531d2ff9f648ee7d45a9da2d34764dd3",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 20.0,
+        "mean": 20.0,
+        "min": 20.0,
+        "n_finite": 1764
+      }
+    },
+    "eco_hour": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "03d35281334e24fc2741cd3edf63d2567f874cc9e5d5ed119137c9ca250cc56f",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 20.0,
+        "mean": 20.0,
+        "min": 20.0,
+        "n_finite": 1
+      }
+    },
+    "eco_insitu_dt_min": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "6356a9bdcaef78db781db0f6be2b90204fb36601483d757350e5ad4c04e8926c",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1
+      }
+    },
+    "eco_insitu_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "7424fc5ff9b2671ae8c2bbd41f414296b4e41e8f737088cfb439518e081e2b35",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 13.0,
+        "mean": 13.0,
+        "min": 13.0,
+        "n_finite": 1
+      }
+    },
+    "eco_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "ca3778d576ced2de3e8010fcc0eb895e03f23541eea46370246c39316aeb8ef0",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 286.0,
+        "mean": 286.0,
+        "min": 286.0,
+        "n_finite": 1764
+      }
+    },
+    "eco_swrad": {
+      "attrs": {
+        "long_name": "swrad at the eco overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "f2d7c7045e54282a5b7d3a652d7bd11e7bc1a273f17fd444eff73a1ae43b1730",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 800.0,
+        "mean": 800.0,
+        "min": 800.0,
+        "n_finite": 1764
+      }
+    },
+    "eco_tide": {
+      "attrs": {
+        "long_name": "tide height at the eco overpass (rel. MSL)",
+        "units": "m"
+      },
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "c6b44048a3999d91dd6bf4a7d3c613ee4f678bb56e556ce5fd60e8fddbaeaee0",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": -0.866025,
+        "mean": -0.866025,
+        "min": -0.866025,
+        "n_finite": 1
+      }
+    },
+    "eco_valid": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "bd2c2fe3964b53518c9c9b411aaffa7af70c94874a81f720931edad3b9a7786d",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.333333,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "eco_water_class": {
+      "attrs": {
+        "flag_meanings": "submerged exposed unknown",
+        "flag_values": [
+          0,
+          1,
+          255
+        ],
+        "long_name": "submerged/exposed at the eco overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "edbcc7e6eb3faee01bb643f9de6397ff83a6377a11e4d748a628d8d50dd4c1a4",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 255.0,
+        "mean": 170.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "eco_water_elev": {
+      "attrs": {
+        "datum_offset_m": 0.0,
+        "long_name": "ground elevation rel. to the waterline at the eco overpass (0 at the waterline, + exposed, - submerged)",
+        "units": "m"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "5cce1f3e8e234f196e817fdda38056416a5a2868560323e6332332991ecca56e",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": -9.133975,
+        "mean": -9.133975,
+        "min": -9.133975,
+        "n_finite": 1764
+      }
+    },
+    "eco_wind_speed": {
+      "attrs": {
+        "long_name": "wind_speed at the eco overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "7c12d754b7e98ad8f0d552c6e4b17e099975ce9d17d0311e08a38004b0a414db",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 7.0,
+        "mean": 7.0,
+        "min": 7.0,
+        "n_finite": 1764
+      }
+    },
+    "insitu_n": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "6feb2bbe0ec5429bd498b63c327d6971a9edd0b109218f004964dcae7bd121f8",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.000567,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "insitu_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "9b8961b1aacf70bfd5045013c6bb6971c6aa0ad90fbaa12d2d0c075f47ce11a9",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 12.5,
+        "mean": 12.5,
+        "min": 12.5,
+        "n_finite": 1
+      }
+    },
+    "insitu_station": {
+      "attrs": {
+        "long_name": "index into the insitu_stations attr (0 = none)"
+      },
+      "dims": [
+        "y",
+        "x"
+      ],
+      "dtype": "uint16",
+      "fingerprint": "005f1fe879df3717c3be586dcd0ba85a5484c6d947df97ae161369fa32feecfd",
+      "shape": [
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.000567,
+        "min": 0.0,
+        "n_finite": 1764
+      }
+    },
+    "landcover_water": {
+      "attrs": {},
+      "dims": [
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "5d9cb3df3c4a319d416c4b1f8664a0ef8a74a6da78578b7032b8fe6fc3828367",
+      "shape": [
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.880952,
+        "min": 0.0,
+        "n_finite": 1764
+      }
+    },
+    "landmask": {
+      "attrs": {},
+      "dims": [
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "a0e3a8a1c21e1befc315c33eb2d532abdcf52ffa5e151f3ae4ade9778274c0df",
+      "shape": [
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.119048,
+        "min": 0.0,
+        "n_finite": 1764
+      }
+    },
+    "lst_airtemp": {
+      "attrs": {
+        "long_name": "airtemp at the lst overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "23ff28ef82ae99f13d587862a6ba50e350b93e3f6fc552500f3fa7add2f4ffd5",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 299.0,
+        "mean": 299.0,
+        "min": 299.0,
+        "n_finite": 1764
+      }
+    },
+    "lst_cloud": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "95f4e7bdcf925c0e0e50cd44f1c13117f8cecaba554ecee5da3d60af781cc0b0",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1764
+      }
+    },
+    "lst_cloud_cover": {
+      "attrs": {
+        "long_name": "cloud_cover at the lst overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "51533c931ff5d1ce4ebe4f18667c128a531d2ff9f648ee7d45a9da2d34764dd3",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 20.0,
+        "mean": 20.0,
+        "min": 20.0,
+        "n_finite": 1764
+      }
+    },
+    "lst_hour": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "d5fa64b7511ecb97dbbbcc1bff210778d7e982a4a182610c01687f74f6079988",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 18.0,
+        "mean": 18.0,
+        "min": 18.0,
+        "n_finite": 1
+      }
+    },
+    "lst_insitu_dt_min": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "6356a9bdcaef78db781db0f6be2b90204fb36601483d757350e5ad4c04e8926c",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1
+      }
+    },
+    "lst_insitu_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "9b8961b1aacf70bfd5045013c6bb6971c6aa0ad90fbaa12d2d0c075f47ce11a9",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 12.5,
+        "mean": 12.5,
+        "min": 12.5,
+        "n_finite": 1
+      }
+    },
+    "lst_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "eb475e09f8582231a770637488f525c0d38efe03f52d15d8dfede0a67fa0e530",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 288.0,
+        "mean": 288.0,
+        "min": 288.0,
+        "n_finite": 1764
+      }
+    },
+    "lst_swrad": {
+      "attrs": {
+        "long_name": "swrad at the lst overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "f2d7c7045e54282a5b7d3a652d7bd11e7bc1a273f17fd444eff73a1ae43b1730",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 800.0,
+        "mean": 800.0,
+        "min": 800.0,
+        "n_finite": 1764
+      }
+    },
+    "lst_tide": {
+      "attrs": {
+        "long_name": "tide height at the lst overpass (rel. MSL)",
+        "units": "m"
+      },
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "a2ed5efbf2f82dda3fc690502e47de69f016756415d568cdaaf87c1edd5b476c",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1
+      }
+    },
+    "lst_valid": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "bd2c2fe3964b53518c9c9b411aaffa7af70c94874a81f720931edad3b9a7786d",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.333333,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "lst_water_class": {
+      "attrs": {
+        "flag_meanings": "submerged exposed unknown",
+        "flag_values": [
+          0,
+          1,
+          255
+        ],
+        "long_name": "submerged/exposed at the lst overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "edbcc7e6eb3faee01bb643f9de6397ff83a6377a11e4d748a628d8d50dd4c1a4",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 255.0,
+        "mean": 170.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "lst_water_elev": {
+      "attrs": {
+        "datum_offset_m": 0.0,
+        "long_name": "ground elevation rel. to the waterline at the lst overpass (0 at the waterline, + exposed, - submerged)",
+        "units": "m"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "013bb42719ee0edc4be3becf6aa3d9d722b9cd7b2433817d949984e019f57747",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": -10.0,
+        "mean": -10.0,
+        "min": -10.0,
+        "n_finite": 1764
+      }
+    },
+    "lst_wind_speed": {
+      "attrs": {
+        "long_name": "wind_speed at the lst overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "7c12d754b7e98ad8f0d552c6e4b17e099975ce9d17d0311e08a38004b0a414db",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 7.0,
+        "mean": 7.0,
+        "min": 7.0,
+        "n_finite": 1764
+      }
+    },
+    "met_source": {
+      "attrs": {
+        "flag_values": [
+          0,
+          1
+        ],
+        "legend": "[\"none\", \"unknown\"]",
+        "long_name": "which source produced met on this day"
+      },
+      "dims": [
+        "time"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "d82e10da4a3d980debf2e7ecd0b4a4a90f2384ee054da9ebb3cf0ce5a138884f",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 1.0,
+        "min": 1.0,
+        "n_finite": 3
+      }
+    },
+    "modis_airtemp": {
+      "attrs": {
+        "long_name": "airtemp at the modis overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "9a886aa3c74692b300b5c98a346d9134c5164d45e3e6c2791b3530a9fce4097e",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 285.0,
+        "mean": 285.0,
+        "min": 285.0,
+        "n_finite": 1764
+      }
+    },
+    "modis_cloud_cover": {
+      "attrs": {
+        "long_name": "cloud_cover at the modis overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "20cb9282cc50bce444c56b41ca3d01bbb2bf2c2451236884b69376cc4a151643",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 20.0,
+        "mean": 20.0,
+        "min": 20.0,
+        "n_finite": 1764
+      }
+    },
+    "modis_hour": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "7a6cdceefa0a8012668a5155acf50b5473bba617bd64a5881c3bb86f6c5fe403",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 21.0,
+        "mean": 21.0,
+        "min": 21.0,
+        "n_finite": 1
+      }
+    },
+    "modis_insitu_dt_min": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "c4b08f7411bda18dd468ecc889d8d59e99790bc06da795338a4e5cbddcf16aef",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1
+      }
+    },
+    "modis_insitu_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "639ff0ebcb42b5466ea0fdb0ce831876d39c5cf42c051cbfbcafdba44f93bd0d",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 14.0,
+        "mean": 14.0,
+        "min": 14.0,
+        "n_finite": 1
+      }
+    },
+    "modis_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "5b1a9d0fd2d0ec5d21a3a05628616a1fdab531a3dee8d4f1b504fe7a2eb83942",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 287.0,
+        "mean": 287.0,
+        "min": 287.0,
+        "n_finite": 1764
+      }
+    },
+    "modis_swrad": {
+      "attrs": {
+        "long_name": "swrad at the modis overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "66a54feba7a7158f6953eaefa476aa4f34be4810c6a4d34e43726c8d4265e9be",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 800.0,
+        "mean": 800.0,
+        "min": 800.0,
+        "n_finite": 1764
+      }
+    },
+    "modis_tide": {
+      "attrs": {
+        "long_name": "tide height at the modis overpass (rel. MSL)",
+        "units": "m"
+      },
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "428e5682cece932767ad81d5edcb14b629be06f4c0ea7d213f39ce2e9f430c1e",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": -1.0,
+        "mean": -1.0,
+        "min": -1.0,
+        "n_finite": 1
+      }
+    },
+    "modis_valid": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "55c7b65c24c285be5c67d994f1669dd6645c98b93bdda67d19f28bdfe481b285",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.333333,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "modis_water_class": {
+      "attrs": {
+        "flag_meanings": "submerged exposed unknown",
+        "flag_values": [
+          0,
+          1,
+          255
+        ],
+        "long_name": "submerged/exposed at the modis overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "0edb3fdd212d69a927abadb85e7ad091500276138ad8fa2f77eb6ed6b5a9f9e1",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 255.0,
+        "mean": 170.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "modis_water_elev": {
+      "attrs": {
+        "datum_offset_m": 0.0,
+        "long_name": "ground elevation rel. to the waterline at the modis overpass (0 at the waterline, + exposed, - submerged)",
+        "units": "m"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "947ddb2ecebc123bbc8978cbf12ba4bf27f41997b632d135f4c92ab7176123d7",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": -9.0,
+        "mean": -9.0,
+        "min": -9.0,
+        "n_finite": 1764
+      }
+    },
+    "modis_wind_speed": {
+      "attrs": {
+        "long_name": "wind_speed at the modis overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "e46674838465038ed2a37bd3b7d8aab46b5443c6c4dcc20d854afa587fda5ab9",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 7.0,
+        "mean": 7.0,
+        "min": 7.0,
+        "n_finite": 1764
+      }
+    },
+    "mur_filled": {
+      "attrs": {
+        "long_name": "MUR SST was nearest-neighbour filled from the closest observed water cell (a plausible value, NOT an observation; no distance cap)"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "8ed4cd2c2acbb6cb4e1590eedf4f31c8d2395f6323e9283212f6096705a2ce3a",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "mur_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "f4be454f6e13bb5c3a247f5c5b4ae1e3634ef36977679cef52a2cec29ca4d14e",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 287.0,
+        "mean": 286.0,
+        "min": 285.0,
+        "n_finite": 4914
+      }
+    },
+    "mur_valid": {
+      "attrs": {
+        "long_name": "MUR SST was OBSERVED in this cell (not filled)"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "3db761556b8bab2516cf9d3acab0041dd2346a4fb3a49dff14672790462cd0e8",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.928571,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "swrad": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "60790958da492a996aaf5043cf6d5e6b033c5e826ec4edd644e3f725fef0df6a",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 500.0,
+        "mean": 500.0,
+        "min": 500.0,
+        "n_finite": 5292
+      }
+    },
+    "tide": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "9a8c6f936ca07db4c3c6f2eee20dba5c598d203fa429b9f60bbf0452d43e70f9",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 3
+      }
+    },
+    "tide_range": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "5fb077383920afee76fbf605f6ea194227150139dc55d98e6bde6db5327d0bde",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 2.0,
+        "mean": 2.0,
+        "min": 2.0,
+        "n_finite": 3
+      }
+    },
+    "wind_speed": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "5371f32b9004864145d77b059d45d6fbd41ff9dfd95085848283c57aab8342be",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 3.0,
+        "mean": 3.0,
+        "min": 3.0,
+        "n_finite": 5292
+      }
+    },
+    "wind_u": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "deabb24859cca128788df392d6b041b542bd5f80301c467199a1d61875c59d10",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "n_finite": 0
+      }
+    },
+    "wind_v": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "deabb24859cca128788df392d6b041b542bd5f80301c467199a1d61875c59d10",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "n_finite": 0
+      }
+    }
+  },
+  "dims": {
+    "time": 3,
+    "x": 42,
+    "y": 42
+  },
+  "global_attrs": {
+    "aoi_id": "aoi1",
+    "coverage": "{\"cmems\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"met\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"mur\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"tides\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}}",
+    "crs": "EPSG:32610",
+    "datum_method": "none",
+    "datum_offset_m": 0.0,
+    "datum_status": "unresolved_assumed_zero",
+    "insitu_stations": "[{\"index\": 1, \"id\": \"s1\", \"name\": \"Test Station\", \"lat\": 45.5, \"lon\": -123.9, \"row\": 21, \"col\": 20, \"snap_m\": 0.0}]",
+    "met_time": "reference"
+  }
+}
