@@ -40,11 +40,15 @@ internal; a spec names its module as a dotted STRING, resolved lazily at dispatc
 
 Adding a product is now: write the module, add a ProductSpec here -- and every registry in
 the ladder above is derived, so acquisition, dispatch, ordering, auth and the skip guard all
-pick it up for free. ONE ASYMMETRY REMAINS: the datacube ASSEMBLER is registry-driven only
-for the per-overpass sensor family (it loops over `sensors()`); every other product is read
-by a hand-written block in `datacube.assemble_aoi`. So a new SENSOR is one declaration, but a
-new non-sensor covariate also needs an assembler block (and a provenance mapping). The full
-walkthrough -- including that asymmetry and the acquire() contract -- is docs/DEVELOPMENT.md.
+pick it up for free. The datacube ASSEMBLER is uniform too: every product contributes through
+one `(ctx) -> channels` protocol (`datacube.CONTRIBUTORS`), the run order is topologically
+sorted from each contributor's declared slot reads/writes, and a non-sensor product with no
+registered contributor (and no `cube_opt_out=True`) is a hard error at import
+(`datacube._check_contributors`) rather than a silent omission. So a new SENSOR is one
+declaration; a new non-sensor covariate is a ProductSpec + a module + one registered
+Contributor (+ a provenance mapping for its channels) -- and forgetting the contributor
+fails loudly. The full walkthrough -- protocol and the acquire() contract -- is
+docs/DEVELOPMENT.md.
 """
 
 from __future__ import annotations
