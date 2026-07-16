@@ -162,6 +162,10 @@ class ProductSpec:
 
     # --- assembly -------------------------------------------------------- #
     sensor: SensorSpec | None = None
+    # A product that acquires to disk but deliberately has NO cube channel. Default False, so
+    # the loud-omission invariant (datacube._check_contributors) fails at import for any
+    # non-sensor product without a registered contributor -- opt out here to say "on purpose".
+    cube_opt_out: bool = False
     # The cube channel that proves this product produced data on a given day, for the
     # coverage check. Only DAILY products can be judged this way: an overpass sensor with no
     # scene on a day is normal, not a defect, and warning about it would train the user to

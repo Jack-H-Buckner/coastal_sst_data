@@ -66,7 +66,9 @@ from __future__ import annotations
 import json
 import logging
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -416,158 +418,318 @@ def load_landcover(d: Path, aoi_id, H, W):
 # --------------------------------------------------------------------------- #
 # Assemble one AoI onto its shared grid
 # --------------------------------------------------------------------------- #
-def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
-    """Build the analysis-ready Dataset for one AoI from its aligned files.
+# --------------------------------------------------------------------------- #
+# The contributor protocol
+#
+# Every product -- sensor and non-sensor alike -- contributes to the cube through ONE uniform
+# `(ctx) -> channels` mechanism, and the run order is DERIVED (topological sort) from each
+# contributor's declared slot reads/writes rather than a hand-kept sequence. This replaces the
+# old asymmetry where the sensor family was registry-driven but every other product was a
+# hand-written block in `assemble_aoi` -- an omission the loud invariant (`_check_contributors`)
+# now makes impossible. See docs/DEVELOPMENT.md.
+# --------------------------------------------------------------------------- #
 
-    NOTE FOR EXTENDERS: the per-overpass SENSOR family is registry-driven (the loop below
-    over `products.sensors()`), so a new sensor needs no edit here. Every OTHER product is
-    read by a HAND-WRITTEN block -- MUR, met, CMEMS, tides, bathymetry, land-cover, in-situ
-    each have their own `load_*` call and their own entry in the final `xr.Dataset` literal.
-    A brand-new non-sensor covariate acquires to disk from its ProductSpec alone but will NOT
-    appear in any cube until it is wired in here. See docs/DEVELOPMENT.md section 3c.
+# Shared-intermediate slot names, as module constants so a typo is a NameError, not a silent
+# miss. After the S1 raw-output simplification the surface is just these two:
+SLOT_SENSOR_TIMES = "sensor_times"   # {prefix: [datetime|None per day]}  (sensors -> met_overpass, insitu)
+SLOT_REF_UTC = "ref_utc"             # [datetime|None per day]  met reference time (met -> insitu)
+
+T3 = ("time", "y", "x")
+
+
+@dataclass
+class AssemblyContext:
+    """The shared state a contributor reads and writes while one AoI's cube is assembled.
+
+    A contributor mutates `channels` (name -> (dims, array), merged into the Dataset),
+    `slots` (shared intermediates keyed by SLOT_*), `global_attrs` (ds.attrs), and
+    `var_attrs` (per-channel attrs). It never touches the Dataset object directly -- the
+    orchestrator builds that once every contributor has run.
     """
-    H, W = g.height, g.width
-    xs, ys = g.xy_centers()
-    aid = g.name
+    g: AoiGrid
+    eff: dict
+    days: Any
+    aid: str
+    H: int
+    W: int
+    slots: dict[str, Any]
+    channels: dict[str, tuple]
+    global_attrs: dict[str, Any]
+    var_attrs: dict[str, dict]
 
-    def adir(src):
-        return eff["aligned_root"] / PRODUCT_DIRS[src] / "aligned" / aid
+    def adir(self, product: str, source: str | None = None) -> Path:
+        """The <DIR>/aligned/<aoi> folder a product's acquisition stage wrote.
 
-    elev, depth, depth_p25, depth_p75 = load_bathy(adir("bathymetry"), aid, H, W)
+        `source` is unused today (one directory per product); the per-source layout of
+        stages S3-S4 will resolve it to <DIR>/<source>/aligned/<aoi>.
+        """
+        return self.eff["aligned_root"] / PRODUCT_DIRS[product] / "aligned" / self.aid
 
-    mur_sst = load_daily_sensor(adir("mur"), aid, days, H, W, "sst")
+    def emit(self, name: str, dims, arr, **attrs) -> None:
+        """Add a channel (and, optionally, merge in its per-variable attrs)."""
+        self.channels[name] = (dims, arr)
+        if attrs:
+            self.var_attrs.setdefault(name, {}).update(attrs)
 
-    # THE PER-OVERPASS THERMAL SENSORS -- one loop over the registry.
-    #
-    # This used to be three hardcoded `load_clearest_overpass` calls, and the tuple
-    # ("eco", "lst", "modis") written out by hand in three more places below. Each sensor's
-    # validity rules (inverted water polarity, gate-on-QC-not-cloud, trust-the-valid-layer)
-    # now live on its ProductSpec.sensor, so a fourth sensor gets every channel below --
-    # `_sst`, `_cloud`, `_valid`, `_hour`, its overpass-met snapshots and its in-situ
-    # matchups -- from its spec alone.
-    sensors: dict[str, dict] = {}
+
+@dataclass(frozen=True)
+class Contributor:
+    """One product's (or derived field's) contribution to the cube.
+
+    `reads` / `writes` are SLOT_* names; the assembler topologically sorts the registry so
+    every slot is written before it is read (see `_topo_order`). `key` is the product's
+    registry name (`s.product.value`), or `"derived:<name>"` / a plain label for a pure
+    computation; the loud-omission invariant asserts every non-sensor product has one.
+    """
+    key: str
+    reads: tuple[str, ...]
+    writes: tuple[str, ...]
+    fn: Callable[[AssemblyContext], None]
+
+
+# --------------------------------------------------------------------------- #
+# Contributors (one per product; two derived). Each reads/writes only what it declares.
+# --------------------------------------------------------------------------- #
+def _contribute_bathymetry(ctx: AssemblyContext) -> None:
+    elev, depth, depth_p25, depth_p75 = load_bathy(ctx.adir("bathymetry"), ctx.aid, ctx.H, ctx.W)
+    ctx.emit("elevation", ("y", "x"), elev,
+             units="m", long_name="ground/seafloor elevation in the DEM's native vertical "
+                                  "datum (+ up); add datum_offset_m to reference it to MSL")
+    ctx.emit("depth", ("y", "x"), depth)
+    ctx.emit("depth_p25", ("y", "x"), depth_p25)
+    ctx.emit("depth_p75", ("y", "x"), depth_p75)
+
+
+def _contribute_sensors(ctx: AssemblyContext) -> None:
+    """THE PER-OVERPASS THERMAL SENSORS -- one COLLECTIVE contributor over the registry.
+
+    Each sensor's validity rules (inverted water polarity, gate-on-QC-not-cloud, trust-the-
+    valid-layer) live on its ProductSpec.sensor, so a fourth sensor gets its full channel set
+    -- `_sst`, `_cloud`, `_valid`, `_hour`, plus overpass-met and in-situ matchups downstream
+    -- from its spec alone. Writes each sensor's chosen scene time into `sensor_times`.
+    """
+    sensor_times: dict[str, list] = {}
     for s in products.sensors():
         sp = s.sensor
         sst, cloud, valid, hour, _water_union, times = load_clearest_overpass(
-            adir(s.product.value), aid, days, H, W,
+            ctx.adir(s.product.value), ctx.aid, ctx.days, ctx.H, ctx.W,
             water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
             qc_levels=list(sp.qc_levels) if sp.qc_levels is not None else None,
             trust_valid=sp.trust_valid)
-        sensors[sp.prefix] = {
-            "spec": sp, "sst": sst, "cloud": cloud, "valid": valid, "hour": hour,
-            "times": times,
-        }
+        pre = sp.prefix
+        ctx.emit(f"{pre}_sst", T3, sst)
+        if sp.has_cloud:      # MODIS arrives pre-filtered with no cloud layer; an all-zero
+            ctx.emit(f"{pre}_cloud", T3, cloud)   # channel would falsely read "never cloudy"
+        ctx.emit(f"{pre}_valid", T3, valid)
+        ctx.emit(f"{pre}_hour", ("time",), hour)
+        sensor_times[pre] = times
+    ctx.slots[SLOT_SENSOR_TIMES] = sensor_times
 
-    # Met: one snapshot per day at the REFERENCE time of day (default 10:30 local solar,
-    # Landsat's overpass) rather than a daily mean, which would smear the diurnal cycle.
-    lon_c = 0.5 * (g.search_bbox[0] + g.search_bbox[2])
-    mprefix, mlabel = met_prefix(adir("met"), aid, days, eff["met_time"])
 
-    def met(var):
-        return load_daily_sensor(adir("met"), aid, days, H, W, var, prefix=mprefix)
+def _contribute_mur(ctx: AssemblyContext) -> None:
+    # MUR ships its OBSERVED values with honest NaN gaps -- no NN water fill (S1). Filling is
+    # a downstream determination the model makes per-process from the raw channels.
+    ctx.emit("mur_sst", T3, load_daily_sensor(ctx.adir("mur"), ctx.aid, ctx.days, ctx.H, ctx.W, "sst"))
 
-    airtemp, wind_u, wind_v = met("airtemp"), met("wind_u"), met("wind_v")
-    wind_speed, swrad, cloud_cover = met("wind_speed"), met("swrad"), met("cloud_cover")
-    tide, tide_range = load_tide_daily(adir("tides"), aid, days)
 
-    # ...and, per sensor, the forcing at that sensor's own overpass, so a pre-dawn
-    # ECOSTRESS scene and a mid-morning Landsat scene on the same day do not share one
-    # value. Keyed on the CHOSEN scene's timestamp, not merely its day.
-    sensor_times = {pre: v["times"] for pre, v in sensors.items()}
-    op_met = {}
-    for pre, tt in sensor_times.items():
-        for var in eff["overpass_met"]:
-            op_met[f"{pre}_{var}"] = (("time", "y", "x"),
-                                      load_at_times(adir("met"), aid, tt, H, W, var))
+def _contribute_met(ctx: AssemblyContext) -> None:
+    """Met FORCING: one snapshot per day at the REFERENCE time of day (default 10:30 local
+    solar, Landsat's overpass) rather than a daily mean, which would smear the diurnal cycle.
+    Also writes `ref_utc` -- the daily reference instant the in-situ channel samples against.
+    """
+    d = ctx.adir("met")
+    mprefix, mlabel = met_prefix(d, ctx.aid, ctx.days, ctx.eff["met_time"])
+    for var in ("airtemp", "wind_u", "wind_v", "wind_speed", "swrad", "cloud_cover"):
+        ctx.emit(var, T3, load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var, prefix=mprefix))
+    ctx.global_attrs["met_time"] = mlabel
+    lon_c = 0.5 * (ctx.g.search_bbox[0] + ctx.g.search_bbox[2])
+    ctx.slots[SLOT_REF_UTC] = [
+        met_mod.reference_time_utc(dd, lon_c, ctx.eff["ref_hours"], ctx.eff["ref_basis"])
+        if ctx.eff["ref_hours"] is not None else None for dd in ctx.days]
 
+
+def _contribute_met_overpass(ctx: AssemblyContext) -> None:
+    """Met at each sensor's OWN overpass, so a pre-dawn ECOSTRESS scene and a mid-morning
+    Landsat scene on the same day do not share one value -- keyed on the CHOSEN scene's
+    timestamp, not merely its day. Reads `sensor_times`.
+    """
+    d = ctx.adir("met")
+    for pre, tt in ctx.slots[SLOT_SENSOR_TIMES].items():
+        for var in ctx.eff["overpass_met"]:
+            ctx.emit(f"{pre}_{var}", T3, load_at_times(d, ctx.aid, tt, ctx.H, ctx.W, var),
+                     long_name=f"{var} at the {pre} overpass")
+
+
+def _contribute_tides(ctx: AssemblyContext) -> None:
+    tide, tide_range = load_tide_daily(ctx.adir("tides"), ctx.aid, ctx.days)
+    ctx.emit("tide", ("time",), tide)
+    ctx.emit("tide_range", ("time",), tide_range)
+
+
+def _contribute_cmems(ctx: AssemblyContext) -> None:
+    # The offshore water column at the acquired depths, shipped with honest NaN gaps (its
+    # ~9 km land mask can swallow an estuary; downstream fills as it sees fit). Channels are
+    # discovered from the files, so whatever variables/depths were acquired come through.
+    d = ctx.adir("cmems")
+    for var in cmems_channels(d, ctx.aid):
+        ctx.emit(f"cmems_{var}", T3, load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var))
+
+
+def _contribute_landcover(ctx: AssemblyContext) -> None:
     # Land-cover water, shipped RAW as a loss-filter channel (1=water, 0=land; unknown ->
-    # water, a no-op filter). Land-masking is a downstream MODELLING determination now, so
-    # the cube ships this raw ingredient rather than an opinionated derived land mask.
-    lc_raw = load_landcover(adir("landcover"), aid, H, W)     # 1=water,0=land,NaN=unknown
+    # water, a no-op filter). Land-masking is a downstream MODELLING determination now (S1).
+    lc_raw = load_landcover(ctx.adir("landcover"), ctx.aid, ctx.H, ctx.W)
     lc_known = np.isfinite(lc_raw)
-    landcover_water = np.where(lc_known, lc_raw > 0.5, True).astype("uint8")
+    ctx.emit("landcover_water", ("y", "x"), np.where(lc_known, lc_raw > 0.5, True).astype("uint8"))
 
-    # MUR ships its OBSERVED values with honest NaN gaps -- no NN water fill. Water-filling
-    # is a downstream determination the model makes per-process from the raw channels.
 
-    # CMEMS: the offshore water column at the acquired depths, shipped with honest NaN gaps
-    # (its ~9 km land mask can swallow an estuary; downstream fills as it sees fit).
-    # Channels are discovered from the files, so whatever variables/depths were acquired
-    # come through without a second config list.
-    cmems_vars = {}
-    for var in cmems_channels(adir("cmems"), aid):
-        arr = load_daily_sensor(adir("cmems"), aid, days, H, W, var)
-        cmems_vars[f"cmems_{var}"] = (("time", "y", "x"), arr)
+def _contribute_insitu(ctx: AssemblyContext) -> None:
+    """In-situ: the cube's only ground truth. The value goes in the cell the station sits in,
+    sampled at the SAME INSTANT each satellite flew -- so a scene can be validated against a
+    buoy pixel-for-pixel and minute-for-minute -- plus one at the daily reference time,
+    contemporaneous with the met channels. Reads `sensor_times` and `ref_utc`.
+    """
+    if not ctx.eff["insitu"]:
+        return
+    ids = load_insitu(ctx.adir("insitu"), ctx.aid)
+    if ids is None:
+        return
+    targets = {"insitu": ctx.slots[SLOT_REF_UTC], **ctx.slots[SLOT_SENSOR_TIMES]}
+    insitu_vars, station_table, station_map = build_insitu(
+        ids, ctx.g, ctx.days, targets, ctx.eff["insitu_max_dt_min"])
+    ids.close()
+    log.info("  in-situ: %d station(s) placed", len(station_table))
+    for name, (dims, arr) in insitu_vars.items():
+        ctx.emit(name, dims, arr)
+    if station_map is not None:
+        ctx.emit("insitu_station", ("y", "x"), station_map)
+    if station_table:
+        # The station map is an index INTO this table, so the table must travel with the
+        # cube -- a pixel that says "station 3" is useless without it.
+        ctx.global_attrs["insitu_stations"] = json.dumps(station_table)
+        ctx.var_attrs.setdefault("insitu_station", {})["long_name"] = (
+            "index into the insitu_stations attr (0 = none)")
 
-    # In-situ: the cube's only ground truth. The value goes in the cell the station sits
-    # in, sampled at the SAME INSTANT each satellite flew -- so a scene can be validated
-    # against a buoy pixel-for-pixel and minute-for-minute -- plus one at the daily
-    # reference time, contemporaneous with the met channels.
-    insitu_vars, station_table, station_map = {}, [], None
-    ids = load_insitu(adir("insitu"), aid) if eff["insitu"] else None
-    if ids is not None:
-        ref_utc = [met_mod.reference_time_utc(d, lon_c, eff["ref_hours"], eff["ref_basis"])
-                   if eff["ref_hours"] is not None else None for d in days]
-        # The daily reference time, plus one target per sensor at its own chosen overpass.
-        targets = {"insitu": ref_utc, **sensor_times}
-        insitu_vars, station_table, station_map = build_insitu(
-            ids, g, days, targets, eff["insitu_max_dt_min"])
-        ids.close()
-        log.info("  in-situ: %d station(s) placed", len(station_table))
 
-    doy = days.dayofyear.values.astype("float32")
-    doy_sin = np.sin(2 * np.pi * doy / 365.25).astype("float32")
-    doy_cos = np.cos(2 * np.pi * doy / 365.25).astype("float32")
+def _contribute_doy(ctx: AssemblyContext) -> None:
+    doy = ctx.days.dayofyear.values.astype("float32")
+    ctx.emit("doy_sin", ("time",), np.sin(2 * np.pi * doy / 365.25).astype("float32"))
+    ctx.emit("doy_cos", ("time",), np.cos(2 * np.pi * doy / 365.25).astype("float32"))
 
-    T = ("time", "y", "x")
 
-    # Datum: the DEM->MSL offset downstream needs to reference `elevation` to MSL. Water
-    # level / submerged-exposed classification is now a DOWNSTREAM computation on the raw
-    # ingredients the cube ships (elevation, tide, <s>_hour) plus this offset (D12), so the
-    # per-sensor water_level channels are gone -- only the offset survives, as a cube attr.
-    # It follows the DEM that actually ran, resolved against that file's fingerprint (see
-    # water_level.resolve_datum_offset / processes.datum).
-    _, datum_attrs = water_level.resolve_datum_offset(
-        eff["project"], aid, bathy_attrs=load_bathy_attrs(adir("bathymetry"), aid))
+# The registry of contributors. Declaration order is the deterministic tie-break for the
+# topo-sort (see `_topo_order`); it is NOT the run order, which is derived from reads/writes.
+CONTRIBUTORS: tuple[Contributor, ...] = (
+    Contributor("bathymetry", (), (), _contribute_bathymetry),
+    Contributor("sensors", (), (SLOT_SENSOR_TIMES,), _contribute_sensors),
+    Contributor("mur", (), (), _contribute_mur),
+    Contributor("met", (), (SLOT_REF_UTC,), _contribute_met),
+    Contributor("met_overpass", (SLOT_SENSOR_TIMES,), (), _contribute_met_overpass),
+    Contributor("tides", (), (), _contribute_tides),
+    Contributor("cmems", (), (), _contribute_cmems),
+    Contributor("landcover", (), (), _contribute_landcover),
+    Contributor("insitu", (SLOT_SENSOR_TIMES, SLOT_REF_UTC), (), _contribute_insitu),
+    Contributor("derived:doy", (), (), _contribute_doy),
+)
 
-    # Each sensor's own channels. `<pre>_cloud` only where the sensor actually publishes a
-    # cloud layer: MODIS arrives pre-filtered with none, and an all-zero cloud channel would
-    # read as "this scene was never cloudy" -- a claim its files do not make.
-    sensor_vars: dict = {}
-    for pre, v in sensors.items():
-        sensor_vars[f"{pre}_sst"] = (T, v["sst"])
-        if v["spec"].has_cloud:
-            sensor_vars[f"{pre}_cloud"] = (T, v["cloud"])
-        sensor_vars[f"{pre}_valid"] = (T, v["valid"])
-        sensor_vars[f"{pre}_hour"] = (("time",), v["hour"])
 
-    ds = xr.Dataset(
-        {
-            **op_met, **cmems_vars, **insitu_vars, **sensor_vars,
-            "mur_sst": (T, mur_sst),
-            "airtemp": (T, airtemp), "wind_u": (T, wind_u), "wind_v": (T, wind_v),
-            "wind_speed": (T, wind_speed), "swrad": (T, swrad), "cloud_cover": (T, cloud_cover),
-            "elevation": (("y", "x"), elev),
-            "depth": (("y", "x"), depth),
-            "depth_p25": (("y", "x"), depth_p25), "depth_p75": (("y", "x"), depth_p75),
-            **({"insitu_station": (("y", "x"), station_map)} if station_map is not None else {}),
-            "landcover_water": (("y", "x"), landcover_water),
-            "tide": (("time",), tide), "tide_range": (("time",), tide_range),
-            "doy_sin": (("time",), doy_sin), "doy_cos": (("time",), doy_cos),
-        },
-        coords={"time": days, "y": ys, "x": xs},
-    )
-    ds.attrs.update(aoi_id=aid, crs=g.target_crs, met_time=mlabel)
+def _topo_order(contributors: tuple[Contributor, ...]) -> list[Contributor]:
+    """Order contributors so every slot is written before it is read.
+
+    Edges run writer(slot) -> reader(slot); ties are broken by declaration order for
+    determinism (mirrors pipeline.process_order). `_check_contributors` guarantees every
+    `reads` slot has a producer, so the sort cannot starve on a missing slot -- a cycle
+    (which `required_vars`/slot design should preclude) raises rather than dropping work.
+    """
+    import heapq
+    idx = {c.key: i for i, c in enumerate(contributors)}
+    by_key = {c.key: c for c in contributors}
+    writers: dict[str, list[str]] = {}
+    for c in contributors:
+        for w in c.writes:
+            writers.setdefault(w, []).append(c.key)
+    adj: dict[str, set] = {c.key: set() for c in contributors}
+    indeg = {c.key: 0 for c in contributors}
+    for c in contributors:
+        for r in c.reads:
+            for wk in writers.get(r, ()):
+                if c.key not in adj[wk]:
+                    adj[wk].add(c.key)
+                    indeg[c.key] += 1
+    ready = [idx[c.key] for c in contributors if indeg[c.key] == 0]
+    heapq.heapify(ready)
+    out: list[Contributor] = []
+    while ready:
+        c = contributors[heapq.heappop(ready)]
+        out.append(c)
+        for nk in adj[c.key]:
+            indeg[nk] -= 1
+            if indeg[nk] == 0:
+                heapq.heappush(ready, idx[nk])
+    if len(out) != len(contributors):
+        stuck = sorted(k for k in indeg if by_key[k] not in out)
+        raise RuntimeError(f"contributor graph has a cycle among slots; unresolved: {stuck}")
+    return out
+
+
+def _check_contributors() -> None:
+    """Fail LOUDLY at import if a non-sensor product has cube presence but no contributor.
+
+    This closes the silent-omission trap: a new covariate that acquires to disk from its
+    ProductSpec but is never wired into the cube used to vanish without a trace. Now it raises
+    here until a contributor is registered (or the product sets `cube_opt_out=True`). Also
+    asserts every declared `reads` slot has a producer, so `_topo_order` cannot starve.
+    """
+    keys = {c.key for c in CONTRIBUTORS}
+    for s in products.REGISTRY:
+        if s.sensor is not None:        # covered collectively by the `sensors` contributor
+            continue
+        if s.cube_opt_out:              # a product that deliberately has no cube presence
+            continue
+        if s.product.value not in keys:
+            raise RuntimeError(
+                f"{s.product.value}: no cube contributor registered. Add one to "
+                "datacube.CONTRIBUTORS, or set cube_opt_out=True on its ProductSpec.")
+    produced = {w for c in CONTRIBUTORS for w in c.writes}
+    for c in CONTRIBUTORS:
+        missing = set(c.reads) - produced
+        if missing:
+            raise RuntimeError(
+                f"contributor {c.key!r} reads unproduced slot(s) {sorted(missing)}.")
+
+
+_check_contributors()
+
+
+def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
+    """Build the analysis-ready Dataset for one AoI from its aligned files.
+
+    UNIFORM CONTRIBUTOR PROTOCOL: every product -- sensor and non-sensor alike -- contributes
+    through one `(ctx) -> channels` mechanism (`CONTRIBUTORS`), run in an order derived by
+    topological sort from each contributor's declared slot reads/writes. A new non-sensor
+    covariate needs a `ProductSpec`, a module, and a registered `Contributor`; forgetting the
+    last is a hard error at import (`_check_contributors`), not a silent omission. See
+    docs/DEVELOPMENT.md.
+    """
+    ctx = AssemblyContext(
+        g=g, eff=eff, days=days, aid=g.name, H=g.height, W=g.width,
+        slots={}, channels={}, global_attrs={}, var_attrs={})
+    for c in _topo_order(CONTRIBUTORS):
+        c.fn(ctx)
+
+    xs, ys = g.xy_centers()
+    ds = xr.Dataset(ctx.channels, coords={"time": days, "y": ys, "x": xs})
+    ds.attrs.update(aoi_id=ctx.aid, crs=g.target_crs)
+    ds.attrs.update(ctx.global_attrs)
+    for name, attrs in ctx.var_attrs.items():
+        ds[name].attrs.update(attrs)
 
     # COVERAGE. The time axis is built from the CONFIG (start..end), not from the data, and
     # every loader defaults a missing day to NaN. So a run that lost 40 of 100 days to a
-    # flaky network still yields a 100-step cube whose gaps are indistinguishable from
-    # cloudy days -- and the old log line printed `t=100` either way. Count what actually
-    # landed, stamp it on the cube, and say so when a product is thin.
-    # Which products actually wrote files for this AoI -- needed to tell a product that is
-    # THIN (ran, lost days) from one that is ABSENT (never ran). Also feeds the provenance
-    # record below, so it is collected once.
-    prod = provenance.collect(eff["aligned_root"], aid, PRODUCT_DIRS)
+    # flaky network still yields a 100-step cube whose gaps are indistinguishable from cloudy
+    # days. Count what actually landed, stamp it on the cube, and say so when a product is
+    # thin. `prod` (which products wrote files) also feeds provenance, so it is collected once.
+    prod = provenance.collect(eff["aligned_root"], ctx.aid, PRODUCT_DIRS)
     cov = coverage(ds, days, present=set(prod))
     ds.attrs["coverage"] = json.dumps(cov, sort_keys=True)
     for product, c in sorted(cov.items()):
@@ -575,25 +737,20 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
             log.warning("  %s: %s covers only %d of %d day(s) (%.0f%%) -- the rest are NaN "
                         "slices, which look exactly like cloudy days. Check the run report "
                         "for what failed.",
-                        aid, product, c["days_with_data"], c["days_expected"],
+                        ctx.aid, product, c["days_with_data"], c["days_expected"],
                         100 * c["fraction"])
 
-    ds["elevation"].attrs.update(
-        units="m", long_name="ground/seafloor elevation in the DEM's native vertical datum "
-                             "(+ up); add datum_offset_m to reference it to MSL")
+    # DATUM: the DEM->MSL offset ships as GLOBAL cube attrs so downstream can reference
+    # `elevation` to MSL and reconstruct water level. Retained as a stage (D12) but NOT a
+    # contributor -- it publishes attrs, not a channel. Resolved against the DEM that actually
+    # ran (see water_level.resolve_datum_offset / processes.datum). A cube whose offset could
+    # not be resolved looks complete, so `datum_status` travelling with it is the only signal.
+    _, datum_attrs = water_level.resolve_datum_offset(
+        eff["project"], ctx.aid, bathy_attrs=load_bathy_attrs(ctx.adir("bathymetry"), ctx.aid))
 
-    if station_table:
-        # The station map is an index INTO this table, so the table must travel with the
-        # cube -- a pixel that says "station 3" is useless without it.
-        ds.attrs["insitu_stations"] = json.dumps(station_table)
-        ds["insitu_station"].attrs["long_name"] = "index into the insitu_stations attr (0 = none)"
-    for name in op_met:
-        ds[name].attrs["long_name"] = (
-            f"{name.split('_', 1)[1]} at the {name.split('_', 1)[0]} overpass")
-
-    # PROVENANCE: the config that built this cube, and for every field the source(s) it
-    # came from and when they were accessed. Zarr attrs must be JSON-serialisable, so the
-    # structured parts are JSON strings.
+    # PROVENANCE: the config that built this cube, and for every field the source(s) it came
+    # from and when they were accessed. Zarr attrs must be JSON-serialisable, so the structured
+    # parts are JSON strings.
     rec = provenance.build(eff["project"], list(ds.data_vars), prod)
     ds.attrs.update(
         created_at=rec["created_at"], package_version=rec["package_version"],
@@ -606,10 +763,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     if guessed:
         log.warning("  %s: access dates for %s came from FILE MTIMES, not recorded stamps "
                     "(acquired before provenance existed, or the tree was copied)",
-                    aid, ", ".join(sorted(guessed)))
-    # Datum provenance is a GLOBAL cube attr, not just a per-variable one: a cube whose
-    # offset could not be resolved is complete and plausible-looking, so the only thing
-    # that tells a downstream user it is biased is `datum_status` travelling with it.
+                    ctx.aid, ", ".join(sorted(guessed)))
     ds.attrs.update({k: v for k, v in datum_attrs.items() if v is not None})
     return ds
 

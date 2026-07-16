@@ -415,12 +415,25 @@ Land this with the met vertical slice (stage S4.2), since it is a product/regist
 - **Registry** — two `ProductSpec`s (`met`, `met_overpass`), each source-selectable over the same met
   data sources. `met_overpass` sets `cube_opt_out=False` and registers its contributor; the
   loud-omission invariant (D8) then guarantees it can't be silently dropped.
+- **`Kind` — add a new `OVERPASS_ALIGNED` member** (resolved; see the design note). `met_overpass`
+  is declared `kind=Kind.OVERPASS_ALIGNED`, `sensor=None`. Use this exact name at S4.
 - **Validation** — a `met_overpass` combination naming a sensor that isn't loaded, or a source with no
   coverage, fails config validation rather than silently producing an empty channel.
 
-> Design note: `met_overpass` is a sensor-time-aligned raster product. It reuses the existing
-> `load_at_times` reader, so it does not need a brand-new `Kind` — but confirm during implementation
-> whether it warrants its own `Kind` label for clarity vs. reusing `DAILY_RASTER` semantics.
+> **Design note — `Kind` for `met_overpass` (RESOLVED at S2 review: add `Kind.OVERPASS_ALIGNED`).**
+> `met_overpass`'s aligned files are timestamped (`<aoi>_<YYYYMMDDThhmmss>.nc`) and read at *another*
+> product's chosen overpass times via `load_at_times` — with no clearest-scene selection and no
+> `SensorSpec`. Neither existing `Kind` fits: `DAILY_RASTER` is wrong on file shape (these are not
+> `<aoi>_<YYYYMMDD>.nc` daily files), and `OVERPASS_SENSOR` is wrong on semantics *and* would break
+> the registry invariant `(s.sensor is not None) == (s.kind == Kind.OVERPASS_SENSOR)`
+> ([`test_products.py`](../tests/test_products.py)), since `met_overpass` carries no `SensorSpec`. So
+> add a distinct `Kind.OVERPASS_ALIGNED` = "timestamped rasters read at another product's overpass
+> times." `Kind` is descriptive metadata today (nothing branches on it; it only feeds that invariant),
+> so this is a labelling choice that keeps the `sensor ⟺ OVERPASS_SENSOR` invariant intact. After S1,
+> `met_overpass` is the *only* overpass-aligned non-instrument product — tide-at-overpass was dropped
+> (D12; downstream reconstructs it from the daily `tide` series + `<s>_hour`) — so this one `Kind`
+> covers the whole category. If that invariant is stated as a biconditional, widen it at S4 to
+> "`sensor is not None` ⟹ `OVERPASS_SENSOR`" (one-directional) so `OVERPASS_ALIGNED` is permitted.
 
 ### 6.2 Config migration & back-compat (do not silently no-op an existing config)
 
@@ -618,7 +631,7 @@ end and build **S2** in the §5.3a 4-slot shape instead of §5.3b.
 
 **S4 — replicate the slice**
 - [ ] **S4.1** Replicate for `cmems` and `tides` (remove their internal fallback chains).
-- [ ] **S4.2** `met`: replicate the slice **and** split into `met` (forcing, no sensor dep) + `met_overpass` (product, sensor-dep, user combos); config surface (D14/D15).
+- [ ] **S4.2** `met`: replicate the slice **and** split into `met` (forcing, no sensor dep) + `met_overpass` (product, sensor-dep, user combos, `kind=Kind.OVERPASS_ALIGNED` — new `Kind`, see §6.1); config surface (D14/D15).
 - [ ] **S4.3** Config migration: loudly reject removed `source`/`fallback`/`default_source`/`overpass_met`/`water_level` keys (§6.2) + a test per key.
 - [ ] **S4.4** Update `coverage_channel`/`coverage()` to "any loaded source finite".
 
