@@ -580,9 +580,19 @@ def _contribute_met_overpass(ctx: AssemblyContext) -> None:
 
 
 def _contribute_tides(ctx: AssemblyContext) -> None:
-    tide, tide_range = load_tide_daily(ctx.adir("tides"), ctx.aid, ctx.days)
-    ctx.emit("tide", ("time",), tide)
-    ctx.emit("tide_range", ("time",), tide_range)
+    # DISTINCT-DATA per source (D10): one daily tide channel set per stacked source
+    # (`tide_coops`, `tide_eo_tides`), discovered from `TIDE/<src>/aligned/<aoi>`. A source
+    # with no series here (e.g. no CO-OPS gauge nearby) simply has no channel.
+    base = ctx.eff["aligned_root"] / PRODUCT_DIRS["tides"]
+    if not base.exists():
+        return
+    for src in sorted(d.name for d in base.iterdir() if d.is_dir()):
+        d = ctx.adir("tides", src)
+        if not (d / f"{ctx.aid}_tides.nc").exists():
+            continue
+        tide, tide_range = load_tide_daily(d, ctx.aid, ctx.days)
+        ctx.emit(f"tide_{src}", ("time",), tide)
+        ctx.emit(f"tide_range_{src}", ("time",), tide_range)
 
 
 def _contribute_cmems(ctx: AssemblyContext) -> None:

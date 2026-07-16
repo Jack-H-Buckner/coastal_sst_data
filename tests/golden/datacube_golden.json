@@ -1052,7 +1052,7 @@
         "n_finite": 5292
       }
     },
-    "tide": {
+    "tide_coops": {
       "attrs": {},
       "dims": [
         "time"
@@ -1069,7 +1069,7 @@
         "n_finite": 3
       }
     },
-    "tide_range": {
+    "tide_range_coops": {
       "attrs": {},
       "dims": [
         "time"
@@ -1151,7 +1151,7 @@
   },
   "global_attrs": {
     "aoi_id": "aoi1",
-    "coverage": "{\"cmems\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"met\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"mur\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"tides\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}}",
+    "coverage": "{\"cmems\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"met\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"mur\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}}",
     "crs": "EPSG:32610",
     "insitu_stations": "[{\"index\": 1, \"id\": \"s1\", \"name\": \"Test Station\", \"lat\": 45.5, \"lon\": -123.9, \"row\": 21, \"col\": 20}]",
     "met_time": "reference"

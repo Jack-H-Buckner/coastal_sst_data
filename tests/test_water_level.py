@@ -51,14 +51,20 @@ def _write(project, sub, fname, ds):
     ds.to_netcdf(d / fname)
 
 
-def write_tides(project, days, *, amplitude=1.0):
-    """Hourly tide over the window: a 12 h sinusoid, 0 m at each day's midnight."""
+def write_tides(project, days, *, amplitude=1.0, src="coops"):
+    """One tide source's hourly series (TIDE/<src>/aligned/<aoi>): a 12 h sinusoid."""
     times = pd.date_range(days[0], days[-1] + pd.Timedelta("23h"), freq="h")
     hours = np.arange(len(times), dtype="float64")
     tide = amplitude * np.sin(2 * np.pi * hours / 12.0)
     ds = xr.Dataset({"tide": (("time",), tide.astype("float32"))},
                     coords={"time": times})
-    _write(project, "TIDE", f"{AOI}_tides.nc", ds)
+    d = project.output_dir / "TIDE" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}_tides.nc")
+
+
+def _tide_series_dir(project, src="coops"):
+    return project.output_dir / "TIDE" / src / "aligned" / AOI
 
 
 def write_bathymetry(project, g, elev, src="cudem", *, datum_offset_m=0.0,
@@ -97,7 +103,7 @@ def write_ecostress(project, g, day, hour):
 def test_tide_interpolated_to_the_overpass_hour(project, days):
     write_tides(project, days)
     s = water_level.load_tide_series(
-        project.output_dir / "TIDE" / "aligned" / AOI, AOI)
+        _tide_series_dir(project), AOI)
     # Scene at 03:30 on day 0; the series is hourly, so the value is the linear
     # interpolant between 03:00 and 04:00.
     tide = water_level.tide_at_overpass(s, days, [3.5, np.nan, np.nan])
@@ -114,7 +120,7 @@ def test_tide_is_nan_without_a_series(days):
 def test_tide_outside_the_series_is_nan_not_clamped(project, days):
     write_tides(project, days)
     s = water_level.load_tide_series(
-        project.output_dir / "TIDE" / "aligned" / AOI, AOI)
+        _tide_series_dir(project), AOI)
     # The series stops at 23:00 on the last day; an overpass past its end must not
     # inherit the final height.
     late = pd.date_range(days[-1] + pd.Timedelta("1D"), periods=1, freq="D")
@@ -194,7 +200,7 @@ def test_cube_ships_raw_water_level_ingredients_not_derived_channels(project, gr
     # ...and the raw ingredients to rebuild them ship instead: the per-source DEM elevation,
     # the daily tide series, and each sensor's overpass hour.
     assert ds["elevation_cudem"].isel(y=0, x=0).item() == pytest.approx(-0.5)
-    assert np.isfinite(ds["tide"].isel(time=0).item())                      # daily tide ships
+    assert np.isfinite(ds["tide_coops"].isel(time=0).item())                # daily tide ships (per source)
     assert ds["eco_hour"].isel(time=0).item() == pytest.approx(9.0)         # overpass hour
 
     # The DEM->MSL offset travels PER SOURCE, as attrs on that source's elevation channel.

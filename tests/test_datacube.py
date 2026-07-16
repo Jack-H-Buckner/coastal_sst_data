@@ -158,12 +158,13 @@ def test_channel_layout_and_dims(project, grids, days):
     write_mur(project, g, days, water_hole_cols=slice(0, 3))
     write_bathymetry(project, g)
     write_landcover(project, g, land_cols=slice(0, 5))
+    write_tides(project, g, days)
     eff = datacube._build_eff(project)
     ds = datacube.assemble_aoi(g, eff, days)
 
     assert ds.sizes == {"time": len(days), "y": g.height, "x": g.width}
     for v in ["mur_sst", "eco_sst", "lst_sst", "modis_sst", "airtemp",
-              "elevation_cudem", "depth_cudem", "landcover_water", "tide", "doy_sin"]:
+              "elevation_cudem", "depth_cudem", "landcover_water", "tide_coops", "doy_sin"]:
         assert v in ds.data_vars
     # S1 removed these derived/fill channels; S3 made bathymetry per-source (no bare names).
     for gone in ["landmask", "mur_valid", "mur_filled", "eco_water_elev", "eco_tide",
@@ -687,12 +688,14 @@ RUNSTAMP_ATTRS = ("created_at", "code_version", "package_version",
                   "provenance", "provenance_products")
 
 
-def write_tides(project, g, days, *, amplitude=1.0):
-    """Hourly tide over the window: a 12 h sinusoid, 0 m at each day's midnight."""
+def write_tides(project, g, days, *, amplitude=1.0, src="coops"):
+    """One tide source's hourly series (TIDE/<src>/aligned/<aoi>): a 12 h sinusoid."""
     hours = pd.date_range(days[0], periods=24 * len(days), freq="h")
     tide = amplitude * np.sin(2 * np.pi * np.arange(len(hours)) / 12.0)
     ds = xr.Dataset({"tide": (("time",), tide.astype("float32"))}, coords={"time": hours})
-    _write(project, "TIDE", f"{AOI}_tides.nc", ds)
+    d = project.output_dir / "TIDE" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}_tides.nc")
 
 
 def write_insitu(project, g, times, values):

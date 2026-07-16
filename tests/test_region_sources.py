@@ -45,7 +45,7 @@ def _two_continent_project(tmp_path):
             "cmems": {"sources": ["my_global", "anfc_global"],
                       "variables": ["thetao"], "depths": [0.0, 10.0]},
             "insitu": {"source": "ioos", "qc_flags": [1, 2]},
-            "tides": {"default_source": "coops"},
+            "tides": {"sources": ["coops", "eo_tides"]},
             "bathymetry": {"sources": ["cudem"]},
         },
         "auth": {"earthdata": {"auth_strategy": "netrc"},
@@ -61,7 +61,7 @@ def _two_continent_project(tmp_path):
                  "cmems": {"sources": ["anfc_med"],
                            "datasets": {"anfc_med": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"}},
                  "insitu": {"source": "ioos", "exclude_stations": ["bogus1"]},
-                 "tides": {"source": "eo_tides", "model": "FES2022"},
+                 "tides": {"sources": ["eo_tides"], "model": "FES2022"},
                  "bathymetry": {"sources": ["gmrt"]},
              },
              "areas": [{"name": "ligurian", "center_lat": 44.0, "center_lon": 9.0,
@@ -90,11 +90,11 @@ def test_cmems_sources_differ_per_region(tmp_path):
     assert ds["ligurian"]["datasets"]["anfc_med"] == "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"
 
 
-def test_tide_source_differs_per_region(tmp_path):
-    """CO-OPS gauges are U.S.-only -> the Mediterranean AoI uses a global tide model."""
+def test_tide_sources_differ_per_region(tmp_path):
+    """CO-OPS gauges are U.S.-only -> the Mediterranean AoI stacks only the global model."""
     ds = tides._build_eff(_two_continent_project(tmp_path))["ds"]
-    assert ds["tillamook"]["source"] == "coops"
-    assert ds["ligurian"]["source"] == "eo_tides"
+    assert ds["tillamook"]["sources"] == ["coops", "eo_tides"]
+    assert ds["ligurian"]["sources"] == ["eo_tides"]
     assert ds["ligurian"]["model"] == "FES2022"
 
 

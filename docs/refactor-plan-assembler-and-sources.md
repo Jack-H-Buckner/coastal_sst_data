@@ -637,8 +637,9 @@ replication) and the *new overpass products*, each its own reviewed golden diff.
 - [ ] **S4.1** `cmems` per-source (data sources: reanalysis/forecast + regional models); remove its internal fallback chain. Golden diff.
 - [ ] **S4.2** `tides` per-source (data sources: co-ops / model); remove its internal fallback chain. Golden diff.
 - [ ] **S4.3** `met` FORCING per-source (`<var>_<src>`), drop `depends_on=(sensors)`; keep the existing overpass-met contributor unchanged for now. Golden diff.
-- [ ] **S4.4** `met_overpass` as a real product (D14): `DataProduct` + `ProductSpec` (`kind=Kind.OVERPASS_ALIGNED`), module split, `(sensor, source)` combos config (D15), `<sensor>_<var>_<src>` for user combos only (D13). Golden diff.
-- [ ] **S4.5** `tide_overpass` (D17): a DERIVED contributor emitting `<sensor>_tide_<src>` for user `(sensor, source)` combos (interpolate the per-source tide series to `<s>_hour` via `water_level.tide_at_overpass`). Golden diff.
+- [ ] **S4.4** `met_overpass` as a real product (D14): `DataProduct` + `ProductSpec` (`kind=Kind.OVERPASS_ALIGNED`), module split, its OWN `combinations: [(sensor, met_source)]` config (D15), `<sensor>_<var>_<src>` for user combos only (D13). Golden diff.
+- [ ] **S4.5** `tide_overpass` (D17): a DERIVED contributor emitting `<sensor>_tide_<src>` for its OWN `combinations: [(sensor, tide_source)]` (interpolate the per-source tide series to `<s>_hour` via `water_level.tide_at_overpass`). Golden diff.
+- **Combos are PER PRODUCT (S4-review decision):** `met_overpass` and `tide_overpass` each carry their own `combinations` list referencing their own product's sources (met vs tide) — independent pairings, not one shared sensor list (which would recreate the sensor×source cross-product D13 rejects). A combo's sensor must be loaded and its source must be one of that product's sources (validated at config load).
 - [ ] **S4.6** Config migration: loudly reject removed `source`/`fallback`/`default_source`/`overpass_met` keys (§6.2) + a test per key; add the `met_overpass`/`tide_overpass` combos config.
 - [ ] **S4.7** Update `coverage_channel`/`coverage()` to "any loaded source finite".
 

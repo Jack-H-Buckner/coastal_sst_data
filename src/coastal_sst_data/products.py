@@ -385,13 +385,20 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.tides,
         dir="TIDE",                # NOT "TIDES" -- the one name that used to need two aliases
         kind=Kind.SERIES_1D,
-        module="coastal_sst_data.processes.tides",
+        # DISTINCT-DATA sources, STACKED one channel per source (D10): CO-OPS gauge synthesis
+        # (U.S. waters) and a global ocean-tide model (everywhere). No fallback -- a source
+        # with no coverage here (e.g. no CO-OPS gauge nearby) simply contributes no channel.
+        sources={
+            "coops": "coastal_sst_data.processes.tides",
+            "eo_tides": "coastal_sst_data.processes.tides",
+        },
+        source_kind=SourceKind.DATA,
         options=_COMMON | {
-            "source", "default_source", "fallback", "model", "model_directory", "interval",
-            "stations", "warn_distance_km", "fallback_distance_km"},
-        # CO-OPS gauges exist only in U.S. waters -> elsewhere, a global model + its
-        # downloaded directory, which is a property of the machine and the region.
-        region_options=frozenset({"source", "model", "model_directory", "stations"}),
+            "sources", "model", "model_directory", "interval",
+            "stations", "warn_distance_km", "max_distance_km"},
+        # CO-OPS gauges exist only in U.S. waters -> elsewhere, stack the global model, whose
+        # downloaded directory is a property of the machine and the region.
+        region_options=frozenset({"sources", "model", "model_directory", "stations"}),
         required_vars=("tide",),
         coverage_channel="tide",
         provenance_inputs=("tides",),
