@@ -244,13 +244,13 @@ def collect(aligned_root: Path, aoi: str, product_dirs: dict) -> dict:
     for product, sub in product_dirs.items():
         s = by_value.get(product)
         if s is not None and s.is_stacked_data:
-            # DATA product: gather across its per-source trees into one merged record. (The
-            # per-source <var>_<source> attribution in field_inputs is a later refinement;
-            # here we only need the product to appear as PRESENT with its combined window.)
-            recs = [r for src in s.known_sources
-                    if (r := collect_product(
-                        Path(aligned_root) / products.aligned_rel(sub, src) / aoi, product))
-                    is not None]
+            # DATA product: gather across its per-source trees (globbed, so config-registered
+            # sources are covered) into one merged record. (The per-source <var>_<source>
+            # attribution in field_inputs is a later refinement; here we only need the product
+            # to appear as PRESENT with its combined window.)
+            base = Path(aligned_root) / sub
+            recs = [r for sd in (sorted(base.glob("*/aligned")) if base.exists() else [])
+                    if (r := collect_product(sd / aoi, product)) is not None]
             rec = _merge_records(recs, product) if recs else None
         else:
             rec = collect_product(Path(aligned_root) / sub / "aligned" / aoi, product)

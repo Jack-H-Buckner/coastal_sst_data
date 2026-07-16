@@ -279,13 +279,21 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.cmems,
         dir="CMEMS",
         kind=Kind.DAILY_RASTER,
-        module="coastal_sst_data.processes.cmems",
+        # DISTINCT-DATA sources, STACKED one channel per source (D10). Each source is a TAG
+        # naming an exact CMEMS dataset -- `my_global`/`anfc_global` are built in; regional
+        # tags (`my_baltic`, `anfc_med`, ...) are registered per config via `datasets`. The
+        # tag IS the provenance identity, so a `cmems_<var>_<tag>` channel is self-describing
+        # and there is no fallback chain. All tags are served by the one cmems module.
+        sources={
+            "my_global": "coastal_sst_data.processes.cmems",
+            "anfc_global": "coastal_sst_data.processes.cmems",
+        },
+        source_kind=SourceKind.DATA,
         auth="copernicus",
         options=_COMMON | {
-            "source", "fallback", "dataset_id", "variables", "depths", "pad_deg"},
-        # CMEMS publishes regional models (Baltic, Mediterranean, NW Shelf) alongside the
-        # global one; which is right is a fact about where the AoI is.
-        region_options=frozenset({"source", "fallback", "dataset_id"}),
+            "sources", "datasets", "variables", "depths", "pad_deg"},
+        # Which regional models cover this AoI is a fact about where it is -> region-settable.
+        region_options=frozenset({"sources", "datasets"}),
         # + >= 1 configured variable, asserted by the >=1-data-var rule (the channel set is
         # config-dependent, so it cannot be named up front).
         required_vars=("valid",),

@@ -586,12 +586,18 @@ def _contribute_tides(ctx: AssemblyContext) -> None:
 
 
 def _contribute_cmems(ctx: AssemblyContext) -> None:
-    # The offshore water column at the acquired depths, shipped with honest NaN gaps (its
-    # ~9 km land mask can swallow an estuary; downstream fills as it sees fit). Channels are
-    # discovered from the files, so whatever variables/depths were acquired come through.
-    d = ctx.adir("cmems")
-    for var in cmems_channels(d, ctx.aid):
-        ctx.emit(f"cmems_{var}", T3, load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var))
+    # DISTINCT-DATA per source TAG (D10): one channel set per stacked CMEMS source, discovered
+    # from the per-source dirs (`CMEMS/<tag>/aligned/<aoi>`). The offshore water column ships
+    # with honest NaN gaps (its ~9 km land mask can swallow an estuary; downstream fills). The
+    # variables/depths within a source are discovered from its files.
+    base = ctx.eff["aligned_root"] / PRODUCT_DIRS["cmems"]
+    if not base.exists():
+        return
+    for src in sorted(d.name for d in base.iterdir() if d.is_dir()):
+        d = ctx.adir("cmems", src)
+        for var in cmems_channels(d, ctx.aid):
+            ctx.emit(f"cmems_{var}_{src}", T3,
+                     load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var))
 
 
 def _contribute_landcover(ctx: AssemblyContext) -> None:

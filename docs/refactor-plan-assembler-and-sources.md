@@ -72,14 +72,17 @@ Settled during the design discussion; fixed for this plan.
 | D14 | **Split met into two products / processes.** `met` = **daily forcing** (standalone per-source variables at a reference time; **no sensor dependency**). `met_overpass` = **overpass documentation** (snapshots time-aligned to a sensor; **depends on the sensors**). Today one module does both simultaneously. | Two clear responsibilities; `met` loses its `depends_on=(eco,lst,modis)`; the overpass concern is isolated in its own product with its own config. |
 | D15 | **Config surface for met (per region).** `met`: a list of `sources` (standalone daily variables) + a `reference_time` for the daily sample. `met_overpass`: a list of `(sensor, source)` **combinations** the user wants. Both region-overridable. | The user picks exactly which forcing sources and which sensor-met alignments are produced. |
 | D16 | **(was O5) Forcing met keeps both `reference_time` snapshot and `daily_mean` modes**, config-selectable via `met_time` (default: reference-time snapshot). | No change to the existing dual-mode behavior; the config chooses. |
+| D17 | **(S4-review) Add `tide_overpass`, correcting D12's tide claim.** D12 said downstream reconstructs overpass tide from "daily `tide` + `<s>_hour`", but the cube ships only the daily **mean** tide, which for a ~zero-mean tidal signal is ≈0 and carries no phase — the instantaneous overpass tide (needed for water level) is **not** recoverable from it. So the cube emits `<sensor>_tide_<src>` per user-specified `(sensor, source)` combo, matching `met_overpass`'s channel shape and config. **Implementation differs from `met_overpass`, though:** the tide series is a smooth signal already fully on disk (the tides product's series), so `tide_overpass` is a **DERIVED contributor** at assembly (interpolate the per-source series to each sensor's `<s>_hour`, reusing `water_level.tide_at_overpass`) — NOT a new acquisition/`Kind.OVERPASS_ALIGNED` product. `met_overpass` stays an acquisition product because a weather model's value at an instant is not interpolatable from a daily sample. | Downstream can reconstruct overpass water level from the cube alone; the daily-mean `tide` channel (near-useless for a zero-mean signal) is superseded. |
 
 **Supersession notes.** D7 supersedes an earlier tentative "keep one union `landmask`" — Goal 3
 (downstream owns land-masking) means the cube ships raw per-source ingredients, not an opinionated
 mask. D12 supersedes keeping `water_elev`/`water_class`.
 
-**Datum stage retained.** With `water_level` gone the datum derived stage no longer feeds a cube
-*channel*, but its offset is still needed downstream to reference `elevation_<src>` to MSL, so the
-stage stays and its result is published as a per-source cube **attribute** (D12).
+**Datum resolution folded into bathymetry (S3 outcome).** The offset is still needed downstream to
+reference `elevation_<src>` to MSL, but rather than a standalone stage/sidecar it is now resolved by
+the datum *library* INSIDE the bathymetry module as each DEM source is acquired, and ships as
+attributes on that source's `elevation_<src>` channel (per-source, since CUDEM/NAVD88 and GMRT/MSL
+differ). The standalone `datum` stage and `coastal-sst-data datum` subcommand were removed.
 
 ---
 
@@ -629,11 +632,15 @@ end and build **S2** in the §5.3a 4-slot shape instead of §5.3b.
 - [ ] **S3.2** Per-source layout for bathymetry across `store.done`, **`store.scan`/`REQUIRED_VARS`**, `product_dirs`, `provenance.collect`; config `sources: [..]` with empty/unknown rejection.
 - [ ] **S3.3** Bathymetry per-source channels (`depth_<src>`, `elevation_<src>`, `depth_p25/p75_<src>`) + provenance — proving the whole pattern on one product.
 
-**S4 — replicate the slice**
-- [ ] **S4.1** Replicate for `cmems` and `tides` (remove their internal fallback chains).
-- [ ] **S4.2** `met`: replicate the slice **and** split into `met` (forcing, no sensor dep) + `met_overpass` (product, sensor-dep, user combos, `kind=Kind.OVERPASS_ALIGNED` — new `Kind`, see §6.1); config surface (D14/D15).
-- [ ] **S4.3** Config migration: loudly reject removed `source`/`fallback`/`default_source`/`overpass_met`/`water_level` keys (§6.2) + a test per key.
-- [ ] **S4.4** Update `coverage_channel`/`coverage()` to "any loaded source finite".
+**S4 — replicate the slice.** The bundled S4.2 is split into per-source *layering* (mechanical S3
+replication) and the *new overpass products*, each its own reviewed golden diff.
+- [ ] **S4.1** `cmems` per-source (data sources: reanalysis/forecast + regional models); remove its internal fallback chain. Golden diff.
+- [ ] **S4.2** `tides` per-source (data sources: co-ops / model); remove its internal fallback chain. Golden diff.
+- [ ] **S4.3** `met` FORCING per-source (`<var>_<src>`), drop `depends_on=(sensors)`; keep the existing overpass-met contributor unchanged for now. Golden diff.
+- [ ] **S4.4** `met_overpass` as a real product (D14): `DataProduct` + `ProductSpec` (`kind=Kind.OVERPASS_ALIGNED`), module split, `(sensor, source)` combos config (D15), `<sensor>_<var>_<src>` for user combos only (D13). Golden diff.
+- [ ] **S4.5** `tide_overpass` (D17): a DERIVED contributor emitting `<sensor>_tide_<src>` for user `(sensor, source)` combos (interpolate the per-source tide series to `<s>_hour` via `water_level.tide_at_overpass`). Golden diff.
+- [ ] **S4.6** Config migration: loudly reject removed `source`/`fallback`/`default_source`/`overpass_met` keys (§6.2) + a test per key; add the `met_overpass`/`tide_overpass` combos config.
+- [ ] **S4.7** Update `coverage_channel`/`coverage()` to "any loaded source finite".
 
 **S5 — finish**
 - [ ] **S5.1** Provenance per-source (`<var>_<source>` field mapping; delete `daily_sources`).

@@ -65,7 +65,28 @@
         "n_finite": 5292
       }
     },
-    "cmems_thetao_0m": {
+    "cmems_thetao_0m_anfc_global": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "d46e7a8730f0dd1148aa75aaa8c1dae1e879171c3caf934ed0c79ee92633a696",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 284.0,
+        "mean": 284.0,
+        "min": 284.0,
+        "n_finite": 4788
+      }
+    },
+    "cmems_thetao_0m_my_global": {
       "attrs": {},
       "dims": [
         "time",

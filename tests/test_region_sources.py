@@ -42,7 +42,8 @@ def _two_continent_project(tmp_path):
             # Project-wide defaults are the North American ones...
             "met": {"source": "auto", "fallback": "era5",
                     "variables": ["airtemp", "wind"]},
-            "cmems": {"source": "my", "variables": ["thetao"], "depths": [0.0, 10.0]},
+            "cmems": {"sources": ["my_global", "anfc_global"],
+                      "variables": ["thetao"], "depths": [0.0, 10.0]},
             "insitu": {"source": "ioos", "qc_flags": [1, 2]},
             "tides": {"default_source": "coops"},
             "bathymetry": {"sources": ["cudem"]},
@@ -57,7 +58,8 @@ def _two_continent_project(tmp_path):
              # ...and the Mediterranean region says, per source, what actually reaches it.
              "sources": {
                  "met": {"source": "era5", "fallback": "none"},
-                 "cmems": {"dataset_id": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"},
+                 "cmems": {"sources": ["anfc_med"],
+                           "datasets": {"anfc_med": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"}},
                  "insitu": {"source": "ioos", "exclude_stations": ["bogus1"]},
                  "tides": {"source": "eo_tides", "model": "FES2022"},
                  "bathymetry": {"sources": ["gmrt"]},
@@ -79,11 +81,13 @@ def test_met_chain_differs_per_region(tmp_path):
     assert ds["ligurian"]["chain"] == ["era5"]            # ERA5 only -- deliberate, not a fallback
 
 
-def test_cmems_dataset_differs_per_region(tmp_path):
-    """CMEMS publishes regional models; the Ligurian AoI names the Mediterranean one."""
+def test_cmems_sources_differ_per_region(tmp_path):
+    """CMEMS publishes regional models; the Ligurian AoI stacks the Mediterranean tag, whose
+    dataset id it registers via `datasets`. Distinct-data sources are a stacked LIST now."""
     ds = cmems._build_eff(_two_continent_project(tmp_path))["ds"]
-    assert ds["tillamook"]["chain"] == ["my", "anfc"]     # the global reanalysis chain
-    assert ds["ligurian"]["chain"] == ["cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"]
+    assert ds["tillamook"]["sources"] == ["my_global", "anfc_global"]   # the global tags
+    assert ds["ligurian"]["sources"] == ["anfc_med"]
+    assert ds["ligurian"]["datasets"]["anfc_med"] == "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"
 
 
 def test_tide_source_differs_per_region(tmp_path):

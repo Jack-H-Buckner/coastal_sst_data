@@ -72,24 +72,27 @@ def fake_source(days, g, *, temp_at_depth=None, variables=("thetao",)):
 # --------------------------------------------------------------------------- #
 # Config -> acquisition params
 # --------------------------------------------------------------------------- #
-# `eff["ds"]` is keyed by AoI: which CMEMS model covers an AoI is region-dependent, so the
-# chain is resolved per AoI (region override -> project default) rather than once per run.
-def test_default_chain_is_reanalysis_then_forecast(project):
+# `eff["ds"]` is keyed by AoI: which CMEMS models cover an AoI is region-dependent, so the
+# STACKED source list is resolved per AoI (region override -> project default).
+def test_default_sources_are_the_two_global_tags(project):
     eff = cmems._build_eff(project)
-    assert eff["ds"][AOI]["chain"] == ["my", "anfc"]
-    assert cmems.DATASET_IDS["my"] == "cmems_mod_glo_phy_my_0.083deg_P1D-m"
+    assert eff["ds"][AOI]["sources"] == ["my_global", "anfc_global"]
+    assert eff["ds"][AOI]["datasets"]["my_global"] == "cmems_mod_glo_phy_my_0.083deg_P1D-m"
     assert eff["ds"][AOI]["depths"] == [0.0, 10.0, 30.0]
     assert eff["ds"][AOI]["variables"] == ["thetao"]
 
 
-def test_fallback_can_be_disabled(tmp_path):
-    eff = cmems._build_eff(_project(tmp_path, fallback="none"))
-    assert eff["ds"][AOI]["chain"] == ["my"]
+def test_a_regional_tag_is_registered_via_datasets(tmp_path):
+    eff = cmems._build_eff(_project(
+        tmp_path, sources=["anfc_med"],
+        datasets={"anfc_med": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"}))
+    assert eff["ds"][AOI]["sources"] == ["anfc_med"]
+    assert eff["ds"][AOI]["datasets"]["anfc_med"] == "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"
 
 
-def test_an_unknown_source_fails_loudly(tmp_path):
-    with pytest.raises(ValueError, match="not recognized"):
-        cmems._build_eff(_project(tmp_path, source="glorys4"))
+def test_an_unknown_source_fails_at_config_load(tmp_path):
+    with pytest.raises(Exception, match="unknown source"):
+        _project(tmp_path, sources=["glorys4"])   # not a built-in tag, not in `datasets`
 
 
 def test_netrc_strategy_points_the_toolbox_at_netrc(project):
@@ -171,30 +174,26 @@ def test_a_day_the_product_does_not_cover_returns_none(days, g):
 
 
 # --------------------------------------------------------------------------- #
-# The my -> anfc chain
+# Per-source STACKING (no fallback): each tag -> its own tree
 # --------------------------------------------------------------------------- #
-def test_forecast_backfills_the_days_the_reanalysis_does_not_reach(monkeypatch, project,
-                                                                   g, days):
-    """The reanalysis ends partway through the window; the forecast covers the rest, and
-    each day's file records WHICH product produced it."""
-    calls = []
-
+def test_each_source_writes_its_own_tree_independently(monkeypatch, project, g, days):
+    """No fallback (D10): each source tag is acquired into its OWN tree, covering whatever
+    days its dataset covers. Here my_global reaches only days 0-1; anfc_global covers all 3.
+    A day my_global misses simply has no file there -> a NaN slice in that tag's cube channel."""
     def fake_open(dataset_id, variables, bbox, pad, start, end, depths, creds):
-        calls.append(dataset_id)
-        if dataset_id == cmems.DATASET_IDS["my"]:
+        if dataset_id == cmems.DATASET_IDS["my_global"]:
             return fake_source(days[:2], g)          # reanalysis: days 0-1 only
-        return fake_source(days, g)                  # forecast: everything
+        return fake_source(days, g)                  # forecast: all days
 
     monkeypatch.setattr(cmems, "open_window", fake_open)
     cmems.acquire(project, grids={AOI: g})
 
-    out = project.output_dir / "CMEMS" / "aligned" / AOI
-    srcs = {}
-    for d in days:
-        with xr.open_dataset(out / f"{AOI}_{d.strftime('%Y%m%d')}.nc") as ds:
-            srcs[d.strftime("%Y%m%d")] = ds.attrs["cmems_source"]
-    assert srcs == {"20260601": "my", "20260602": "my", "20260603": "anfc"}
-    assert calls == [cmems.DATASET_IDS["my"], cmems.DATASET_IDS["anfc"]]
+    my = project.output_dir / "CMEMS" / "my_global" / "aligned" / AOI
+    anfc = project.output_dir / "CMEMS" / "anfc_global" / "aligned" / AOI
+    assert sorted(p.name for p in my.glob("*.nc")) == [
+        f"{AOI}_20260601.nc", f"{AOI}_20260602.nc"]      # my_global covered only days 0-1
+    assert len(list(anfc.glob("*.nc"))) == 3             # anfc_global covered all 3
+    assert not (my / f"{AOI}_20260603.nc").exists()      # no backfill from anfc into my's tree
 
 
 def test_already_acquired_days_are_not_refetched(monkeypatch, project, g, days):
@@ -221,8 +220,9 @@ def test_dry_run_opens_nothing(monkeypatch, project, g):
 # --------------------------------------------------------------------------- #
 # Into the cube: channels + the nearest-neighbour water fill
 # --------------------------------------------------------------------------- #
-def _write_cmems(project, g, days, *, hole=None):
-    """Aligned CMEMS files, optionally with a NaN hole (the model's coarse land mask)."""
+def _write_cmems(project, g, days, *, hole=None, src="my_global"):
+    """One source tag's aligned CMEMS files (CMEMS/<src>/aligned/<aoi>), optionally with a
+    NaN hole (the model's coarse land mask)."""
     xs, ys = g.xy_centers()
     H, W = g.height, g.width
     for day in days:
@@ -232,7 +232,7 @@ def _write_cmems(project, g, days, *, hole=None):
         ds = xr.Dataset({"thetao_0m": (("time", "y", "x"), arr[None]),
                          "valid": (("time", "y", "x"), np.isfinite(arr[None]).astype("uint8"))},
                         coords={"time": [day], "y": ys, "x": xs})
-        d = project.output_dir / "CMEMS" / "aligned" / AOI
+        d = project.output_dir / "CMEMS" / src / "aligned" / AOI
         d.mkdir(parents=True, exist_ok=True)
         ds.to_netcdf(d / f"{AOI}_{day.strftime('%Y%m%d')}.nc")
 
@@ -247,23 +247,28 @@ def _write_landcover(project, g, *, land_cols):
     ds.to_netcdf(d / f"{AOI}.nc")
 
 
-def test_cmems_channels_reach_the_cube(project, g, days):
-    _write_cmems(project, g, days)
+def test_cmems_channels_reach_the_cube_per_source(project, g, days):
+    """Each stacked source tag gets its own channel: cmems_<var>_<tag> (D5)."""
+    _write_cmems(project, g, days, src="my_global")
+    _write_cmems(project, g, days, src="anfc_global")
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert "cmems_thetao_0m" in ds.data_vars
-    assert float(np.nanmean(ds["cmems_thetao_0m"].isel(time=0).values)) == pytest.approx(12.0)
+    for tag in ("my_global", "anfc_global"):
+        assert f"cmems_thetao_0m_{tag}" in ds.data_vars
+        assert float(np.nanmean(ds[f"cmems_thetao_0m_{tag}"].isel(time=0).values)) \
+            == pytest.approx(12.0)
+    assert "cmems_thetao_0m" not in ds.data_vars            # no bare (source-less) channel
 
 
 def test_missing_water_pixels_ship_as_honest_nan_gaps(project, g, days):
     """S1: CMEMS is no longer NN-filled. The 9 km model's land holes stay NaN in the cube
     and carry no `_filled` mask -- filling is a downstream determination now (Goal 3)."""
-    _write_cmems(project, g, days, hole=slice(0, 7))
+    _write_cmems(project, g, days, hole=slice(0, 7), src="my_global")
     _write_landcover(project, g, land_cols=slice(0, 5))
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    arr = ds["cmems_thetao_0m"].isel(time=0).values
+    arr = ds["cmems_thetao_0m_my_global"].isel(time=0).values
     assert np.isnan(arr[:, :7]).all()                       # the model hole is untouched
     assert np.isfinite(arr[:, 7:]).all()                    # resolved cells survive
-    assert "cmems_thetao_0m_filled" not in ds.data_vars
+    assert "cmems_thetao_0m_my_global_filled" not in ds.data_vars
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

@@ -108,9 +108,12 @@ def write_modis(project, g, day, temp=287.0):
     _write(project, "MODIS", f"{AOI}_{day.strftime('%Y%m%d')}T210000.nc", ds)
 
 
-def write_cmems(project, g, days, *, land_cols):
-    """CMEMS daily files. The ~9 km model's land mask swallows `land_cols` (NaN there)."""
+def write_cmems(project, g, days, *, land_cols, src="my_global"):
+    """One CMEMS source tag's daily files (CMEMS/<src>/aligned/<aoi>). The ~9 km model's land
+    mask swallows `land_cols` (NaN there)."""
     H, W, xs, ys = _grid_hw(g)
+    d = project.output_dir / "CMEMS" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
     for day in days:
         arr = np.full((H, W), 284.0, "float32")
         arr[:, land_cols] = np.nan                     # model never resolved these cells
@@ -118,7 +121,7 @@ def write_cmems(project, g, days, *, land_cols):
                          "valid": (("time", "y", "x"),
                                    np.isfinite(arr)[None].astype("uint8"))},
                         coords={"time": [day], "y": ys, "x": xs})
-        _write(project, "CMEMS", f"{AOI}_{day.strftime('%Y%m%d')}.nc", ds)
+        ds.to_netcdf(d / f"{AOI}_{day.strftime('%Y%m%d')}.nc")
 
 
 def write_bathymetry(project, g, src="cudem", *, datum_offset_m=1.3, datum_status="ok"):
@@ -597,10 +600,10 @@ def test_cmems_ships_raw_observed_values_with_honest_nan_gaps(project, grids, da
     write_cmems(project, g, days, land_cols=slice(0, 4))        # model has no data cols 0-3
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
-    assert "cmems_thetao_0m" in ds.data_vars
-    assert "cmems_thetao_0m_filled" not in ds.data_vars
+    assert "cmems_thetao_0m_my_global" in ds.data_vars
+    assert "cmems_thetao_0m_my_global_filled" not in ds.data_vars
     assert "cmems_source" not in ds.data_vars                   # per-day source code is gone
-    val = ds["cmems_thetao_0m"].isel(time=0).values
+    val = ds["cmems_thetao_0m_my_global"].isel(time=0).values
     assert np.isnan(val[:, :4]).all()        # unresolved cells stay NaN, not filled
     assert np.isfinite(val[:, 4:]).all()     # resolved cells survive
 
@@ -717,7 +720,8 @@ def _write_full_fixture(project, g, days):
     write_ecostress_two_scenes(project, g, days[0])      # clearest scene 20:00
     write_landsat(project, g, days[0], hour=18)
     write_modis(project, g, days[1], temp=287.0)         # overpass 21:00
-    write_cmems(project, g, days, land_cols=slice(0, 4))
+    write_cmems(project, g, days, land_cols=slice(0, 4), src="my_global")
+    write_cmems(project, g, days, land_cols=slice(0, 4), src="anfc_global")  # stacked (D10)
     write_met_daily(project, g, days, temp=280.0)                 # daily mean
     write_met_daily(project, g, days, temp=291.0, prefix="ref_")  # reference snapshot
     write_met_snapshot(project, g, days[0], 20, temp=286.0)       # eco overpass

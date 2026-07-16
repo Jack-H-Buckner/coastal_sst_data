@@ -33,8 +33,10 @@ products:
   mur:
     variable: analysed_sst
   cmems:                     # Copernicus Marine global physics (offshore water column)
-    source: my               # my (GLORYS12 reanalysis, default) | anfc (analysis/forecast)
-    fallback: anfc           # covers days past the end of the reanalysis | none
+    # DISTINCT-DATA sources are STACKED (one cmems_<var>_<tag> channel each), not picked-one:
+    # my_global (GLORYS12 reanalysis), anfc_global (analysis/forecast). Regional models
+    # register a tag under `datasets` and a region lists it in `sources` (see below).
+    sources: [my_global, anfc_global]
     variables: [thetao]      # also: so, uo, vo, zos, mlotst
     depths: [0, 10]      # metres; each SNAPPED to the nearest model level
   landsat:

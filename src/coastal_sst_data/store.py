@@ -281,11 +281,12 @@ def scan(root: Path, aois=None, *, deep: bool = True):
     bad: list[tuple[str, Path]] = []
     n = 0
     for s in REGISTRY:
-        # A DATA (stacked) product nests each DEM under `<DIR>/<source>/aligned`, so walking
+        # A DATA (stacked) product nests each source under `<DIR>/<source>/aligned`, so walking
         # only `<DIR>/aligned` would find NOTHING and SILENTLY validate none of it -- exactly
-        # the omission this pass exists to catch. Walk every source's tree for those.
+        # the omission this pass exists to catch. GLOB every source subtree (so config-
+        # registered sources, e.g. CMEMS regional tags, are covered too, not just built-ins).
         if s.is_stacked_data:
-            bases = [root / s.dir / src / "aligned" for src in s.known_sources]
+            bases = sorted((root / s.dir).glob("*/aligned")) if (root / s.dir).exists() else []
         else:
             bases = [root / s.dir / "aligned"]
         for base in bases:

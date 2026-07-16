@@ -586,6 +586,20 @@ class Project(BaseModel):
         """
         problems: list[str] = []
 
+        # Some DATA products have an OPEN source set: a `datasets: {tag: id}` map registers
+        # extra source tags (CMEMS regional models). Gather every registered tag per product,
+        # from the global bag AND any region, so a tag defined anywhere is a valid source name.
+        def _datasets(opts) -> set:
+            d = (getattr(opts, "model_extra", None) or {}).get("datasets") or {}
+            return set(d) if isinstance(d, dict) else set()
+
+        registered: dict[DataProduct, set] = {}
+        for product, opts in self.products.items():
+            registered.setdefault(product, set()).update(_datasets(opts))
+        for r in self.regions:
+            for product, opts in r.sources.items():
+                registered.setdefault(product, set()).update(_datasets(opts))
+
         def check(where: str, product: DataProduct, opts):
             s = spec(product)
             if not s.is_stacked_data:
@@ -593,14 +607,16 @@ class Project(BaseModel):
             val = (getattr(opts, "model_extra", None) or {}).get("sources")
             if val is None:
                 return
+            allowed = set(s.known_sources) | registered.get(product, set())
             names = [val] if isinstance(val, str) else list(val)
             if not names:
                 problems.append(f"{where}.{product.value}.sources is empty; list at least "
-                                f"one of {list(s.known_sources)}.")
+                                f"one of {sorted(allowed)}.")
             for name in names:
-                if name not in s.known_sources:
+                if name not in allowed:
                     problems.append(f"{where}.{product.value}.sources has unknown source "
-                                    f"{name!r}; choose from {list(s.known_sources)}.")
+                                    f"{name!r}; choose from {sorted(allowed)} (register a "
+                                    "regional tag with `datasets: {tag: dataset_id}`).")
 
         for product, opts in self.products.items():
             check("products", product, opts)

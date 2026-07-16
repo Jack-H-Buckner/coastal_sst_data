@@ -8,17 +8,19 @@ one skin temperature at the surface, this gives the water column -- so a model c
 the stratification and the offshore water mass that upwelling and tidal exchange draw
 into an estuary.
 
-Two products, tried in order (the "source chain", like met's hrrr->era5):
+DISTINCT-DATA sources, STACKED (D10) -- each a source TAG naming an exact dataset, acquired
+INDEPENDENTLY into its own tree and emitted as its own `cmems_<var>_<tag>` cube channel. There
+is NO fallback chain: the user lists the tags they need, and a day/region a tag does not cover
+is a NaN slice they fill by stacking another tag. Built-in tags:
 
-  * my   (default) -- cmems_mod_glo_phy_my_0.083deg_P1D-m, the GLORYS12 REANALYSIS
-    (hindcast): 1/12 deg, daily means, 50 depth levels. Best quality, but it stops a
-    year or two behind the present.
-  * anfc -- cmems_mod_glo_phy_anfc_0.083deg_P1D-m, the ANALYSIS/FORECAST product, which
-    covers right up to the present. It backfills whatever days the reanalysis does not
-    reach, so a project spanning the reanalysis cut-off is still gap-free.
+  * my_global   -- cmems_mod_glo_phy_my_0.083deg_P1D-m, the GLORYS12 REANALYSIS (hindcast):
+    1/12 deg, daily means, 50 depth levels. Best quality, but stops a year or two behind.
+  * anfc_global -- cmems_mod_glo_phy_anfc_0.083deg_P1D-m, the ANALYSIS/FORECAST product,
+    which reaches the present.
 
-Each output file records which product actually produced it in `ds.attrs["source"]`, so
-a reanalysis day and a forecast day are never silently conflated.
+Regional models (Baltic/Med/NW-Shelf) are registered per config as extra tags:
+`datasets: {anfc_med: <dataset_id>}`, then listed in `sources` for the region that needs them.
+The tag IS the provenance identity, so each channel is self-describing.
 
 DEPTHS. The model has ~50 fixed levels (0.494, 1.54, 2.65, 5.08 m ...). The config asks
 for depths in metres and each is snapped to the NEAREST model level -- no interpolation,
@@ -35,7 +37,7 @@ Data is streamed with `copernicusmarine.open_dataset`, which is LAZY: the AoI wi
 subset server-side, so the global model is never downloaded. One open per AoI covers the
 whole time range.
 
-    <output_dir>/CMEMS/aligned/<aoi>/<aoi>_<YYYYMMDD>.nc
+    <output_dir>/CMEMS/<tag>/aligned/<aoi>/<aoi>_<YYYYMMDD>.nc
 
 CREDENTIALS. Needs a free Copernicus Marine account (https://data.marine.copernicus.eu).
 Like Earthdata, the secret never goes in the config: it lives in ~/.netrc under
@@ -67,14 +69,16 @@ log = logging.getLogger(__name__)
 
 SOURCE = "cmems"
 
-# source key -> dataset id. The chain is [my, anfc]: reanalysis first, forecast to cover
-# the days it does not reach.
+# BUILT-IN source TAG -> dataset id. Each tag names an exact CMEMS dataset and IS the
+# provenance identity, so a `cmems_<var>_<tag>` channel is self-describing. Regional tags
+# (`my_baltic`, `anfc_med`, ...) are registered per config via the `datasets` option, since
+# their ids vary (and some regionals split variables into separate products). No fallback:
+# distinct-data sources are STACKED, not substituted (D10) -- the user lists what they need.
 DATASET_IDS = {
-    "my": "cmems_mod_glo_phy_my_0.083deg_P1D-m",       # GLORYS12 reanalysis (hindcast)
-    "anfc": "cmems_mod_glo_phy_anfc_0.083deg_P1D-m",   # analysis / forecast
+    "my_global": "cmems_mod_glo_phy_my_0.083deg_P1D-m",       # GLORYS12 reanalysis (hindcast)
+    "anfc_global": "cmems_mod_glo_phy_anfc_0.083deg_P1D-m",   # analysis / forecast
 }
-DEFAULT_SOURCE = "my"
-DEFAULT_FALLBACK = "anfc"                # "none" to disable
+DEFAULT_SOURCES = ["my_global", "anfc_global"]
 DEFAULT_VARIABLES = ["thetao"]           # sea water potential temperature
 DEFAULT_DEPTHS = [0.0]                   # metres; snapped to the nearest model level
 DEFAULT_PAD_DEG = 0.15                   # >= one 1/12 deg cell of padding around the AoI
@@ -84,18 +88,6 @@ SURFACE_ONLY = {"zos", "mlotst", "siconc", "sithick", "bottomT"}
 
 OUT_UNITS = {"thetao": "degC", "so": "1e-3", "uo": "m s-1", "vo": "m s-1",
              "zos": "m", "mlotst": "m", "bottomT": "degC"}
-
-
-def _resolve_chain(source: str, fallback: str) -> list[str]:
-    """['my', 'anfc'] for the defaults; a single source when the fallback is off."""
-    chain = [DEFAULT_SOURCE] if source == "auto" else [source]
-    if fallback and fallback not in ("none", "", None) and fallback not in chain:
-        chain.append(fallback)
-    bad = [s for s in chain if s not in DATASET_IDS]
-    if bad:
-        raise ValueError(f"cmems source(s) not recognized ({bad}); "
-                         f"choose from {sorted(DATASET_IDS)}.")
-    return chain
 
 
 def depth_label(d: float) -> str:
@@ -134,10 +126,10 @@ def open_window(dataset_id, variables, bbox_ll, pad, start, end, depths, creds):
         return net.retry(lambda: copernicusmarine.open_dataset(**kw),
                          what=f"CMEMS open {dataset_id}")
     except Exception as exc:
-        # This returns None, which the chain reads as "this product has no such day" and
-        # falls through to the NEXT product. That is right for a genuine coverage gap and
-        # WRONG for an expired credential -- which used to look identical, at INFO. Say
-        # which one this is, loudly, because the fallback silently serves different data.
+        # Returns None -> this source contributes no data here (a NaN slice in its channel).
+        # That is right for a genuine coverage gap and WRONG for an expired credential -- which
+        # used to look identical, at INFO. Say which one this is, loudly, so a missing channel
+        # is not mistaken for "this source doesn't cover the AoI".
         if net.is_transient(exc):
             log.warning("  %s: unreachable after retries (%s); treating as no data",
                         dataset_id, exc)
@@ -221,85 +213,75 @@ def day_dataset(src_ds: xr.Dataset, day, g: AoiGrid, variables, level_of, grid_c
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
-def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
+def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=None):
+    """Acquire each configured CMEMS SOURCE TAG independently into its own tree.
+
+    No fallback chain (D10): a tag covers whatever days its dataset covers, and a day it does
+    not reach simply has no file there -> a NaN slice in that tag's cube channel, which the
+    user fills by stacking another tag. `only_source` narrows the run to one tag.
+    """
     grid_cfg = eff["grid"]
-    out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
+    cmems_root, fmt, overwrite = eff["cmems_root"], eff["fmt"], eff["overwrite"]
     to_celsius = grid_cfg.get("to_celsius", False)
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
     days = pd.date_range(start, end, freq="D")
 
     names = select_aois(grids, only_aoi)
-
     rep = report.ProductReport("cmems")
 
     for name in names:
         g = grids[name]
-        # Resolved PER AoI: which CMEMS model covers this AoI is a fact about where it is
-        # (the global product, or one of the regional ones), so the chain comes from the
-        # AoI's region where it overrides the project default.
         ds_cfg = eff["ds"][name]
-        chain, variables, depths = ds_cfg["chain"], ds_cfg["variables"], ds_cfg["depths"]
-        pad = float(ds_cfg["pad_deg"])
-        log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s | vars=%s depths=%s ===",
-                 name, g.target_crs, g.width, g.height, "->".join(chain),
-                 variables, depths)
-        if dry_run:
-            log.info("  [dry-run] would acquire %d day(s) from %s", len(days),
-                     " -> ".join(DATASET_IDS[s] for s in chain))
-            continue
+        variables, depths, pad = ds_cfg["variables"], ds_cfg["depths"], float(ds_cfg["pad_deg"])
+        datasets = ds_cfg["datasets"]
+        sources = [s for s in ds_cfg["sources"] if only_source is None or s == only_source]
 
-        aoi_out = out_root / name
-        remaining = [d for d in days
-                     if not store.done(aoi_out / f"{naming.day_stem(name, d)}.nc",
-                                       store.REQUIRED_VARS["CMEMS"], shape=(g.height, g.width),
-                                       overwrite=overwrite)]
-        rep.expect(len(days))
-        rep.skip(len(days) - len(remaining))
-        if not remaining:
-            log.info("  all %d day(s) already processed, skipping", len(days))
-            continue
+        for src in sources:
+            dsid = datasets.get(src)
+            if dsid is None:
+                log.warning("  %s: no dataset id for source %r (register it in `datasets`)",
+                            name, src)
+                rep.fail(f"{name} {src}", "no dataset id"); continue
+            log.info("=== AOI: %s (grid=%dx%d) | source=%s (%s) | vars=%s depths=%s ===",
+                     name, g.width, g.height, src, dsid, variables, depths)
 
-        # Walk the chain: the reanalysis covers what it covers, the forecast product
-        # picks up the rest. One lazy open per product, not per day.
-        for src in chain:
+            aoi_out = cmems_root / src / "aligned" / name
+            remaining = [d for d in days
+                         if not store.done(aoi_out / f"{naming.day_stem(name, d)}.nc",
+                                           store.REQUIRED_VARS["CMEMS"], shape=(g.height, g.width),
+                                           overwrite=overwrite)]
+            rep.expect(len(days)); rep.skip(len(days) - len(remaining))
             if not remaining:
-                break
-            sds = open_window(DATASET_IDS[src], variables, g.search_bbox, pad,
-                              min(remaining).date(), max(remaining).date(), depths,
-                              eff["creds"])
+                log.info("  all %d day(s) already processed, skipping", len(days)); continue
+            if dry_run:
+                log.info("  [dry-run] would acquire %d day(s) from %s", len(remaining), dsid); continue
+
+            sds = open_window(dsid, variables, g.search_bbox, pad,
+                              min(remaining).date(), max(remaining).date(), depths, eff["creds"])
             if sds is None:
+                log.warning("  %s: %s (%s) has no coverage here; no channel from it "
+                            "(stack another source)", name, src, dsid)
+                for d in remaining:
+                    rep.fail(f"{name} {src} {naming.day_stamp(d)}", f"{src}: no coverage")
                 continue
             level_of = snap_depths(sds, depths)
             if level_of:
-                log.info("  %s: depths %s -> model levels %s", src,
-                         [f"{d:g}" for d in level_of],
+                log.info("  %s: depths %s -> model levels %s", src, [f"{d:g}" for d in level_of],
                          [f"{v:.2f}" for v in level_of.values()])
-
-            still: list = []
             for day in remaining:
                 try:
                     ds = day_dataset(sds, day, g, variables, level_of, grid_cfg, to_celsius)
                 except Exception as exc:
-                    log.warning("    %s: %s", day.strftime("%Y%m%d"), exc)
-                    still.append(day)
+                    log.warning("    %s: %s", day.strftime("%Y%m%d"), exc); continue
+                if ds is None:                       # this source has no such day -> NaN in cube
                     continue
-                if ds is None:                       # this product has no such day
-                    still.append(day)
-                    continue
-                ds.attrs.update(aoi_id=name, source=DATASET_IDS[src], cmems_source=src,
+                ds.attrs.update(aoi_id=name, source=dsid, cmems_source=src,
                                 processing="subset + bilinear reproject to AOI grid",
                                 **provenance.stamp(eff))
                 log.info("  [%s] %s -> %s", src, naming.day_stamp(day),
                          store.write_output(ds, aoi_out, naming.day_stem(name, day), fmt).name)
-                rep.wrote(source=DATASET_IDS[src])
-            remaining = still
+                rep.wrote(source=dsid)
             sds.close()
-
-        if remaining:
-            log.warning("  %s: %d day(s) NOT COVERED by %s", name, len(remaining),
-                        " or ".join(chain))
-            for d in remaining:
-                rep.fail(f"{name} {naming.day_stamp(d)}", f"not covered by {' or '.join(chain)}")
     rep.log_summary()
     return rep
 
@@ -308,22 +290,22 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
 def _ds_cfg(opts) -> dict:
-    """One AoI's CMEMS settings, from its region-resolved options bag.
+    """One AoI's CMEMS settings: which SOURCE TAGS to STACK (region-overridable), plus the
+    tag->dataset-id map (built-ins + any regional tags registered via `datasets`).
 
-    `source`/`fallback`/`dataset_id` are region-overridable (which model covers this AoI);
-    `variables`/`depths` are not, so every AoI's cube carries the same CMEMS channels.
+    `sources`/`datasets` are region-overridable (which model covers this AoI); `variables`/
+    `depths` are not, so every AoI's cube carries the same CMEMS channels.
     """
-    chain = _resolve_chain(_opt(opts, "source", DEFAULT_SOURCE),
-                           _opt(opts, "fallback", DEFAULT_FALLBACK))
-    # An explicit dataset_id overrides the chain entirely (an escape hatch for any of
-    # the other CMEMS physics products, and how a region names its regional model).
-    dataset_id = _opt(opts, "dataset_id", None)
-    if dataset_id:
-        DATASET_IDS.setdefault(dataset_id, dataset_id)
-        chain = [dataset_id]
-
+    srcs = _opt(opts, "sources", None)
+    if srcs is None:
+        srcs = list(DEFAULT_SOURCES)
+    elif isinstance(srcs, str):
+        srcs = [srcs]
+    datasets = dict(DATASET_IDS)
+    datasets.update(_opt(opts, "datasets", {}) or {})
     return {
-        "chain": chain,
+        "sources": [str(s) for s in srcs],
+        "datasets": datasets,
         "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
         "depths": [float(d) for d in _opt(opts, "depths", DEFAULT_DEPTHS)],
         "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
@@ -349,7 +331,7 @@ def _build_eff(project: Project) -> dict:
                for a in project.all_areas},
         "grid": grid_cfg,
         "creds": creds,
-        "out_dir": Path(project.output_dir) / "CMEMS" / "aligned",
+        "cmems_root": Path(project.output_dir) / "CMEMS",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
         "time": {
@@ -360,14 +342,19 @@ def _build_eff(project: Project) -> dict:
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
-            overwrite=False) -> None:
-    """Acquire CMEMS physics for a validated Project. Entry point for pipeline.py."""
+            overwrite=False, source=None) -> None:
+    """Acquire CMEMS physics for a validated Project. Entry point for pipeline.py.
+
+    Every configured source tag is acquired and stacked; `source` (from the pipeline, or
+    unset on a direct CLI run) narrows to one tag. A tag with no dataset id / no coverage
+    simply contributes no channel -- there is no fallback.
+    """
     eff = _build_eff(project)
     if overwrite:
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    return run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run, only_source=source)
 
 
 def main():
