@@ -290,13 +290,15 @@ Runs the credential preflight on its own — handy before a long unattended run,
 
 The terminal stage: once the products are acquired, it knits their per-AOI aligned files into one analysis-ready **Zarr datacube per AOI** (`<output_dir>/datacube/<aoi>.zarr`), on a common **daily** time axis and the same shared grid every product was regridded onto. It reads only files already on disk, so it needs no network — run it after a `run`, or fold it into one with `run --assemble`.
 
-Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `modis_sst`) so a downstream model can learn per-source offsets; each high-res sensor carries its own `valid` mask and overpass hour, and multiple scenes on a day collapse to the **clearest** one. The water/land mask is taken from **land-cover** (authoritative where known), and the gap-free MUR backbone is nearest-neighbour filled over land-cover water so it has no holes in narrow estuaries.
+Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `modis_sst`) so a downstream model can learn per-source offsets; each high-res sensor carries its own `valid` mask and overpass hour, and multiple scenes on a day collapse to the **clearest** one. The cube ships **raw ingredients** on a common grid and daily axis — MUR ships its observed values with honest NaN gaps (no fill), and the raw land-cover water layer ships as `landcover_water` rather than an opinionated derived land mask.
 
 - `--aoi <name> …` — assemble only specific AOIs (default: all).
 - `--overwrite` — rebuild cubes that already exist.
 - `--dry-run` — report what would be assembled; write nothing.
 
-Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `fill_mur_water`, `water_level`, `met_time`, `overpass_met`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision.
+Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, `overpass_met`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision.
+
+> **Note (raw-output simplification).** The cube ships **raw ingredients** on a common grid and daily axis; masking, water-filling, station snapping, and multi-input derivations are downstream modelling determinations. The `fill_mur_water`, `fill_cmems_water`, and `water_level` keys were **removed** — MUR/CMEMS ship observed values with honest NaN gaps, there is no derived `landmask`, and water level is reconstructed downstream from the raw `elevation` + `depth` + `tide` channels plus the `datum_offset_m` / `datum_status` cube attributes. An old config that still sets any of these three keys now **fails validation** rather than being silently ignored.
 
 #### Provenance: what produced each field, and when
 
@@ -327,7 +329,7 @@ Two things this is careful about:
 
 **A guessed date is never passed off as a recorded one.** Acquisition stamps `acquired_at` into every file it writes. Data acquired *before* this existed has no stamp, so the access date falls back to the file's **mtime** — and every record says which basis it used. An mtime is wrong the moment a tree is rsynced or restored from backup, so that has to be legible rather than silent. Re-acquire (or `--overwrite`) to replace a guessed date with a recorded one.
 
-**Derived fields list all of their inputs.** `eco_water_elev` is bathymetry *and* tides *and* the datum resolution tying them together *and* the ECOSTRESS overpass that set the instant. Picking one to report would be tidy and wrong. A channel with no mapping is logged loudly rather than shipping blank.
+**Derived fields list all of their inputs.** `eco_airtemp` (the forcing at the ECOSTRESS overpass) is met *and* the ECOSTRESS overpass that set the instant; `insitu_sst` is the in-situ network *and* the met reference time it is sampled at. Picking one to report would be tidy and wrong. A channel with no mapping is logged loudly rather than shipping blank.
 
 Because the config is embedded, `provenance` also **detects drift**: if the config on disk has changed since the cube was built, it says so and prints both hashes. That matters here because several products switch source underneath you — CMEMS falls back reanalysis→forecast, met falls back HRRR→ERA5, bathymetry falls back CUDEM→GMRT — so "which source produced this number" has a real, per-run answer.
 
@@ -339,26 +341,24 @@ The basis is *solar*, not UTC, because a fixed UTC hour is a different time of d
 
 **Each sensor additionally carries the forcing at its own overpass.** Where `products.met.overpass_from` made met snapshot the thermal scenes, the cube emits `<sensor>_<var>` — `eco_airtemp`, `lst_wind_speed`, `modis_swrad`, and so on — so an ECOSTRESS scene at 03:00 and a Landsat scene at 19:00 on the same day see *different* air temperature and wind, rather than sharing one value. Pick the variables with `datacube.overpass_met` (default `[airtemp, wind_speed, swrad, cloud_cover]`; `[]` disables). These are matched to the **exact scene the cube kept** — when a sensor flies twice in a day, only the clearest scene survives, and the forcing follows *that* scene's timestamp, not merely its date. Days with no scene from a sensor stay NaN rather than carrying a stale value.
 
-#### Water level (derived at assembly)
+#### Water level: reconstructed downstream from raw ingredients
 
-The assembler also **derives** a water level from two products it already has: the static bathymetry DEM and the 1D tide series. Because a tidal flat's state depends on *when* the sensor flew, the water level is evaluated **at each sensor's overpass time** — the hourly tide series is linearly interpolated to the scene's hour — giving, for each of `eco` / `lst` / `modis`:
+Water level (and the submerged/exposed classification of a tidal flat) is a **modelling determination**, so the cube no longer ships a pre-derived `<sensor>_water_elev` / `<sensor>_water_class` / `<sensor>_tide`. It ships instead the **raw ingredients** to reconstruct any of them per-process:
 
-| Channel | Dims | Meaning |
+| Ingredient | Dims | Role |
 | --- | --- | --- |
-| `<sensor>_water_elev` | (time, y, x) | ground elevation relative to the tide-adjusted waterline, in metres: **0 at the waterline**, positive above it (exposed, height above water), negative below it (submerged — the magnitude is the water depth) |
-| `<sensor>_water_class` | (time, y, x) | `0` = submerged, `1` = exposed, `255` = unknown |
-| `<sensor>_tide` | (time,) | the interpolated tide height at that overpass (m, rel. MSL) |
+| `elevation` | (y, x) | the DEM's ground/seafloor elevation, in its native vertical datum (+ up) |
+| `depth` (+ `depth_p25`/`depth_p75`) | (y, x) | mean water depth where the DEM is known |
+| `tide`, `tide_range` | (time,) | the daily tide statistics from the 1D series |
+| `<sensor>_hour` | (time,) | the exact overpass hour of the scene the cube kept (NaN where none) |
 
-On a day with no scene from that sensor there is no overpass time, so the fields are NaN / `255` rather than carrying a stale value; the same holds where the DEM has no coverage. This is a pure function of `bathymetry` + `tides`, so it needs both selected in the config; it is a derived stage rather than an acquisition product and is turned off with `datacube.water_level: false`.
+A downstream process interpolates the tide series to a sensor's `<sensor>_hour`, references `elevation` to MSL with the datum offset below, and classifies each cell — exactly the computation the assembler used to hard-code, now made per-process.
 
-Two things to know about the classification:
-
-- **Datum.** Tides are relative to **MSL** (a *tidal* datum — the 19-year mean of observed water level at a gauge), but a DEM need not be: CUDEM is **NAVD88** (a *geodetic* datum). The gap between the two surfaces is **local** and far from negligible — MSL sits roughly **1.0–1.4 m above NAVD88 in the Pacific Northwest** (vs. ~0.1–0.3 m on the Gulf coast), which is comparable to the entire intertidal range, so ignoring it misclassifies much of a tidal flat. This offset is **resolved automatically** by the [`datum` stage](#datum) — you do not configure it.
-- **It is purely geometric** — "is this cell's ground below the waterline?" — and deliberately does **not** consult land-cover. Land-cover routinely classifies tidal flats as non-water, so letting it override here would erase exactly the intertidal signal these fields exist to capture. The cost is that diked or reclaimed ground lying below the waterline reads as submerged; intersect with the cube's `landmask` / `landcover_water` if you need a hydrologically-connected water mask.
+**Datum.** Tides are relative to **MSL** (a *tidal* datum — the 19-year mean of observed water level at a gauge), but a DEM need not be: CUDEM is **NAVD88** (a *geodetic* datum). The gap between the two surfaces is **local** and far from negligible — MSL sits roughly **1.0–1.4 m above NAVD88 in the Pacific Northwest** (vs. ~0.1–0.3 m on the Gulf coast), which is comparable to the entire intertidal range, so ignoring it misclassifies much of a tidal flat. This offset is **resolved automatically** by the [`datum` stage](#datum) and ships with the cube as the `datum_offset_m` / `datum_status` attributes — you do not configure it, and downstream adds it to `elevation` to put the DEM and the tide on one surface.
 
 ### `datum`
 
-Resolves each AOI's **DEM→MSL vertical-datum offset** — the number the [water-level fields](#water-level-derived-at-assembly) need to put the DEM and the tide on one surface. It runs automatically inside `run` (after bathymetry, before the assembler) whenever bathymetry is selected and `datacube.water_level` is on; the subcommand exists to **backfill an existing data tree** without re-downloading a single DEM tile, since it reads the bathymetry output off disk rather than re-fetching it.
+Resolves each AOI's **DEM→MSL vertical-datum offset** — the number a downstream process needs to put the DEM (`elevation`) and the tide on one surface when [reconstructing water level](#water-level-reconstructed-downstream-from-raw-ingredients). It ships with the cube as the `datum_offset_m` / `datum_status` attributes. It runs automatically inside `run` (after bathymetry, before the assembler) whenever bathymetry is selected; the subcommand exists to **backfill an existing data tree** without re-downloading a single DEM tile, since it reads the bathymetry output off disk rather than re-fetching it.
 
 Why it can't be a config constant: the right offset depends on **which DEM actually ran**, and bathymetry silently falls back CUDEM→GMRT where CUDEM has no coverage. So two AOIs in one region can legitimately need different offsets, and a project-wide number would be wrong for one of them.
 
@@ -552,7 +552,7 @@ CMEMS supplies the **offshore ocean state at depth** — the water column the ne
 
 - **Where it comes from**: the Copernicus Marine global physics models (1/12°, daily means, ~50 depth levels), streamed with the `copernicusmarine` toolbox. `open_dataset` subsets the AOI window **server-side and lazily**, so the global model is never downloaded. Two products form a **source chain**, like met's HRRR→ERA5:
     - **`my`** (default) — `cmems_mod_glo_phy_my_0.083deg_P1D-m`, the **GLORYS12 reanalysis** (hindcast). Best quality, but it stops a year or two behind the present.
-    - **`anfc`** — `cmems_mod_glo_phy_anfc_0.083deg_P1D-m`, the **analysis/forecast** product, which reaches the present and backfills whatever days the reanalysis cannot cover. Each output file records which product produced it in its `source` / `cmems_source` attrs, so a reanalysis day and a forecast day are never silently conflated.
+    - **`anfc`** — `cmems_mod_glo_phy_anfc_0.083deg_P1D-m`, the **analysis/forecast** product, which reaches the present and backfills whatever days the reanalysis cannot cover. Each aligned output file records which product produced it in its `source` attribute, so a reanalysis day and a forecast day are never silently conflated.
 - **What it measures**: whichever `variables` you select (default `thetao`, sea-water potential temperature; also `so` salinity, `uo`/`vo` currents, and the 2D `zos` / `mlotst`), emitted **once per requested depth**.
 
 **Depths.** The model has ~50 *fixed* levels (0.494, 1.541, 2.646, 5.078 m …), so a requested depth is snapped to the **nearest level** — never interpolated. Every value is therefore one the model actually computed. The channel is named for what you asked for; the level actually used is recorded in the variable's `model_depth_m` attr:
@@ -575,7 +575,7 @@ gives `thetao_0m` (level 0.494 m), `thetao_10m` (level **9.573** m), `thetao_30m
 
 **Region-level options**: none.
 
-**In the cube** the channels arrive prefixed — `cmems_thetao_0m`, `cmems_thetao_30m` — and, like MUR, are **nearest-neighbour filled over land-cover water** (`datacube.fill_cmems_water`, default `true`). This matters more here than for MUR: at ~9 km the model's land mask can swallow an entire estuary, and the nearest resolved water column is the honest value for a cell the model never resolved. Real land is left NaN.
+**In the cube** the channels arrive prefixed — `cmems_thetao_0m`, `cmems_thetao_30m` — and ship the model's **observed values with honest NaN gaps**, like MUR. At ~9 km the model's land mask can swallow an entire estuary, so expect NaN over cells it never resolved; filling those from the nearest resolved water column is a downstream determination the model makes per-process, not something the cube bakes in.
 
 **Credentials**: a free [Copernicus Marine](https://data.marine.copernicus.eu) account, declared as `auth.copernicus`. The toolbox reads `~/.netrc` natively, so the secret lives there like every other one:
 

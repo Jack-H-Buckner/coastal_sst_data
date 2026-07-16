@@ -264,9 +264,11 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
 
     # Derived stage: resolve each AoI's DEM->MSL datum offset from the bathymetry file
     # that was just written (which DEM won is only known now -- bathymetry falls back
-    # cudem->gmrt on coverage failure). Cheap, network-light, and idempotent; it must
-    # run before the assembler, which reads its sidecar to build the water-level fields.
-    if DataProduct.bathymetry in selected and project.datacube.water_level:
+    # cudem->gmrt on coverage failure). Cheap, network-light, and idempotent; it must run
+    # before the assembler, which reads its sidecar to publish datum_offset_m/datum_status
+    # as cube attrs. Gated on bathymetry alone now that the `water_level` config flag is gone
+    # (the per-sensor water-level channels moved downstream; only the offset attr survives).
+    if DataProduct.bathymetry in selected:
         log.info("=== datum (DEM->MSL offset) ===")
         try:
             rep = datum.resolve(project, grids=grids, aois=aois,

@@ -240,7 +240,7 @@ def test_grid_spec_rejects_non_positive_resolution(bad):
 # ---------------------------------------------------------------------------
 def test_datacube_defaults_when_omitted(base_project):
     cfg = parse_config(base_project)                       # no datacube block
-    assert cfg.datacube.fill_mur_water is True
+    assert cfg.datacube.met_time == "reference"
     assert cfg.datacube.output_subdir == "datacube"
     assert cfg.datacube.compression.codec == "zstd"
     assert cfg.datacube.compression.shuffle == "shuffle"
@@ -248,6 +248,16 @@ def test_datacube_defaults_when_omitted(base_project):
 
 def test_datacube_rejects_unknown_key(base_project):
     base_project["datacube"] = {"bogus": 1}
+    with pytest.raises(ValidationError):
+        parse_config(base_project)
+
+
+@pytest.mark.parametrize("removed", ["fill_mur_water", "fill_cmems_water", "water_level"])
+def test_datacube_rejects_removed_raw_output_keys(base_project, removed):
+    """S1 removed these keys; an un-migrated config must FAIL loudly (extra='forbid'), never
+    be silently ignored -- the cube now ships raw ingredients and downstream owns the fill /
+    mask / water-level determinations."""
+    base_project["datacube"] = {removed: True}
     with pytest.raises(ValidationError):
         parse_config(base_project)
 

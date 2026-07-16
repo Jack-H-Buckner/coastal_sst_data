@@ -254,24 +254,16 @@ def test_cmems_channels_reach_the_cube(project, g, days):
     assert float(np.nanmean(ds["cmems_thetao_0m"].isel(time=0).values)) == pytest.approx(12.0)
 
 
-def test_missing_water_pixels_are_nn_filled_like_mur(project, g, days):
-    """The 9 km model calls a whole estuary 'land'. Fill those cells from the nearest
-    resolved water column -- but do NOT invent values over real land."""
-    _write_cmems(project, g, days, hole=slice(0, 7))
-    _write_landcover(project, g, land_cols=slice(0, 5))     # cols 0-4 land, 5+ water
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    arr = ds["cmems_thetao_0m"].isel(time=0).values
-    assert np.isfinite(arr[:, 5:7]).all()                   # water hole filled
-    assert np.isnan(arr[:, :5]).all()                       # land hole NOT filled
-
-
-def test_the_fill_can_be_turned_off(project, g, days):
+def test_missing_water_pixels_ship_as_honest_nan_gaps(project, g, days):
+    """S1: CMEMS is no longer NN-filled. The 9 km model's land holes stay NaN in the cube
+    and carry no `_filled` mask -- filling is a downstream determination now (Goal 3)."""
     _write_cmems(project, g, days, hole=slice(0, 7))
     _write_landcover(project, g, land_cols=slice(0, 5))
-    eff = datacube._build_eff(project)
-    eff["fill_cmems_water"] = False
-    ds = datacube.assemble_aoi(g, eff, days)
-    assert np.isnan(ds["cmems_thetao_0m"].isel(time=0).values[:, :7]).all()
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    arr = ds["cmems_thetao_0m"].isel(time=0).values
+    assert np.isnan(arr[:, :7]).all()                       # the model hole is untouched
+    assert np.isfinite(arr[:, 7:]).all()                    # resolved cells survive
+    assert "cmems_thetao_0m_filled" not in ds.data_vars
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

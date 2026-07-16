@@ -141,11 +141,11 @@ def test_stamp_records_the_time_and_the_config_it_ran_under():
     ("airtemp", ["met"]),
     ("tide", ["tides"]),
     ("depth_p25", ["bathymetry"]),
+    ("elevation", ["bathymetry"]),                          # raw ingredient (S1)
     # the derived ones: several genuine inputs, all of them load-bearing
-    ("eco_water_elev", ["bathymetry", "tides", "datum", "ecostress"]),
     ("lst_airtemp", ["met", "landsat"]),
     ("modis_insitu_sst", ["insitu", "modis"]),
-    ("landmask", ["landcover", "bathymetry"]),
+    ("landcover_water", ["landcover"]),
     ("doy_sin", []),                                        # computed; no data source
 ])
 def test_field_inputs(field, inputs):

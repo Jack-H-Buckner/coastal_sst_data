@@ -180,64 +180,42 @@ def test_region_override_is_used_when_the_stage_has_not_run(tmp_path):
 # --------------------------------------------------------------------------- #
 # Through the assembler
 # --------------------------------------------------------------------------- #
-def test_assembled_cube_carries_the_per_sensor_water_level(project, grids, days):
-    g = grids[AOI]
-    # West half is a tidal flat 0.5 m below MSL; east half is deep water.
-    elev = np.full((g.height, g.width), -10.0, "float32")
-    elev[:, : g.width // 2] = -0.5
-    write_bathymetry(project, g, elev)
-    write_tides(project, days)
-    write_ecostress(project, g, days[0], hour=3)    # tide = sin(2pi*3/12) = +1 m
-
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-
-    assert ds["eco_tide"].isel(time=0).item() == pytest.approx(1.0, abs=1e-5)
-    rel = ds["eco_water_elev"].isel(time=0).values
-    cls = ds["eco_water_class"].isel(time=0).values
-    # At a +1 m tide the flat (-0.5 m) sits 1.5 m under water; both halves submerged.
-    assert rel[:, : g.width // 2] == pytest.approx(-1.5, abs=1e-5)
-    assert rel[:, g.width // 2:] == pytest.approx(-11.0, abs=1e-5)
-    assert (cls == SUBMERGED).all()
-
-    # Days with no ECOSTRESS scene have no overpass tide -> unknown, not stale.
-    assert np.isnan(ds["eco_water_elev"].isel(time=1).values).all()
-    assert (ds["eco_water_class"].isel(time=1).values == UNKNOWN).all()
-    # Landsat never flew here at all.
-    assert (ds["lst_water_class"].values == UNKNOWN).all()
-
-
-def test_flat_is_exposed_at_low_tide(project, grids, days):
+def test_cube_ships_raw_water_level_ingredients_not_derived_channels(project, grids, days):
+    """S1 (D12): the per-sensor water-level channels are GONE from the cube -- water level
+    is a downstream computation now. What the cube ships instead are the RAW ingredients to
+    reconstruct it (elevation, per-day tide, each sensor's overpass hour) plus the DEM->MSL
+    datum offset as cube attributes, so downstream can reference elevation to MSL itself."""
     g = grids[AOI]
     elev = np.full((g.height, g.width), -0.5, "float32")
     write_bathymetry(project, g, elev)
     write_tides(project, days)
-    write_ecostress(project, g, days[0], hour=9)   # tide = sin(2pi*9/12) = -1 m
+    write_ecostress(project, g, days[0], hour=9)
 
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert ds["eco_tide"].isel(time=0).item() == pytest.approx(-1.0, abs=1e-5)
-    # Waterline is 1 m below MSL, so ground at -0.5 m stands 0.5 m clear of it.
-    assert ds["eco_water_elev"].isel(time=0).values == pytest.approx(0.5, abs=1e-5)
-    assert (ds["eco_water_class"].isel(time=0).values == EXPOSED).all()
+
+    # The derived channels are gone...
+    for pre in ("eco", "lst", "modis"):
+        for suf in ("water_elev", "water_class", "tide"):
+            assert f"{pre}_{suf}" not in ds.data_vars
+
+    # ...and the raw ingredients to rebuild them ship instead: the DEM elevation, the daily
+    # tide series, and each sensor's overpass hour (downstream interpolates tide to the hour).
+    assert ds["elevation"].isel(y=0, x=0).item() == pytest.approx(-0.5)
+    assert np.isfinite(ds["tide"].isel(time=0).item())                      # daily tide ships
+    assert ds["eco_hour"].isel(time=0).item() == pytest.approx(9.0)         # overpass hour
+
+    # The DEM->MSL offset travels as cube attributes (here: nothing resolved -> assumed 0).
+    assert ds.attrs["datum_offset_m"] == 0.0
+    assert ds.attrs["datum_status"] == "unresolved_assumed_zero"
 
 
-def test_water_level_can_be_turned_off(project, grids, days):
+def test_datum_offset_ships_even_without_tides(project, grids, days):
+    """The datum offset is bathymetry-only now -- it publishes as a cube attr regardless of
+    whether tides ran (water level moved downstream, but MSL referencing still needs it)."""
     g = grids[AOI]
     write_bathymetry(project, g, np.full((g.height, g.width), -1.0, "float32"))
-    write_tides(project, days)
-    eff = datacube._build_eff(project)
-    eff["water_level"] = False
-    ds = datacube.assemble_aoi(g, eff, days)
-    for v in ("eco_water_elev", "eco_water_class", "eco_tide"):
-        assert v not in ds.data_vars
-
-
-def test_water_level_survives_missing_bathymetry_and_tide(project, grids, days):
-    """Neither product acquired: the fields still exist, all-unknown."""
-    g = grids[AOI]
-    write_ecostress(project, g, days[0], hour=3)
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert np.isnan(ds["eco_water_elev"].values).all()
-    assert (ds["eco_water_class"].values == UNKNOWN).all()
+    assert "datum_offset_m" in ds.attrs and "datum_status" in ds.attrs
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

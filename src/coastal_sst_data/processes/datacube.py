@@ -19,30 +19,26 @@ Design (locked with the maintainer):
     per-source offsets survive; each high-res sensor carries its own valid mask
     and overpass hour.
   * Multiple scenes of one sensor on a day -> keep the CLEAREST (most valid px).
-  * Water/land mask comes from LAND-COVER (authoritative where known), falling
-    back to the sensor water union + sea-level bathymetry where it is unknown.
-  * The MUR backbone is nearest-neighbour filled over land-cover water so the
-    always-present channel has no holes in narrow estuaries.
-
-  * Water level: bathymetry + tide give, per sensor and at that sensor's OVERPASS
-    time, the ground elevation relative to the tide-adjusted waterline and a
-    submerged/exposed class (see processes.water_level).
+  * The cube ships RAW ingredients on a common grid + daily axis; masking, water-filling,
+    station snapping, and multi-input derivations are DOWNSTREAM modelling determinations.
+    So MUR/CMEMS ship observed values with honest NaN gaps (no NN fill), land-cover water
+    ships raw (no opinionated land mask), and bathymetry ships `elevation` + `depth` for a
+    downstream water-level computation rather than a pre-derived water_level channel.
 
   * Met is taken at a REFERENCE time of day (default 10:30 local solar -- Landsat's
     overpass), not as a daily mean, which would smear the diurnal cycle. Each sensor
     additionally carries the forcing at ITS OWN overpass (datacube.overpass_met), so
     two sensors that flew hours apart on one day do not share one value.
 
-  * CMEMS gives the offshore water column at the requested depths, NN-filled over water
-    like MUR (its ~9 km land mask can swallow a whole estuary).
+  * CMEMS gives the offshore water column at the requested depths (its ~9 km land mask can
+    swallow a whole estuary, so expect NaN gaps a downstream process may choose to fill).
 
   * IN-SITU is the cube's only ground truth: each station's value is written into the
     grid cell it sits in, at the INSTANT each satellite flew, so a scene can be validated
     against a buoy pixel-for-pixel and minute-for-minute (see processes.insitu).
 
-  * OBSERVED vs FILLED are different channels. `*_valid` means the value was MEASURED;
-    `*_filled` means it was invented by the NN fill and is plausible, not observed. A
-    model told that a fabricated pixel is valid has no way to learn otherwise.
+  * The DEM->MSL datum offset ships as the cube attributes `datum_offset_m` / `datum_status`
+    so a downstream user can reference `elevation` to MSL and reconstruct water level.
 
 Channel layout in each <aoi>.zarr. `<s>` ranges over the per-overpass thermal SENSORS, which
 are not a fixed list: they are every product declaring a SensorSpec in the registry
@@ -50,19 +46,15 @@ are not a fixed list: they are every product declaring a SensorSpec in the regis
 generated from that spec, so registering a fourth sensor produces its full set without an
 edit here.
 
-  3D (time,y,x): mur_sst, mur_valid, mur_filled,
+  3D (time,y,x): mur_sst,
                  <s>_sst, <s>_valid, <s>_cloud (where the sensor publishes a cloud layer),
                  airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover,
-                 <s>_water_elev, <s>_water_class,
                  <s>_{airtemp,wind_speed,swrad,cloud_cover},
-                 cmems_<var>_<depth>m, cmems_<var>_<depth>m_filled,
+                 cmems_<var>_<depth>m,
                  insitu_sst, insitu_n, <s>_insitu_sst, <s>_insitu_dt_min
-  2D (y,x) static: depth, depth_p25, depth_p75, landmask, landcover_water,
+  2D (y,x) static: elevation, depth, depth_p25, depth_p75, landcover_water,
                    insitu_station (index into the insitu_stations attr)
-  1D (time): tide, tide_range, <s>_hour, <s>_tide, doy_sin, doy_cos,
-             met_source, cmems_source -- which source served that DAY (uint8 code; the
-             `legend` attr names each code). These exist because met and CMEMS fall back
-             per-day, and a set-of-sources cannot say which day came from which.
+  1D (time): tide, tide_range, <s>_hour, doy_sin, doy_cos
 
 Usage:
     python -m coastal_sst_data.processes.datacube --config config.yaml
@@ -280,17 +272,16 @@ def load_bathy(d: Path, aoi_id, H, W):
     `np.where(elev < 0, -elev, 0.0)` -- looks right and is catastrophically wrong when the
     file is missing: `elev` is then all-NaN, `np.nan < 0` is False, so every cell takes the
     0.0 branch and the cube ships a flawless, NaN-free "everything is exactly at sea level"
-    bathymetry. That is fabricated data wearing the costume of real data, and it feeds
-    landmask and every *_water_elev channel. Depth is therefore derived only where the
-    elevation is actually KNOWN.
+    bathymetry. That is fabricated data wearing the costume of real data, and downstream
+    reconstructs water level from `elevation` + `depth`. Depth is therefore derived only
+    where the elevation is actually KNOWN.
     """
     elev = np.full((H, W), np.nan, "float32")
     depth = dp25 = dp75 = None
     f = d / f"{aoi_id}.nc"
     if not f.exists():
-        log.warning("  %s: no bathymetry file (%s); depth/depth_p25/depth_p75 will be NaN "
-                    "and the land mask falls back to the sensor water union",
-                    aoi_id, f.name)
+        log.warning("  %s: no bathymetry file (%s); elevation/depth/depth_p25/depth_p75 "
+                    "will be NaN", aoi_id, f.name)
     else:
         ds = xr.open_dataset(f)
 
@@ -323,7 +314,7 @@ def load_insitu(d: Path, aoi_id):
     return xr.open_dataset(f)
 
 
-def build_insitu(ids: xr.Dataset, g: AoiGrid, days, water, targets: dict, max_dt_min):
+def build_insitu(ids: xr.Dataset, g: AoiGrid, days, targets: dict, max_dt_min):
     """In-situ channels: the station's value at each target time, in the station's pixel.
 
     `targets` maps a channel prefix to one target datetime per day -- 'insitu' (the daily
@@ -332,12 +323,16 @@ def build_insitu(ids: xr.Dataset, g: AoiGrid, days, water, targets: dict, max_dt
     stations sit. A satellite pixel and a buoy pixel then line up exactly, at the same
     instant, which is the whole point of carrying in-situ at all.
 
+    A station goes into the cell it FALLS in -- no snapping to a water mask (that was the
+    last water-mask consumer; masking is a downstream determination now, per Goal 3). A
+    station in a land cell stays there.
+
     Returns (channels, station_table, station_map).
     """
     H, W = g.height, g.width
     lons = np.asarray(ids["lon"].values, dtype="float64")
     lats = np.asarray(ids["lat"].values, dtype="float64")
-    placed = insitu.station_pixels(lons, lats, g, water)
+    placed = insitu.station_pixels(lons, lats, g)             # water=None: no snapping
 
     times = pd.DatetimeIndex(ids["time"].values)
     sst = ids["sst"].values                         # (station, time)
@@ -354,14 +349,11 @@ def build_insitu(ids: xr.Dataset, g: AoiGrid, days, water, targets: dict, max_dt
             log.warning("  in-situ station %s falls outside the AoI grid; dropped", sid)
             continue
         r, c = place["row"], place["col"]
-        if place["snap_m"] and place["snap_m"] > insitu.SNAP_WARN_M:
-            log.warning("  in-situ station %s sits on a land pixel; snapped %.0f m to the "
-                        "nearest water cell -- check its coordinates", sid, place["snap_m"])
 
         table.append({"index": len(table) + 1, "id": sid,
                       "name": str(ids["station_name"].values[s]),
                       "lat": float(lats[s]), "lon": float(lons[s]),
-                      "row": r, "col": c, "snap_m": round(float(place["snap_m"] or 0.0), 1)})
+                      "row": r, "col": c})
         station_map[r, c] = len(table)
 
         for i in range(len(days)):
@@ -421,27 +413,6 @@ def load_landcover(d: Path, aoi_id, H, W):
     return water
 
 
-def fill_water_nn(arr, water):
-    """Nearest-neighbour fill of NaNs over `water` pixels, per time slice.
-
-    For each day, water pixels with no value take the nearest finite value
-    (typically just-offshore open water). Land / non-water NaNs are left as-is.
-    `arr` is (T,H,W); `water` is (H,W) bool.
-    """
-    from scipy.ndimage import distance_transform_edt
-    out = arr.copy()
-    for t in range(out.shape[0]):
-        m = out[t]
-        finite = np.isfinite(m)
-        need = (~finite) & water
-        if need.any() and finite.any():
-            idx = distance_transform_edt(~finite, return_distances=False, return_indices=True)
-            nn = m[tuple(idx)]
-            m[need] = nn[need]
-            out[t] = m
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # Assemble one AoI onto its shared grid
 # --------------------------------------------------------------------------- #
@@ -472,19 +443,19 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     # ("eco", "lst", "modis") written out by hand in three more places below. Each sensor's
     # validity rules (inverted water polarity, gate-on-QC-not-cloud, trust-the-valid-layer)
     # now live on its ProductSpec.sensor, so a fourth sensor gets every channel below --
-    # `_sst`, `_cloud`, `_valid`, `_hour`, `_tide`, `_water_elev`, `_water_class`, its
-    # overpass-met snapshots and its in-situ matchups -- from its spec alone.
+    # `_sst`, `_cloud`, `_valid`, `_hour`, its overpass-met snapshots and its in-situ
+    # matchups -- from its spec alone.
     sensors: dict[str, dict] = {}
     for s in products.sensors():
         sp = s.sensor
-        sst, cloud, valid, hour, water_union, times = load_clearest_overpass(
+        sst, cloud, valid, hour, _water_union, times = load_clearest_overpass(
             adir(s.product.value), aid, days, H, W,
             water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
             qc_levels=list(sp.qc_levels) if sp.qc_levels is not None else None,
             trust_valid=sp.trust_valid)
         sensors[sp.prefix] = {
             "spec": sp, "sst": sst, "cloud": cloud, "valid": valid, "hour": hour,
-            "water_union": water_union, "times": times,
+            "times": times,
         }
 
     # Met: one snapshot per day at the REFERENCE time of day (default 10:30 local solar,
@@ -509,66 +480,24 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
             op_met[f"{pre}_{var}"] = (("time", "y", "x"),
                                       load_at_times(adir("met"), aid, tt, H, W, var))
 
-    # Water/land mask: land-cover is authoritative where known; elsewhere fall back
-    # to the sensor water union + sea-level bathymetry (no tunable thresholds).
+    # Land-cover water, shipped RAW as a loss-filter channel (1=water, 0=land; unknown ->
+    # water, a no-op filter). Land-masking is a downstream MODELLING determination now, so
+    # the cube ships this raw ingredient rather than an opinionated derived land mask.
     lc_raw = load_landcover(adir("landcover"), aid, H, W)     # 1=water,0=land,NaN=unknown
     lc_known = np.isfinite(lc_raw)
-    water_union = np.zeros((H, W), dtype=bool)
-    for v in sensors.values():
-        water_union |= v["water_union"]          # a sensor with no water layer contributes none
-    fallback = water_union | (np.isfinite(elev) & (elev < 0))
-    water = np.where(lc_known, lc_raw > 0.5, fallback)
-    landmask = (~water).astype("uint8")                       # 1 = land
-    # Raw land-cover water as a loss-filter channel (unknown -> water, a no-op filter).
     landcover_water = np.where(lc_known, lc_raw > 0.5, True).astype("uint8")
-    wf = float(water.mean())
-    if wf > 0.98:
-        log.warning("  %s: water is %.0f%% of the tile -- check the land-cover layer", aid, 100 * wf)
 
-    # MUR is 1 km upsampled: NN-fill it over land-cover water so the backbone has
-    # no holes in narrow estuaries.
-    #
-    # `valid` is computed BEFORE the fill, and this ordering is the whole point: a filled
-    # pixel's value was INVENTED by copying the nearest offshore cell, and flagging it
-    # valid would tell a model that a fabricated number is an observation. So `valid` means
-    # OBSERVED, `filled` means INVENTED-BUT-USABLE, and a consumer can choose. (There is no
-    # distance cap on the fill, so a filled pixel can be far from the cell it copied --
-    # another reason the two must be distinguishable.)
-    mur_observed = np.isfinite(mur_sst)
-    if eff["fill_mur_water"]:
-        mur_sst = fill_water_nn(mur_sst, water)
-    mur_valid = mur_observed.astype("uint8")
-    mur_filled = (np.isfinite(mur_sst) & ~mur_observed).astype("uint8")
+    # MUR ships its OBSERVED values with honest NaN gaps -- no NN water fill. Water-filling
+    # is a downstream determination the model makes per-process from the raw channels.
 
-    # PER-DAY SOURCE. The products that fall back do so a DAY AT A TIME -- CMEMS can serve
-    # reanalysis in March and forecast in April, met can drop from HRRR to ERA5 for a
-    # fortnight -- and the per-product provenance record unions those into a set, which
-    # says "both" and tells you nothing about the day you are looking at. These channels
-    # carry the answer on the time axis, so a row of the cube can be traced to the file
-    # that made it. (mur/modis have one source each, so a channel would be a constant.)
-    src_channels, src_legends = {}, {}
-    for product, prefix in (("met", mprefix), ("cmems", "")):
-        codes, legend = provenance.daily_sources(adir(product), aid, days, prefix=prefix)
-        if len(legend) > 1:                       # >1 means at least one file was found
-            src_channels[f"{product}_source"] = (("time",), np.array(codes, "uint8"))
-            src_legends[f"{product}_source"] = legend
-
-    # CMEMS is a ~9 km ocean model, so its land mask is far coarser than the AoI grid:
-    # an entire estuary can fall in its land cells. NN-fill over land-cover water for the
-    # same reason MUR is filled -- the nearest offshore water column is the honest value
-    # for a cell the model never resolved. Channels are discovered from the files, so
-    # whatever variables/depths were acquired come through without a second config list.
-    # Each variable carries its OWN filled mask: the model's land mask deepens with depth,
-    # so thetao_0m and thetao_50m are not filled in the same cells.
+    # CMEMS: the offshore water column at the acquired depths, shipped with honest NaN gaps
+    # (its ~9 km land mask can swallow an estuary; downstream fills as it sees fit).
+    # Channels are discovered from the files, so whatever variables/depths were acquired
+    # come through without a second config list.
     cmems_vars = {}
     for var in cmems_channels(adir("cmems"), aid):
         arr = load_daily_sensor(adir("cmems"), aid, days, H, W, var)
-        observed = np.isfinite(arr)
-        if eff["fill_cmems_water"]:
-            arr = fill_water_nn(arr, water)
         cmems_vars[f"cmems_{var}"] = (("time", "y", "x"), arr)
-        cmems_vars[f"cmems_{var}_filled"] = (
-            ("time", "y", "x"), (np.isfinite(arr) & ~observed).astype("uint8"))
 
     # In-situ: the cube's only ground truth. The value goes in the cell the station sits
     # in, sampled at the SAME INSTANT each satellite flew -- so a scene can be validated
@@ -582,7 +511,7 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
         # The daily reference time, plus one target per sensor at its own chosen overpass.
         targets = {"insitu": ref_utc, **sensor_times}
         insitu_vars, station_table, station_map = build_insitu(
-            ids, g, days, water, targets, eff["insitu_max_dt_min"])
+            ids, g, days, targets, eff["insitu_max_dt_min"])
         ids.close()
         log.info("  in-situ: %d station(s) placed", len(station_table))
 
@@ -592,24 +521,14 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     T = ("time", "y", "x")
 
-    # Water level per sensor, at that sensor's overpass time: the DEM re-referenced
-    # to the tide-adjusted waterline, plus its submerged/exposed class. All-NaN /
-    # all-UNKNOWN when bathymetry or tide is absent.
-    wl = {}
-    datum_attrs = {}
-    offset = None
-    if eff["water_level"]:
-        series = water_level.load_tide_series(adir("tides"), aid)
-        # The offset follows the DEM that actually ran, so it is resolved against that
-        # file's fingerprint (see water_level.resolve_datum_offset / processes.datum).
-        offset, datum_attrs = water_level.resolve_datum_offset(
-            eff["project"], aid, bathy_attrs=load_bathy_attrs(adir("bathymetry"), aid))
-        for pre, v in sensors.items():
-            th = water_level.tide_at_overpass(series, days, v["hour"])
-            elev_rel, cls = water_level.water_level_fields(elev, th, datum_offset_m=offset)
-            wl[f"{pre}_tide"] = (("time",), th)
-            wl[f"{pre}_water_elev"] = (T, elev_rel)
-            wl[f"{pre}_water_class"] = (T, cls)
+    # Datum: the DEM->MSL offset downstream needs to reference `elevation` to MSL. Water
+    # level / submerged-exposed classification is now a DOWNSTREAM computation on the raw
+    # ingredients the cube ships (elevation, tide, <s>_hour) plus this offset (D12), so the
+    # per-sensor water_level channels are gone -- only the offset survives, as a cube attr.
+    # It follows the DEM that actually ran, resolved against that file's fingerprint (see
+    # water_level.resolve_datum_offset / processes.datum).
+    _, datum_attrs = water_level.resolve_datum_offset(
+        eff["project"], aid, bathy_attrs=load_bathy_attrs(adir("bathymetry"), aid))
 
     # Each sensor's own channels. `<pre>_cloud` only where the sensor actually publishes a
     # cloud layer: MODIS arrives pre-filtered with none, and an all-zero cloud channel would
@@ -624,14 +543,13 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 
     ds = xr.Dataset(
         {
-            **wl, **op_met, **cmems_vars, **insitu_vars, **src_channels, **sensor_vars,
-            "mur_sst": (T, mur_sst), "mur_valid": (T, mur_valid),
-            "mur_filled": (T, mur_filled),
+            **op_met, **cmems_vars, **insitu_vars, **sensor_vars,
+            "mur_sst": (T, mur_sst),
             "airtemp": (T, airtemp), "wind_u": (T, wind_u), "wind_v": (T, wind_v),
             "wind_speed": (T, wind_speed), "swrad": (T, swrad), "cloud_cover": (T, cloud_cover),
+            "elevation": (("y", "x"), elev),
             "depth": (("y", "x"), depth),
             "depth_p25": (("y", "x"), depth_p25), "depth_p75": (("y", "x"), depth_p75),
-            "landmask": (("y", "x"), landmask),
             **({"insitu_station": (("y", "x"), station_map)} if station_map is not None else {}),
             "landcover_water": (("y", "x"), landcover_water),
             "tide": (("time",), tide), "tide_range": (("time",), tide_range),
@@ -660,30 +578,9 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
                         aid, product, c["days_with_data"], c["days_expected"],
                         100 * c["fraction"])
 
-    # The valid/filled distinction has to travel WITH the cube: a downstream reader who
-    # trains on `mur_sst` without knowing which cells were invented has no way to find out.
-    ds["mur_valid"].attrs["long_name"] = "MUR SST was OBSERVED in this cell (not filled)"
-    ds["mur_filled"].attrs["long_name"] = (
-        "MUR SST was nearest-neighbour filled from the closest observed water cell "
-        "(a plausible value, NOT an observation; no distance cap)")
-    # The legend has to travel WITH the cube: a `met_source` of 2 is meaningless without
-    # the list that says 2 == era5. flag_meanings cannot hold it (source names contain
-    # spaces), so it goes as JSON alongside the numeric flag_values.
-    for cname, legend in src_legends.items():
-        ds[cname].attrs.update(
-            long_name=f"which source produced {cname[:-len('_source')]} on this day",
-            flag_values=np.arange(len(legend), dtype="uint8"),
-            legend=json.dumps(legend))
-        if len(legend) > 2:      # more than "none" + one source -> the source CHANGED
-            log.warning("  %s: %s changed source mid-series (%s); see the `%s` channel "
-                        "for which day came from which",
-                        aid, cname[:-len("_source")], ", ".join(legend[1:]), cname)
-
-    for name in cmems_vars:
-        if name.endswith("_filled"):
-            ds[name].attrs["long_name"] = (
-                f"{name[:-len('_filled')]} was nearest-neighbour filled over water the "
-                "~9 km model did not resolve (NOT an observation)")
+    ds["elevation"].attrs.update(
+        units="m", long_name="ground/seafloor elevation in the DEM's native vertical datum "
+                             "(+ up); add datum_offset_m to reference it to MSL")
 
     if station_table:
         # The station map is an index INTO this table, so the table must travel with the
@@ -714,21 +611,6 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     # offset could not be resolved is complete and plausible-looking, so the only thing
     # that tells a downstream user it is biased is `datum_status` travelling with it.
     ds.attrs.update({k: v for k, v in datum_attrs.items() if v is not None})
-    for pre in sensors:
-        if f"{pre}_water_elev" not in ds:
-            continue
-        ds[f"{pre}_tide"].attrs.update(
-            units="m", long_name=f"tide height at the {pre} overpass (rel. MSL)")
-        ds[f"{pre}_water_elev"].attrs.update(
-            units="m",
-            long_name=f"ground elevation rel. to the waterline at the {pre} overpass "
-                      "(0 at the waterline, + exposed, - submerged)",
-            datum_offset_m=offset)
-        ds[f"{pre}_water_class"].attrs.update(
-            long_name=f"submerged/exposed at the {pre} overpass",
-            flag_values=np.array([water_level.SUBMERGED, water_level.EXPOSED,
-                                  water_level.UNKNOWN], dtype="uint8"),
-            flag_meanings="submerged exposed unknown")
     return ds
 
 
@@ -853,9 +735,6 @@ def _build_eff(project: Project) -> dict:
         "aligned_root": root,                         # per-product <DIR>/aligned/<aoi>
         "out_dir": root / dc.output_subdir,
         "chunks": dict(dc.chunks),
-        "fill_mur_water": bool(dc.fill_mur_water),
-        "fill_cmems_water": bool(dc.fill_cmems_water),
-        "water_level": bool(dc.water_level),
         "met_time": str(dc.met_time),
         "overpass_met": list(dc.overpass_met),
         "insitu": bool(dc.insitu),

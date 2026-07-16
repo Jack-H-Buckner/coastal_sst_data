@@ -316,23 +316,23 @@ class CompressionSpec(BaseModel):
 class DataCubeSpec(BaseModel):
     """How the assembler knits the aligned per-product files into one Zarr cube.
 
-    Every field has a default, so the whole `datacube:` block is optional. The
-    water/land mask is derived from land-cover (authoritative where known), so
-    there are no elevation/depth threshold knobs here.
+    Every field has a default, so the whole `datacube:` block is optional. The cube
+    ships raw ingredients on a common grid; masking / filling / derivation are downstream
+    modelling determinations, so there are no mask or fill knobs here.
     """
     model_config = {"extra": "forbid"}
     chunks: dict[str, int] = Field(default_factory=lambda: {"time": 64, "y": 128, "x": 128})
-    fill_mur_water: bool = True                # NN-fill the MUR backbone over land-cover water
-    # Same for the CMEMS ocean-model channels: at ~9 km its land mask can swallow a
-    # whole estuary, so fill those cells from the nearest resolved water column.
-    fill_cmems_water: bool = True
-    # Emit the per-sensor water-level fields (bathymetry + tide re-referenced to the
-    # tide-adjusted waterline at each overpass). Needs both products. The DEM->MSL
-    # datum offset is RESOLVED automatically by the `datum` stage (processes.datum),
-    # not configured: it is a property of the DEM that actually ran and of where the
-    # AoI is, so no project-wide constant can be right across a study area. The only
-    # knob is an optional per-region override, regions[].sources.bathymetry.datum_offset_m.
-    water_level: bool = True
+    # NOTE: `fill_mur_water`, `fill_cmems_water`, and `water_level` were REMOVED -- the cube
+    # now ships raw ingredients (observed values with honest NaN gaps; `elevation` + `depth`
+    # + `tide` for a downstream water-level computation) and masking/filling/derivation are
+    # downstream modelling determinations. `extra="forbid"` means an old config that still
+    # sets any of these three keys fails validation loudly rather than being silently ignored.
+    #
+    # The DEM->MSL datum offset still ships (as the cube attrs datum_offset_m/datum_status);
+    # it is RESOLVED automatically by the `datum` stage (processes.datum) whenever bathymetry
+    # is selected, not configured. The only knob is an optional per-region override,
+    # regions[].sources.bathymetry.datum_offset_m.
+    #
     # Which met file feeds the cube's met channels (airtemp, wind_*, swrad, cloud_cover):
     #   "reference"  -- the daily snapshot at products.met.reference_time (default 10:30
     #                   local solar, Landsat's overpass). One time of day, every day.

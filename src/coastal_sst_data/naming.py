@@ -7,8 +7,7 @@ acquisition stages encode a timestamp into it and the assembler decodes it back 
 `datacube.load_clearest_overpass` finds a sensor's scenes by globbing `<aoi>_*T*.nc` and
 parsing the stamp; `datacube.load_at_times` reconstructs a filename from a datetime to
 fetch the met snapshot taken at that exact overpass; `met.overpass_times_for_day`
-discovers the scenes to snapshot against by parsing the same stamp; `provenance.
-daily_sources` matches per-day files to timesteps the same way.
+discovers the scenes to snapshot against by parsing the same stamp.
 
 Until now that convention was re-declared wherever it was needed -- the same
 `re.compile(r"(\\d{8}T\\d{6})")` appeared in FOUR modules, and the corresponding

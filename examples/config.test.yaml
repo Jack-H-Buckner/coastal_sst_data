@@ -70,9 +70,10 @@ products:
 # Every field has a default, so the whole block is optional.
 datacube:
   chunks: {time: 64, y: 128, x: 128}
-  fill_mur_water: true       # NN-fill the MUR backbone over land-cover water
-  fill_cmems_water: true     # ...and the CMEMS channels (its ~9 km land mask is coarse)
-  water_level: true          # emit the per-sensor water level (needs bathymetry + tides)
+  # NOTE: fill_mur_water / fill_cmems_water / water_level were REMOVED. The cube ships raw
+  # ingredients (observed values with honest NaN gaps; elevation + depth + tide) and
+  # masking/filling/water-level are downstream modelling determinations. The DEM->MSL datum
+  # offset still ships as the datum_offset_m / datum_status cube attributes.
   met_time: reference        # reference (products.met.reference_time) | daily_mean
   insitu: true               # buoy value at the reference time + a matchup per overpass
   insitu_max_dt_min: 60      # matchup tolerance; beyond it an overpass gets NaN

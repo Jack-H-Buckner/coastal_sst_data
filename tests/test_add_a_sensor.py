@@ -107,10 +107,6 @@ def test_provenance_maps_every_channel_it_will_produce(registered):
     assert provenance.SENSORS["viirs"] == "viirs"
     assert provenance.field_inputs("viirs_sst") == ["viirs"]
     assert provenance.field_inputs("viirs_valid") == ["viirs"]
-    assert provenance.field_inputs("viirs_tide") == ["tides", "viirs"]
-    # The derived water-level fields genuinely have four inputs, and the record says so.
-    assert provenance.field_inputs("viirs_water_elev") == [
-        "bathymetry", "tides", "datum", "viirs"]
     assert provenance.field_inputs("viirs_insitu_sst") == ["insitu", "viirs"]
     assert provenance.field_inputs("viirs_airtemp") == ["met", "viirs"]
 
@@ -143,8 +139,8 @@ def _write(project, sub, fname, ds):
 
 def test_an_assembled_cube_gains_the_new_sensors_channels(registered, project):
     """The payoff. Write VIIRS aligned files; the assembler -- untouched -- produces its
-    sst / cloud / valid / hour / tide / water_elev / water_class channels, honouring the
-    validity rule from its SPEC (QC-gated, normal water polarity)."""
+    sst / cloud / valid / hour channels, honouring the validity rule from its SPEC
+    (QC-gated, normal water polarity)."""
     g = grid.project_grids(project)[AOI]
     days = pd.date_range("2026-06-01", "2026-06-02", freq="D")
     H, W = g.height, g.width
@@ -176,8 +172,7 @@ def test_an_assembled_cube_gains_the_new_sensors_channels(registered, project):
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
     # Every channel the sensor family generates, present for a sensor nobody hand-wired.
-    for ch in ("viirs_sst", "viirs_cloud", "viirs_valid", "viirs_hour",
-               "viirs_tide", "viirs_water_elev", "viirs_water_class"):
+    for ch in ("viirs_sst", "viirs_cloud", "viirs_valid", "viirs_hour"):
         assert ch in ds.data_vars, f"{ch} missing"
 
     assert np.nanmean(ds["viirs_sst"].isel(time=0).values) == pytest.approx(291.0)
