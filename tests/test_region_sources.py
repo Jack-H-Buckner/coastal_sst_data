@@ -45,7 +45,7 @@ def _two_continent_project(tmp_path):
             "cmems": {"source": "my", "variables": ["thetao"], "depths": [0.0, 10.0]},
             "insitu": {"source": "ioos", "qc_flags": [1, 2]},
             "tides": {"default_source": "coops"},
-            "bathymetry": {"source": "cudem"},
+            "bathymetry": {"sources": ["cudem"]},
         },
         "auth": {"earthdata": {"auth_strategy": "netrc"},
                  "copernicus": {"auth_strategy": "netrc"}},
@@ -60,7 +60,7 @@ def _two_continent_project(tmp_path):
                  "cmems": {"dataset_id": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"},
                  "insitu": {"source": "ioos", "exclude_stations": ["bogus1"]},
                  "tides": {"source": "eo_tides", "model": "FES2022"},
-                 "bathymetry": {"dem_source": "gmrt"},
+                 "bathymetry": {"sources": ["gmrt"]},
              },
              "areas": [{"name": "ligurian", "center_lat": 44.0, "center_lon": 9.0,
                         "buffer_ns_km": 8, "buffer_ew_km": 8}]},
@@ -94,12 +94,13 @@ def test_tide_source_differs_per_region(tmp_path):
     assert ds["ligurian"]["model"] == "FES2022"
 
 
-def test_bathymetry_dem_differs_per_region(tmp_path):
-    """CUDEM is CONUS-only -> the Mediterranean AoI falls to the global GMRT."""
+def test_bathymetry_dems_differ_per_region(tmp_path):
+    """CUDEM is CONUS-only -> the Mediterranean AoI stacks the global GMRT instead. Distinct
+    -data sources are a LIST now (stacked), region-overridable, with no fallback."""
     from coastal_sst_data.processes import bathymetry
     ds = bathymetry._build_eff(_two_continent_project(tmp_path))["ds"]
-    assert ds["tillamook"]["source"] == "cudem"
-    assert ds["ligurian"]["source"] == "gmrt"
+    assert ds["tillamook"]["sources"] == ["cudem"]
+    assert ds["ligurian"]["sources"] == ["gmrt"]
 
 
 def test_insitu_station_excludes_are_per_region(tmp_path):

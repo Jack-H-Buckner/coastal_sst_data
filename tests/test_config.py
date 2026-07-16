@@ -32,7 +32,7 @@ def test_load_config():
     assert all(isinstance(d, (int, float)) for d in cfg.products[DataProduct.cmems].depths)
     assert cfg.products[DataProduct.landsat].source == "pc"
     # region-dependent source options live under the region's `sources`
-    assert cfg.regions[0].sources[DataProduct.bathymetry].dem_source == "cudem"
+    assert cfg.regions[0].sources[DataProduct.bathymetry].sources == ["cudem"]
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +474,7 @@ def test_earthdata_auth_invalid_strategy_rejected():
 def test_source_for_selected_product_ok(base_project):
     """Control: a source for a product that IS in `products` validates."""
     cfg = parse_config(base_project)                  # bathymetry is selected
-    assert cfg.regions[0].sources[DataProduct.bathymetry].dem_source == "cudem"
+    assert cfg.regions[0].sources[DataProduct.bathymetry].sources == ["cudem"]
 
 
 def test_source_for_unselected_product_rejected(base_project):
@@ -549,35 +549,41 @@ def test_a_typo_gets_a_suggestion(base_project):
         parse_config(_cfg(base_project, "bathymetry", {"stats_subgrid": 10}))
 
 
-def test_bathymetry_source_is_now_a_recognised_option(base_project):
-    """It was documented, settable, and silently discarded -- the module read
-    `default_source`, so `source: cudem` quietly produced ~100 m GMRT."""
-    p = parse_config(_cfg(base_project, "bathymetry", {"source": "cudem"}))
-    assert p.products[DataProduct.bathymetry].source == "cudem"
-
-
-def test_source_wins_over_default_source(base_project):
+def test_bathymetry_sources_is_a_list_read_by_the_module(base_project):
+    """Distinct-data sources are a STACKED list (D10): the config lists the DEMs, and the
+    module reads exactly that list (no `source`/`fallback`/`default_source` any more)."""
     from coastal_sst_data.processes import bathymetry
-    p = parse_config(_cfg(base_project, "bathymetry", {"source": "cudem"}))
-    assert bathymetry._build_eff(p)["ds"]["a1"]["source"] == "cudem"    # the config is OBEYED
+    cfg = _cfg(base_project, "bathymetry", {"sources": ["cudem", "gmrt"]})
+    cfg["regions"][0]["sources"] = None      # no region override -> the global list flows through
+    p = parse_config(cfg)
+    assert bathymetry._build_eff(p)["ds"]["a1"]["sources"] == ["cudem", "gmrt"]
 
 
-def test_default_source_still_works(base_project):
-    from coastal_sst_data.processes import bathymetry
-    p = parse_config(_cfg(base_project, "bathymetry", {"default_source": "cudem"}))
-    assert bathymetry._build_eff(p)["ds"]["a1"]["source"] == "cudem"
+@pytest.mark.parametrize("removed", ["source", "fallback", "default_source", "dem_source"])
+def test_removed_bathymetry_source_keys_are_rejected(base_project, removed):
+    """S3 removed pick-one/fallback for bathymetry. An un-migrated config setting any of these
+    fails loudly (pointing at `sources`) rather than being silently ignored."""
+    with pytest.raises(ValidationError, match="SILENTLY IGNORED"):
+        parse_config(_cfg(base_project, "bathymetry", {removed: "cudem"}))
+
+
+def test_empty_or_unknown_stacked_sources_are_rejected(base_project):
+    with pytest.raises(ValidationError, match="is empty"):
+        parse_config(_cfg(base_project, "bathymetry", {"sources": []}))
+    with pytest.raises(ValidationError, match="unknown source"):
+        parse_config(_cfg(base_project, "bathymetry", {"sources": ["gebco"]}))
 
 
 def test_unknown_region_source_key_is_rejected(base_project):
     cfg = copy.deepcopy(base_project)
-    cfg["regions"][0]["sources"] = {"bathymetry": {"dem_sauce": "cudem"}}
-    with pytest.raises(ValidationError, match="did you mean 'dem_source'"):
+    cfg["regions"][0]["sources"] = {"bathymetry": {"sourcez": ["cudem"]}}
+    with pytest.raises(ValidationError, match="did you mean 'sources'"):
         parse_config(cfg)
 
 
 def test_known_region_source_key_is_accepted(base_project):
     cfg = copy.deepcopy(base_project)
-    cfg["regions"][0]["sources"] = {"bathymetry": {"dem_source": "cudem",
+    cfg["regions"][0]["sources"] = {"bathymetry": {"sources": ["cudem"],
                                                    "datum_offset_m": 1.3}}
     parse_config(cfg)          # must not raise
 

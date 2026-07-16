@@ -89,6 +89,22 @@ class Kind(str, Enum):
     STATION_TABLE = "station_table"      # <aoi>_insitu.nc, dims (station, time) -- in-situ
 
 
+class SourceKind(str, Enum):
+    """For a source-selectable product (`sources=`), what its multiple sources MEAN.
+
+    ACCESS -- REDUNDANT access to the SAME data through different pipes (Landsat via
+              Planetary Computer vs AWS; ESA land-cover vs WorldCover). Pick ONE; the
+              cube gets a single channel and the output lives in one `<DIR>/aligned/<aoi>`.
+    DATA   -- DISTINCT data that the user STACKS (bathymetry CUDEM + GMRT; later met
+              HRRR + ERA5). Each source is acquired independently, writes its own
+              `<DIR>/<source>/aligned/<aoi>` tree, and the cube emits ONE channel per
+              source (`depth_cudem`, `depth_gmrt`). There is no fallback and no
+              default -- the user loads as many sources as they need to span coverage.
+    """
+    ACCESS = "access"
+    DATA = "data"
+
+
 @dataclass(frozen=True)
 class SensorSpec:
     """A per-overpass thermal sensor, and how to read its validity.
@@ -131,6 +147,10 @@ class ProductSpec:
     module: str | None = None
     sources: dict[str, str | None] | None = None
     default_source: str | None = None
+    # For a `sources=` product, whether its sources are REDUNDANT ACCESS (pick-one, one
+    # channel, one directory) or DISTINCT DATA (stacked, one channel + one directory PER
+    # source). Only meaningful when `sources` is set; ignored for `module=` singletons.
+    source_kind: SourceKind = SourceKind.ACCESS
 
     # --- config surface -------------------------------------------------- #
     # Which options the module actually READS. A key not listed here does NOTHING, and
@@ -195,6 +215,17 @@ class ProductSpec:
     def known_sources(self) -> tuple[str, ...]:
         return tuple(sorted(self.sources)) if self.sources else ()
 
+    @property
+    def is_stacked_data(self) -> bool:
+        """True when this product's sources are DISTINCT DATA stacked one-channel-per-source
+        (bathymetry), as opposed to REDUNDANT ACCESS picked one-at-a-time (Landsat)."""
+        return self.sources is not None and self.source_kind is SourceKind.DATA
+
+    def one_module(self) -> str | None:
+        """The single module a DATA product's sources all share (it fans out over its
+        sources internally). Only valid for a `is_stacked_data` product."""
+        return next(iter(self.sources.values()))
+
 
 # --------------------------------------------------------------------------- #
 # THE REGISTRY
@@ -214,13 +245,20 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.bathymetry,
         dir="BATHYMETRY",
         kind=Kind.STATIC_RASTER,
-        module="coastal_sst_data.processes.bathymetry",
+        # DISTINCT-DATA sources, STACKED one channel per source (D10). Both DEMs are served
+        # by the one bathymetry module, which fans out over the configured `sources` list
+        # internally; there is no default and no fallback -- the user stacks what they need.
+        sources={
+            "cudem": "coastal_sst_data.processes.bathymetry",
+            "gmrt": "coastal_sst_data.processes.bathymetry",
+        },
+        source_kind=SourceKind.DATA,
         options=_COMMON | {
-            "source", "default_source", "fallback", "pad_deg", "layer", "resolution",
+            "sources", "pad_deg", "layer", "resolution",
             "stats_subgrid_m", "min_cudem_cover", "cudem_urllist", "cudem_index_cache"},
-        # CUDEM is CONUS-only, so an AoI outside it must name its own DEM.
-        region_options=frozenset({"source", "dem_source", "fallback", "datum_offset_m"}),
-        region_only_options=frozenset({"dem_source", "datum_offset_m"}),
+        # CUDEM is CONUS-only, so an AoI outside it stacks GMRT (or its own DEM) instead.
+        region_options=frozenset({"sources", "datum_offset_m"}),
+        region_only_options=frozenset({"datum_offset_m"}),
         required_vars=("elevation", "depth", "depth_p25", "depth_p75"),
         provenance_inputs=("bathymetry",),
     ),
@@ -406,9 +444,11 @@ def sensors() -> tuple[ProductSpec, ...]:
 
 # --------------------------------------------------------------------------- #
 # Derived stages: not products, so not selectable in a config, but they own an output
-# directory that provenance and the assembler must be able to find.
+# directory that provenance and the assembler must be able to find. (The datum offset is
+# resolved INSIDE the bathymetry module now and ships with each DEM source's output, so
+# there is no longer a standalone DATUM stage or sidecar directory.)
 # --------------------------------------------------------------------------- #
-DERIVED_DIRS: dict[str, str] = {"datum": "DATUM"}
+DERIVED_DIRS: dict[str, str] = {}
 
 
 def product_dirs() -> dict[str, str]:
@@ -419,6 +459,15 @@ def product_dirs() -> dict[str, str]:
     `tide` and another said `tides` are gone.
     """
     return {s.product.value: s.dir for s in REGISTRY} | DERIVED_DIRS
+
+
+def aligned_rel(dir_name: str, source: str | None = None) -> str:
+    """The '<DIR>[/<source>]/aligned' path segment for a product's aligned tree.
+
+    A DATA (stacked) product nests each source under its own `<source>` level so the DEMs
+    do not overwrite one another; every other product keeps the flat `<DIR>/aligned`.
+    """
+    return f"{dir_name}/{source}/aligned" if source else f"{dir_name}/aligned"
 
 
 # --------------------------------------------------------------------------- #
@@ -432,10 +481,21 @@ def _check_registry() -> None:
             raise RuntimeError(
                 f"{s.product.value}: set exactly one of `module` (single implementation) "
                 "or `sources` (source-selectable).")
-        if s.sources is not None and s.default_source not in s.sources:
+        if s.sources is not None and s.source_kind is SourceKind.ACCESS \
+                and s.default_source not in s.sources:
             raise RuntimeError(
                 f"{s.product.value}: default_source {s.default_source!r} is not one of "
                 f"{sorted(s.sources)}.")
+        if s.is_stacked_data:
+            # A DATA product has no pick-one default (the user stacks sources), and its one
+            # module fans out over all of them, so every source must resolve to that module.
+            if s.default_source is not None:
+                raise RuntimeError(
+                    f"{s.product.value}: a DATA (stacked) product takes no default_source.")
+            if len(set(s.sources.values())) != 1 or None in set(s.sources.values()):
+                raise RuntimeError(
+                    f"{s.product.value}: DATA sources must all map to ONE implemented module "
+                    f"(it fans out over sources internally); got {s.sources}.")
         # Auth keyed by source must cover exactly the declared sources, or a config naming a
         # valid source would fail auth resolution with a confusing "not recognized".
         if isinstance(s.auth, dict):

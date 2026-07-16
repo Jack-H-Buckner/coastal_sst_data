@@ -575,6 +575,43 @@ class Project(BaseModel):
                 + "\n  ".join(problems))
         return self
 
+    @model_validator(mode="after")
+    def _stacked_source_lists_are_valid(self):
+        """A DATA (stacked) product's `sources` must be a non-empty list of known sources.
+
+        Distinct-data products (bathymetry) STACK the sources the user lists -- so an empty
+        list means "acquire nothing" and an unknown name is a typo that would silently drop a
+        DEM. Both fail here, at load time, rather than producing a cube missing a channel the
+        config asked for. (Absent `sources` is fine: the module defaults to every known one.)
+        """
+        problems: list[str] = []
+
+        def check(where: str, product: DataProduct, opts):
+            s = spec(product)
+            if not s.is_stacked_data:
+                return
+            val = (getattr(opts, "model_extra", None) or {}).get("sources")
+            if val is None:
+                return
+            names = [val] if isinstance(val, str) else list(val)
+            if not names:
+                problems.append(f"{where}.{product.value}.sources is empty; list at least "
+                                f"one of {list(s.known_sources)}.")
+            for name in names:
+                if name not in s.known_sources:
+                    problems.append(f"{where}.{product.value}.sources has unknown source "
+                                    f"{name!r}; choose from {list(s.known_sources)}.")
+
+        for product, opts in self.products.items():
+            check("products", product, opts)
+        for r in self.regions:
+            for product, opts in r.sources.items():
+                check(f"regions[{r.name}].sources", product, opts)
+
+        if problems:
+            raise ValueError("invalid stacked-source list(s):\n  " + "\n  ".join(problems))
+        return self
+
     # What this project was LOADED FROM. Kept so an assembled datacube can embed the
     # exact config that produced it -- a cube whose config has since been edited, moved,
     # or deleted is still reproducible from its own attrs. Private (not config fields), so

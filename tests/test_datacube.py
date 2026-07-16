@@ -121,14 +121,20 @@ def write_cmems(project, g, days, *, land_cols):
         _write(project, "CMEMS", f"{AOI}_{day.strftime('%Y%m%d')}.nc", ds)
 
 
-def write_bathymetry(project, g):
+def write_bathymetry(project, g, src="cudem", *, datum_offset_m=1.3, datum_status="ok"):
+    """One DEM source's aligned output (BATHYMETRY/<src>/aligned/<aoi>), datum stamped on."""
     H, W, xs, ys = _grid_hw(g)
     ds = xr.Dataset({"elevation": (("y", "x"), np.full((H, W), -10.0, "float32")),
                      "depth": (("y", "x"), np.full((H, W), 10.0, "float32")),
                      "depth_p25": (("y", "x"), np.full((H, W), 8.0, "float32")),
                      "depth_p75": (("y", "x"), np.full((H, W), 12.0, "float32"))},
                     coords={"y": ys, "x": xs})
-    _write(project, "BATHYMETRY", f"{AOI}.nc", ds)
+    ds.attrs.update(bathy_source=src, datum_offset_m=datum_offset_m, datum_status=datum_status,
+                    datum_method="stub",
+                    dem_vertical_datum="NAVD88" if src == "cudem" else "MSL_APPROX")
+    d = project.output_dir / "BATHYMETRY" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}.nc")
 
 
 def write_landcover(project, g, *, land_cols):
@@ -154,11 +160,14 @@ def test_channel_layout_and_dims(project, grids, days):
 
     assert ds.sizes == {"time": len(days), "y": g.height, "x": g.width}
     for v in ["mur_sst", "eco_sst", "lst_sst", "modis_sst", "airtemp",
-              "elevation", "depth", "landcover_water", "tide", "doy_sin"]:
+              "elevation_cudem", "depth_cudem", "landcover_water", "tide", "doy_sin"]:
         assert v in ds.data_vars
-    # The raw-output simplification (S1) removed these derived/fill channels.
-    for gone in ["landmask", "mur_valid", "mur_filled", "eco_water_elev", "eco_tide"]:
+    # S1 removed these derived/fill channels; S3 made bathymetry per-source (no bare names).
+    for gone in ["landmask", "mur_valid", "mur_filled", "eco_water_elev", "eco_tide",
+                 "elevation", "depth"]:
         assert gone not in ds.data_vars
+    # Each DEM source's datum offset rides on its own elevation channel (S3).
+    assert ds["elevation_cudem"].attrs["datum_offset_m"] == pytest.approx(1.3)
     assert ds["mur_sst"].dtype == np.float32
     assert ds["landcover_water"].dtype == np.uint8
     assert list(pd.to_datetime(ds["time"].values)) == list(days)
@@ -179,21 +188,33 @@ def test_mur_ships_raw_observed_values_with_honest_nan_gaps(project, grids, days
     assert "mur_filled" not in ds.data_vars
 
 
-def test_missing_bathymetry_gives_nan_depth_not_a_fabricated_sea_level(project, grids, days,
-                                                                       caplog):
-    """The worst bug in the audit: with no DEM, `np.where(elev < 0, -elev, 0.0)` took the
-    0.0 branch for every cell (np.nan < 0 is False) and shipped a flawless, NaN-free
-    'everything is exactly at sea level' bathymetry that looked entirely real."""
+def test_no_bathymetry_means_no_channels_not_a_fabricated_sea_level(project, grids, days):
+    """With no DEM acquired, the cube ships NO bathymetry channels -- an ABSENT product, not a
+    fabricated one. (The old bug shipped a flawless 'everything at sea level' DEM.)"""
     g = grids[AOI]
     write_mur(project, g, days, water_hole_cols=slice(0, 0))
     write_landcover(project, g, land_cols=slice(0, 5))
     # deliberately NO write_bathymetry(...)
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert not [v for v in ds.data_vars if v.startswith(("elevation", "depth"))]
+
+
+def test_a_dem_without_usable_elevation_gives_nan_not_zeros(project, grids, days, caplog):
+    """The worst audit bug: `np.where(elev < 0, -elev, 0.0)` took the 0.0 branch for every
+    cell when elev was all-NaN, fabricating a NaN-free sea-level DEM. A per-source file that
+    lacks a usable elevation must yield NaN, not zeros."""
+    g = grids[AOI]
+    H, W, xs, ys = _grid_hw(g)
+    d = project.output_dir / "BATHYMETRY" / "cudem" / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    # a file with NO usable elevation (and no depth) -> nothing to derive depth from
+    xr.Dataset({"junk": (("y", "x"), np.zeros((H, W), "float32"))},
+               coords={"y": ys, "x": xs}).to_netcdf(d / f"{AOI}.nc")
     with caplog.at_level("WARNING"):
         ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-
-    for v in ("elevation", "depth", "depth_p25", "depth_p75"):
-        assert np.isnan(ds[v].values).all(), f"{v} was fabricated, not NaN"
-    assert "no bathymetry file" in caplog.text        # and the user is TOLD
+    assert np.isnan(ds["elevation_cudem"].values).all()
+    assert np.isnan(ds["depth_cudem"].values).all(), "depth was fabricated, not NaN"
+    assert "no usable `elevation`" in caplog.text
 
 
 def test_clearest_overpass_is_kept(project, grids, days):
@@ -690,7 +711,8 @@ def _write_full_fixture(project, g, days):
     dates are fixed, so every derived channel (fills, water level, coverage, doy) is stable.
     """
     write_mur(project, g, days, water_hole_cols=slice(0, 3))
-    write_bathymetry(project, g)
+    write_bathymetry(project, g, "cudem", datum_offset_m=1.3, datum_status="ok")
+    write_bathymetry(project, g, "gmrt", datum_offset_m=0.0, datum_status="ok")  # stacked (D10)
     write_landcover(project, g, land_cols=slice(0, 5))
     write_ecostress_two_scenes(project, g, days[0])      # clearest scene 20:00
     write_landsat(project, g, days[0], hour=18)

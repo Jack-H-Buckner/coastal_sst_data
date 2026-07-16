@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-coastal_sst_data -- DEM vertical-datum offset (derived stage; runs after bathymetry).
+coastal_sst_data -- DEM vertical-datum offset RESOLVER (a library, used by bathymetry).
 
-The datacube's water-level fields need the DEM and the tide on ONE vertical datum:
+Referencing a DEM's `elevation` to MSL needs the DEM and the tide on ONE vertical datum:
 
     elev_msl = elev_dem - datum_offset_m        # datum_offset_m = MSL in the DEM's datum
-    water_elev = elev_msl - tide                # tide is rel. MSL
 
-This stage RESOLVES `datum_offset_m` per AoI instead of making the user type it in.
-The right value is a property of (the DEM that actually ran, where the AoI is) --
-not of the project -- so it cannot be a project-wide constant:
+`resolve_aoi(grid, elevation, dem_source, ...)` computes that offset per (AoI, DEM source).
+It is called INLINE by the bathymetry module as each DEM source is acquired, so the offset
+travels with that source's output (stamped as its `datum_offset_m` / `datum_status` attrs)
+rather than in a separate stage/sidecar. Adding a bathymetry source therefore means adding
+its `DEM_DATUM` entry here -- part of the contract for a new DEM.
+
+The right value is a property of (the DEM that actually ran, where the AoI is) -- not of
+the project -- so it cannot be a project-wide constant:
 
   * CUDEM is referenced to NAVD88, a GEODETIC datum. MSL is a TIDAL one (the 19-year
     mean of observed water level). The gap between the two surfaces is LOCAL: ~1.3 m
@@ -21,41 +25,33 @@ not of the project -- so it cannot be a project-wide constant:
     made. (Residual geoid-vs-LMSL difference is well under GMRT's own vertical error
     at 100 m in an estuary.)
 
-Crucially the offset must follow the DEM that WON, not the one configured: bathymetry
-falls back cudem->gmrt when CUDEM lacks coverage, so a region configured for CUDEM can
-end up holding a GMRT DEM. We read the DEM that actually ran back off its own output.
+Because each DEM source is now acquired into its OWN tree and the offset is resolved for it
+right there, the offset always follows the DEM it belongs to -- there is no separate stage
+reading a possibly-stale winner back off disk, and no cudem->gmrt fallback to track.
 
 Both tide sources are zero-mean (CO-OPS harmonic constituents carry no Z0 term; EOT20
 likewise), so the TIDE side of the equation needs no correction -- only the DEM side.
 Both are on the 1983-2001 NTDE, so a ~5-15 cm residual against contemporaneous MSL
 remains; it is recorded, not corrected.
 
-Output -- one small sidecar per AoI, so the datacube assembler stays OFFLINE:
-
-    <output_dir>/DATUM/aligned/<aoi>/<aoi>_datum.json
-
-It is read back by processes.water_level. Because it reads the DEM off disk rather than
-re-fetching it, this stage is idempotent, cheap, and BACKFILLS an existing data tree
-without re-downloading a single DEM tile:
-
-    coastal-sst-data datum --config config.yaml
+The result is a small record; bathymetry stamps `datum_offset_m` / `datum_status` /
+`datum_method` onto each DEM source's output, and the datacube assembler surfaces them as
+per-source cube attributes. To re-resolve, re-run bathymetry with `--overwrite` (there is no
+separate `datum` subcommand any more).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 
 import numpy as np
 import requests
 import xarray as xr
 
 from ..config import DataProduct, Project, opt, resolve_opts
-from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, report, store
+from ..grid import AoiGrid
 from . import tides
 
 log = logging.getLogger(__name__)
@@ -492,104 +488,6 @@ def _apply_override(rec: dict, override: float | None, aoi: str) -> dict:
     return rec
 
 
-# --------------------------------------------------------------------------- #
-# Sidecar I/O
-# --------------------------------------------------------------------------- #
-def sidecar_path(root: Path, aoi_id: str) -> Path:
-    return Path(root) / "DATUM" / "aligned" / aoi_id / f"{aoi_id}_datum.json"
-
-
-def bathy_path(root: Path, aoi_id: str) -> Path:
-    return Path(root) / "BATHYMETRY" / "aligned" / aoi_id / f"{aoi_id}.nc"
-
-
-def load_sidecar(root: Path, aoi_id: str) -> dict | None:
-    f = sidecar_path(root, aoi_id)
-    if not f.exists():
-        return None
-    try:
-        return json.loads(f.read_text())
-    except (OSError, ValueError) as exc:
-        log.warning("  %s: unreadable datum sidecar (%s)", aoi_id, exc)
-        return None
-
-
-def write_sidecar(root: Path, aoi_id: str, rec: dict) -> Path:
-    f = sidecar_path(root, aoi_id)
-    return store.write_text(f, json.dumps(rec, indent=2, sort_keys=True) + "\n")
-
-
-# --------------------------------------------------------------------------- #
-# Stage entry points
-# --------------------------------------------------------------------------- #
-def _read_bathy(root: Path, aoi_id: str, shape) -> tuple[np.ndarray, str, str]:
-    """(elevation, dem_source, fingerprint) from the AoI's bathymetry output."""
-    f = bathy_path(root, aoi_id)
-    if not f.exists():
-        raise FileNotFoundError(f"no bathymetry output at {f}; run the bathymetry stage first")
-    with xr.open_dataset(f) as ds:
-        if "elevation" not in ds or ds["elevation"].shape != shape:
-            raise ValueError(f"{f} has no usable `elevation` on the AoI grid")
-        elev = ds["elevation"].values.astype("float32")
-        dem_source = dem_source_of(ds)
-        fingerprint = str(ds.attrs.get("source", ""))
-    return elev, dem_source, fingerprint
-
-
-def run(project: Project, grids: dict[str, AoiGrid], only_aoi, dry_run, overwrite):
-    """Resolve + write the datum sidecar for each AoI."""
-    root = Path(project.output_dir)
-    names = select_aois(grids, only_aoi)
-
-    stations = None                       # fetched lazily, once, and reused across AoIs
-    rep = report.ProductReport("datum")
-
-    for name in names:
-        g = grids[name]
-        try:
-            elev, dem_source, fingerprint = _read_bathy(root, name, g.shape)
-        except (FileNotFoundError, ValueError) as exc:
-            log.warning("=== %s: %s; skipping ===", name, exc)
-            continue
-
-        old = load_sidecar(root, name)
-        if old and not overwrite and old.get("dem_fingerprint") == fingerprint:
-            log.info("=== %s: datum offset %.3f m already resolved (%s); skipping ===",
-                     name, old.get("datum_offset_m", float("nan")), old.get("method"))
-            continue
-        if old and old.get("dem_fingerprint") != fingerprint:
-            log.info("  %s: the DEM changed since the last resolve; re-resolving", name)
-
-        override = resolve_override(project, name)
-        if dry_run:
-            log.info("=== %s: [dry-run] would resolve the datum for a %s DEM (%s)%s ===",
-                     name, dem_source, DEM_DATUM.get(dem_source, "?"),
-                     f", config override {override}" if override is not None else "")
-            continue
-
-        log.info("=== %s (DEM=%s, %s) ===", name, dem_source, DEM_DATUM.get(dem_source, "?"))
-        if stations is None and DEM_DATUM.get(dem_source) == "NAVD88":
-            try:
-                stations = tides.fetch_stations()
-            except Exception as exc:
-                log.warning("  CO-OPS station list unavailable (%s); no cross-check", exc)
-                stations = []
-
-        rec = resolve_aoi(g, elev, dem_source, override=override, stations=stations)
-        rec["dem_fingerprint"] = fingerprint
-        f = write_sidecar(root, name, rec)
-        log.info("  wrote %s  offset=%.3f m  method=%s  status=%s", f.name,
-                 rec["datum_offset_m"], rec["method"], rec["status"])
-        # An UNRESOLVED datum is written (offset 0.0) and the cube stays plausible-looking,
-        # so it has to show up in the tally or nothing tells the user the cube is biased.
-        if rec["status"].startswith("unresolved"):
-            rep.fail(name, f"datum unresolved ({rec['status']}); offset assumed 0.0 m")
-        else:
-            rep.wrote(source=rec["method"])
-    rep.log_summary()
-    return rep
-
-
 def resolve_override(project: Project, aoi_name: str) -> float | None:
     """The optional region-level `sources.bathymetry.datum_offset_m`, or None.
 
@@ -599,22 +497,3 @@ def resolve_override(project: Project, aoi_name: str) -> float | None:
     """
     val = opt(resolve_opts(project, aoi_name, DataProduct.bathymetry), "datum_offset_m")
     return None if val is None else float(val)
-
-
-def resolve(project: Project, *, grids=None, aois=None, dry_run=False,
-            overwrite=False) -> None:
-    """Resolve the DEM->MSL offset for each AoI. Runs after bathymetry; reads it off disk."""
-    if grids is None:
-        grids = project_grids(project)
-    return run(project, grids, aois, dry_run, overwrite)
-
-
-def main():
-    # A derived stage, so its entry point is `resolve` rather than `acquire` -- but it
-    # takes the same (project, aois, dry_run, overwrite) arguments, so the shared parser
-    # drives it unchanged.
-    entry.process_main(resolve, "coastal_sst_data DEM datum-offset resolver.")
-
-
-if __name__ == "__main__":
-    main()

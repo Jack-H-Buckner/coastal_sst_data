@@ -85,10 +85,13 @@ regions:
     # Region-DEPENDENT source options (which source has coverage here, etc.).
     sources:
       bathymetry:
-        dem_source: cudem
-        # The DEM->MSL datum offset is resolved automatically (NOAA VDatum, cross-checked
-        # against the nearest CO-OPS gauge) -- it follows the DEM that actually ran, so it
-        # is NOT set per project. Uncomment only to assert a value you trust more:
+        # DISTINCT-DATA sources are STACKED, not picked-one: list the DEMs to acquire here
+        # (each gets its own depth_<src>/elevation_<src> channel). CUDEM covers CONUS; add
+        # GMRT to fill gaps outside it. There is no `source`/`fallback`/`dem_source` any more.
+        sources: [cudem]
+        # Each DEM's DEM->MSL datum offset is resolved automatically as it is acquired (NOAA
+        # VDatum for CUDEM/NAVD88, 0 for GMRT/MSL) and ships as per-source cube attributes.
+        # Uncomment only to assert a value you trust more for this region:
         # datum_offset_m: 1.31   # elevation of MSL in the DEM's datum (m)
     # list aois in the region.
     areas:

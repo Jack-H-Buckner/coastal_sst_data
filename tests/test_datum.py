@@ -1,10 +1,8 @@
-"""DEM vertical-datum resolver. All network goes through the single seam
-`datum._http_json`, which is monkeypatched with table-driven fakes -- so every test
-here is offline. The emphasis is on the ways this can be silently WRONG (a bad offset
-biases every water-level pixel by ~1 m while the cube still looks healthy), not merely
-missing: the -999999 sentinel, the sign, region pinning, staleness, and the override."""
-
-import json
+"""DEM vertical-datum resolver (a LIBRARY, called inline by the bathymetry module). All
+network goes through the single seam `datum._http_json`, which is monkeypatched with
+table-driven fakes -- so every test here is offline. The emphasis is on the ways this can be
+silently WRONG (a bad offset biases every water-level pixel by ~1 m while the cube still looks
+healthy), not merely missing: the -999999 sentinel, the sign, region pinning, and the override."""
 
 import numpy as np
 import pytest
@@ -12,7 +10,7 @@ import xarray as xr
 
 from coastal_sst_data.config import parse_config
 from coastal_sst_data import grid
-from coastal_sst_data.processes import datacube, datum, water_level
+from coastal_sst_data.processes import datacube, datum
 
 
 AOI = "aoi1"
@@ -33,7 +31,7 @@ STATIONS = [{"id": "9447130", "name": "Seattle", "lat": 45.52, "lon": -123.93}]
 
 
 def _project(tmp_path, override=None):
-    sources = {"bathymetry": {"dem_source": "cudem"}}
+    sources = {"bathymetry": {"sources": ["cudem"]}}
     if override is not None:
         sources["bathymetry"]["datum_offset_m"] = override
     return parse_config({
@@ -80,14 +78,23 @@ class FakeHTTP:
         return sum(1 for u, _ in self.calls if "vdatum" in u)
 
 
-def _bathy(project, g, elev, source='NCEI CUDEM 1/9" (98% cover, 10x10 subgrid)'):
+def _bathy_source(project, g, elev, src, *, datum_offset_m, datum_status="ok",
+                  dem_vertical_datum="NAVD88"):
+    """Write one DEM source's aligned output (BATHYMETRY/<src>/aligned/<aoi>) with its datum
+    offset stamped on -- exactly the shape the bathymetry module now produces per source."""
     xs, ys = g.xy_centers()
-    ds = xr.Dataset({"elevation": (("y", "x"), elev)}, coords={"y": ys, "x": xs})
-    ds.attrs.update(aoi_id=AOI, source=source)
-    d = project.output_dir / "BATHYMETRY" / "aligned" / AOI
+    ds = xr.Dataset(
+        {"elevation": (("y", "x"), elev),
+         "depth": (("y", "x"), np.where(elev < 0, -elev, 0.0).astype("float32")),
+         "depth_p25": (("y", "x"), np.where(elev < 0, -elev, 0.0).astype("float32")),
+         "depth_p75": (("y", "x"), np.where(elev < 0, -elev, 0.0).astype("float32"))},
+        coords={"y": ys, "x": xs})
+    ds.attrs.update(aoi_id=AOI, bathy_source=src, datum_offset_m=datum_offset_m,
+                    datum_status=datum_status, datum_method="vdatum_navd88_to_lmsl",
+                    dem_vertical_datum=dem_vertical_datum)
+    d = project.output_dir / "BATHYMETRY" / src / "aligned" / AOI
     d.mkdir(parents=True, exist_ok=True)
     ds.to_netcdf(d / f"{AOI}.nc")
-    return ds.attrs["source"]
 
 
 def _shore(g):
@@ -306,97 +313,26 @@ def test_navd88_override_on_an_msl_dem_is_rejected(monkeypatch, tmp_path, caplog
 
 
 # --------------------------------------------------------------------------- #
-# The stage: idempotency, dry-run, staleness
+# Hand-off to the cube: each DEM source's offset ships as attrs on its elevation_<src>
+# channel (stamped by bathymetry when it acquired that DEM, surfaced by the assembler).
 # --------------------------------------------------------------------------- #
-def test_stage_writes_a_sidecar_then_is_a_no_op(monkeypatch, project, g):
-    _bathy(project, g, _shore(g))
-    fake = FakeHTTP(vdatum=[VD_OK] * 30, coops=COOPS_OK)
-    monkeypatch.setattr(datum, "_http_json", fake)
-    monkeypatch.setattr(datum.tides, "fetch_stations", lambda: STATIONS)
-
-    datum.resolve(project)
-    rec = json.loads((project.output_dir / "DATUM" / "aligned" / AOI /
-                      f"{AOI}_datum.json").read_text())
-    assert rec["datum_offset_m"] == pytest.approx(1.278)
-    assert rec["dem_source"] == "cudem"
-
-    n = len(fake.calls)
-    datum.resolve(project)                      # second run: already resolved
-    assert len(fake.calls) == n                 # ...zero further requests
-
-
-def test_dry_run_touches_nothing(monkeypatch, project, g):
-    _bathy(project, g, _shore(g))
-    fake = FakeHTTP()
-    monkeypatch.setattr(datum, "_http_json", fake)
-    datum.resolve(project, dry_run=True)
-    assert fake.calls == []
-    assert not (project.output_dir / "DATUM").exists()
-
-
-def test_a_changed_dem_forces_a_re_resolve(monkeypatch, project, g):
-    _bathy(project, g, _shore(g))
-    fake = FakeHTTP(vdatum=[VD_OK] * 60, coops=COOPS_OK)
-    monkeypatch.setattr(datum, "_http_json", fake)
-    monkeypatch.setattr(datum.tides, "fetch_stations", lambda: STATIONS)
-    datum.resolve(project)
-
-    _bathy(project, g, _shore(g), source="GMRT (topo, max)")   # DEM re-ran as GMRT
-    datum.resolve(project)
-    rec = datum.load_sidecar(project.output_dir, AOI)
-    assert rec["dem_source"] == "gmrt" and rec["datum_offset_m"] == 0.0
-
-
-# --------------------------------------------------------------------------- #
-# Hand-off to water_level / the cube
-# --------------------------------------------------------------------------- #
-def test_water_level_reads_the_sidecar(project, g):
-    fp = _bathy(project, g, _shore(g))
-    datum.write_sidecar(project.output_dir, AOI, {
-        "datum_offset_m": 1.278, "method": "vdatum_navd88_to_lmsl", "status": "ok",
-        "dem_source": "cudem", "dem_vertical_datum": "NAVD88", "dem_fingerprint": fp})
-    off, prov = water_level.resolve_datum_offset(
-        project, AOI, bathy_attrs={"source": fp})
-    assert off == pytest.approx(1.278)
-    assert prov["datum_status"] == "ok"
-
-
-def test_a_stale_sidecar_is_refused(project, g, caplog):
-    """The sidecar says CUDEM/1.278, but the DEM on disk is now GMRT: applying the old
-    offset would bias every pixel by 1.3 m while the cube still looked healthy."""
-    datum.write_sidecar(project.output_dir, AOI, {
-        "datum_offset_m": 1.278, "method": "vdatum_navd88_to_lmsl", "status": "ok",
-        "dem_source": "cudem", "dem_fingerprint": 'NCEI CUDEM 1/9" (98% cover, 10x10 subgrid)'})
-    fp = _bathy(project, g, _shore(g), source="GMRT (topo, max)")
-
-    with caplog.at_level("ERROR"):
-        off, prov = water_level.resolve_datum_offset(project, AOI, bathy_attrs={"source": fp})
-    assert off == 0.0                                   # NOT 1.278
-    assert prov["datum_status"] == "unresolved_assumed_zero"
-    assert "resolved for a different DEM" in caplog.text
-
-
-def test_missing_sidecar_falls_back_to_the_region_override(tmp_path):
-    p = _project(tmp_path, override=1.31)
-    off, prov = water_level.resolve_datum_offset(p, AOI)
-    assert off == pytest.approx(1.31)
-    assert prov["datum_method"] == "config_override"
-
-
-def test_the_cube_carries_the_datum_provenance(project, g):
+def test_the_cube_carries_each_sources_datum_on_its_elevation_channel(project, g):
     import pandas as pd
-    fp = _bathy(project, g, np.full((g.height, g.width), -0.5, "float32"))
-    datum.write_sidecar(project.output_dir, AOI, {
-        "datum_offset_m": 1.3, "method": "vdatum_navd88_to_lmsl", "status": "ok",
-        "uncertainty_m": 0.077, "dem_source": "cudem", "dem_vertical_datum": "NAVD88",
-        "tidal_datum_epoch": "1983-2001", "dem_fingerprint": fp})
+    # Two DEMs stacked: CUDEM (NAVD88, offset 1.3) and GMRT (MSL, offset 0) -- and a single
+    # global offset would be WRONG for one of them, which is why it is per source.
+    elev = np.full((g.height, g.width), -0.5, "float32")
+    _bathy_source(project, g, elev, "cudem", datum_offset_m=1.3, dem_vertical_datum="NAVD88")
+    _bathy_source(project, g, elev, "gmrt", datum_offset_m=0.0,
+                  dem_vertical_datum="MSL_APPROX")
     days = pd.date_range("2026-06-01", "2026-06-02", freq="D")
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
-    assert ds.attrs["datum_offset_m"] == pytest.approx(1.3)
-    assert ds.attrs["datum_status"] == "ok"
-    assert ds.attrs["dem_vertical_datum"] == "NAVD88"
-    assert ds.attrs["datum_uncertainty_m"] == pytest.approx(0.077)
+    assert ds["elevation_cudem"].attrs["datum_offset_m"] == pytest.approx(1.3)
+    assert ds["elevation_cudem"].attrs["datum_status"] == "ok"
+    assert ds["elevation_cudem"].attrs["dem_vertical_datum"] == "NAVD88"
+    assert ds["elevation_gmrt"].attrs["datum_offset_m"] == pytest.approx(0.0)
+    # ...and no single global datum attr any more (it would be wrong for one source).
+    assert "datum_offset_m" not in ds.attrs
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

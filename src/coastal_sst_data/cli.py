@@ -100,13 +100,6 @@ def _cmd_provenance(args):
         ds.close()
 
 
-def _cmd_datum(args):
-    from .processes import datum
-    project = load_config(args.config)
-    datum.resolve(project, aois=args.aois, dry_run=args.dry_run,
-                  overwrite=args.overwrite)
-
-
 def _cmd_verify(args):
     project = load_config(args.config)
     try:
@@ -251,15 +244,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_asm.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
     p_asm.set_defaults(func=_cmd_assemble)
 
-    p_dat = sub.add_parser(
-        "datum",
-        help="Resolve each AoI's DEM->MSL datum offset (needed by the water-level fields).")
-    add_common(p_dat)
-    p_dat.add_argument("--aoi", nargs="+", dest="aois", help="Only these AoI name(s).")
-    p_dat.add_argument("--overwrite", action="store_true",
-                       help="Re-resolve offsets that are already on disk.")
-    p_dat.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
-    p_dat.set_defaults(func=_cmd_datum)
+    # The DEM->MSL datum offset is resolved INLINE by the bathymetry stage (per DEM source)
+    # and stamped onto its output, so there is no separate `datum` subcommand -- re-run
+    # `bathymetry --overwrite` to re-resolve it.
 
     p_prov = sub.add_parser(
         "provenance",

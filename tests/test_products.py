@@ -58,8 +58,6 @@ def test_assembler_dirs_and_coverage_are_derived():
             # Overpass sensors must NOT be coverage-checked: a day with no scene is normal,
             # and warning about it would train the user to ignore the warning.
             assert s.product.value not in datacube.DAILY_CHANNELS
-    # The derived stage still gets a directory even though it is not a selectable product.
-    assert datacube.PRODUCT_DIRS["datum"] == "DATUM"
 
 
 def test_provenance_sensor_map_is_derived():

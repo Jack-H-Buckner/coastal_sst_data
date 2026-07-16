@@ -77,7 +77,7 @@ import xarray as xr
 from ..config import CompressionSpec, DataProduct, Project
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, naming, products, provenance, report, store
-from . import insitu, met as met_mod, water_level
+from . import insitu, met as met_mod
 
 log = logging.getLogger(__name__)
 
@@ -458,12 +458,14 @@ class AssemblyContext:
     var_attrs: dict[str, dict]
 
     def adir(self, product: str, source: str | None = None) -> Path:
-        """The <DIR>/aligned/<aoi> folder a product's acquisition stage wrote.
+        """The `<DIR>[/<source>]/aligned/<aoi>` folder a product's acquisition stage wrote.
 
-        `source` is unused today (one directory per product); the per-source layout of
-        stages S3-S4 will resolve it to <DIR>/<source>/aligned/<aoi>.
+        A DISTINCT-DATA (stacked) product nests each source under its own `<source>` level
+        (bathymetry: `BATHYMETRY/cudem/aligned/<aoi>`); every other product is flat
+        (`<DIR>/aligned/<aoi>`), i.e. pass `source=None`.
         """
-        return self.eff["aligned_root"] / PRODUCT_DIRS[product] / "aligned" / self.aid
+        return (self.eff["aligned_root"]
+                / products.aligned_rel(PRODUCT_DIRS[product], source) / self.aid)
 
     def emit(self, name: str, dims, arr, **attrs) -> None:
         """Add a channel (and, optionally, merge in its per-variable attrs)."""
@@ -490,14 +492,31 @@ class Contributor:
 # --------------------------------------------------------------------------- #
 # Contributors (one per product; two derived). Each reads/writes only what it declares.
 # --------------------------------------------------------------------------- #
+_DATUM_ATTRS = ("datum_offset_m", "datum_status", "datum_method", "dem_vertical_datum")
+
+
 def _contribute_bathymetry(ctx: AssemblyContext) -> None:
-    elev, depth, depth_p25, depth_p75 = load_bathy(ctx.adir("bathymetry"), ctx.aid, ctx.H, ctx.W)
-    ctx.emit("elevation", ("y", "x"), elev,
-             units="m", long_name="ground/seafloor elevation in the DEM's native vertical "
-                                  "datum (+ up); add datum_offset_m to reference it to MSL")
-    ctx.emit("depth", ("y", "x"), depth)
-    ctx.emit("depth_p25", ("y", "x"), depth_p25)
-    ctx.emit("depth_p75", ("y", "x"), depth_p75)
+    """DISTINCT-DATA per source (D5): one channel set PER stacked DEM source, discovered from
+    the per-source directories on disk (`BATHYMETRY/<src>/aligned/<aoi>`). Each source's
+    DEM->MSL datum offset -- resolved and stamped by the bathymetry module when it acquired
+    that DEM -- travels as attributes on its `elevation_<src>` channel, so a downstream user
+    references THAT DEM's elevation to MSL with its OWN offset (CUDEM/NAVD88 != GMRT/MSL)."""
+    base = ctx.eff["aligned_root"] / PRODUCT_DIRS["bathymetry"]
+    if not base.exists():
+        return
+    for src in sorted(d.name for d in base.iterdir() if d.is_dir()):
+        adir = ctx.adir("bathymetry", src)
+        if not (adir / f"{ctx.aid}.nc").exists():
+            continue                              # e.g. the _tmp scratch dir, or a lost AoI
+        elev, depth, depth_p25, depth_p75 = load_bathy(adir, ctx.aid, ctx.H, ctx.W)
+        attrs = load_bathy_attrs(adir, ctx.aid)
+        datum = {k: attrs[k] for k in _DATUM_ATTRS if k in attrs}
+        ctx.emit(f"elevation_{src}", ("y", "x"), elev, units="m",
+                 long_name=f"{src} DEM elevation in its native vertical datum (+ up); add "
+                           "datum_offset_m to reference it to MSL", **datum)
+        ctx.emit(f"depth_{src}", ("y", "x"), depth)
+        ctx.emit(f"depth_p25_{src}", ("y", "x"), depth_p25)
+        ctx.emit(f"depth_p75_{src}", ("y", "x"), depth_p75)
 
 
 def _contribute_sensors(ctx: AssemblyContext) -> None:
@@ -740,13 +759,10 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
                         ctx.aid, product, c["days_with_data"], c["days_expected"],
                         100 * c["fraction"])
 
-    # DATUM: the DEM->MSL offset ships as GLOBAL cube attrs so downstream can reference
-    # `elevation` to MSL and reconstruct water level. Retained as a stage (D12) but NOT a
-    # contributor -- it publishes attrs, not a channel. Resolved against the DEM that actually
-    # ran (see water_level.resolve_datum_offset / processes.datum). A cube whose offset could
-    # not be resolved looks complete, so `datum_status` travelling with it is the only signal.
-    _, datum_attrs = water_level.resolve_datum_offset(
-        eff["project"], ctx.aid, bathy_attrs=load_bathy_attrs(ctx.adir("bathymetry"), ctx.aid))
+    # (The DEM->MSL datum offset ships PER SOURCE, as attributes on each `elevation_<src>`
+    # channel -- resolved and stamped by the bathymetry module when it acquired that DEM, and
+    # surfaced by `_contribute_bathymetry`. CUDEM/NAVD88 and GMRT/MSL need different offsets,
+    # so a single global attr would be wrong for one of them.)
 
     # PROVENANCE: the config that built this cube, and for every field the source(s) it came
     # from and when they were accessed. Zarr attrs must be JSON-serialisable, so the structured
@@ -764,7 +780,6 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
         log.warning("  %s: access dates for %s came from FILE MTIMES, not recorded stamps "
                     "(acquired before provenance existed, or the tree was copied)",
                     ctx.aid, ", ".join(sorted(guessed)))
-    ds.attrs.update({k: v for k, v in datum_attrs.items() if v is not None})
     return ds
 
 

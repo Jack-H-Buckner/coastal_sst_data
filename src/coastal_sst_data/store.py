@@ -280,17 +280,24 @@ def scan(root: Path, aois=None, *, deep: bool = True):
     root = Path(root)
     bad: list[tuple[str, Path]] = []
     n = 0
-    for product, required in REQUIRED_VARS.items():
-        base = root / product / "aligned"
-        if not base.exists():
-            continue
-        for aoi_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-            if aois and aoi_dir.name not in aois:
+    for s in REGISTRY:
+        # A DATA (stacked) product nests each DEM under `<DIR>/<source>/aligned`, so walking
+        # only `<DIR>/aligned` would find NOTHING and SILENTLY validate none of it -- exactly
+        # the omission this pass exists to catch. Walk every source's tree for those.
+        if s.is_stacked_data:
+            bases = [root / s.dir / src / "aligned" for src in s.known_sources]
+        else:
+            bases = [root / s.dir / "aligned"]
+        for base in bases:
+            if not base.exists():
                 continue
-            for f in sorted(aoi_dir.glob("*.nc")):
-                n += 1
-                if not is_complete(f, required, deep=deep):
-                    bad.append((product, f))
+            for aoi_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+                if aois and aoi_dir.name not in aois:
+                    continue
+                for f in sorted(aoi_dir.glob("*.nc")):
+                    n += 1
+                    if not is_complete(f, s.required_vars, deep=deep):
+                        bad.append((s.dir, f))
     leftovers = sorted(p for p in root.rglob(f"*{PART_SUFFIX}*"))
     return n, bad, leftovers
 

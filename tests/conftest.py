@@ -28,7 +28,7 @@ def base_project():
                      "mur": {"variable": "analysed_sst"}},
         "regions": [{
             "name": "r1",
-            "sources": {"bathymetry": {"dem_source": "cudem"}},
+            "sources": {"bathymetry": {"sources": ["cudem"]}},
             "areas": [{"name": "a1", "center_lat": 45.0, "center_lon": -123.0,
                        "buffer_ns_km": 25, "buffer_ew_km": 15}],
         }],

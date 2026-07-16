@@ -33,7 +33,7 @@ import logging
 from . import auth, products, report
 from .config import (DataProduct, DEFAULT_SOURCE, Project, load_config, opt, resolve_opts)
 from .grid import AoiGrid, compute_aoi_grid
-from .processes import datacube, datum
+from .processes import datacube
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +116,12 @@ def _module_for(project: Project, product: DataProduct, aoi: str | None = None):
     `aoi=None` answers for the project as a whole (the first AoI's module) -- used by
     `validate`, which is summarising rather than dispatching.
     """
+    spec = products.spec(product)
+    if spec.is_stacked_data:
+        # DISTINCT-DATA sources (bathymetry) are all served by ONE module that fans out over
+        # the configured `sources` list internally, so there is no per-AoI source selector to
+        # resolve here -- dispatch the shared module once and let it stack the sources.
+        return _resolve(spec.one_module())
     sources = SOURCE_MODULES.get(product)
     if sources is None:
         return _resolve(PROCESS_MODULES.get(product))
@@ -262,25 +268,9 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
                     if n)
             run_report.add(product.value, merged)
 
-    # Derived stage: resolve each AoI's DEM->MSL datum offset from the bathymetry file
-    # that was just written (which DEM won is only known now -- bathymetry falls back
-    # cudem->gmrt on coverage failure). Cheap, network-light, and idempotent; it must run
-    # before the assembler, which reads its sidecar to publish datum_offset_m/datum_status
-    # as cube attrs. Gated on bathymetry alone now that the `water_level` config flag is gone
-    # (the per-sensor water-level channels moved downstream; only the offset attr survives).
-    if DataProduct.bathymetry in selected:
-        log.info("=== datum (DEM->MSL offset) ===")
-        try:
-            rep = datum.resolve(project, grids=grids, aois=aois,
-                                dry_run=dry_run, overwrite=overwrite)
-            outcomes["datum"] = rep.outcome if rep is not None else "ok"
-            run_report.add("datum", rep)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            log.error("=== datum FAILED: %s ===", exc)
-            outcomes["datum"] = f"failed: {exc}"
-            run_report.add("datum", None, outcome=f"stage raised: {exc}")
+    # (The DEM->MSL datum offset is no longer a separate stage: bathymetry resolves it INLINE
+    # per DEM source and stamps it onto that source's output, so it always follows the DEM it
+    # belongs to. The datacube assembler surfaces it as per-source cube attributes.)
 
     # Terminal stage: knit the aligned outputs into per-AoI datacubes.
     if assemble:

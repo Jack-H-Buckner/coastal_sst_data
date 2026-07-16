@@ -178,6 +178,9 @@ def field_inputs(name: str) -> list[str]:
         return ["cmems"]
     if name.startswith("mur_"):
         return ["mur"]
+    # Per-source bathymetry (D4/D5): `elevation_cudem`, `depth_gmrt`, `depth_p25_<src>`, ...
+    if any(name.startswith(v + "_") for v in ("elevation", "depth", "depth_p25", "depth_p75")):
+        return ["bathymetry"]
 
     m = _SENSOR_RE.match(name) if _SENSOR_RE else None
     if m:
@@ -236,27 +239,38 @@ def collect(aligned_root: Path, aoi: str, product_dirs: dict) -> dict:
     reconcile two hand-maintained lists that disagreed. With one registry there is one name,
     and the alias is gone.
     """
+    by_value = {s.product.value: s for s in products.REGISTRY}
     out = {}
     for product, sub in product_dirs.items():
-        rec = collect_product(Path(aligned_root) / sub / "aligned" / aoi, product)
+        s = by_value.get(product)
+        if s is not None and s.is_stacked_data:
+            # DATA product: gather across its per-source trees into one merged record. (The
+            # per-source <var>_<source> attribution in field_inputs is a later refinement;
+            # here we only need the product to appear as PRESENT with its combined window.)
+            recs = [r for src in s.known_sources
+                    if (r := collect_product(
+                        Path(aligned_root) / products.aligned_rel(sub, src) / aoi, product))
+                    is not None]
+            rec = _merge_records(recs, product) if recs else None
+        else:
+            rec = collect_product(Path(aligned_root) / sub / "aligned" / aoi, product)
         if rec is not None:
             out[product] = rec
-    # The datum stage writes a JSON sidecar, not a NetCDF; pick it up so water-level
-    # fields can name the resolution that produced their offset.
-    dj = Path(aligned_root) / "DATUM" / "aligned" / aoi / f"{aoi}_datum.json"
-    if dj.exists():
-        import json
-        try:
-            rec = json.loads(dj.read_text())
-            out["datum"] = {"product": "datum",
-                            "sources": [str(rec.get("method", "unknown"))],
-                            "n_files": 1,
-                            "accessed_first": rec.get("resolved_at"),
-                            "accessed_last": rec.get("resolved_at"),
-                            "basis": STAMPED}
-        except ValueError:
-            pass
     return out
+
+
+def _merge_records(recs: list[dict], product: str) -> dict:
+    """Fold one product's per-source records into a single record (union sources / window)."""
+    accessed_first = [r["accessed_first"] for r in recs if r["accessed_first"]]
+    accessed_last = [r["accessed_last"] for r in recs if r["accessed_last"]]
+    return {
+        "product": product,
+        "sources": sorted({s for r in recs for s in r["sources"]}),
+        "n_files": sum(r["n_files"] for r in recs),
+        "accessed_first": min(accessed_first) if accessed_first else None,
+        "accessed_last": max(accessed_last) if accessed_last else None,
+        "basis": STAMPED if all(r["basis"] == STAMPED for r in recs) else FILE_MTIME,
+    }
 
 
 def build(project, fields, products: dict) -> dict:
