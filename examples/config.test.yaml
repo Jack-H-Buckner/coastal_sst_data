@@ -33,15 +33,18 @@ products:
   mur:
     variable: analysed_sst
   cmems:                     # Copernicus Marine global physics (offshore water column)
-    source: my               # my (GLORYS12 reanalysis, default) | anfc (analysis/forecast)
-    fallback: anfc           # covers days past the end of the reanalysis | none
+    # DISTINCT-DATA sources are STACKED (one cmems_<var>_<tag> channel each), not picked-one:
+    # my_global (GLORYS12 reanalysis), anfc_global (analysis/forecast). Regional models
+    # register a tag under `datasets` and a region lists it in `sources` (see below).
+    sources: [my_global, anfc_global]
     variables: [thetao]      # also: so, uo, vo, zos, mlotst
     depths: [0, 10]      # metres; each SNAPPED to the nearest model level
   landsat:
     source: "pc"        # pc (default) | aws | gee
-  met:
-    source: auto              # auto (HRRR -> ERA5) | hrrr | era5
-    fallback: era5            # era5 | none  (backfill where the primary misses)
+  met:                        # daily FORCING (no sensor dependency)
+    # DISTINCT-DATA sources STACKED (one <var>_<src> channel each): hrrr (N. America), era5
+    # (global). No fallback -- a region outside HRRR stacks only era5.
+    sources: [hrrr, era5]
     variables: [airtemp, wind, swrad, cloud]
     # One snapshot per day at a fixed TIME OF DAY -- the cube's default met channel.
     # 10:30 is Landsat's overpass; the basis is LOCAL SOLAR, so it is the same time of
@@ -49,7 +52,11 @@ products:
     reference_time: "10:30"
     reference_basis: solar    # solar (local, per-AOI longitude) | utc
     daily_mean_hours: [0, 6, 12, 18]   # UTC hours averaged for the daily field ([] = skip)
-    overpass_from: [ecostress, landsat]  # snapshot forcing at these scenes' times
+  met_overpass:               # met matched to each thermal sensor's overpass instant
+    sources: [hrrr, era5]
+    variables: [airtemp, wind, swrad, cloud]
+    # Which (sensor, source) pairings to produce -> cube channels <sensor>_<var>_<src>.
+    combinations: [[lst, hrrr], [eco, hrrr]]
   tides:
     interval: h               # prediction step (h = hourly)
     # Optional per-AOI gauge overrides (else nearest CO-OPS water-level station):
@@ -70,24 +77,27 @@ products:
 # Every field has a default, so the whole block is optional.
 datacube:
   chunks: {time: 64, y: 128, x: 128}
-  fill_mur_water: true       # NN-fill the MUR backbone over land-cover water
-  fill_cmems_water: true     # ...and the CMEMS channels (its ~9 km land mask is coarse)
-  water_level: true          # emit the per-sensor water level (needs bathymetry + tides)
+  # NOTE: fill_mur_water / fill_cmems_water / water_level were REMOVED. The cube ships raw
+  # ingredients (observed values with honest NaN gaps; elevation + depth + tide) and
+  # masking/filling/water-level are downstream modelling determinations. The DEM->MSL datum
+  # offset still ships as the datum_offset_m / datum_status cube attributes.
   met_time: reference        # reference (products.met.reference_time) | daily_mean
   insitu: true               # buoy value at the reference time + a matchup per overpass
   insitu_max_dt_min: 60      # matchup tolerance; beyond it an overpass gets NaN
-  # Met also emitted at each sensor's own overpass, as <sensor>_<var> ([] to disable):
-  overpass_met: [airtemp, wind_speed, swrad, cloud_cover]
+  # (Met-at-overpass moved to the `met_overpass` product above; overpass_met was removed.)
 
 regions:
   - name: pnw_estuaries
     # Region-DEPENDENT source options (which source has coverage here, etc.).
     sources:
       bathymetry:
-        dem_source: cudem
-        # The DEM->MSL datum offset is resolved automatically (NOAA VDatum, cross-checked
-        # against the nearest CO-OPS gauge) -- it follows the DEM that actually ran, so it
-        # is NOT set per project. Uncomment only to assert a value you trust more:
+        # DISTINCT-DATA sources are STACKED, not picked-one: list the DEMs to acquire here
+        # (each gets its own depth_<src>/elevation_<src> channel). CUDEM covers CONUS; add
+        # GMRT to fill gaps outside it. There is no `source`/`fallback`/`dem_source` any more.
+        sources: [cudem]
+        # Each DEM's DEM->MSL datum offset is resolved automatically as it is acquired (NOAA
+        # VDatum for CUDEM/NAVD88, 0 for GMRT/MSL) and ships as per-source cube attributes.
+        # Uncomment only to assert a value you trust more for this region:
         # datum_offset_m: 1.31   # elevation of MSL in the DEM's datum (m)
     # list aois in the region.
     areas:

@@ -30,9 +30,9 @@ def _ds(eff):
 # _build_eff: config -> acquisition params
 # --------------------------------------------------------------------------- #
 def test_build_eff_maps_example_config():
-    """The example config maps to the expected met acquisition parameters."""
+    """The example config maps to the expected met FORCING acquisition parameters."""
     eff = met._build_eff(load_config(EXAMPLE))
-    assert _ds(eff)["chain"] == ["hrrr", "era5"]          # source: auto, fallback: era5
+    assert _ds(eff)["sources"] == ["hrrr", "era5"]        # stacked (D10)
     assert _ds(eff)["variables"] == ["airtemp", "wind", "swrad", "cloud"]
     assert _ds(eff)["daily_mean_hours"] == [0, 6, 12, 18]
     assert _ds(eff)["era5_zarr"] == met.ARCO_ERA5_URI     # default ARCO store
@@ -40,12 +40,9 @@ def test_build_eff_maps_example_config():
     assert eff["fmt"] == "netcdf"
     assert eff["time"] == {"start_date": "2026-06-01", "end_date": "2026-06-30"}
     assert eff["grid"]["resolution_m"] == 100.0
-    assert eff["out_dir"] == Path("path/to/data") / "MET" / "aligned"
-    # overpass dirs resolve to the thermal-scene aligned dirs
-    assert eff["overpass_dirs"] == [
-        Path("path/to/data") / "ECOSTRESS" / "aligned",
-        Path("path/to/data") / "LANDSAT" / "aligned",
-    ]
+    assert eff["met_root"] == Path("path/to/data") / "MET"    # per-source dirs under here
+    # overpass documentation is a SEPARATE product now (met_overpass); met carries no overpass.
+    assert "overpass_dirs" not in eff
     # AoI geometry lives in the shared grid (grid.py), not in eff.
     assert "aois" not in eff
 
@@ -61,44 +58,31 @@ def test_build_eff_defaults_when_options_omitted(base_project):
     """A bare `met:` (no options) falls back to product defaults."""
     base_project["products"]["met"] = None                 # bare -> default options
     eff = met._build_eff(parse_config(base_project))
-    assert _ds(eff)["chain"] == ["hrrr", "era5"]
+    assert _ds(eff)["sources"] == met.DEFAULT_SOURCES == ["hrrr", "era5"]
     assert _ds(eff)["variables"] == met.DEFAULT_VARIABLES
     assert _ds(eff)["daily_mean_hours"] == met.DEFAULT_MEAN_HOURS
-    assert eff["overpass_dirs"] == []                       # no overpass_from set
     assert eff["overwrite"] is False
 
 
 def test_build_eff_applies_option_overrides(base_project):
     """met options override the product defaults."""
     base_project["products"]["met"] = {
-        "source": "era5", "variables": ["airtemp", "wind"],
+        "sources": ["era5"], "variables": ["airtemp", "wind"],
         "regrid_radius_m": 3000, "output_format": "geotiff", "overwrite": True,
     }
     eff = met._build_eff(parse_config(base_project))
-    assert _ds(eff)["chain"] == ["era5"]                  # era5-only, no fallback dup
+    assert _ds(eff)["sources"] == ["era5"]                # era5-only stack
     assert _ds(eff)["variables"] == ["airtemp", "wind"]
     assert _ds(eff)["regrid_radius_m"] == 3000.0
     assert eff["fmt"] == "geotiff"
     assert eff["overwrite"] is True
 
 
-# --------------------------------------------------------------------------- #
-# Source chain resolution
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("source,fallback,expected", [
-    ("auto", "era5", ["hrrr", "era5"]),   # default
-    ("hrrr", "era5", ["hrrr", "era5"]),
-    ("era5", "era5", ["era5"]),           # fallback == primary -> not duplicated
-    ("auto", "none", ["hrrr"]),           # fallback disabled
-    ("era5", "none", ["era5"]),
-])
-def test_resolve_chain(source, fallback, expected):
-    assert met._resolve_chain(source, fallback) == expected
-
-
-def test_resolve_chain_rejects_unknown_source():
-    with pytest.raises(ValueError, match="source 'gfs' not recognized"):
-        met._resolve_chain("gfs", "era5")
+def test_unknown_source_is_rejected_at_config_load(base_project):
+    """A typo'd source in the stacked list fails at config validation, before any work."""
+    base_project["products"]["met"] = {"sources": ["gfs"]}
+    with pytest.raises(Exception, match="unknown source"):
+        parse_config(base_project)
 
 
 # --------------------------------------------------------------------------- #
@@ -207,43 +191,35 @@ def test_reference_defaults_are_the_landsat_overpass():
 
 
 # --------------------------------------------------------------------------- #
-# The fallback must be LOUD. This was the quietest failure in the package: a run whose
-# entire met forcing came from 28 km ERA5 instead of 3 km HRRR produced a log in which
-# the string "era5" never appeared.
+# Per-source fetch (no chain, no fallback -- sources are STACKED as separate channels)
 # --------------------------------------------------------------------------- #
 def _stub_sources(monkeypatch, **by_name):
     """Replace the source registry: {name: callable(g, dt, cfg) -> grids or None}."""
     monkeypatch.setattr(met, "_SOURCES", by_name)
 
 
-def test_fetch_at_logs_every_fall_through(monkeypatch, caplog, aoi_grid):
+def test_fetch_one_returns_a_sources_grids(monkeypatch, aoi_grid):
     _stub_sources(monkeypatch,
-                  hrrr=lambda g, dt, cfg: None,                  # a CLEAN None -- was silent
                   era5=lambda g, dt, cfg: {"airtemp": np.zeros((2, 2), "float32")})
-    with caplog.at_level("INFO"):
-        got, src = met._fetch_at(["hrrr", "era5"], aoi_grid, datetime(2023, 7, 15, 18), {})
-
-    assert src == "era5" and got is not None
-    assert "hrrr has no data" in caplog.text        # the fall-through is now stated
-    assert "FELL BACK to era5" in caplog.text       # ...and named as a fallback
+    got = met._fetch_one("era5", aoi_grid, datetime(2023, 7, 15, 18), {})
+    assert got is not None and "airtemp" in got
 
 
-def test_fetch_at_tallies_which_source_served(monkeypatch, aoi_grid):
-    _stub_sources(monkeypatch,
-                  hrrr=lambda g, dt, cfg: None,
+def test_fetch_one_no_data_returns_none_no_substitution(monkeypatch, aoi_grid):
+    """No fallback (D10): a source with no data here yields None (a NaN slice in ITS channel),
+    never the OTHER source's data -- HRRR and ERA5 are not interchangeable."""
+    _stub_sources(monkeypatch, hrrr=lambda g, dt, cfg: None,
                   era5=lambda g, dt, cfg: {"airtemp": np.zeros((2, 2), "float32")})
-    tally = {}
-    for h in (0, 6, 12):
-        met._fetch_at(["hrrr", "era5"], aoi_grid, datetime(2023, 7, 15, h), {}, tally)
-    assert tally == {"era5": 3}          # -> the run can say what actually served it
+    assert met._fetch_one("hrrr", aoi_grid, datetime(2023, 7, 15, 18), {}) is None
 
 
-def test_fetch_at_warns_when_no_source_has_data(monkeypatch, caplog, aoi_grid):
-    _stub_sources(monkeypatch, hrrr=lambda g, dt, cfg: None, era5=lambda g, dt, cfg: None)
-    with caplog.at_level("INFO"):
-        got, src = met._fetch_at(["hrrr", "era5"], aoi_grid, datetime(2023, 7, 15, 18), {})
-    assert got is None and src is None
-    assert "NO source" in caplog.text
+def test_fetch_one_swallows_a_source_error(monkeypatch, aoi_grid, caplog):
+    def boom(g, dt, cfg):
+        raise RuntimeError("herbie exploded")
+    _stub_sources(monkeypatch, hrrr=boom)
+    with caplog.at_level("WARNING"):
+        assert met._fetch_one("hrrr", aoi_grid, datetime(2023, 7, 15, 18), {}) is None
+    assert "hrrr failed" in caplog.text
 
 
 def test_daily_mean_records_the_hours_that_ACTUALLY_contributed(monkeypatch, tmp_path,
@@ -256,25 +232,22 @@ def test_daily_mean_records_the_hours_that_ACTUALLY_contributed(monkeypatch, tmp
             return None
         return {"airtemp": np.full((aoi_grid.height, aoi_grid.width), 290.0, "float32")}
 
-    _stub_sources(monkeypatch, hrrr=only_noon, era5=lambda g, dt, cfg: None)
+    _stub_sources(monkeypatch, hrrr=only_noon)
 
     eff = {
-        # `ds` is keyed by AoI -- met's chain is resolved per AoI, since HRRR is North
-        # America only and a region outside it must start at ERA5.
         "ds": {aoi_grid.name: {
-            "chain": ["hrrr", "era5"], "daily_mean_hours": [0, 6, 12, 18],
+            "sources": ["hrrr"], "daily_mean_hours": [0, 6, 12, 18],
             "reference_time": None, "reference_basis": "solar", "variables": ["airtemp"],
             "model": "auto", "fxx": 0, "product": "sfc", "regrid_radius_m": 6000.0}},
         "grid": {"to_celsius": False},
-        "out_dir": tmp_path, "fmt": "netcdf", "overwrite": False,
-        "overpass_dirs": {},
+        "met_root": tmp_path, "fmt": "netcdf", "overwrite": False,
         "time": {"start_date": "2023-07-15", "end_date": "2023-07-15"},
         "config_sha256": "x",
     }
     with caplog.at_level("WARNING"):
         met.run(eff, {aoi_grid.name: aoi_grid}, None, False)
 
-    f = tmp_path / aoi_grid.name / f"{aoi_grid.name}_20230715.nc"
+    f = tmp_path / "hrrr" / "aligned" / aoi_grid.name / f"{aoi_grid.name}_20230715.nc"
     with xr.open_dataset(f) as ds:
         assert ds.attrs["daily_mean_hours"] == "[12]"                  # what we GOT
         assert ds.attrs["daily_mean_hours_requested"] == "[0, 6, 12, 18]"   # what we asked

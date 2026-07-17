@@ -1,16 +1,18 @@
-"""Bathymetry: config -> params, per-region DEM source resolution, and the
-source-registry / fallback machinery. Pure/offline (no CUDEM or GMRT network).
+"""Bathymetry: config -> params, per-region STACKED DEM sources (D10), and the per-source
+acquisition (each DEM its own tree, its datum resolved inline). Pure/offline (no CUDEM or
+GMRT network; the datum resolver + CO-OPS station fetch are stubbed).
 
-The fallback + registry tests inject STUB sources into `bathymetry.SOURCES`, so
-they exercise the machinery independently of cudem/gmrt -- proving new sources
-(gebco, copernicus_glo30, ...) will plug in without touching this logic."""
+The registry tests inject STUB sources into `bathymetry.SOURCES`, so they exercise the
+machinery independently of cudem/gmrt -- proving new sources (gebco, ...) plug in cleanly."""
 
 from pathlib import Path
 
 import numpy as np
 import pytest
+import xarray as xr
 
-from coastal_sst_data.config import load_config, parse_config
+from coastal_sst_data import grid, products
+from coastal_sst_data.config import DataProduct, load_config, parse_config
 from coastal_sst_data.processes import bathymetry as B
 
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.test.yaml"
@@ -26,28 +28,46 @@ def _ok(tag):
 
 
 def _none(g, params):
-    return None                     # signals insufficient coverage -> fallback
+    return None                     # signals insufficient coverage -> no channel from it
 
 
 def _boom(g, params):
     raise RuntimeError("read failed")
 
 
+def _stub_datum(monkeypatch, offsets=None):
+    """Stub the inline datum resolution so no network is touched. `offsets` maps source->m."""
+    offsets = offsets or {"cudem": 1.3, "gmrt": 0.0}
+    monkeypatch.setattr(B.tides, "fetch_stations", lambda: [])
+    monkeypatch.setattr(B.datum, "resolve_aoi", lambda g, elev, src, **kw: {
+        "datum_offset_m": offsets.get(src, 0.0), "status": "ok", "method": "stub",
+        "dem_vertical_datum": "NAVD88" if src == "cudem" else "MSL_APPROX"})
+
+
+def _one_aoi_project(tmp_path, sources):
+    return parse_config({
+        "name": "b", "output_dir": str(tmp_path),
+        "time": {"start_date": "2026-06-01", "end_date": "2026-06-02"},
+        "products": {"bathymetry": {"sources": sources}},
+        "regions": [{"name": "r", "areas": [
+            {"name": "a1", "center_lat": 45.5, "center_lon": -123.9,
+             "buffer_ns_km": 2, "buffer_ew_km": 2}]}],
+    })
+
+
 # ---------------------------------------------------------------------------
-# _build_eff: global (source-agnostic) params.
+# _build_eff: global (source-agnostic) params + the per-AoI STACKED source list.
 # ---------------------------------------------------------------------------
 def test_build_eff_maps_example_config():
     eff = B._build_eff(load_config(EXAMPLE))
-    assert eff["out_dir"] == Path("path/to/data") / "BATHYMETRY" / "aligned"
+    assert eff["bathy_root"] == Path("path/to/data") / "BATHYMETRY"
     assert eff["params"]["stats_subgrid_m"] == 10.0
     assert eff["params"]["min_cudem_cover"] == 0.5
 
-    # `ds` is keyed by AoI, and the example config already exercises the split: the
-    # pnw_estuaries region names `dem_source: cudem`, puget_sound names nothing and takes
-    # the project default. Two AoIs, two DEMs, one config -- which is the entire point.
-    assert eff["ds"]["tillamook_bay"]["source"] == "cudem"   # region override
-    assert eff["ds"]["padilla_bay"]["source"] == "gmrt"      # project default
-    assert eff["ds"]["tillamook_bay"]["fallback"] == "gmrt"
+    # `ds` is keyed by AoI: pnw_estuaries stacks just [cudem]; puget_sound names nothing and
+    # takes the project default (every known source). One config, per-AoI source lists.
+    assert eff["ds"]["tillamook_bay"]["sources"] == ["cudem"]       # region override
+    assert eff["ds"]["padilla_bay"]["sources"] == ["cudem", "gmrt"]  # project default (all)
 
 
 def test_build_eff_requires_bathymetry_selected(base_project):
@@ -59,107 +79,130 @@ def test_build_eff_requires_bathymetry_selected(base_project):
 
 def test_build_eff_applies_option_overrides(base_project):
     base_project["products"]["bathymetry"] = {
-        "default_source": "cudem", "fallback": None, "stats_subgrid_m": 5.0,
+        "sources": ["cudem"], "stats_subgrid_m": 5.0,
         "min_cudem_cover": 0.8, "output_format": "geotiff",
     }
+    base_project["regions"][0]["sources"] = None       # no region override
     eff = B._build_eff(parse_config(base_project))
-    assert eff["ds"]["a1"]["source"] == "cudem"
-    assert eff["ds"]["a1"]["fallback"] is None
+    assert eff["ds"]["a1"]["sources"] == ["cudem"]
     assert eff["params"]["stats_subgrid_m"] == 5.0
     assert eff["fmt"] == "geotiff"
 
 
 # ---------------------------------------------------------------------------
-# The two-level lookup (region override -> project default), which now lives in
-# config.resolve_opts and lands in eff["ds"][<aoi>] like every other product's settings.
+# Region override -> project default, resolved through config.resolve_opts and landing in
+# eff["ds"][<aoi>]["sources"] like every other product's per-AoI settings.
 # ---------------------------------------------------------------------------
-def test_source_region_override(base_project):
+def test_sources_region_override(base_project):
     base_project["products"] = {"bathymetry": None}
-    base_project["regions"][0]["sources"] = {"bathymetry": {"dem_source": "cudem"}}
+    base_project["regions"][0]["sources"] = {"bathymetry": {"sources": ["gmrt"]}}
     eff = B._build_eff(parse_config(base_project))
-    assert eff["ds"]["a1"]["source"] == "cudem"
+    assert eff["ds"]["a1"]["sources"] == ["gmrt"]
 
 
-def test_source_falls_back_to_project_default(base_project):
+def test_sources_default_when_unset(base_project):
     base_project["products"] = {"bathymetry": None}
     base_project["regions"][0]["sources"] = {}      # region names no source
     eff = B._build_eff(parse_config(base_project))
-    assert eff["ds"]["a1"]["source"] == "gmrt"      # the module default
+    assert eff["ds"]["a1"]["sources"] == ["cudem", "gmrt"]   # the module default (all known)
 
 
-def test_source_differs_per_region(base_project):
-    """The whole point: two regions, two different DEM sources."""
+def test_sources_differ_per_region(base_project):
+    """The whole point: two regions stack different DEM sources."""
     base_project["products"] = {"bathymetry": None}
     base_project["regions"] = [
         {"name": "r_cudem",
-         "sources": {"bathymetry": {"dem_source": "cudem"}},
+         "sources": {"bathymetry": {"sources": ["cudem"]}},
          "areas": [{"name": "a1", "center_lat": 45.0, "center_lon": -123.0,
                     "buffer_ns_km": 10, "buffer_ew_km": 10}]},
-        {"name": "r_default",   # no bathymetry source -> default
+        {"name": "r_gmrt",
+         "sources": {"bathymetry": {"sources": ["gmrt"]}},
          "areas": [{"name": "a2", "center_lat": 58.0, "center_lon": -135.0,
                     "buffer_ns_km": 10, "buffer_ew_km": 10}]},
     ]
     eff = B._build_eff(parse_config(base_project))
-    assert eff["ds"]["a1"]["source"] == "cudem"
-    assert eff["ds"]["a2"]["source"] == "gmrt"
-
-
-def test_region_source_spelling_also_accepts_plain_source(base_project):
-    """`dem_source` is the historical region spelling; `source` is what the docs call it.
-    Both reach the module, so a region that writes the obvious thing is not silently ignored."""
-    base_project["products"] = {"bathymetry": None}
-    base_project["regions"][0]["sources"] = {"bathymetry": {"source": "cudem"}}
-    eff = B._build_eff(parse_config(base_project))
-    assert eff["ds"]["a1"]["source"] == "cudem"
+    assert eff["ds"]["a1"]["sources"] == ["cudem"]
+    assert eff["ds"]["a2"]["sources"] == ["gmrt"]
 
 
 # ---------------------------------------------------------------------------
-# acquire: per-AoI source is validated against the SOURCES registry.
+# acquire: every configured source is validated against the SOURCES registry.
 # ---------------------------------------------------------------------------
-def test_acquire_rejects_unknown_source(base_project):
-    base_project["products"] = {"bathymetry": None}
-    base_project["regions"][0]["sources"] = {"bathymetry": {"dem_source": "banana"}}
-    with pytest.raises(ValueError, match="not recognized"):
-        B.acquire(parse_config(base_project), dry_run=True)
+def test_unknown_source_is_rejected_at_config_load(base_project):
+    """An unknown DEM in a `sources` list fails at config validation -- before acquire runs
+    at all -- so a typo can never silently drop a source the user asked to stack."""
+    base_project["products"] = {"bathymetry": {"sources": ["cudem"]}}
+    base_project["regions"][0]["sources"] = {"bathymetry": {"sources": ["banana"]}}
+    with pytest.raises(ValueError, match="unknown source"):
+        parse_config(base_project)
 
 
 def test_acquire_accepts_newly_registered_source(monkeypatch, base_project):
-    """Registering a source in SOURCES makes it usable -- no validation edits."""
+    """Adding a DEM source is: register it in the spec's `sources` (so config validation
+    knows it), implement it in `SOURCES`, and give it a `DEM_DATUM` entry -- then a config
+    naming it just works, no edits to the dispatch or acquire logic."""
+    bathy = products.BY_PRODUCT[DataProduct.bathymetry]
+    monkeypatch.setitem(bathy.sources, "gebco", "coastal_sst_data.processes.bathymetry")
     monkeypatch.setitem(B.SOURCES, "gebco", _ok("gebco"))
-    base_project["products"] = {"bathymetry": None}
-    base_project["regions"][0]["sources"] = {"bathymetry": {"dem_source": "gebco"}}
+    monkeypatch.setitem(B.datum.DEM_DATUM, "gebco", "MSL_APPROX")
+    base_project["products"] = {"bathymetry": {"sources": ["gebco"]}}
+    base_project["regions"][0]["sources"] = None
     B.acquire(parse_config(base_project), dry_run=True)   # must NOT raise
 
 
 # ---------------------------------------------------------------------------
-# _fetch_with_fallback: source-agnostic machinery (stub registry).
+# _fetch_one: ONE source, NO fallback (distinct-data sources are stacked, not substituted).
 # ---------------------------------------------------------------------------
-def test_fetch_primary_success_skips_fallback(monkeypatch, aoi_grid):
-    monkeypatch.setattr(B, "SOURCES", {"x": _ok("x"), "gmrt": _ok("gmrt")})
-    res = B._fetch_with_fallback("x", aoi_grid, {}, "gmrt")
-    assert res[-1] == "x"                     # primary used; fallback untouched
+def test_fetch_one_returns_the_source_result(monkeypatch, aoi_grid):
+    monkeypatch.setattr(B, "SOURCES", {"x": _ok("x")})
+    assert B._fetch_one("x", aoi_grid, {})[-1] == "x"
 
 
-def test_fetch_none_triggers_fallback(monkeypatch, aoi_grid):
-    monkeypatch.setattr(B, "SOURCES", {"x": _none, "gmrt": _ok("gmrt")})
-    res = B._fetch_with_fallback("x", aoi_grid, {}, "gmrt")
-    assert res[-1] == "gmrt"                   # None -> fell back
-
-
-def test_fetch_error_triggers_fallback(monkeypatch, aoi_grid):
-    monkeypatch.setattr(B, "SOURCES", {"x": _boom, "gmrt": _ok("gmrt")})
-    res = B._fetch_with_fallback("x", aoi_grid, {}, "gmrt")
-    assert res[-1] == "gmrt"                   # exception -> fell back
-
-
-def test_fetch_no_fallback_returns_none(monkeypatch, aoi_grid):
+def test_fetch_one_no_coverage_returns_none(monkeypatch, aoi_grid):
     monkeypatch.setattr(B, "SOURCES", {"x": _none})
-    assert B._fetch_with_fallback("x", aoi_grid, {}, None) is None
+    assert B._fetch_one("x", aoi_grid, {}) is None        # contributes no channel here
 
 
-def test_fetch_fallback_also_fails_returns_none(monkeypatch, aoi_grid):
-    monkeypatch.setattr(B, "SOURCES", {"x": _none, "gmrt": _none})
-    assert B._fetch_with_fallback("x", aoi_grid, {}, "gmrt") is None
+def test_fetch_one_read_error_returns_none(monkeypatch, aoi_grid):
+    monkeypatch.setattr(B, "SOURCES", {"x": _boom})
+    assert B._fetch_one("x", aoi_grid, {}) is None        # non-tile error -> skip the source
+
+
+def test_fetch_one_tile_read_error_PROPAGATES(monkeypatch, aoi_grid):
+    """A transient read failure must NOT be silently swallowed (that used to become a
+    permanent CUDEM->GMRT downgrade); it fails loudly so the next run retries."""
+    monkeypatch.setitem(B.SOURCES, "cudem",
+                        lambda g, p: (_ for _ in ()).throw(B.TileReadError("boom")))
+    with pytest.raises(B.TileReadError):
+        B._fetch_one("cudem", aoi_grid, {})
+
+
+# ---------------------------------------------------------------------------
+# acquire end-to-end: one tree PER source, each with its own datum offset stamped.
+# ---------------------------------------------------------------------------
+def test_acquire_writes_one_tree_per_source_with_its_own_datum(tmp_path, monkeypatch):
+    monkeypatch.setattr(B, "SOURCES", {"cudem": _ok("cudem-DEM"), "gmrt": _ok("gmrt-DEM")})
+    _stub_datum(monkeypatch, {"cudem": 1.3, "gmrt": 0.0})
+    p = _one_aoi_project(tmp_path, ["cudem", "gmrt"])
+    B.acquire(p, grids=grid.project_grids(p))
+
+    for src, off in [("cudem", 1.3), ("gmrt", 0.0)]:
+        f = tmp_path / "BATHYMETRY" / src / "aligned" / "a1" / "a1.nc"
+        assert f.exists(), f"{src} tree not written"
+        with xr.open_dataset(f) as ds:
+            assert ds.attrs["bathy_source"] == src
+            assert ds.attrs["datum_offset_m"] == pytest.approx(off)
+            assert ds.attrs["datum_status"] == "ok"
+
+
+def test_acquire_skips_a_source_with_no_coverage(tmp_path, monkeypatch):
+    """A source that has no coverage here simply writes no tree -- the user stacks another."""
+    monkeypatch.setattr(B, "SOURCES", {"cudem": _none, "gmrt": _ok("gmrt-DEM")})
+    _stub_datum(monkeypatch)
+    p = _one_aoi_project(tmp_path, ["cudem", "gmrt"])
+    B.acquire(p, grids=grid.project_grids(p))
+    assert not (tmp_path / "BATHYMETRY" / "cudem" / "aligned" / "a1" / "a1.nc").exists()
+    assert (tmp_path / "BATHYMETRY" / "gmrt" / "aligned" / "a1" / "a1.nc").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -285,32 +328,6 @@ def test_a_network_failure_does_not_masquerade_as_missing_coverage(monkeypatch, 
                               aoi_grid.transform, aoi_grid.width, aoi_grid.height,
                               aoi_grid.geom_proj, "http://idx", "/tmp/idx.txt", 10.0)
 
-
-def test_a_tile_read_error_does_NOT_fall_back_to_gmrt(monkeypatch, aoi_grid):
-    """Falling back on a transient error swaps a 3 m NAVD88 DEM for a ~100 m MSL one
-    because a CDN hiccuped -- and nothing ever puts it back, because the next run finds a
-    complete B file and skips the AoI."""
-    gmrt_called = []
-    monkeypatch.setitem(B.SOURCES, "cudem",
-                        lambda g, p: (_ for _ in ()).throw(B.TileReadError("boom")))
-    monkeypatch.setitem(B.SOURCES, "gmrt",
-                        lambda g, p: gmrt_called.append(1) or "gmrt-result")
-
-    with pytest.raises(B.TileReadError):
-        B._fetch_with_fallback("cudem", aoi_grid, {}, "gmrt")
-    assert not gmrt_called          # the AoI FAILS and is retried, not downgraded
-
-
-def test_genuine_missing_coverage_DOES_fall_back(monkeypatch, aoi_grid, caplog):
-    """...while an area CUDEM genuinely does not cover still falls back, loudly."""
-    monkeypatch.setitem(B.SOURCES, "cudem", lambda g, p: None)   # no coverage
-    monkeypatch.setitem(B.SOURCES, "gmrt", lambda g, p: "gmrt-result")
-
-    with caplog.at_level("WARNING"):
-        res = B._fetch_with_fallback("cudem", aoi_grid, {}, "gmrt")
-
-    assert res == "gmrt-result"
-    assert "FALLING BACK" in caplog.text and "different vertical datum" in caplog.text
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

@@ -40,11 +40,15 @@ internal; a spec names its module as a dotted STRING, resolved lazily at dispatc
 
 Adding a product is now: write the module, add a ProductSpec here -- and every registry in
 the ladder above is derived, so acquisition, dispatch, ordering, auth and the skip guard all
-pick it up for free. ONE ASYMMETRY REMAINS: the datacube ASSEMBLER is registry-driven only
-for the per-overpass sensor family (it loops over `sensors()`); every other product is read
-by a hand-written block in `datacube.assemble_aoi`. So a new SENSOR is one declaration, but a
-new non-sensor covariate also needs an assembler block (and a provenance mapping). The full
-walkthrough -- including that asymmetry and the acquire() contract -- is docs/DEVELOPMENT.md.
+pick it up for free. The datacube ASSEMBLER is uniform too: every product contributes through
+one `(ctx) -> channels` protocol (`datacube.CONTRIBUTORS`), the run order is topologically
+sorted from each contributor's declared slot reads/writes, and a non-sensor product with no
+registered contributor (and no `cube_opt_out=True`) is a hard error at import
+(`datacube._check_contributors`) rather than a silent omission. So a new SENSOR is one
+declaration; a new non-sensor covariate is a ProductSpec + a module + one registered
+Contributor (+ a provenance mapping for its channels) -- and forgetting the contributor
+fails loudly. The full walkthrough -- protocol and the acquire() contract -- is
+docs/DEVELOPMENT.md.
 """
 
 from __future__ import annotations
@@ -66,6 +70,7 @@ class DataProduct(str, Enum):
     landsat = "landsat"
     modis = "modis"
     met = "met"
+    met_overpass = "met_overpass"
     tides = "tides"
     landcover = "landcover"
     insitu = "insitu"
@@ -80,9 +85,29 @@ class Kind(str, Enum):
     """
     DAILY_RASTER = "daily_raster"        # <aoi>_<YYYYMMDD>.nc      -- MUR, CMEMS, met
     OVERPASS_SENSOR = "overpass_sensor"  # <aoi>_<YYYYMMDDThhmmss>.nc -- ECOSTRESS, Landsat, MODIS
+    # Timestamped rasters like a sensor, but NOT an instrument: read at ANOTHER product's
+    # chosen overpass times (no clearest-scene pick, no SensorSpec). `met_overpass` documents
+    # a weather model's value at each thermal sensor's overpass instant.
+    OVERPASS_ALIGNED = "overpass_aligned"  # <aoi>_<YYYYMMDDThhmmss>.nc -- met_overpass
     STATIC_RASTER = "static_raster"      # <aoi>.nc, no time dim    -- bathymetry, land-cover
     SERIES_1D = "series_1d"              # <aoi>_tides.nc, dims (time,) -- tides
     STATION_TABLE = "station_table"      # <aoi>_insitu.nc, dims (station, time) -- in-situ
+
+
+class SourceKind(str, Enum):
+    """For a source-selectable product (`sources=`), what its multiple sources MEAN.
+
+    ACCESS -- REDUNDANT access to the SAME data through different pipes (Landsat via
+              Planetary Computer vs AWS; ESA land-cover vs WorldCover). Pick ONE; the
+              cube gets a single channel and the output lives in one `<DIR>/aligned/<aoi>`.
+    DATA   -- DISTINCT data that the user STACKS (bathymetry CUDEM + GMRT; later met
+              HRRR + ERA5). Each source is acquired independently, writes its own
+              `<DIR>/<source>/aligned/<aoi>` tree, and the cube emits ONE channel per
+              source (`depth_cudem`, `depth_gmrt`). There is no fallback and no
+              default -- the user loads as many sources as they need to span coverage.
+    """
+    ACCESS = "access"
+    DATA = "data"
 
 
 @dataclass(frozen=True)
@@ -127,6 +152,10 @@ class ProductSpec:
     module: str | None = None
     sources: dict[str, str | None] | None = None
     default_source: str | None = None
+    # For a `sources=` product, whether its sources are REDUNDANT ACCESS (pick-one, one
+    # channel, one directory) or DISTINCT DATA (stacked, one channel + one directory PER
+    # source). Only meaningful when `sources` is set; ignored for `module=` singletons.
+    source_kind: SourceKind = SourceKind.ACCESS
 
     # --- config surface -------------------------------------------------- #
     # Which options the module actually READS. A key not listed here does NOTHING, and
@@ -162,6 +191,10 @@ class ProductSpec:
 
     # --- assembly -------------------------------------------------------- #
     sensor: SensorSpec | None = None
+    # A product that acquires to disk but deliberately has NO cube channel. Default False, so
+    # the loud-omission invariant (datacube._check_contributors) fails at import for any
+    # non-sensor product without a registered contributor -- opt out here to say "on purpose".
+    cube_opt_out: bool = False
     # The cube channel that proves this product produced data on a given day, for the
     # coverage check. Only DAILY products can be judged this way: an overpass sensor with no
     # scene on a day is normal, not a defect, and warning about it would train the user to
@@ -187,6 +220,17 @@ class ProductSpec:
     def known_sources(self) -> tuple[str, ...]:
         return tuple(sorted(self.sources)) if self.sources else ()
 
+    @property
+    def is_stacked_data(self) -> bool:
+        """True when this product's sources are DISTINCT DATA stacked one-channel-per-source
+        (bathymetry), as opposed to REDUNDANT ACCESS picked one-at-a-time (Landsat)."""
+        return self.sources is not None and self.source_kind is SourceKind.DATA
+
+    def one_module(self) -> str | None:
+        """The single module a DATA product's sources all share (it fans out over its
+        sources internally). Only valid for a `is_stacked_data` product."""
+        return next(iter(self.sources.values()))
+
 
 # --------------------------------------------------------------------------- #
 # THE REGISTRY
@@ -206,13 +250,20 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.bathymetry,
         dir="BATHYMETRY",
         kind=Kind.STATIC_RASTER,
-        module="coastal_sst_data.processes.bathymetry",
+        # DISTINCT-DATA sources, STACKED one channel per source (D10). Both DEMs are served
+        # by the one bathymetry module, which fans out over the configured `sources` list
+        # internally; there is no default and no fallback -- the user stacks what they need.
+        sources={
+            "cudem": "coastal_sst_data.processes.bathymetry",
+            "gmrt": "coastal_sst_data.processes.bathymetry",
+        },
+        source_kind=SourceKind.DATA,
         options=_COMMON | {
-            "source", "default_source", "fallback", "pad_deg", "layer", "resolution",
+            "sources", "pad_deg", "layer", "resolution",
             "stats_subgrid_m", "min_cudem_cover", "cudem_urllist", "cudem_index_cache"},
-        # CUDEM is CONUS-only, so an AoI outside it must name its own DEM.
-        region_options=frozenset({"source", "dem_source", "fallback", "datum_offset_m"}),
-        region_only_options=frozenset({"dem_source", "datum_offset_m"}),
+        # CUDEM is CONUS-only, so an AoI outside it stacks GMRT (or its own DEM) instead.
+        region_options=frozenset({"sources", "datum_offset_m"}),
+        region_only_options=frozenset({"datum_offset_m"}),
         required_vars=("elevation", "depth", "depth_p25", "depth_p75"),
         provenance_inputs=("bathymetry",),
     ),
@@ -233,13 +284,21 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.cmems,
         dir="CMEMS",
         kind=Kind.DAILY_RASTER,
-        module="coastal_sst_data.processes.cmems",
+        # DISTINCT-DATA sources, STACKED one channel per source (D10). Each source is a TAG
+        # naming an exact CMEMS dataset -- `my_global`/`anfc_global` are built in; regional
+        # tags (`my_baltic`, `anfc_med`, ...) are registered per config via `datasets`. The
+        # tag IS the provenance identity, so a `cmems_<var>_<tag>` channel is self-describing
+        # and there is no fallback chain. All tags are served by the one cmems module.
+        sources={
+            "my_global": "coastal_sst_data.processes.cmems",
+            "anfc_global": "coastal_sst_data.processes.cmems",
+        },
+        source_kind=SourceKind.DATA,
         auth="copernicus",
         options=_COMMON | {
-            "source", "fallback", "dataset_id", "variables", "depths", "pad_deg"},
-        # CMEMS publishes regional models (Baltic, Mediterranean, NW Shelf) alongside the
-        # global one; which is right is a fact about where the AoI is.
-        region_options=frozenset({"source", "fallback", "dataset_id"}),
+            "sources", "datasets", "variables", "depths", "pad_deg"},
+        # Which regional models cover this AoI is a fact about where it is -> region-settable.
+        region_options=frozenset({"sources", "datasets"}),
         # + >= 1 configured variable, asserted by the >=1-data-var rule (the channel set is
         # config-dependent, so it cannot be named up front).
         required_vars=("valid",),
@@ -311,33 +370,68 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.met,
         dir="MET",
         kind=Kind.DAILY_RASTER,
-        module="coastal_sst_data.processes.met",
+        # FORCING only now (D14): daily reference-time / daily-mean fields, NO sensor
+        # dependency. The overpass documentation split out to `met_overpass`. DISTINCT-DATA
+        # sources STACKED per channel (D10): `airtemp_hrrr`, `airtemp_era5`, ... no fallback.
+        sources={
+            "hrrr": "coastal_sst_data.processes.met",
+            "era5": "coastal_sst_data.processes.met",
+        },
+        source_kind=SourceKind.DATA,
         options=_COMMON | {
-            "source", "fallback", "variables", "model", "product", "fxx", "era5_zarr",
+            "sources", "variables", "model", "product", "fxx", "era5_zarr",
             "regrid_radius_m", "pad_deg", "reference_time", "reference_basis",
-            "daily_mean_hours", "overpass_from"},
-        # HRRR is North America only: outside it the chain MUST start at ERA5, and saying so
-        # per region is the difference between a deliberate choice and a silent fallback.
-        region_options=frozenset({"source", "fallback", "model"}),
+            "daily_mean_hours"},
+        # HRRR is North America only: outside it a region stacks only ERA5.
+        region_options=frozenset({"sources", "model"}),
         required_vars=(),          # channel set is config-dependent (see ProductSpec)
-        # Its overpass snapshots are taken at times read from the sensors' aligned dirs, so
-        # every sensor must have run first.
-        depends_on=(DataProduct.ecostress, DataProduct.landsat, DataProduct.modis),
         coverage_channel="airtemp",
         provenance_inputs=("met",),
+    ),
+
+    ProductSpec(
+        product=DataProduct.met_overpass,
+        dir="MET_OVERPASS",
+        # Timestamped snapshots read at each thermal sensor's overpass instant -- NOT a
+        # sensor itself, so a distinct Kind (see Kind.OVERPASS_ALIGNED). DISTINCT-DATA sources
+        # STACKED (same hrrr/era5 as forcing), but the CUBE emits `<sensor>_<var>_<src>` only
+        # for the user's `(sensor, source)` combinations (D13), not the full cross-product.
+        kind=Kind.OVERPASS_ALIGNED,
+        sources={
+            "hrrr": "coastal_sst_data.processes.met_overpass",
+            "era5": "coastal_sst_data.processes.met_overpass",
+        },
+        source_kind=SourceKind.DATA,
+        options=_COMMON | {
+            "sources", "combinations", "variables", "model", "product", "fxx", "era5_zarr",
+            "regrid_radius_m", "pad_deg"},
+        region_options=frozenset({"sources", "combinations", "model"}),
+        required_vars=(),          # channel set is config-dependent
+        # Snapshots are taken at times read from the sensors' aligned dirs, so the sensors
+        # must have run first.
+        depends_on=(DataProduct.ecostress, DataProduct.landsat, DataProduct.modis),
+        provenance_inputs=("met_overpass",),
     ),
 
     ProductSpec(
         product=DataProduct.tides,
         dir="TIDE",                # NOT "TIDES" -- the one name that used to need two aliases
         kind=Kind.SERIES_1D,
-        module="coastal_sst_data.processes.tides",
+        # DISTINCT-DATA sources, STACKED one channel per source (D10): CO-OPS gauge synthesis
+        # (U.S. waters) and a global ocean-tide model (everywhere). No fallback -- a source
+        # with no coverage here (e.g. no CO-OPS gauge nearby) simply contributes no channel.
+        sources={
+            "coops": "coastal_sst_data.processes.tides",
+            "eo_tides": "coastal_sst_data.processes.tides",
+        },
+        source_kind=SourceKind.DATA,
         options=_COMMON | {
-            "source", "default_source", "fallback", "model", "model_directory", "interval",
-            "stations", "warn_distance_km", "fallback_distance_km"},
-        # CO-OPS gauges exist only in U.S. waters -> elsewhere, a global model + its
-        # downloaded directory, which is a property of the machine and the region.
-        region_options=frozenset({"source", "model", "model_directory", "stations"}),
+            "sources", "model", "model_directory", "interval",
+            "stations", "warn_distance_km", "max_distance_km", "overpass_combinations"},
+        # CO-OPS gauges exist only in U.S. waters -> elsewhere, stack the global model, whose
+        # downloaded directory is a property of the machine and the region.
+        region_options=frozenset({"sources", "model", "model_directory", "stations",
+                                  "overpass_combinations"}),
         required_vars=("tide",),
         coverage_channel="tide",
         provenance_inputs=("tides",),
@@ -398,9 +492,11 @@ def sensors() -> tuple[ProductSpec, ...]:
 
 # --------------------------------------------------------------------------- #
 # Derived stages: not products, so not selectable in a config, but they own an output
-# directory that provenance and the assembler must be able to find.
+# directory that provenance and the assembler must be able to find. (The datum offset is
+# resolved INSIDE the bathymetry module now and ships with each DEM source's output, so
+# there is no longer a standalone DATUM stage or sidecar directory.)
 # --------------------------------------------------------------------------- #
-DERIVED_DIRS: dict[str, str] = {"datum": "DATUM"}
+DERIVED_DIRS: dict[str, str] = {}
 
 
 def product_dirs() -> dict[str, str]:
@@ -411,6 +507,15 @@ def product_dirs() -> dict[str, str]:
     `tide` and another said `tides` are gone.
     """
     return {s.product.value: s.dir for s in REGISTRY} | DERIVED_DIRS
+
+
+def aligned_rel(dir_name: str, source: str | None = None) -> str:
+    """The '<DIR>[/<source>]/aligned' path segment for a product's aligned tree.
+
+    A DATA (stacked) product nests each source under its own `<source>` level so the DEMs
+    do not overwrite one another; every other product keeps the flat `<DIR>/aligned`.
+    """
+    return f"{dir_name}/{source}/aligned" if source else f"{dir_name}/aligned"
 
 
 # --------------------------------------------------------------------------- #
@@ -424,10 +529,21 @@ def _check_registry() -> None:
             raise RuntimeError(
                 f"{s.product.value}: set exactly one of `module` (single implementation) "
                 "or `sources` (source-selectable).")
-        if s.sources is not None and s.default_source not in s.sources:
+        if s.sources is not None and s.source_kind is SourceKind.ACCESS \
+                and s.default_source not in s.sources:
             raise RuntimeError(
                 f"{s.product.value}: default_source {s.default_source!r} is not one of "
                 f"{sorted(s.sources)}.")
+        if s.is_stacked_data:
+            # A DATA product has no pick-one default (the user stacks sources), and its one
+            # module fans out over all of them, so every source must resolve to that module.
+            if s.default_source is not None:
+                raise RuntimeError(
+                    f"{s.product.value}: a DATA (stacked) product takes no default_source.")
+            if len(set(s.sources.values())) != 1 or None in set(s.sources.values()):
+                raise RuntimeError(
+                    f"{s.product.value}: DATA sources must all map to ONE implemented module "
+                    f"(it fans out over sources internally); got {s.sources}.")
         # Auth keyed by source must cover exactly the declared sources, or a config naming a
         # valid source would fail auth resolution with a confusing "not recognized".
         if isinstance(s.auth, dict):

@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-coastal_sst_data -- tide-height forcing (NOAA CO-OPS + global model backup).
+coastal_sst_data -- tide-height forcing (NOAA CO-OPS + global model, STACKED).
 
 Reads the validated project config (coastal_sst_data.config.Project) and the
 shared per-AoI grids (coastal_sst_data.grid.AoiGrid). Tide is ~spatially uniform
-over a small AoI, so this produces one 1D height series per AoI from one of two
-interchangeable SOURCES (a source registry + fallback, like bathymetry):
+over a small AoI, so this produces one 1D height series per AoI per SOURCE. The
+sources are DISTINCT DATA, STACKED one channel per source (D10) -- not a primary +
+fallback -- so the user lists what they need and there is no substitution:
 
-  * coops (default) -- NOAA CO-OPS. Find the nearest CO-OPS water-level station
-    (from the AoI grid centroid), fetch its published HARMONIC CONSTITUENTS
-    (harcon.json, one tiny/fast metadata request), and synthesize the series
-    LOCALLY with pytides2. Public, no auth, any date range -- but CO-OPS gauges
-    only exist in U.S. waters, so it has no coverage elsewhere.
+  * coops -- NOAA CO-OPS. Find the nearest CO-OPS water-level station (from the AoI
+    grid centroid), fetch its published HARMONIC CONSTITUENTS (harcon.json, one
+    tiny/fast metadata request), and synthesize the series LOCALLY with pytides2.
+    Public, no auth, any date range -- but CO-OPS gauges only exist in U.S. waters,
+    so where the nearest gauge is farther than `max_distance_km` it contributes NO
+    channel here (the user stacks the global model).
   * eo_tides -- a GLOBAL ocean tide model (EOT20 by default) sampled at the AoI
-    centroid via the eo-tides package (pyTMD under the hood). Works anywhere, so
-    it is the natural BACKUP where CO-OPS has no nearby gauge.
+    centroid via the eo-tides package (pyTMD under the hood). Works anywhere.
 
-By default coops is the source with eo_tides as the fallback: if the nearest
-CO-OPS gauge is farther than `fallback_distance_km`, or the CO-OPS fetch fails,
-the AoI is served from the global model instead. Either can also be selected
-explicitly (project `default_source`, or per-region `sources.tides.source`).
+By default both are stacked (`sources: [coops, eo_tides]`); a region overrides the
+list (e.g. `sources: [eo_tides]` outside U.S. waters). The cube emits `tide_<source>`
+/ `tide_range_<source>` per source.
 
-    <output_dir>/TIDE/aligned/<aoi>/<aoi>_tides.nc   (dims: time; var: tide [m], rel. MSL)
+    <output_dir>/TIDE/<source>/aligned/<aoi>/<aoi>_tides.nc  (dims: time; var: tide [m], rel. MSL)
 
 Unlike the gridded products this is a 1D time series per Aoi: the datacube
 assembler broadcasts it across the AoI grid and samples it at the daily /
@@ -57,9 +57,8 @@ SOURCE = "tides"
 # --- tides product defaults (overridable via the tides product options block) - #
 DEFAULT_INTERVAL = "h"        # prediction step; "h" = hourly
 DEFAULT_WARN_KM = 75.0        # warn if the nearest gauge is farther than this
-DEFAULT_SOURCE = "coops"      # primary tide source
-DEFAULT_FALLBACK = "eo_tides"  # global backup when coops has no coverage
-DEFAULT_FALLBACK_KM = 150.0   # nearest coops gauge farther than this -> backup
+DEFAULT_SOURCES = ["coops", "eo_tides"]   # STACKED (D10): coops in U.S. waters, model global
+DEFAULT_MAX_KM = 150.0        # nearest coops gauge farther than this -> no coops channel here
 DEFAULT_MODEL = "EOT20"       # eo-tides global model (see eo-tides docs)
 
 
@@ -282,118 +281,85 @@ def _source_eo_tides(lon, lat, start, end, ds_cfg, station):
 SOURCES = {"coops": _source_coops, "eo_tides": _source_eo_tides}
 
 
-def _predict_with_fallback(source, fallback, lon, lat, start, end, ds_cfg, station, name):
-    """Run the resolved source; on error, try `fallback` if set/different.
-
-    Returns (Series, attrs, used_source) or None if both failed.
-    """
-    try:
-        s, attrs = SOURCES[source](lon, lat, start, end, ds_cfg, station)
-        return s, attrs, source
-    except Exception as exc:
-        log.warning("  %s: %s tide source failed (%s)", name, source, exc)
-    if fallback and fallback != source and fallback in SOURCES:
-        log.info("  %s: falling back to %s", name, fallback)
-        try:
-            s, attrs = SOURCES[fallback](lon, lat, start, end, ds_cfg, station)
-            return s, attrs, fallback
-        except Exception as exc:
-            log.warning("  %s: %s fallback failed (%s)", name, fallback, exc)
-    return None
+def _resolve_coops_station(name, lon, lat, ds_cfg, stations_cache):
+    """The CO-OPS gauge serving this AoI (config override, else nearest), or None if the
+    nearest is farther than `max_distance_km` -- in which case coops has no coverage here and
+    contributes no channel (the user stacks the global model). Returns (station|None, stations_cache)."""
+    if ds_cfg["stations"].get(name):
+        return {"id": str(ds_cfg["stations"][name]), "name": "(config override)",
+                "lat": lat, "lon": lon, "distance_km": 0.0}, stations_cache
+    if stations_cache is None:
+        log.info("Fetching CO-OPS water-level station list...")
+        stations_cache = fetch_stations()
+        log.info("  %d stations", len(stations_cache))
+    st, dist = nearest_station(lon, lat, stations_cache)
+    if dist > ds_cfg["max_distance_km"]:
+        log.warning("  %s: nearest CO-OPS gauge %s '%s' is %.0f km (> %.0f km); no tide_coops "
+                    "channel here (stack the global model)", name, st["id"], st["name"], dist,
+                    ds_cfg["max_distance_km"])
+        return None, stations_cache
+    if dist > ds_cfg["warn_distance_km"]:
+        log.warning("  %s: nearest gauge is %.0f km away", name, dist)
+    return {**st, "distance_km": dist}, stations_cache
 
 
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
-def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    """Acquire a 1D tide series per AoI from its resolved source (+ fallback).
+def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=None):
+    """Acquire a 1D tide series per (AoI, SOURCE), each in its own `<source>/` tree.
 
-    The extra `aoi_sources` argument this used to take is gone: the per-AoI source now
-    arrives in `eff["ds"][name]` like every other product's per-AoI settings, so tides
-    honours exactly the same run() contract as the rest.
+    No fallback (D10): each configured source is produced independently. CO-OPS with no gauge
+    within `max_distance_km` contributes no channel; the global model always does. `only_source`
+    narrows the run to one source.
     """
-    out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
+    tide_root, fmt, overwrite = eff["tide_root"], eff["fmt"], eff["overwrite"]
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
     names = select_aois(grids, only_aoi)
-
-    # The CO-OPS station list is only needed if some AoI could be served by coops (as its
-    # source or as its fallback); load it lazily on first use. Both are per-AoI now, so the
-    # question is asked of every AoI rather than of one project-wide fallback.
-    coops_in_play = any(eff["ds"][n]["source"] == "coops"
-                        or eff["ds"][n]["fallback"] == "coops" for n in names)
-    stations = None
-
+    stations = None                       # CO-OPS station list, fetched lazily on first coops use
     rep = report.ProductReport("tides")
 
     for name in names:
         g = grids[name]
         lon, lat = grid_centroid_lonlat(g)
         ds_cfg = eff["ds"][name]
-        source, fallback = ds_cfg["source"], ds_cfg["fallback"]
-        station_overrides = ds_cfg["stations"]
-        warn_km = ds_cfg["warn_distance_km"]
-        fallback_km = ds_cfg["fallback_distance_km"]
+        sources = [s for s in ds_cfg["sources"] if only_source is None or s == only_source]
 
-        # Resolve a CO-OPS gauge if coops could serve this AoI (source or fallback).
-        station = None
-        if coops_in_play and (source == "coops" or fallback == "coops"):
-            if station_overrides.get(name):
-                station = {"id": str(station_overrides[name]), "name": "(config override)",
-                           "lat": lat, "lon": lon, "distance_km": 0.0}
+        for src in sources:
+            out_path = tide_root / src / "aligned" / name / f"{name}_tides.nc"
+            if store.done(out_path, store.REQUIRED_VARS["TIDE"], overwrite=overwrite):
+                log.info("  %s [%s]: already processed, skipping", name, src); rep.skip(); continue
+
+            station = None
+            if src == "coops":
+                station, stations = _resolve_coops_station(name, lon, lat, ds_cfg, stations)
+                if station is None:                  # no gauge in range -> no coops channel here
+                    rep.fail(f"{name} coops", "no CO-OPS gauge in range"); continue
+                log.info("=== AOI: %s | source=coops | station %s '%s' (%.1f km) ===",
+                         name, station["id"], station["name"], station["distance_km"])
             else:
-                if stations is None:
-                    log.info("Fetching CO-OPS water-level station list...")
-                    stations = fetch_stations()
-                    log.info("  %d stations", len(stations))
-                st, dist = nearest_station(lon, lat, stations)
-                station = {**st, "distance_km": dist}
+                log.info("=== AOI: %s | source=%s ===", name, src)
+            if dry_run:
+                log.info("  [dry-run] would build tides (%s) for %s (%s..%s @ %s)",
+                         src, name, start, end, ds_cfg["interval"]); continue
 
-        # Distance pre-empt: if the nearest coops gauge is too far and a global
-        # backup is available, serve this AoI from the backup instead.
-        effective = source
-        if (source == "coops" and station is not None
-                and station["name"] != "(config override)"
-                and station["distance_km"] > fallback_km
-                and fallback and fallback != "coops" and fallback in SOURCES):
-            log.info("=== AOI: %s | nearest gauge %s '%s' is %.0f km (> %.0f km) -> %s ===",
-                     name, station["id"], station["name"], station["distance_km"],
-                     fallback_km, fallback)
-            effective = fallback
-        elif source == "coops" and station is not None:
-            log.info("=== AOI: %s | station %s '%s' (%.1f km) ===",
-                     name, station["id"], station["name"], station["distance_km"])
-            if station["distance_km"] > warn_km:
-                log.warning("    nearest gauge is %.0f km away", station["distance_km"])
-        else:
-            log.info("=== AOI: %s | source=%s ===", name, effective)
+            try:
+                s, attrs = SOURCES[src](lon, lat, start, end, ds_cfg, station)
+            except Exception as exc:
+                log.warning("  %s: %s tide source failed (%s); no channel from it", name, src, exc)
+                rep.fail(f"{name} {src}", f"{src} failed: {exc}"); continue
 
-        out_path = out_root / name / f"{name}_tides.nc"
-        if store.done(out_path, store.REQUIRED_VARS["TIDE"], overwrite=overwrite):
-            log.info("  already processed, skipping")
-            rep.skip()
-            continue
-        if dry_run:
-            log.info("  [dry-run] would build tides (%s) for %s (%s..%s @ %s)",
-                     effective, name, start, end, ds_cfg["interval"])
-            continue
-
-        res = _predict_with_fallback(effective, fallback, lon, lat, start, end,
-                                     ds_cfg, station, name)
-        if res is None:
-            log.warning("  FAILED %s (no tide series from %s or fallback)", name, effective)
-            rep.fail(name, f"no tide series from {effective} or fallback")
-            continue
-        s, attrs, used = res
-
-        da = xr.DataArray(s.values.astype("float32"),
-                          coords={"time": s.index.values}, dims="time", name="tide")
-        da.attrs.update(units="m", long_name="tide height (harmonic prediction, rel. MSL)")
-        ds = da.to_dataset()
-        ds.attrs.update(aoi_id=name, source=used, **attrs, **provenance.stamp(eff))
-        log.info("  wrote %s (%d steps) [%s]",
-                 write_output(ds, out_root / name, name, fmt), ds.sizes["time"], used)
-        rep.wrote(source=used)
+            da = xr.DataArray(s.values.astype("float32"),
+                              coords={"time": s.index.values}, dims="time", name="tide")
+            da.attrs.update(units="m", long_name="tide height (harmonic prediction, rel. MSL)")
+            ds = da.to_dataset()
+            ds.attrs.update(aoi_id=name, source=src, tide_source=src, **attrs,
+                            **provenance.stamp(eff))
+            log.info("  wrote %s (%d steps) [%s]",
+                     write_output(ds, tide_root / src / "aligned" / name, name, fmt),
+                     ds.sizes["time"], src)
+            rep.wrote(source=src)
     rep.log_summary()
     return rep
 
@@ -402,33 +368,26 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
 def _ds_cfg(opts) -> dict:
-    """One AoI's tide settings, from its region-resolved options bag.
+    """One AoI's tide settings: which SOURCES to STACK (region-overridable), plus the model /
+    gauge knobs. CO-OPS gauges exist only in U.S. waters, so elsewhere the AoI stacks the
+    global model; which model is downloaded (and where) is a property of the machine/region.
 
-    `source`, the global `model` and its `model_directory`, and the per-AoI gauge overrides
-    are all region-overridable: CO-OPS gauges exist only in U.S. waters, so elsewhere the
-    AoI must be served from a global ocean-tide model, and which model has been downloaded
-    (and where) is a property of the machine and the region, not of the project.
-
-    The distance thresholds and the prediction interval stay project-global -- they decide
-    how the series is BUILT, not which gauge or model exists here.
+    The distance thresholds and the prediction interval stay project-global -- they decide how
+    a series is BUILT / whether coops has coverage, not which sources exist.
     """
-    # A blank / "none" fallback disables the backup entirely.
-    fallback = _opt(opts, "fallback", DEFAULT_FALLBACK)
-    if fallback in (None, "none", ""):
-        fallback = None
-
+    srcs = _opt(opts, "sources", None)
+    if srcs is None:
+        srcs = list(DEFAULT_SOURCES)
+    elif isinstance(srcs, str):
+        srcs = [srcs]
     return {
+        "sources": [str(s) for s in srcs],
         "interval": _opt(opts, "interval", DEFAULT_INTERVAL),
-        # per-AoI gauge overrides: {aoi_name: CO-OPS station id}. Tide gauges are
-        # per-location, so this lives with the product rather than on the AoI.
+        # per-AoI gauge overrides: {aoi_name: CO-OPS station id}. Tide gauges are per-location,
+        # so this lives with the product rather than on the AoI.
         "stations": dict(_opt(opts, "stations", {}) or {}),
         "warn_distance_km": float(_opt(opts, "warn_distance_km", DEFAULT_WARN_KM)),
-        # Source selection + global backup. `source` is the region-facing spelling;
-        # `default_source` is the project-level one it overrides.
-        "source": (_opt(opts, "source", None)
-                   or _opt(opts, "default_source", DEFAULT_SOURCE)),
-        "fallback": fallback,
-        "fallback_distance_km": float(_opt(opts, "fallback_distance_km", DEFAULT_FALLBACK_KM)),
+        "max_distance_km": float(_opt(opts, "max_distance_km", DEFAULT_MAX_KM)),
         # eo_tides (global model) options.
         "model": _opt(opts, "model", DEFAULT_MODEL),
         "model_directory": _opt(opts, "model_directory", None),
@@ -446,7 +405,7 @@ def _build_eff(project: Project) -> dict:
         "config_sha256": project.config_sha256,
         "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.tides))
                for a in project.all_areas},
-        "out_dir": root / "TIDE" / "aligned",
+        "tide_root": root / "TIDE",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
         "time": {
@@ -457,22 +416,13 @@ def _build_eff(project: Project) -> dict:
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
-            overwrite=False) -> None:
+            overwrite=False, source=None) -> None:
     """Acquire tide forcing for a validated Project. Entry point for pipeline.py.
 
-    Parameters
-    ----------
-    project      validated config (coastal_sst_data.config.Project)
-    grids        pre-computed {aoi_name: AoiGrid}; if None, computed here so all
-                 products share one grid computation. Only the AoI centroid is
-                 used (tide is a per-AoI 1D series, not regridded).
-    aois         restrict to these AoI name(s); default all
-    dry_run      resolve the source only, no fetch/predict/write
-    overwrite    reprocess AoIs even if the aligned file exists
-
-    The source is resolved PER AoI (region override -> project default) by
-    `config.resolve_opts`, then validated against the SOURCES registry, so a typo'd source
-    fails loudly -- before a single gauge is queried.
+    Every configured source is acquired and STACKED into its own `TIDE/<source>/` tree;
+    `source` (from the pipeline, or unset on a direct CLI run) narrows to one. The sources are
+    resolved PER AoI (region override -> project default) and validated against the SOURCES
+    registry, so a typo fails loudly -- before a single gauge is queried.
     """
     eff = _build_eff(project)
     if overwrite:
@@ -480,12 +430,12 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if grids is None:
         grids = project_grids(project)
 
-    bad = sorted(f"{n}:{c[k]}" for n, c in eff["ds"].items() for k in ("source", "fallback")
-                 if c[k] is not None and c[k] not in SOURCES)
+    bad = sorted(f"{n}:{s}" for n, c in eff["ds"].items() for s in c["sources"]
+                 if s not in SOURCES)
     if bad:
         raise ValueError(f"tides source not recognized ({', '.join(bad)}); "
                          f"choose from {sorted(SOURCES)}.")
-    return run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run, only_source=source)
 
 
 def main():

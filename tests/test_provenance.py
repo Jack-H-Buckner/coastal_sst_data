@@ -130,6 +130,28 @@ def test_stamp_records_the_time_and_the_config_it_ran_under():
     assert st["package_version"]
 
 
+def test_a_per_source_channel_attributes_to_its_ONE_source(tmp_path):
+    """S5.1: a DATA product's channel names its source, so its provenance must record only THAT
+    source -- not the union of every stacked source (which the old per-day chain had to)."""
+    for src in ("cudem", "gmrt"):
+        d = tmp_path / "BATHYMETRY" / src / "aligned" / AOI
+        d.mkdir(parents=True)
+        ds = xr.Dataset({"elevation": (("y", "x"), np.zeros((2, 2), "float32"))},
+                        coords={"y": [0, 1], "x": [0, 1]})
+        ds.attrs.update(source=f"{src}-DEM", **provenance.stamp())
+        ds.to_netcdf(d / f"{AOI}.nc")
+
+    from coastal_sst_data import products
+    prod = provenance.collect(tmp_path, AOI, products.product_dirs())
+    assert set(prod["bathymetry"]["sources"]) == {"cudem-DEM", "gmrt-DEM"}   # union at product
+
+    class _P:
+        config_sha256 = config_path = config_text = None
+    rec = provenance.build(_P(), ["elevation_cudem", "depth_gmrt"], prod)
+    assert rec["fields"]["elevation_cudem"]["sources"] == ["cudem-DEM"]      # ...but ONE per channel
+    assert rec["fields"]["depth_gmrt"]["sources"] == ["gmrt-DEM"]
+
+
 # --------------------------------------------------------------------------- #
 # field -> source mapping
 # --------------------------------------------------------------------------- #
@@ -138,14 +160,16 @@ def test_stamp_records_the_time_and_the_config_it_ran_under():
     ("eco_sst", ["ecostress"]),
     ("lst_valid", ["landsat"]),
     ("cmems_thetao_10m", ["cmems"]),
-    ("airtemp", ["met"]),
-    ("tide", ["tides"]),
-    ("depth_p25", ["bathymetry"]),
+    ("airtemp_hrrr", ["met"]),                              # per-source forcing (D5)
+    ("tide_coops", ["tides"]),                              # per-source tide (D5)
+    ("tide_range_eo_tides", ["tides"]),
+    ("depth_p25_cudem", ["bathymetry"]),
+    ("elevation_cudem", ["bathymetry"]),                    # raw ingredient, per source
     # the derived ones: several genuine inputs, all of them load-bearing
-    ("eco_water_elev", ["bathymetry", "tides", "datum", "ecostress"]),
-    ("lst_airtemp", ["met", "landsat"]),
+    ("lst_airtemp_hrrr", ["met_overpass", "landsat"]),      # overpass met (D13)
+    ("eco_tide_coops", ["tides", "ecostress"]),             # overpass tide (D17)
     ("modis_insitu_sst", ["insitu", "modis"]),
-    ("landmask", ["landcover", "bathymetry"]),
+    ("landcover_water", ["landcover"]),
     ("doy_sin", []),                                        # computed; no data source
 ])
 def test_field_inputs(field, inputs):

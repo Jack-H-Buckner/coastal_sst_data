@@ -1,52 +1,45 @@
 #!/usr/bin/env python3
 """
-coastal_sst_data -- meteorological forcing acquisition (HRRR, ERA5 fallback).
+coastal_sst_data -- meteorological FORCING acquisition (HRRR + ERA5, STACKED per source).
 
-Reads the validated project config (coastal_sst_data.config.Project) and the
-shared per-AoI grids (coastal_sst_data.grid.AoiGrid), exactly like the SST
-stages. For each AoI it pulls 2 m air temperature, 10 m wind (u/v + speed),
-downward shortwave and total cloud cover, regrids onto the AoI grid, and writes:
+Reads the validated project config (coastal_sst_data.config.Project) and the shared per-AoI
+grids (coastal_sst_data.grid.AoiGrid), exactly like the SST stages. For each AoI it pulls
+2 m air temperature, 10 m wind (u/v + speed), downward shortwave and total cloud cover,
+regrids onto the AoI grid, and writes, PER SOURCE:
 
-  * a REFERENCE-time file per day:       <output_dir>/MET/aligned/<aoi>/<aoi>_ref_<YYYYMMDD>.nc
-  * a daily-mean file per day:           <output_dir>/MET/aligned/<aoi>/<aoi>_<YYYYMMDD>.nc
-  * an instantaneous file per overpass:  <output_dir>/MET/aligned/<aoi>/<aoi>_<YYYYMMDDThhmmss>.nc
+  * a REFERENCE-time file per day: <output_dir>/MET/<source>/aligned/<aoi>/<aoi>_ref_<YYYYMMDD>.nc
+  * a daily-mean file per day:     <output_dir>/MET/<source>/aligned/<aoi>/<aoi>_<YYYYMMDD>.nc
 
-The REFERENCE file is one snapshot per day at a fixed time of day -- by default 10:30
-LOCAL SOLAR time, Landsat's overpass. It is the datacube's default met channel: a daily
-mean smears the diurnal cycle (dawn and mid-afternoon forcing averaged together), which
-is the wrong forcing to hand a model of a sensor that flew at one instant. The basis is
-solar rather than UTC because a fixed UTC hour is a different time of day in every AoI,
-so cross-AoI comparisons would not be like-for-like. Set `reference_time: null` to skip.
+The REFERENCE file is one snapshot per day at a fixed time of day -- by default 10:30 LOCAL
+SOLAR time, Landsat's overpass. It is the cube's default met channel: a daily mean smears the
+diurnal cycle, which is the wrong forcing to hand a model of a sensor that flew at one instant.
+The basis is solar rather than UTC because a fixed UTC hour is a different time of day in every
+AoI, so cross-AoI comparisons would not be like-for-like. Set `reference_time: null` to skip.
 
-Overpass times are discovered from the ECOSTRESS/Landsat aligned dirs so the
-forcing can be matched to each thermal scene (for the skin->bulk correction); the
-datacube reads those snapshots into per-sensor channels (`eco_airtemp`, ...).
+This is FORCING only (D14) -- NO sensor dependency. Met matched to each thermal sensor's
+overpass instant is the SEPARATE `met_overpass` product (processes.met_overpass), which reuses
+the HRRR/ERA5 fetchers here.
 
-Two sources, tried in order (the "source chain"):
-  * hrrr -- NOAA HRRR 3 km surface fields via Herbie. CONUS uses the 'hrrr'
-    domain; AoIs above ~50N use the Alaska domain 'hrrrak' (auto by latitude).
-    Curvilinear grid -> pyresample nearest-neighbour resample.
-  * era5 -- ECMWF ERA5 0.25 deg hourly reanalysis, streamed from Google's public
-    ARCO-ERA5 Zarr on GCS (no auth). Global, so it fills any AoI/date/cycle HRRR
-    cannot cover. Regular lat/lon grid -> rioxarray bilinear reproject.
+DISTINCT-DATA sources, STACKED one channel per source (D10) -- NOT a chain/fallback: the cube
+emits `<var>_<source>` (`airtemp_hrrr`, `airtemp_era5`). A source with no data here (HRRR is
+North America only) simply contributes NaN to ITS channel; the two are never conflated (they
+differ in resolution, and `swrad` is instantaneous under HRRR but an hourly mean in ERA5).
 
-With `source: auto` (default) the chain is [hrrr, era5]: ERA5 transparently
-backfills wherever HRRR misses. Both sources are unit-harmonized to a single
-convention (airtemp K, swrad W m-2, cloud_cover %) so the written files are
-source-agnostic; each file records its provenance in `ds.attrs["source"]`.
+  * hrrr -- NOAA HRRR 3 km surface fields via Herbie. CONUS uses the 'hrrr' domain; AoIs above
+    ~50N use the Alaska domain 'hrrrak' (auto by latitude). Curvilinear -> pyresample nearest.
+  * era5 -- ECMWF ERA5 0.25 deg hourly reanalysis, streamed from Google's public ARCO-ERA5 Zarr
+    on GCS (no auth). Global. Regular lat/lon grid -> rioxarray bilinear reproject.
 
-Forcing is gap-free, so there is no mask -- these are complete driver channels.
+Both are unit-harmonized (airtemp K, swrad W m-2, cloud_cover %); each file records its source.
 
-Usage (run AFTER the SST stages so overpass times exist):
+Usage:
     python -m coastal_sst_data.processes.met --config config.yaml
-    python -m coastal_sst_data.processes.met --config config.yaml --aoi hood_canal
-    python -m coastal_sst_data.processes.met --config config.yaml --dry-run
+    python -m coastal_sst_data.processes.met --config config.yaml --aoi hood_canal --dry-run
 """
 
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -65,8 +58,7 @@ log = logging.getLogger(__name__)
 SOURCE = "met"
 
 # --- met product defaults (overridable via the met product options block) ---- #
-DEFAULT_SOURCE = "auto"                   # auto (hrrr->era5) | hrrr | era5
-DEFAULT_FALLBACK = "era5"                 # era5 | none
+DEFAULT_SOURCES = ["hrrr", "era5"]        # STACKED (D10): hrrr in N. America, era5 global
 DEFAULT_VARIABLES = ["airtemp", "wind", "swrad", "cloud"]
 DEFAULT_MEAN_HOURS = [0, 6, 12, 18]       # UTC hours averaged for the daily field ([] = skip)
 # The daily REFERENCE time: one snapshot per day, the same time of day everywhere, so a
@@ -258,70 +250,19 @@ def _fetch_era5(g: AoiGrid, dt: datetime, cfg: dict) -> dict | None:
 _SOURCES = {"hrrr": _fetch_hrrr, "era5": _fetch_era5}
 
 
-def _resolve_chain(source: str, fallback: str) -> list[str]:
-    """Ordered source chain from the `source`/`fallback` selectors.
+def _fetch_one(src: str, g: AoiGrid, dt: datetime, cfg: dict) -> dict | None:
+    """Fetch + regrid ONE source for one timestamp -> {outname: 2D array} or None.
 
-    auto  -> [hrrr]  (then + fallback)   hrrr -> [hrrr]   era5 -> [era5]
-    A non-'none' fallback is appended if not already the primary, so the default
-    (source=auto, fallback=era5) yields [hrrr, era5].
+    No chain / no fallback (D10): sources are STACKED as separate channels, so a source with
+    no data here (HRRR off-continent, no ERA5 cell) simply contributes NaN to ITS channel --
+    it is never silently substituted by another (HRRR and ERA5 are not interchangeable:
+    different resolution, and `swrad` is instantaneous under HRRR but an hourly mean in ERA5).
     """
-    source = str(source or "auto").lower()
-    if source == "auto":
-        chain = ["hrrr"]
-    elif source in _SOURCES:
-        chain = [source]
-    else:
-        raise ValueError(f"met source {source!r} not recognized; choose from "
-                         f"{['auto'] + sorted(_SOURCES)}.")
-    fb = str(fallback or "none").lower()
-    if fb != "none":
-        if fb not in _SOURCES:
-            raise ValueError(f"met fallback {fb!r} not recognized; choose from "
-                             f"{['none'] + sorted(_SOURCES)}.")
-        if fb not in chain:
-            chain.append(fb)
-    return chain
-
-
-def _fetch_at(chain, g: AoiGrid, dt: datetime, cfg: dict, tally: dict | None = None,
-              fallbacks: list | None = None):
-    """Walk the source chain; return (grids, source_name) of the first hit.
-
-    EVERY fall-through is logged. This was the quietest failure in the package: the three
-    clean `None` returns on the HRRR path (AoI outside the HRRR box, no fields returned, no
-    cycle available) said nothing at all, and the success lines never named the source that
-    won -- so a run whose entire met forcing silently came from 28 km ERA5 instead of 3 km
-    HRRR produced a log in which the string "era5" never appeared. The two are not
-    interchangeable: different resolution, different regridding, and `swrad` is an
-    INSTANTANEOUS flux under HRRR but an hourly MEAN under ERA5.
-
-    `tally` accumulates {source: n} so the run can report what actually served it.
-    `fallbacks` records (primary_abandoned, source_that_won) for each fetch that fell
-    through -- recorded HERE, at the moment it happens, because the chain is now resolved
-    PER AoI (a project may run hrrr->era5 in Oregon and era5-only in the Mediterranean),
-    so no single project-wide `chain[0]` exists to compare against afterwards.
-    """
-    for i, name in enumerate(chain):
-        try:
-            grids = _SOURCES[name](g, dt, cfg)
-        except Exception as exc:
-            log.warning("    met: %s failed @ %s (%s)", name, dt, exc)
-            grids = None
-        if grids:
-            if i:                      # a later link won -> we fell back, silently until now
-                log.info("    met: FELL BACK to %s @ %s (%s had no data)",
-                         name, dt, " -> ".join(chain[:i]))
-                if fallbacks is not None:
-                    fallbacks.append((chain[0], name))
-            if tally is not None:
-                tally[name] = tally.get(name, 0) + 1
-            return grids, name
-        log.info("    met: %s has no data @ %s; trying the next source in the chain",
-                 name, dt)
-    log.warning("    met: NO source in %s returned data @ %s", " -> ".join(chain), dt)
-    if tally is not None:
-        tally["<none>"] = tally.get("<none>", 0) + 1
-    return None, None
+    try:
+        return _SOURCES[src](g, dt, cfg)
+    except Exception as exc:
+        log.warning("    met: %s failed @ %s (%s)", src, dt, exc)
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -397,140 +338,99 @@ def overpass_times_for_day(overpass_dirs, aoi_id: str, day) -> list[datetime]:
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
-def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    """Acquire met forcing onto the pre-computed per-AoI grids."""
+def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=None):
+    """Acquire met FORCING onto the pre-computed per-AoI grids, one tree PER SOURCE.
+
+    Each configured source is written independently to `MET/<source>/aligned/<aoi>` (the
+    reference-time snapshot and, optionally, the daily mean); the cube emits `<var>_<source>`.
+    No chain / no fallback (D10). `only_source` narrows the run to one source. Overpass
+    documentation is a SEPARATE product now (`met_overpass`), not written here.
+    """
     grid_cfg = eff["grid"]
-    out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
+    met_root, fmt, overwrite = eff["met_root"], eff["fmt"], eff["overwrite"]
     to_celsius = grid_cfg.get("to_celsius", False)
-    overpass_dirs = eff["overpass_dirs"]
     start = pd.Timestamp(eff["time"]["start_date"])
     end = pd.Timestamp(eff["time"]["end_date"])
     days = pd.date_range(start, end, freq="D")
 
     names = select_aois(grids, only_aoi)
-
     rep = report.ProductReport("met")
-    tally: dict[str, int] = {}     # {source: n fetches} -- folded into `rep` at the end
-    fallbacks: list[tuple[str, str]] = []   # (primary abandoned, source that won)
 
     for name in names:
         g = grids[name]
-        # Resolved PER AoI. HRRR is NORTH AMERICA ONLY, so an AoI outside it must start the
-        # chain at ERA5 -- and a project that spans both cannot name one chain and be
-        # telling the truth. The region says which; the project default covers the rest.
         ds_cfg = eff["ds"][name]
-        chain = ds_cfg["chain"]
         mean_hours = ds_cfg["daily_mean_hours"]
         ref_time = ds_cfg["reference_time"]
         ref_basis = ds_cfg["reference_basis"]
         ref_hours = parse_hhmm(ref_time)
-
-        log.info("=== AOI: %s (CRS=%s grid=%dx%d) | chain=%s ===",
-                 name, g.target_crs, g.width, g.height, "->".join(chain))
-        if dry_run:
-            log.info("  [dry-run] %d day(s); reference=%s (%s) + daily hours=%s "
-                     "+ overpass snapshots", len(days), ref_time or "off", ref_basis,
-                     mean_hours or "off")
-            continue
-        aoi_out = out_root / name
-
         lon = 0.5 * (g.search_bbox[0] + g.search_bbox[2])
+        sources = [s for s in ds_cfg["sources"] if only_source is None or s == only_source]
 
-        for day in days:
-            dstr = naming.day_stamp(day)
-            ref_stem = naming.day_stem(name, day, prefix="ref_")
-            mean_stem = naming.day_stem(name, day)
+        for src in sources:
+            log.info("=== AOI: %s (grid=%dx%d) | source=%s ===",
+                     name, g.width, g.height, src)
+            if dry_run:
+                log.info("  [dry-run] %d day(s); reference=%s (%s) + daily hours=%s",
+                         len(days), ref_time or "off", ref_basis, mean_hours or "off"); continue
+            aoi_out = met_root / src / "aligned" / name
 
-            # ---- reference-time snapshot (the cube's default met channel) ----
-            if ref_hours is not None and not store.done(
-                    aoi_out / f"{ref_stem}.nc", store.REQUIRED_VARS["MET"],
-                    shape=(g.height, g.width), overwrite=overwrite):
-                rt = reference_time_utc(day, lon, ref_hours, ref_basis)
-                got, src = _fetch_at(chain, g, rt.to_pydatetime(), ds_cfg, tally, fallbacks)
-                if got:
-                    ds = to_dataset(got, g, rt, to_celsius)
-                    ds.attrs.update(aoi_id=name, source=f"{src} @reference",
-                                    reference_time=str(ref_time), reference_basis=ref_basis,
-                                    reference_time_utc=rt.isoformat(),
-                                    **provenance.stamp(eff))
-                    log.info("  %s reference [%s] (%s %s -> %s UTC) -> %s", dstr, src,
-                             ref_time, ref_basis, rt.strftime("%H:%M"),
-                             store.write_output(ds, aoi_out, ref_stem, fmt))
-                    rep.wrote(source=src)
-                else:
-                    rep.fail(f"{name} ref {dstr}", "no source in the chain had data")
+            for day in days:
+                dstr = naming.day_stamp(day)
+                ref_stem = naming.day_stem(name, day, prefix="ref_")
+                mean_stem = naming.day_stem(name, day)
 
-            # ---- daily mean over mean_hours (skipped when daily_mean_hours: []) ----
-            if mean_hours and not store.done(
-                    aoi_out / f"{mean_stem}.nc", store.REQUIRED_VARS["MET"],
-                    shape=(g.height, g.width), overwrite=overwrite):
-                stack, srcs, used_hours = {}, set(), []
-                for hh in mean_hours:
-                    dt = day.to_pydatetime().replace(hour=int(hh))
-                    got, src = _fetch_at(chain, g, dt, ds_cfg, tally, fallbacks)
-                    if not got:
-                        continue
-                    used_hours.append(int(hh))
-                    srcs.add(src)
-                    for k, v in got.items():
-                        stack.setdefault(k, []).append(v)
-                if stack:
-                    mean_grids = {k: np.nanmean(np.stack(v), axis=0) for k, v in stack.items()}
-                    ds = to_dataset(mean_grids, g, day, to_celsius)
-                    # The hours that ACTUALLY contributed, not the ones we asked for. The
-                    # attr used to echo `mean_hours` regardless, so a "daily mean" built
-                    # from 1 of 4 hours claimed all 4 -- a mean over a quarter of the
-                    # diurnal cycle, indistinguishable from the real thing.
-                    if len(used_hours) < len(mean_hours):
-                        missing = [int(h) for h in mean_hours if int(h) not in used_hours]
-                        log.warning("  %s: daily mean built from %d of %d hours "
-                                    "(no data at %s UTC); it is NOT a full-day mean",
-                                    dstr, len(used_hours), len(mean_hours),
-                                    ", ".join(f"{h:02d}h" for h in missing))
-                    ds.attrs.update(aoi_id=name, source=f"{'+'.join(sorted(srcs))} daily mean",
-                                    daily_mean_hours=str(used_hours),
-                                    daily_mean_hours_requested=str([int(h) for h in mean_hours]),
-                                    **provenance.stamp(eff))
-                    log.info("  %s daily [%s, %dh] -> %s", dstr, "+".join(sorted(srcs)),
-                             len(used_hours),
-                             store.write_output(ds, aoi_out, mean_stem, fmt))
-                    rep.wrote(source="+".join(sorted(srcs)) + " daily mean")
-                else:
-                    rep.fail(f"{name} daily {dstr}", "no source had data at any hour")
+                # ---- reference-time snapshot (the cube's default met channel) ----
+                if ref_hours is not None and not store.done(
+                        aoi_out / f"{ref_stem}.nc", store.REQUIRED_VARS["MET"],
+                        shape=(g.height, g.width), overwrite=overwrite):
+                    rt = reference_time_utc(day, lon, ref_hours, ref_basis)
+                    got = _fetch_one(src, g, rt.to_pydatetime(), ds_cfg)
+                    if got:
+                        ds = to_dataset(got, g, rt, to_celsius)
+                        ds.attrs.update(aoi_id=name, source=src, met_source=src,
+                                        reference_time=str(ref_time), reference_basis=ref_basis,
+                                        reference_time_utc=rt.isoformat(),
+                                        **provenance.stamp(eff))
+                        log.info("  %s reference [%s] (%s %s -> %s UTC) -> %s", dstr, src,
+                                 ref_time, ref_basis, rt.strftime("%H:%M"),
+                                 store.write_output(ds, aoi_out, ref_stem, fmt))
+                        rep.wrote(source=src)
+                    else:
+                        rep.fail(f"{name} {src} ref {dstr}", f"{src}: no data")
 
-            # ---- overpass snapshots ----
-            for op in overpass_times_for_day(overpass_dirs, name, day):
-                tstr = naming.time_stamp(op)
-                op_stem = naming.time_stem(name, op)
-                if store.done(aoi_out / f"{op_stem}.nc", store.REQUIRED_VARS["MET"],
-                              shape=(g.height, g.width), overwrite=overwrite):
-                    continue
-                got, src = _fetch_at(chain, g, op, ds_cfg, tally, fallbacks)
-                if not got:
-                    rep.fail(f"{name} overpass {tstr}", "no source in the chain had data")
-                    continue
-                ds = to_dataset(got, g, op, to_celsius)
-                ds.attrs.update(aoi_id=name, source=f"{src} @overpass", **provenance.stamp(eff))
-                log.info("  overpass %s [%s] -> %s", tstr, src,
-                         store.write_output(ds, aoi_out, op_stem, fmt))
-                rep.wrote(source=src)
-
-    # Which source actually SERVED this run -- not which was configured. The per-file
-    # `source` attr is the truth, but nobody reads 3,000 attrs, so the run says it once.
-    #
-    # Counted from the fall-throughs RECORDED AS THEY HAPPENED, not inferred afterwards by
-    # comparing the tally to `chain[0]`: with the chain resolved per AoI there is no single
-    # project-wide primary to compare against. A project running hrrr->era5 in Oregon and
-    # era5-only in the Mediterranean would, under the old test, have seen era5 as "the
-    # primary" and reported no fallback at all -- concealing every Oregon day that dropped
-    # from 3 km HRRR to 28 km ERA5, which is exactly the downgrade this note exists to
-    # announce.
-    if fallbacks:
-        pairs = Counter(fallbacks)
-        detail = ", ".join(f"{lost}->{won} x{n}" for (lost, won), n in pairs.most_common())
-        rep.note = (f"FELL BACK for {len(fallbacks)} fetch(es): {detail} "
-                    "(different resolution; swrad means something different)")
-        log.warning("met: %s", rep.note)
+                # ---- daily mean over mean_hours (skipped when daily_mean_hours: []) ----
+                if mean_hours and not store.done(
+                        aoi_out / f"{mean_stem}.nc", store.REQUIRED_VARS["MET"],
+                        shape=(g.height, g.width), overwrite=overwrite):
+                    stack, used_hours = {}, []
+                    for hh in mean_hours:
+                        dt = day.to_pydatetime().replace(hour=int(hh))
+                        got = _fetch_one(src, g, dt, ds_cfg)
+                        if not got:
+                            continue
+                        used_hours.append(int(hh))
+                        for k, v in got.items():
+                            stack.setdefault(k, []).append(v)
+                    if stack:
+                        mean_grids = {k: np.nanmean(np.stack(v), axis=0) for k, v in stack.items()}
+                        ds = to_dataset(mean_grids, g, day, to_celsius)
+                        # The hours that ACTUALLY contributed, not the ones we asked for -- a
+                        # "daily mean" built from 1 of 4 hours must not claim all 4.
+                        if len(used_hours) < len(mean_hours):
+                            missing = [int(h) for h in mean_hours if int(h) not in used_hours]
+                            log.warning("  %s [%s]: daily mean built from %d of %d hours "
+                                        "(no data at %s UTC); NOT a full-day mean", dstr, src,
+                                        len(used_hours), len(mean_hours),
+                                        ", ".join(f"{h:02d}h" for h in missing))
+                        ds.attrs.update(aoi_id=name, source=src, met_source=src,
+                                        daily_mean_hours=str(used_hours),
+                                        daily_mean_hours_requested=str([int(h) for h in mean_hours]),
+                                        **provenance.stamp(eff))
+                        log.info("  %s daily [%s, %dh] -> %s", dstr, src, len(used_hours),
+                                 store.write_output(ds, aoi_out, mean_stem, fmt))
+                        rep.wrote(source=src)
+                    else:
+                        rep.fail(f"{name} {src} daily {dstr}", f"{src}: no data at any hour")
     rep.log_summary()
     return rep
 
@@ -539,19 +439,17 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
 def _ds_cfg(opts) -> dict:
-    """One AoI's met settings, from its region-resolved options bag.
-
-    `source`/`fallback`/`model` are region-overridable -- HRRR is North America only, so an
-    AoI outside it must start its chain at ERA5, and a project spanning both continents
-    cannot name one chain truthfully. Everything else (the variable set, the reference time
-    and its basis, the daily-mean hours) stays project-global: those decide the cube's met
-    CHANNELS and what they mean, and the assembler names airtemp/wind_*/swrad/cloud_cover
-    explicitly -- so a region that dropped one would ship an all-NaN channel indistinguishable
-    from a forcing that was fetched and came back empty.
-    """
+    """One AoI's met FORCING settings: which SOURCES to STACK (region-overridable) + the fetch
+    knobs. HRRR is North America only, so an AoI outside it stacks only ERA5. The variable set,
+    reference time/basis and daily-mean hours stay project-global (they decide the cube's met
+    channels and what they mean)."""
+    srcs = _opt(opts, "sources", None)
+    if srcs is None:
+        srcs = list(DEFAULT_SOURCES)
+    elif isinstance(srcs, str):
+        srcs = [srcs]
     return {
-        "chain": _resolve_chain(_opt(opts, "source", DEFAULT_SOURCE),
-                                _opt(opts, "fallback", DEFAULT_FALLBACK)),
+        "sources": [str(s) for s in srcs],
         "model": _opt(opts, "model", "auto"),
         "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
         "daily_mean_hours": list(_opt(opts, "daily_mean_hours", DEFAULT_MEAN_HOURS)),
@@ -571,8 +469,6 @@ def _build_eff(project: Project) -> dict:
     if opts is None:
         raise ValueError("met is not a selected product in this config")
 
-    overpass_from = list(_opt(opts, "overpass_from", []))
-
     grid_cfg = project.grid.model_dump()
     grid_cfg.setdefault("to_celsius", False)          # GridSpec has no such field yet
 
@@ -582,9 +478,7 @@ def _build_eff(project: Project) -> dict:
         "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.met))
                for a in project.all_areas},
         "grid": grid_cfg,
-        "out_dir": root / "MET" / "aligned",
-        # thermal-scene dirs to snapshot forcing at (e.g. ECOSTRESS, LANDSAT).
-        "overpass_dirs": [root / s.upper() / "aligned" for s in overpass_from],
+        "met_root": root / "MET",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
         "time": {
@@ -595,27 +489,25 @@ def _build_eff(project: Project) -> dict:
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
-            overwrite=False) -> None:
-    """Acquire met forcing for a validated Project. Entry point for pipeline.py.
+            overwrite=False, source=None) -> None:
+    """Acquire met FORCING for a validated Project. Entry point for pipeline.py.
 
-    Parameters
-    ----------
-    project      validated config (coastal_sst_data.config.Project)
-    grids        pre-computed {aoi_name: AoiGrid}; if None, computed here so all
-                 products share one grid computation.
-    aois         restrict to these AoI name(s); default all
-    dry_run      report only, no fetch/write
-    overwrite    reprocess days even if the aligned file exists
-
-    Runs AFTER the SST stages when `overpass_from` is set, so their aligned files
-    exist to snapshot forcing against.
+    Every configured source is acquired and STACKED into its own `MET/<source>/` tree;
+    `source` (from the pipeline, or unset on a direct CLI run) narrows to one. No sensor
+    dependency any more -- overpass documentation is the separate `met_overpass` product.
     """
     eff = _build_eff(project)
     if overwrite:
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
-    return run(eff, grids, aois, dry_run)
+
+    bad = sorted(f"{n}:{s}" for n, c in eff["ds"].items() for s in c["sources"]
+                 if s not in _SOURCES)
+    if bad:
+        raise ValueError(f"met source not recognized ({', '.join(bad)}); "
+                         f"choose from {sorted(_SOURCES)}.")
+    return run(eff, grids, aois, dry_run, only_source=source)
 
 
 def main():

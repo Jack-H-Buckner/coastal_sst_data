@@ -38,7 +38,7 @@ def test_build_eff_maps_example_config():
     assert _ds(eff)["warn_distance_km"] == tides.DEFAULT_WARN_KM
     assert eff["fmt"] == "netcdf"
     assert eff["time"] == {"start_date": "2026-06-01", "end_date": "2026-06-30"}
-    assert eff["out_dir"] == Path("path/to/data") / "TIDE" / "aligned"
+    assert eff["tide_root"] == Path("path/to/data") / "TIDE"
     assert "aois" not in eff
 
 
@@ -104,66 +104,51 @@ def test_nearest_station_picks_closest():
 
 
 # --------------------------------------------------------------------------- #
-# Source selection + global (eo-tides) backup
+# Stacked sources (D10): coops + the global model, no fallback
 # --------------------------------------------------------------------------- #
 def test_build_eff_source_defaults(base_project):
-    """A bare `tides:` gets the coops-primary / eo_tides-backup defaults."""
+    """A bare `tides:` stacks both built-in sources; the model knobs default too."""
     base_project["products"]["tides"] = None
     eff = tides._build_eff(parse_config(base_project))
-    assert _ds(eff)["source"] == tides.DEFAULT_SOURCE == "coops"
-    assert _ds(eff)["fallback"] == tides.DEFAULT_FALLBACK == "eo_tides"
-    assert _ds(eff)["fallback_distance_km"] == tides.DEFAULT_FALLBACK_KM
+    assert _ds(eff)["sources"] == tides.DEFAULT_SOURCES == ["coops", "eo_tides"]
+    assert _ds(eff)["max_distance_km"] == tides.DEFAULT_MAX_KM
     assert _ds(eff)["model"] == tides.DEFAULT_MODEL == "EOT20"
     assert _ds(eff)["model_directory"] is None
 
 
-def test_build_eff_fallback_none_disables_backup(base_project):
-    """`fallback: none` normalizes to a disabled (None) fallback."""
-    base_project["products"]["tides"] = {"fallback": "none"}
-    eff = tides._build_eff(parse_config(base_project))
-    assert _ds(eff)["fallback"] is None
-
-
 def test_build_eff_reads_source_options(base_project):
-    """Source / model options come through the ds config."""
+    """The stacked `sources` list + model options come through the ds config."""
     base_project["products"]["tides"] = {
-        "default_source": "eo_tides", "fallback": "coops",
-        "fallback_distance_km": 200, "model": "FES2022",
+        "sources": ["eo_tides"], "max_distance_km": 200, "model": "FES2022",
         "model_directory": "/data/tide_models",
     }
     eff = tides._build_eff(parse_config(base_project))
-    assert _ds(eff)["source"] == "eo_tides"
-    assert _ds(eff)["fallback"] == "coops"
-    assert _ds(eff)["fallback_distance_km"] == 200.0
+    assert _ds(eff)["sources"] == ["eo_tides"]
+    assert _ds(eff)["max_distance_km"] == 200.0
     assert _ds(eff)["model"] == "FES2022"
     assert _ds(eff)["model_directory"] == "/data/tide_models"
 
 
-def test_source_region_override(base_project):
-    """A region's `sources.tides.source` overrides the project default.
-
-    The two-level lookup lives in config.resolve_opts now and lands in eff["ds"][<aoi>],
-    like every other product's per-AoI settings -- tides no longer carries its own.
-    """
+def test_sources_region_override(base_project):
+    """A region's `sources.tides.sources` overrides the project default stack."""
     base_project["products"]["tides"] = None
-    base_project["regions"][0]["sources"]["tides"] = {"source": "eo_tides"}
+    base_project["regions"][0]["sources"]["tides"] = {"sources": ["eo_tides"]}
     eff = tides._build_eff(parse_config(base_project))
-    assert eff["ds"]["a1"]["source"] == "eo_tides"
+    assert eff["ds"]["a1"]["sources"] == ["eo_tides"]
 
 
-def test_source_falls_back_to_project_default(base_project):
-    """With no region override, the project default source is used."""
-    base_project["products"]["tides"] = None               # selected, default options
-    eff = tides._build_eff(parse_config(base_project))     # no region tides source set
-    assert eff["ds"]["a1"]["source"] == "coops"
+def test_sources_default_when_unset(base_project):
+    """With no override, the project default stack is used."""
+    base_project["products"]["tides"] = None
+    eff = tides._build_eff(parse_config(base_project))
+    assert eff["ds"]["a1"]["sources"] == ["coops", "eo_tides"]
 
 
-def test_acquire_rejects_unknown_source(base_project):
-    """A typo'd source fails loudly before any network work."""
-    base_project["products"]["tides"] = {"default_source": "bogus"}
-    proj = parse_config(base_project)
-    with pytest.raises(ValueError, match="tides source not recognized"):
-        tides.acquire(proj, dry_run=True)
+def test_unknown_source_is_rejected_at_config_load(base_project):
+    """A typo'd source in the stacked list fails at config validation, before any work."""
+    base_project["products"]["tides"] = {"sources": ["bogus"]}
+    with pytest.raises(Exception, match="unknown source"):
+        parse_config(base_project)
 
 
 def _install_fake_eo_tides(monkeypatch):
@@ -204,37 +189,27 @@ def test_predict_global_raises_helpful_error_without_eo_tides(monkeypatch):
         tides.predict_global(-123.0, 45.0, "2026-06-01", "2026-06-01")
 
 
-def test_predict_with_fallback_uses_backup_on_error(monkeypatch):
-    """When the primary source raises, the fallback source is used."""
+def test_a_source_that_fails_yields_no_channel_no_fallback(monkeypatch, base_project, aoi_grid):
+    """No fallback (D10): if a stacked source raises, it simply contributes no tree here --
+    the OTHER stacked source is unaffected. (The old code fell back coops->eo_tides.)"""
     def bad(*a):
         raise RuntimeError("boom")
 
     def good(lon, lat, start, end, ds_cfg, station):
         s = pd.Series([1.0], index=pd.DatetimeIndex(["2026-06-01"]), name="tide")
-        return s, {"method": "backup"}
+        return s, {"method": "model"}
 
     monkeypatch.setitem(tides.SOURCES, "coops", bad)
     monkeypatch.setitem(tides.SOURCES, "eo_tides", good)
-    res = tides._predict_with_fallback("coops", "eo_tides", -123.0, 45.0,
-                                       "2026-06-01", "2026-06-01",
-                                       {"interval": "h"}, None, "a1")
-    assert res is not None
-    _, attrs, used = res
-    assert used == "eo_tides"
-    assert attrs["method"] == "backup"
+    monkeypatch.setattr(tides, "fetch_stations",
+                        lambda: [{"id": "X", "name": "near", "lon": -123.9, "lat": 45.5}])
+    base_project["products"]["tides"] = None
+    proj = parse_config(base_project)
+    tides.acquire(proj, grids={"a1": aoi_grid})
 
-
-def test_predict_with_fallback_returns_none_when_both_fail(monkeypatch):
-    """If primary and fallback both fail, the AoI yields None (is skipped)."""
-    def bad(*a):
-        raise RuntimeError("boom")
-
-    monkeypatch.setitem(tides.SOURCES, "coops", bad)
-    monkeypatch.setitem(tides.SOURCES, "eo_tides", bad)
-    res = tides._predict_with_fallback("coops", "eo_tides", -123.0, 45.0,
-                                       "2026-06-01", "2026-06-01",
-                                       {"interval": "h"}, None, "a1")
-    assert res is None
+    root = Path(proj.output_dir) / "TIDE"
+    assert not (root / "coops" / "aligned" / "a1" / "a1_tides.nc").exists()   # failed -> no tree
+    assert (root / "eo_tides" / "aligned" / "a1" / "a1_tides.nc").exists()    # the other is fine
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

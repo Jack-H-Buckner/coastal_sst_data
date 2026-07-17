@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """
-OCEANSR -- bathymetry static covariate (NOAA NCEI CUDEM, GMRT fallback).
+OCEANSR -- bathymetry static covariate (NOAA NCEI CUDEM + GMRT, STACKED per source).
 
-Settings come from `sources.bathymetry`. `source: cudem` reads the NOAA NCEI
-Continuously Updated DEM (1/9 arc-second ~3 m seamless topobathy) straight from
-its /vsicurl VRT, aggregates the fine pixels within each 100 m grid cell to
-depth statistics, and (where CUDEM has no coverage, e.g. SE Alaska) falls back
-to `source: gmrt` (GMRT GridServer, ~100 m). Writes ONE static NetCDF per AOI:
+`sources.bathymetry.sources` lists the DEMs to acquire (default: both). Each is fetched
+INDEPENDENTLY -- there is no fallback (D10): CUDEM (NOAA NCEI Continuously Updated DEM,
+1/9 arc-second ~3 m seamless topobathy, read straight from its /vsicurl VRT and aggregated
+to per-cell depth stats) and GMRT (GridServer, ~100 m global) each write their own tree:
 
-    data/BATHYMETRY/aligned/<aoi_id>/<aoi_id>.nc
+    data/BATHYMETRY/<source>/aligned/<aoi_id>/<aoi_id>.nc
+
+so the datacube can ship one channel per source (`depth_cudem`, `depth_gmrt`). A source with
+no coverage simply contributes no channel there; the user closes the gap by stacking another.
 
 Variables (all m):
-  elevation  : mean elevation (neg below sea level) -- used by the landmask
+  elevation  : mean elevation (neg below sea level)
   depth      : mean water depth over the cell (= mean of max(-elev,0))
   depth_p25  : 25th-percentile depth within the cell (sub-grid variability)
   depth_p75  : 75th-percentile depth within the cell
 
-For GMRT (no sub-grid) depth_p25 = depth_p75 = depth. CUDEM is referenced to
-NAVD88, not MSL -- expect the 0 contour (and water_min_depth_m) to shift slightly.
+For GMRT (no sub-grid) depth_p25 = depth_p75 = depth. Each source's DEM->MSL datum offset is
+resolved INLINE (processes.datum: 0 for GMRT/MSL, VDatum for CUDEM/NAVD88) and stamped onto
+its output as `datum_offset_m` / `datum_status`, so `elevation_<source>` can be referenced to
+MSL downstream. Adding a DEM source means adding its `datum.DEM_DATUM` entry.
 
 Usage (from the project root):
-    python src/acquire_bathymetry.py --config configs/config.yaml --aoi hood_canal
+    python -m coastal_sst_data.processes.bathymetry --config configs/config.yaml --aoi hood_canal
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from rasterio.transform import from_origin
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, net, provenance, report, store
+from . import datum, tides
 
 log = logging.getLogger(__name__)
 SOURCE = "bathymetry"
@@ -297,59 +302,47 @@ def _source_gmrt(g: AoiGrid, params: dict):
 SOURCES = {"cudem": _source_cudem, "gmrt": _source_gmrt}
 
 
-def _fetch_with_fallback(source, g: AoiGrid, params, fallback):
-    """Run the resolved source's fetcher; on NO-COVERAGE, try `fallback` if set.
+def _fetch_one(source, g: AoiGrid, params):
+    """Run ONE source's fetcher. No fallback (D3): sources are stacked, not substituted.
 
-    A NETWORK failure is deliberately NOT fallback-worthy. Falling back on one would swap a
-    3 m NAVD88 DEM for a ~100 m MSL one because a CDN hiccuped -- and nothing would ever
-    put it back, since the next run finds a complete bathymetry file and skips the AoI. So
-    a TileReadError propagates: the AoI fails, it is named in the run report, and the next
-    run retries CUDEM properly. Only genuine absence of coverage falls back.
+    A NETWORK failure still propagates as `TileReadError` -- the AoI/source fails, is named
+    in the run report, and the next run retries it properly, rather than a CDN hiccup being
+    frozen into a permanent downgrade. Genuine NO-COVERAGE returns None: that source simply
+    contributes no channel here, and the user closes the gap by stacking another source.
     """
     try:
-        res = SOURCES[source](g, params)
+        return SOURCES[source](g, params)
     except TileReadError:
         raise                                   # transient: fail loudly, retry next run
     except Exception as exc:
         log.warning("  %s: %s read failed (%s)", g.name, source, exc)
-        res = None
-    if res is None and fallback and fallback != source:
-        log.warning("  %s: %s has no coverage here; FALLING BACK to %s "
-                    "(coarser, and a different vertical datum)", g.name, source, fallback)
-        try:
-            res = SOURCES[fallback](g, params)
-        except Exception as exc:
-            log.warning("  %s: %s fallback failed (%s)", g.name, fallback, exc)
-            res = None
-    return res
+        return None
 
 
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
 def _ds_cfg(opts) -> dict:
-    """One AoI's bathymetry settings, from its region-resolved options bag.
+    """One AoI's bathymetry settings: which DEM SOURCES to STACK, region-overridable.
 
-    The DEM `source` and its `fallback` are region-overridable -- CUDEM is CONUS-only, so an
-    AoI outside it must name its own DEM. Three spellings resolve to the same thing, in
-    precedence order:
-
-        dem_source     region-only, and the name the region block has always used
-        source         what the docs (and every user) call it
-        default_source what the code originally read
-
-    They diverged silently for a long time: a config that said `source: cudem` got the
-    `default_source` DEFAULT -- gmrt -- so a project asking for 3 m topobathy quietly got
-    ~100 m GMRT. All three are honoured now, most-specific first.
+    Distinct-data sources (D10): the user lists the DEMs to acquire, and each writes its own
+    `<source>/` tree and its own cube channel (`depth_cudem`, `depth_gmrt`). CUDEM is
+    CONUS-only, so an AoI outside it stacks GMRT (or its own DEM) instead. There is no
+    `source`/`fallback`/`default_source` any more -- a config still setting one fails
+    validation rather than being silently ignored.
 
     The tuning knobs (pad, subgrid, cover threshold, the CUDEM index) are project-global:
     they decide how a DEM is AGGREGATED, not which DEM has coverage.
     """
-    return {
-        "source": (_opt(opts, "dem_source", None) or _opt(opts, "source", None)
-                   or _opt(opts, "default_source", "gmrt")),
-        "fallback": _opt(opts, "fallback", "gmrt"),
-    }
+    srcs = _opt(opts, "sources", None)
+    if srcs is None:
+        srcs = list(SOURCES)                     # default: stack every known DEM source
+    elif isinstance(srcs, str):
+        srcs = [srcs]
+    # `datum_offset_m` is the region-only override honoured per DEM source by the datum resolver.
+    return {"sources": [str(s) for s in srcs],
+            "datum_override": (None if _opt(opts, "datum_offset_m", None) is None
+                               else float(_opt(opts, "datum_offset_m")))}
 
 
 def _build_eff(project: Project) -> dict:
@@ -358,7 +351,7 @@ def _build_eff(project: Project) -> dict:
     if opts is None:
         raise ValueError("bathymetry is not a selected product in this config")
 
-    out_root = Path(project.output_dir) / "BATHYMETRY" / "aligned"
+    bathy_root = Path(project.output_dir) / "BATHYMETRY"
     cache = _opt(opts, "cudem_index_cache", None)
     params = {
         "pad_deg": float(_opt(opts, "pad_deg", 0.02)),
@@ -367,86 +360,114 @@ def _build_eff(project: Project) -> dict:
         "stats_subgrid_m": float(_opt(opts, "stats_subgrid_m", 10.0)),
         "min_cudem_cover": float(_opt(opts, "min_cudem_cover", 0.5)),
         "cudem_urllist": _opt(opts, "cudem_urllist", CUDEM_URLLIST),
-        "cudem_cache": Path(cache) if cache else out_root.parent / "urllist_cudem.txt",
-        "tmp_dir": Path(project.output_dir) / "BATHYMETRY" / "_tmp",
+        "cudem_cache": Path(cache) if cache else bathy_root / "urllist_cudem.txt",
+        "tmp_dir": bathy_root / "_tmp",
     }
     return {
+        "project": project,
         "config_sha256": project.config_sha256,
         "params": params,
         "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.bathymetry))
                for a in project.all_areas},
-        "out_dir": out_root,
+        "bathy_root": bathy_root,
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
     }
 
 
-def run(eff, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    """Build one static bathymetry NetCDF per AoI, each from its resolved source.
+def _source_out_root(bathy_root: Path, source: str) -> Path:
+    """Per-source aligned dir: BATHYMETRY/<source>/aligned. Each DEM is kept separate so
+    stacking CUDEM and GMRT does not have one overwrite the other."""
+    return bathy_root / source / "aligned"
 
-    The extra `aoi_sources` argument this used to take is gone: the per-AoI source now
-    arrives in `eff["ds"][name]` like every other product's per-AoI settings, so bathymetry
-    honours exactly the same run() contract as the rest.
+
+def run(eff, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=None):
+    """Build one static bathymetry NetCDF per (AoI, SOURCE), each in its own `<source>/` tree.
+
+    Every configured source is acquired independently (no fallback); `only_source` narrows
+    the run to one DEM. Each source's DEM->MSL datum offset is resolved INLINE (the datum
+    resolver is source-parameterized: 0 for GMRT/MSL, VDatum for CUDEM/NAVD88) and stamped
+    onto that source's output, so the offset travels with the DEM it references.
     """
     params = eff["params"]
-    out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
+    bathy_root, fmt, overwrite = eff["bathy_root"], eff["fmt"], eff["overwrite"]
 
     names = select_aois(grids, only_aoi)
-
     rep = report.ProductReport("bathymetry")
+    stations = None                       # CO-OPS gauge list for the datum cross-check (lazy)
 
     for name in names:
         g = grids[name]
         ds_cfg = eff["ds"][name]
-        source, fallback = ds_cfg["source"], ds_cfg["fallback"]
-        log.info("=== AOI: %s | grid=%dx%d @ %.0fm | source=%s ===",
-                 name, g.width, g.height, g.resolution_m, source)
+        override = ds_cfg["datum_override"]
+        sources = [s for s in ds_cfg["sources"] if only_source is None or s == only_source]
 
-        out_path = out_root / name / f"{name}.nc"
-        if store.done(out_path, store.REQUIRED_VARS["BATHYMETRY"],
-                      shape=(g.height, g.width), overwrite=overwrite):
-            log.info("  already processed, skipping"); rep.skip(); continue
-        if dry_run:
-            log.info("  [dry-run] would build bathymetry (%s) for %s", source, name); continue
+        for source in sources:
+            log.info("=== AOI: %s | grid=%dx%d @ %.0fm | source=%s ===",
+                     name, g.width, g.height, g.resolution_m, source)
+            out_dir = _source_out_root(bathy_root, source)
+            out_path = out_dir / name / f"{name}.nc"
+            if store.done(out_path, store.REQUIRED_VARS["BATHYMETRY"],
+                          shape=(g.height, g.width), overwrite=overwrite):
+                log.info("  already processed, skipping"); rep.skip(); continue
+            if dry_run:
+                log.info("  [dry-run] would build bathymetry (%s) for %s", source, name); continue
 
-        res = _fetch_with_fallback(source, g, params, fallback)
-        if res is None:
-            log.warning("  FAILED %s (no bathymetry from %s or fallback)", name, source)
-            rep.fail(name, f"no bathymetry from {source} or fallback")
-            continue
-        elev, depth, dp25, dp75, used = res
+            res = _fetch_one(source, g, params)
+            if res is None:
+                log.warning("  %s: %s has no coverage here; no channel from it (stack "
+                            "another source to fill the gap)", name, source)
+                rep.fail(name, f"{source}: no coverage")
+                continue
+            elev, depth, dp25, dp75, used = res
 
-        xs = g.transform.c + (np.arange(g.width) + 0.5) * g.transform.a
-        ys = g.transform.f - (np.arange(g.height) + 0.5) * g.transform.a
-        ds = xr.Dataset(
-            {"elevation": (("y", "x"), elev), "depth": (("y", "x"), depth),
-             "depth_p25": (("y", "x"), dp25), "depth_p75": (("y", "x"), dp75)},
-            coords={"y": ys, "x": xs})
-        ds["elevation"].attrs.update(units="m", long_name="mean elevation (neg below sea level)")
-        ds["depth"].attrs.update(units="m", long_name="mean water depth (0 on land)")
-        ds["depth_p25"].attrs.update(units="m", long_name="25th-percentile depth in cell")
-        ds["depth_p75"].attrs.update(units="m", long_name="75th-percentile depth in cell")
-        ds = ds.rio.write_crs(g.target_crs)
-        ds.attrs.update(aoi_id=name, source=used,
-                        processing="aggregated to AOI grid (mean, p25, p75 depth per cell)",
-                        **provenance.stamp(eff))
-        # Static layer: the stem is the bare AoI name -- no time stamp to encode.
-        log.info("  wrote %s  [%s]",
-                 store.write_output(ds, out_root / name, name, fmt), used)
-        # `used` is the DEM that actually won -- this is what stops "bathymetry ok" from
-        # hiding a silent 3 m CUDEM -> ~100 m GMRT downgrade.
-        rep.wrote(source=used)
+            # The datum offset follows THIS DEM source (CUDEM=NAVD88 -> VDatum; GMRT=MSL -> 0),
+            # resolved from the elevation we just built and stamped onto the output so a
+            # downstream user can reference `elevation_<source>` to MSL.
+            if stations is None and datum.DEM_DATUM.get(source) == "NAVD88":
+                try:
+                    stations = tides.fetch_stations()
+                except Exception as exc:
+                    log.warning("  CO-OPS station list unavailable (%s); no datum cross-check", exc)
+                    stations = []
+            drec = datum.resolve_aoi(g, elev, source, override=override, stations=stations)
+
+            xs = g.transform.c + (np.arange(g.width) + 0.5) * g.transform.a
+            ys = g.transform.f - (np.arange(g.height) + 0.5) * g.transform.a
+            ds = xr.Dataset(
+                {"elevation": (("y", "x"), elev), "depth": (("y", "x"), depth),
+                 "depth_p25": (("y", "x"), dp25), "depth_p75": (("y", "x"), dp75)},
+                coords={"y": ys, "x": xs})
+            ds["elevation"].attrs.update(units="m", long_name="mean elevation (neg below sea level)")
+            ds["depth"].attrs.update(units="m", long_name="mean water depth (0 on land)")
+            ds["depth_p25"].attrs.update(units="m", long_name="25th-percentile depth in cell")
+            ds["depth_p75"].attrs.update(units="m", long_name="75th-percentile depth in cell")
+            ds = ds.rio.write_crs(g.target_crs)
+            ds.attrs.update(aoi_id=name, source=used, bathy_source=source,
+                            processing="aggregated to AOI grid (mean, p25, p75 depth per cell)",
+                            datum_offset_m=float(drec["datum_offset_m"]),
+                            datum_status=str(drec["status"]),
+                            datum_method=str(drec["method"]),
+                            dem_vertical_datum=str(drec.get("dem_vertical_datum", "unknown")),
+                            **provenance.stamp(eff))
+            # Static layer: the stem is the bare AoI name -- no time stamp to encode.
+            log.info("  wrote %s  [%s]  datum_offset=%.3f m (%s)",
+                     store.write_output(ds, out_dir / name, name, fmt), used,
+                     drec["datum_offset_m"], drec["status"])
+            rep.wrote(source=used)
     rep.log_summary()
     return rep
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
-            overwrite=False) -> None:
+            overwrite=False, source=None) -> None:
     """Acquire bathymetry for a validated Project. Entry point for pipeline.py.
 
-    The DEM source is resolved PER AoI (region override -> project default) by
-    `config.resolve_opts`, then validated against the SOURCES registry, so a typo'd source
-    fails loudly -- before a single tile is fetched.
+    The DEM sources are the region-resolved `sources` LIST per AoI (D10), validated against
+    the SOURCES registry so a typo fails loudly before a tile is fetched. Every configured
+    source is acquired and stacked; `source` (from the pipeline, or unset on a direct CLI
+    run) narrows to one DEM. There is no fallback -- a source with no coverage simply
+    contributes no channel.
     """
     eff = _build_eff(project)
     if overwrite:
@@ -454,13 +475,13 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if grids is None:
         grids = project_grids(project)
 
-    bad = sorted(f"{n}:{c[k]}" for n, c in eff["ds"].items() for k in ("source", "fallback")
-                 if c[k] and c[k] not in SOURCES)
+    bad = sorted(f"{n}:{s}" for n, c in eff["ds"].items() for s in c["sources"]
+                 if s not in SOURCES)
     if bad:
         raise ValueError(f"bathymetry source not recognized ({', '.join(bad)}); "
                          f"choose from {sorted(SOURCES)}.")
     net.setup_gdal_env()      # /vsicurl CUDEM tile reads: deadline + retries
-    return run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run, only_source=source)
 
 
 def main():

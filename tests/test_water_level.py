@@ -1,7 +1,7 @@
-"""Water level (bathymetry + tide, derived in the assembler). Unit-tests the tide
-interpolation to the overpass hour, the waterline re-referencing and its
-submerged/exposed classes, and the two-level datum-offset lookup -- then checks
-the fields land in an assembled cube. No network, no real data."""
+"""Water level (the DOWNSTREAM reconstruction from the cube's raw ingredients). Unit-tests
+the tide interpolation to the overpass hour and the waterline re-referencing / submerged-
+exposed classes, then checks the cube ships the raw ingredients (per-source elevation + datum
+attrs, daily tide, overpass hour) rather than pre-derived channels. No network, no real data."""
 
 import numpy as np
 import pandas as pd
@@ -51,20 +51,37 @@ def _write(project, sub, fname, ds):
     ds.to_netcdf(d / fname)
 
 
-def write_tides(project, days, *, amplitude=1.0):
-    """Hourly tide over the window: a 12 h sinusoid, 0 m at each day's midnight."""
+def write_tides(project, days, *, amplitude=1.0, src="coops"):
+    """One tide source's hourly series (TIDE/<src>/aligned/<aoi>): a 12 h sinusoid."""
     times = pd.date_range(days[0], days[-1] + pd.Timedelta("23h"), freq="h")
     hours = np.arange(len(times), dtype="float64")
     tide = amplitude * np.sin(2 * np.pi * hours / 12.0)
     ds = xr.Dataset({"tide": (("time",), tide.astype("float32"))},
                     coords={"time": times})
-    _write(project, "TIDE", f"{AOI}_tides.nc", ds)
+    d = project.output_dir / "TIDE" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}_tides.nc")
 
 
-def write_bathymetry(project, g, elev):
+def _tide_series_dir(project, src="coops"):
+    return project.output_dir / "TIDE" / src / "aligned" / AOI
+
+
+def write_bathymetry(project, g, elev, src="cudem", *, datum_offset_m=0.0,
+                     datum_status="unresolved_assumed_zero"):
+    """One DEM source's aligned output, with its datum offset stamped on (as the bathymetry
+    module now produces it). Writes to the per-source tree BATHYMETRY/<src>/aligned/<aoi>."""
     xs, ys = g.xy_centers()
-    ds = xr.Dataset({"elevation": (("y", "x"), elev)}, coords={"y": ys, "x": xs})
-    _write(project, "BATHYMETRY", f"{AOI}.nc", ds)
+    depth = np.where(elev < 0, -elev, 0.0).astype("float32")
+    ds = xr.Dataset({"elevation": (("y", "x"), elev), "depth": (("y", "x"), depth),
+                     "depth_p25": (("y", "x"), depth), "depth_p75": (("y", "x"), depth)},
+                    coords={"y": ys, "x": xs})
+    ds.attrs.update(bathy_source=src, datum_offset_m=datum_offset_m, datum_status=datum_status,
+                    datum_method="stub",
+                    dem_vertical_datum="NAVD88" if src == "cudem" else "MSL_APPROX")
+    d = project.output_dir / "BATHYMETRY" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}.nc")
 
 
 def write_ecostress(project, g, day, hour):
@@ -86,7 +103,7 @@ def write_ecostress(project, g, day, hour):
 def test_tide_interpolated_to_the_overpass_hour(project, days):
     write_tides(project, days)
     s = water_level.load_tide_series(
-        project.output_dir / "TIDE" / "aligned" / AOI, AOI)
+        _tide_series_dir(project), AOI)
     # Scene at 03:30 on day 0; the series is hourly, so the value is the linear
     # interpolant between 03:00 and 04:00.
     tide = water_level.tide_at_overpass(s, days, [3.5, np.nan, np.nan])
@@ -103,7 +120,7 @@ def test_tide_is_nan_without_a_series(days):
 def test_tide_outside_the_series_is_nan_not_clamped(project, days):
     write_tides(project, days)
     s = water_level.load_tide_series(
-        project.output_dir / "TIDE" / "aligned" / AOI, AOI)
+        _tide_series_dir(project), AOI)
     # The series stops at 23:00 on the last day; an overpass past its end must not
     # inherit the final height.
     late = pd.date_range(days[-1] + pd.Timedelta("1D"), periods=1, freq="D")
@@ -159,85 +176,65 @@ def test_datum_offset_shifts_the_waterline():
 # datum offset: resolved by the `datum` stage, or asserted per region.
 # (The resolution chain itself is covered in tests/test_datum.py.)
 # --------------------------------------------------------------------------- #
-def test_offset_is_zero_with_a_loud_error_when_nothing_resolved_it(project, caplog):
-    with caplog.at_level("ERROR"):
-        offset, prov = water_level.resolve_datum_offset(project, AOI)
-    assert offset == 0.0
-    assert prov["datum_status"] == "unresolved_assumed_zero"    # visible on the cube
-    assert "no datum offset resolved" in caplog.text
-
-
-def test_region_override_is_used_when_the_stage_has_not_run(tmp_path):
-    p = _project(tmp_path)
-    cfg = p.model_dump(mode="json")
-    cfg["regions"][0]["sources"] = {"bathymetry": {"datum_offset_m": 1.31}}
-    p = parse_config(cfg)
-    offset, prov = water_level.resolve_datum_offset(p, AOI)
-    assert offset == pytest.approx(1.31)
-    assert prov["datum_method"] == "config_override"
-
-
 # --------------------------------------------------------------------------- #
 # Through the assembler
 # --------------------------------------------------------------------------- #
-def test_assembled_cube_carries_the_per_sensor_water_level(project, grids, days):
-    g = grids[AOI]
-    # West half is a tidal flat 0.5 m below MSL; east half is deep water.
-    elev = np.full((g.height, g.width), -10.0, "float32")
-    elev[:, : g.width // 2] = -0.5
-    write_bathymetry(project, g, elev)
-    write_tides(project, days)
-    write_ecostress(project, g, days[0], hour=3)    # tide = sin(2pi*3/12) = +1 m
-
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-
-    assert ds["eco_tide"].isel(time=0).item() == pytest.approx(1.0, abs=1e-5)
-    rel = ds["eco_water_elev"].isel(time=0).values
-    cls = ds["eco_water_class"].isel(time=0).values
-    # At a +1 m tide the flat (-0.5 m) sits 1.5 m under water; both halves submerged.
-    assert rel[:, : g.width // 2] == pytest.approx(-1.5, abs=1e-5)
-    assert rel[:, g.width // 2:] == pytest.approx(-11.0, abs=1e-5)
-    assert (cls == SUBMERGED).all()
-
-    # Days with no ECOSTRESS scene have no overpass tide -> unknown, not stale.
-    assert np.isnan(ds["eco_water_elev"].isel(time=1).values).all()
-    assert (ds["eco_water_class"].isel(time=1).values == UNKNOWN).all()
-    # Landsat never flew here at all.
-    assert (ds["lst_water_class"].values == UNKNOWN).all()
-
-
-def test_flat_is_exposed_at_low_tide(project, grids, days):
+def test_cube_ships_raw_water_level_ingredients_not_derived_channels(project, grids, days):
+    """S1 (D12): the per-sensor water-level channels are GONE from the cube -- water level
+    is a downstream computation now. What the cube ships instead are the RAW ingredients to
+    reconstruct it (per-source elevation, per-day tide, each sensor's overpass hour) plus the
+    DEM->MSL datum offset on each elevation_<src> channel, so downstream references it to MSL."""
     g = grids[AOI]
     elev = np.full((g.height, g.width), -0.5, "float32")
-    write_bathymetry(project, g, elev)
+    write_bathymetry(project, g, elev, "cudem", datum_offset_m=1.3, datum_status="ok")
     write_tides(project, days)
-    write_ecostress(project, g, days[0], hour=9)   # tide = sin(2pi*9/12) = -1 m
+    write_ecostress(project, g, days[0], hour=9)
 
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert ds["eco_tide"].isel(time=0).item() == pytest.approx(-1.0, abs=1e-5)
-    # Waterline is 1 m below MSL, so ground at -0.5 m stands 0.5 m clear of it.
-    assert ds["eco_water_elev"].isel(time=0).values == pytest.approx(0.5, abs=1e-5)
-    assert (ds["eco_water_class"].isel(time=0).values == EXPOSED).all()
+
+    # The derived channels are gone...
+    for pre in ("eco", "lst", "modis"):
+        for suf in ("water_elev", "water_class", "tide"):
+            assert f"{pre}_{suf}" not in ds.data_vars
+
+    # ...and the raw ingredients to rebuild them ship instead: the per-source DEM elevation,
+    # the daily tide series, and each sensor's overpass hour.
+    assert ds["elevation_cudem"].isel(y=0, x=0).item() == pytest.approx(-0.5)
+    assert np.isfinite(ds["tide_coops"].isel(time=0).item())                # daily tide ships (per source)
+    assert ds["eco_hour"].isel(time=0).item() == pytest.approx(9.0)         # overpass hour
+
+    # The DEM->MSL offset travels PER SOURCE, as attrs on that source's elevation channel.
+    assert ds["elevation_cudem"].attrs["datum_offset_m"] == pytest.approx(1.3)
+    assert ds["elevation_cudem"].attrs["datum_status"] == "ok"
 
 
-def test_water_level_can_be_turned_off(project, grids, days):
+def test_tide_overpass_interpolates_the_series_to_the_sensor_hour(project, grids, days):
+    """S4.5 (D17): `<sensor>_tide_<src>` is the per-source tide series interpolated to the
+    sensor's overpass hour -- the reconstructable overpass tide, materialised for the user's
+    (sensor, source) combos so downstream can compute water level from the cube alone."""
     g = grids[AOI]
-    write_bathymetry(project, g, np.full((g.height, g.width), -1.0, "float32"))
-    write_tides(project, days)
+    write_tides(project, days, src="coops")                    # 12 h sinusoid, hourly
+    write_ecostress(project, g, days[0], hour=3)               # eco flew at 03:00 -> tide = +1 m
+
     eff = datacube._build_eff(project)
-    eff["water_level"] = False
+    eff["tide_overpass_combos"] = [("eco", "coops")]
     ds = datacube.assemble_aoi(g, eff, days)
-    for v in ("eco_water_elev", "eco_water_class", "eco_tide"):
-        assert v not in ds.data_vars
+
+    assert "eco_tide_coops" in ds.data_vars
+    assert ds["eco_tide_coops"].isel(time=0).item() == pytest.approx(
+        np.sin(2 * np.pi * 3 / 12.0), abs=1e-5)                # tide at 03:00
+    assert np.isnan(ds["eco_tide_coops"].isel(time=1).values).all()   # no scene -> no tide
 
 
-def test_water_level_survives_missing_bathymetry_and_tide(project, grids, days):
-    """Neither product acquired: the fields still exist, all-unknown."""
+def test_datum_offset_ships_on_the_elevation_channel(project, grids, days):
+    """The datum offset is bathymetry-owned now -- it publishes as an attr on elevation_<src>
+    regardless of whether tides ran (water level moved downstream, but MSL referencing needs it)."""
     g = grids[AOI]
-    write_ecostress(project, g, days[0], hour=3)
+    write_bathymetry(project, g, np.full((g.height, g.width), -1.0, "float32"),
+                     "gmrt", datum_offset_m=0.0, datum_status="ok")
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert np.isnan(ds["eco_water_elev"].values).all()
-    assert (ds["eco_water_class"].values == UNKNOWN).all()
+    assert "datum_offset_m" in ds["elevation_gmrt"].attrs
+    assert "datum_status" in ds["elevation_gmrt"].attrs
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

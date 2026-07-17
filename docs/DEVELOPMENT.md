@@ -70,34 +70,32 @@ process module would close an import cycle. See the ladder in
 
 ## 2. The extension surface — what "adding X" actually costs
 
-This is the single most important table in this document, because the registry makes *some*
-extensions genuinely one declaration and leaves *others* needing hand-wiring — and the difference
-is not obvious from the code.
+This is the single most important table in this document, because it says exactly how much each
+kind of extension costs — and, crucially, what happens if you forget a step.
 
 | To add a… | Registry-only? | You also write |
 |---|---|---|
-| **Thermal sensor** (`Kind.OVERPASS_SENSOR`) | ✅ **Yes** | Nothing else. The assembler loops over `products.sensors()`, so every `<prefix>_sst/_cloud/_valid/_hour/_tide/_water_elev/_water_class`, overpass-met, and in-situ-matchup channel is generated from the spec. This is the "acid test" proven by [`test_add_a_sensor.py`](../tests/test_add_a_sensor.py). |
+| **Thermal sensor** (`Kind.OVERPASS_SENSOR`) | ✅ **Yes** | Nothing else. The assembler's `sensors` contributor loops over `products.sensors()`, so every `<prefix>_sst/_cloud/_valid/_hour`, overpass-met, and in-situ-matchup channel is generated from the spec. This is the "acid test" proven by [`test_add_a_sensor.py`](../tests/test_add_a_sensor.py). |
 | **A new source** for an existing product (e.g. `landsat_aws`) | ✅ ~Yes | A process module matching the **existing product's output contract** (§4). The registry already reserves `None` placeholders for these. |
-| **A new daily / static / series covariate** (a *non-sensor* product) | ❌ **No** | A `ProductSpec` **+ a process module (§3b) + a hand-wired block in `datacube.assemble_aoi` (§3c) + provenance rules if it produces derived channels (§3d)**. |
+| **A new daily / static / series covariate** (a *non-sensor* product) | ❌ **No** | A `ProductSpec` **+ a process module (§3b) + a registered `Contributor` in `datacube.CONTRIBUTORS` (§3c) + provenance rules if it produces derived channels (§3d)**. |
 
-> ⚠️ **The trap.** The docstring at [products.py:41](../src/coastal_sst_data/products.py#L41) says
-> "Adding a product is now: write the module, add a ProductSpec here." That is completely true for
-> *acquisition, dispatch, ordering, auth, and the skip guard* — a new covariate will be downloaded,
-> resumed, and provenanced at the product level with nothing but a spec. It is **not** true for
-> *assembly*: [`datacube.assemble_aoi`](../src/coastal_sst_data/processes/datacube.py#L448) reads
-> each non-sensor product through a **hand-written block** (MUR, met, CMEMS, tides, bathymetry,
-> land-cover, in-situ each have their own `load_*` call and `Dataset` entry). A new covariate with
-> a perfect spec and a working `acquire()` will be **acquired to disk and then silently omitted
-> from every cube** until you wire it into the assembler. That silent gap is exactly the class of
-> failure the registry was built to eliminate for *sensors* — it just doesn't extend to arbitrary
-> covariates yet.
+> ✅ **The trap is now closed by a loud invariant.** A covariate still needs a contributor to
+> reach the cube — but forgetting it is no longer *silent*. Every product flows through one uniform
+> `(ctx) -> channels` **contributor protocol** in
+> [`datacube.assemble_aoi`](../src/coastal_sst_data/processes/datacube.py), and
+> [`_check_contributors`](../src/coastal_sst_data/processes/datacube.py) runs **at import**: a
+> non-sensor `ProductSpec` with no registered contributor (and no `cube_opt_out=True`) is a hard
+> `RuntimeError` before a single cube is built. So a new covariate that you acquire to disk but
+> forget to wire will crash the process with a message naming the product, rather than being
+> acquired and then silently omitted from every cube. This is the acid test proven by
+> [`test_add_a_covariate.py`](../tests/test_add_a_covariate.py).
 
-Sensors are registry-driven end-to-end because they are a **uniform family** — every sensor
-produces the same channel shapes and differs only in a handful of validity flags
-([`SensorSpec`](../src/coastal_sst_data/products.py#L82)). A covariate is not a uniform family:
-CMEMS emits per-depth channels discovered from the files, met emits a fixed set with source-code
-channels, bathymetry feeds the land mask. There is no single loop that could serve all of them, so
-each is wired by hand.
+A covariate is not a *uniform family* the way sensors are — CMEMS emits per-depth channels
+discovered from the files, met emits a fixed set and writes the reference-time slot, bathymetry
+publishes elevation/depth. So each still writes its own `_contribute_*` function; the protocol does
+not try to make them one loop. What it *does* give you is a uniform mechanism, a derived run order
+(topological sort over declared slot reads/writes — no hand-kept sequence), and the loud failure
+above, so a covariate can never again be half-wired without anyone noticing.
 
 ---
 
@@ -268,34 +266,39 @@ if __name__ == "__main__": main()
 At this point your product **acquires correctly** — it downloads, resumes, reports, and is
 provenanced at the product level. It is **not yet in any cube.**
 
-### 3c. Wiring a non-sensor product into the datacube
+### 3c. Wiring a non-sensor product into the datacube (write a contributor)
 
-This is the step the registry does *not* do for you (see §2). Open
-[`datacube.assemble_aoi`](../src/coastal_sst_data/processes/datacube.py#L448) and add a block that
-loads your product and contributes its channels to the final `Dataset`. Follow the closest existing
-model:
+The registry gets your product acquired to disk; the **contributor protocol** gets it into the
+cube. You write **one `_contribute_*(ctx)` function** and register **one `Contributor`** in
+[`datacube.CONTRIBUTORS`](../src/coastal_sst_data/processes/datacube.py) — you do *not* hand-edit
+`assemble_aoi` (there is no `Dataset` literal to append to any more). Forgetting the contributor is
+a hard error at import (`_check_contributors`), not a silent omission.
 
-- **Daily raster** → copy the MUR pattern ([datacube.py:459](../src/coastal_sst_data/processes/datacube.py#L459)):
+A contributor receives an `AssemblyContext` (`ctx`) and calls `ctx.emit(name, dims, arr, **attrs)`
+to add channels. It reads aligned files from `ctx.adir("<product>")` and may read/write shared
+intermediates via `ctx.slots[...]`. Declare which slots you read/write on the `Contributor`; the
+run order is **topologically sorted** from those declarations, so you never reason about a global
+sequence. Follow the closest existing model:
+
+- **Daily raster** → copy `_contribute_mur`:
   ```python
-  chl = load_daily_sensor(adir("chl"), aid, days, H, W, "chl")
-  # optionally NN-fill over land-cover water like MUR/CMEMS do, if it's an ocean field
+  def _contribute_chl(ctx):
+      d = ctx.adir("chl")
+      ctx.emit("chl", ("time", "y", "x"),
+               load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, "chl"))
   ```
-  then add `"chl": (T, chl)` to the `xr.Dataset({...})` literal at
-  [datacube.py:617](../src/coastal_sst_data/processes/datacube.py#L617).
-- **Config-dependent channel set** (variables/depths discovered from the files) → copy the CMEMS
-  pattern ([datacube.py:555](../src/coastal_sst_data/processes/datacube.py#L555)), which discovers
-  channels via a `*_channels()` helper rather than a fixed list.
-- **Static raster** → copy `load_bathy` / `load_landcover`.
-- **1D series / station table** → copy `load_tide_daily` / `load_insitu` + `build_insitu`.
+  then add `Contributor("chl", (), (), _contribute_chl)` to the `CONTRIBUTORS` tuple. (The `key`
+  must equal your product's `DataProduct.value`, so the loud invariant matches it to the registry.)
+- **Config-dependent channel set** (variables/depths discovered from the files) → copy
+  `_contribute_cmems`, which discovers channels via a `*_channels()` helper rather than a fixed list.
+- **Static raster** → copy `_contribute_bathymetry` / `_contribute_landcover`.
+- **1D series / station table** → copy `_contribute_tides` / `_contribute_insitu` (+ `build_insitu`).
+- **Reads a shared intermediate** (e.g. a sensor's chosen overpass time) → declare it in `reads`
+  and pull it from `ctx.slots[SLOT_SENSOR_TIMES]`, like `_contribute_met_overpass`/`_contribute_insitu`.
 
-If your product **falls back between sources day-to-day** (like CMEMS reanalysis→forecast or met
-HRRR→ERA5), also add it to the per-day source-channel loop at
-[datacube.py:542](../src/coastal_sst_data/processes/datacube.py#L542) so a row of the cube can be
-traced to the file that produced it.
-
-If your product is daily and you set a `coverage_channel`, the coverage check at
-[datacube.py:744](../src/coastal_sst_data/processes/datacube.py#L744) picks it up from
-`DAILY_CHANNELS` automatically — no wiring.
+If your product is daily and you set a `coverage_channel`, the coverage check picks it up from
+`DAILY_CHANNELS` automatically — no wiring. If your product deliberately ships **no** cube channel,
+set `cube_opt_out=True` on its `ProductSpec` so the invariant knows the omission is intentional.
 
 ### 3d. Teaching provenance about new channels
 
@@ -308,8 +311,9 @@ what this module exists to prevent. Map your channels:
   dict at [provenance.py:151](../src/coastal_sst_data/provenance.py#L151).
 - A whole prefix family (`chl_*`) → add a `name.startswith("chl_")` branch beside the `cmems_` /
   `mur_` ones at [provenance.py:180](../src/coastal_sst_data/provenance.py#L180).
-- **Derived** channels (built from several products) list *all* their inputs — `water_elev` returns
-  `["bathymetry", "tides", "datum", sensor]`. If you add a derived channel, add its full input list;
+- **Derived** channels (built from several products) list *all* their inputs — an overpass-met
+  channel like `eco_airtemp` returns `["met", sensor]`, and `insitu_sst` returns `["insitu", "met"]`
+  (it is sampled at met's reference time). If you add a derived channel, add its full input list;
   naming one input would be tidy and wrong.
 
 Sensor-prefixed channels (`<prefix>_*`) are already handled generically via the `SENSORS` map, so a
@@ -317,18 +321,20 @@ new *sensor* needs nothing here — this step is only for non-sensor and derived
 
 ### 3e. Write a test
 
-The suite's convention is one test module per product (`tests/test_<product>.py`), plus the
-cross-cutting **acid test** [`test_add_a_sensor.py`](../tests/test_add_a_sensor.py) — read it before
-writing yours, it is the executable spec for "a new product is picked up by every derived table."
+The suite's convention is one test module per product (`tests/test_<product>.py`), plus **two**
+cross-cutting acid tests — [`test_add_a_sensor.py`](../tests/test_add_a_sensor.py) for a sensor and
+[`test_add_a_covariate.py`](../tests/test_add_a_covariate.py) for a non-sensor covariate. Read the
+one matching your product before writing yours; each is the executable spec for "a new product is
+picked up by every derived table *and* an assembled cube gains its channels."
 
-Its key technique: because the derived tables (`store.REQUIRED_VARS`, `datacube.PRODUCT_DIRS`,
-`provenance.SENSORS`, `pipeline.PROCESS_MODULES`, …) are computed **once at import**, a test that
-adds a spec must `monkeypatch` those module-level tables to re-derive them from the patched
-`products.REGISTRY` — this simulates "restart the process with the new spec in `products.py`". See
-the `registered` fixture at [test_add_a_sensor.py:61](../tests/test_add_a_sensor.py#L61). For a
-non-sensor product, also assert (as that test does for sensors) that an assembled cube actually
-**gains your channels with correct values** — that's the assertion that would have caught a missing
-§3c wiring.
+Their key technique: because the derived tables (`store.REQUIRED_VARS`, `datacube.PRODUCT_DIRS`,
+`datacube.CONTRIBUTORS`, `provenance.SENSORS`, `pipeline.PROCESS_MODULES`, …) are computed **once at
+import**, a test that adds a spec must `monkeypatch` those module-level tables to re-derive them
+from the patched `products.REGISTRY` — this simulates "restart the process with the new spec in
+`products.py`". `test_add_a_covariate.py` additionally asserts the payoff of the loud invariant:
+registering the spec **without** a contributor makes `_check_contributors()` raise, and adding the
+one contributor both satisfies the invariant and makes the assembled cube gain the channel with
+correct values.
 
 Run `pytest` (offline; the suite stubs the network).
 
@@ -364,19 +370,20 @@ The interchangeability is the whole point: a cube built from `landsat_pc` and on
 
 ## 5. Adding a derived stage
 
-`datum` and `water_level` are **derived stages**, not products — they are not selectable in a config
-and produce nothing from the network; they compute from what other products already wrote. They own
-an output directory the assembler and provenance must find, registered in
-[`DERIVED_DIRS`](../src/coastal_sst_data/products.py#L397) (so `product_dirs()` includes them).
+`datum` is a **derived stage**, not a product — it is not selectable in a config and produces
+nothing from the network; it computes from what other products already wrote. It owns an output
+directory the assembler and provenance must find, registered in
+[`DERIVED_DIRS`](../src/coastal_sst_data/products.py#L397) (so `product_dirs()` includes it).
 
 - A derived stage that writes an aligned sidecar (like `datum`, which writes
   `DATUM/aligned/<aoi>/<aoi>_datum.json`) is dispatched explicitly from
   [`run_pipeline`](../src/coastal_sst_data/pipeline.py#L162) — it is **not** in `PROCESS_ORDER`
   and is called by name after its inputs exist (datum runs after bathymetry, before assembly). Add
-  its dir to `DERIVED_DIRS` and its call site to `run_pipeline`.
-- A derived stage computed **inside** the assembler (like `water_level`, called from within
-  `assemble_aoi`) needs no directory of its own; it just needs its channels mapped in
-  `provenance.field_inputs` (§3d).
+  its dir to `DERIVED_DIRS` and its call site to `run_pipeline`. The assembler reads its result to
+  publish the `datum_offset_m` / `datum_status` cube attributes.
+- A derived stage computed **inside** the assembler that emits a *channel* (rather than an attribute)
+  is just another `Contributor` — key it `"derived:<name>"`, declare the slots it reads, and map its
+  channels in `provenance.field_inputs` (§3d). `_contribute_doy` is the minimal example.
 
 Keep derived stages **idempotent and cheap to re-run**, and have them **read inputs off disk** rather
 than re-fetching, so they can backfill an existing tree — `datum` reads the bathymetry file rather
@@ -422,11 +429,12 @@ The recommended sequence when adding a product:
 coastal-sst-data validate --config config.yaml            # spec picked up? option surface right?
 python -m coastal_sst_data.processes.chl --config … --dry-run   # search works, nothing written
 python -m coastal_sst_data.processes.chl --config … --aoi <one>  # acquire one AoI for real
-coastal-sst-data assemble --config … --aoi <one> --overwrite     # did §3c wiring land the channels?
+coastal-sst-data assemble --config … --aoi <one> --overwrite     # did the contributor land the channels?
 coastal-sst-data provenance --config … --fields                  # is every new channel sourced?
-pytest tests/test_chl.py tests/test_add_a_sensor.py              # the derived tables + assembly
+pytest tests/test_chl.py tests/test_add_a_covariate.py          # the derived tables + assembly
 ```
 
-If `provenance --fields` shows a channel with no products behind it, you missed §3d. If `assemble`
-produces a cube without your channels, you missed §3c. Neither raises — which is exactly why they're
-on the checklist.
+If `provenance --fields` shows a channel with no products behind it, you missed §3d (that one only
+*warns*, so it's on the checklist). Forgetting the contributor itself is louder: `_check_contributors`
+raises at **import** — `assemble` (indeed any command that imports `datacube`) crashes with a message
+naming your product, so a half-wired covariate can't reach a cube unnoticed.

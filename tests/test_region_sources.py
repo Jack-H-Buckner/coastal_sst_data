@@ -40,12 +40,12 @@ def _two_continent_project(tmp_path):
         "time": {"start_date": "2026-06-01", "end_date": "2026-06-03"},
         "products": {
             # Project-wide defaults are the North American ones...
-            "met": {"source": "auto", "fallback": "era5",
-                    "variables": ["airtemp", "wind"]},
-            "cmems": {"source": "my", "variables": ["thetao"], "depths": [0.0, 10.0]},
+            "met": {"sources": ["hrrr", "era5"], "variables": ["airtemp", "wind"]},
+            "cmems": {"sources": ["my_global", "anfc_global"],
+                      "variables": ["thetao"], "depths": [0.0, 10.0]},
             "insitu": {"source": "ioos", "qc_flags": [1, 2]},
-            "tides": {"default_source": "coops"},
-            "bathymetry": {"source": "cudem"},
+            "tides": {"sources": ["coops", "eo_tides"]},
+            "bathymetry": {"sources": ["cudem"]},
         },
         "auth": {"earthdata": {"auth_strategy": "netrc"},
                  "copernicus": {"auth_strategy": "netrc"}},
@@ -56,11 +56,12 @@ def _two_continent_project(tmp_path):
             {"name": "medit",
              # ...and the Mediterranean region says, per source, what actually reaches it.
              "sources": {
-                 "met": {"source": "era5", "fallback": "none"},
-                 "cmems": {"dataset_id": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"},
+                 "met": {"sources": ["era5"]},
+                 "cmems": {"sources": ["anfc_med"],
+                           "datasets": {"anfc_med": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"}},
                  "insitu": {"source": "ioos", "exclude_stations": ["bogus1"]},
-                 "tides": {"source": "eo_tides", "model": "FES2022"},
-                 "bathymetry": {"dem_source": "gmrt"},
+                 "tides": {"sources": ["eo_tides"], "model": "FES2022"},
+                 "bathymetry": {"sources": ["gmrt"]},
              },
              "areas": [{"name": "ligurian", "center_lat": 44.0, "center_lon": 9.0,
                         "buffer_ns_km": 8, "buffer_ew_km": 8}]},
@@ -71,35 +72,38 @@ def _two_continent_project(tmp_path):
 # --------------------------------------------------------------------------- #
 # Coverage: each product resolves a DIFFERENT source per region
 # --------------------------------------------------------------------------- #
-def test_met_chain_differs_per_region(tmp_path):
-    """The one that matters most: HRRR does not reach the Mediterranean, so that region's
-    chain must START at ERA5 rather than silently falling back to it every single fetch."""
+def test_met_sources_differ_per_region(tmp_path):
+    """The one that matters most: HRRR does not reach the Mediterranean, so that region stacks
+    only ERA5 -- a deliberate choice, not a silent fallback."""
     ds = met._build_eff(_two_continent_project(tmp_path))["ds"]
-    assert ds["tillamook"]["chain"] == ["hrrr", "era5"]   # HRRR, with ERA5 to backfill
-    assert ds["ligurian"]["chain"] == ["era5"]            # ERA5 only -- deliberate, not a fallback
+    assert ds["tillamook"]["sources"] == ["hrrr", "era5"]   # both stacked
+    assert ds["ligurian"]["sources"] == ["era5"]            # ERA5 only
 
 
-def test_cmems_dataset_differs_per_region(tmp_path):
-    """CMEMS publishes regional models; the Ligurian AoI names the Mediterranean one."""
+def test_cmems_sources_differ_per_region(tmp_path):
+    """CMEMS publishes regional models; the Ligurian AoI stacks the Mediterranean tag, whose
+    dataset id it registers via `datasets`. Distinct-data sources are a stacked LIST now."""
     ds = cmems._build_eff(_two_continent_project(tmp_path))["ds"]
-    assert ds["tillamook"]["chain"] == ["my", "anfc"]     # the global reanalysis chain
-    assert ds["ligurian"]["chain"] == ["cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"]
+    assert ds["tillamook"]["sources"] == ["my_global", "anfc_global"]   # the global tags
+    assert ds["ligurian"]["sources"] == ["anfc_med"]
+    assert ds["ligurian"]["datasets"]["anfc_med"] == "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"
 
 
-def test_tide_source_differs_per_region(tmp_path):
-    """CO-OPS gauges are U.S.-only -> the Mediterranean AoI uses a global tide model."""
+def test_tide_sources_differ_per_region(tmp_path):
+    """CO-OPS gauges are U.S.-only -> the Mediterranean AoI stacks only the global model."""
     ds = tides._build_eff(_two_continent_project(tmp_path))["ds"]
-    assert ds["tillamook"]["source"] == "coops"
-    assert ds["ligurian"]["source"] == "eo_tides"
+    assert ds["tillamook"]["sources"] == ["coops", "eo_tides"]
+    assert ds["ligurian"]["sources"] == ["eo_tides"]
     assert ds["ligurian"]["model"] == "FES2022"
 
 
-def test_bathymetry_dem_differs_per_region(tmp_path):
-    """CUDEM is CONUS-only -> the Mediterranean AoI falls to the global GMRT."""
+def test_bathymetry_dems_differ_per_region(tmp_path):
+    """CUDEM is CONUS-only -> the Mediterranean AoI stacks the global GMRT instead. Distinct
+    -data sources are a LIST now (stacked), region-overridable, with no fallback."""
     from coastal_sst_data.processes import bathymetry
     ds = bathymetry._build_eff(_two_continent_project(tmp_path))["ds"]
-    assert ds["tillamook"]["source"] == "cudem"
-    assert ds["ligurian"]["source"] == "gmrt"
+    assert ds["tillamook"]["sources"] == ["cudem"]
+    assert ds["ligurian"]["sources"] == ["gmrt"]
 
 
 def test_insitu_station_excludes_are_per_region(tmp_path):
@@ -208,7 +212,7 @@ def test_resolve_opts_layers_region_over_global(tmp_path):
     pnw = resolve_opts(project, "tillamook", DataProduct.met)
     med = resolve_opts(project, "ligurian", DataProduct.met)
     # region override wins where it is set...
-    assert opt(pnw, "source") == "auto" and opt(med, "source") == "era5"
+    assert opt(pnw, "sources") == ["hrrr", "era5"] and opt(med, "sources") == ["era5"]
     # ...and the project-global value shows through where it is not.
     assert opt(pnw, "variables") == opt(med, "variables") == ["airtemp", "wind"]
 

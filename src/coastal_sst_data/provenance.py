@@ -152,11 +152,8 @@ _EXACT = {
     "tide": ["tides"], "tide_range": ["tides"],
     "airtemp": ["met"], "wind_u": ["met"], "wind_v": ["met"], "wind_speed": ["met"],
     "swrad": ["met"], "cloud_cover": ["met"],
-    # which source served met on each day (see daily_sources); cmems_source is caught by
-    # the cmems_ prefix rule below
-    "met_source": ["met"],
+    "elevation": ["bathymetry"],
     "depth": ["bathymetry"], "depth_p25": ["bathymetry"], "depth_p75": ["bathymetry"],
-    "landmask": ["landcover", "bathymetry"],
     "landcover_water": ["landcover"],
     "insitu_sst": ["insitu", "met"],      # sampled at met's reference time
     "insitu_n": ["insitu"],
@@ -166,6 +163,17 @@ _EXACT = {
 }
 
 _MET_VARS = ("airtemp", "wind_u", "wind_v", "wind_speed", "swrad", "cloud_cover")
+
+
+def _matching_source_tag(name: str, sources_by_tag: dict) -> str | None:
+    """The source tag a per-source channel belongs to: the longest tag `t` such that `name`
+    ends with `_<t>` (longest wins, so `tide_range_eo_tides` picks `eo_tides`, not a stray
+    shorter tag). None when the channel names no known source tag."""
+    best = None
+    for tag in sources_by_tag:
+        if name.endswith("_" + tag) and (best is None or len(tag) > len(best)):
+            best = tag
+    return best
 
 
 def field_inputs(name: str) -> list[str]:
@@ -181,6 +189,9 @@ def field_inputs(name: str) -> list[str]:
         return ["cmems"]
     if name.startswith("mur_"):
         return ["mur"]
+    # Per-source bathymetry (D4/D5): `elevation_cudem`, `depth_gmrt`, `depth_p25_<src>`, ...
+    if any(name.startswith(v + "_") for v in ("elevation", "depth", "depth_p25", "depth_p75")):
+        return ["bathymetry"]
 
     m = _SENSOR_RE.match(name) if _SENSOR_RE else None
     if m:
@@ -188,16 +199,23 @@ def field_inputs(name: str) -> list[str]:
         sensor = SENSORS[pre]
         if rest in ("sst", "cloud", "valid", "hour"):
             return [sensor]
-        if rest in ("water_elev", "water_class"):
-            # the DEM, the tide, the datum tying them together, and the overpass that
-            # set the instant -- all four are load-bearing
-            return ["bathymetry", "tides", "datum", sensor]
-        if rest == "tide":
-            return ["tides", sensor]
         if rest.startswith("insitu"):
             return ["insitu", sensor]
-        if rest in _MET_VARS:
-            return ["met", sensor]
+        # overpass met `<sensor>_<metvar>_<src>` (e.g. eco_airtemp_hrrr) -- from met_overpass.
+        if any(rest.startswith(v + "_") for v in _MET_VARS):
+            return ["met_overpass", sensor]
+        # overpass tide `<sensor>_tide_<src>` (e.g. eco_tide_coops) -- derived from the tides
+        # series interpolated to this sensor's overpass (tide_overpass contributor).
+        if rest.startswith("tide_"):
+            return ["tides", sensor]
+
+    # Per-source forcing met `<metvar>_<src>` (airtemp_hrrr) and tides `tide_<src>` /
+    # `tide_range_<src>` (D4/D5). Match by PREFIX -- a source token can itself contain an
+    # underscore (`eo_tides`), so splitting off the last token would misread the base.
+    if any(name.startswith(v + "_") for v in _MET_VARS):
+        return ["met"]
+    if name.startswith("tide_"):
+        return ["tides"]
 
     log.warning("provenance: no source mapping for field %r; it will be recorded with an "
                 "empty input list. Add it to provenance.field_inputs.", name)
@@ -236,39 +254,6 @@ def collect_product(d: Path, product: str) -> dict | None:
     }
 
 
-def daily_sources(d: Path, aoi_id: str, days, prefix: str = "") -> tuple[list[int], list[str]]:
-    """Per-DAY source code for one product in one AoI, plus the legend naming each code.
-
-    `collect_product` above unions a product's sources into a SET, which answers "which
-    sources appear somewhere in this cube" and destroys the per-day answer this module's
-    docstring promises. That union is exactly wrong for the products that switch source
-    underneath you: a CMEMS product with 300 reanalysis days and 65 forecast days reports
-    `[glorys, forecast]` and tells you nothing about any given day, and a met product that
-    fell back to ERA5 for a fortnight in March looks identical to one that never did.
-
-    So the cube carries the answer per timestep. Code 0 is always "none" (no file that
-    day); legend[i] names code i. `prefix` selects a variant written into the same
-    directory (met writes both `<aoi>_<date>.nc` and `<aoi>_ref_<date>.nc`), matched WHOLE
-    so the two cannot be confused.
-    """
-    codes = [0] * len(days)
-    legend = ["none"]
-    if not d.exists():
-        return codes, legend
-
-    pat = re.compile(rf"^{re.escape(aoi_id)}_{re.escape(prefix)}(\d{{8}})\.nc$")
-    idx = {dd.strftime("%Y%m%d"): i for i, dd in enumerate(days)}
-    for f in sorted(d.glob(f"{aoi_id}_{prefix}*.nc")):
-        m = pat.match(f.name)
-        if not m or m.group(1) not in idx:
-            continue
-        s = str(source_of(f) or "unknown")
-        if s not in legend:
-            legend.append(s)
-        codes[idx[m.group(1)]] = legend.index(s)
-    return codes, legend
-
-
 def collect(aligned_root: Path, aoi: str, product_dirs: dict) -> dict:
     """{product: record} for every product that actually wrote files for this AoI.
 
@@ -278,27 +263,42 @@ def collect(aligned_root: Path, aoi: str, product_dirs: dict) -> dict:
     reconcile two hand-maintained lists that disagreed. With one registry there is one name,
     and the alias is gone.
     """
+    by_value = {s.product.value: s for s in products.REGISTRY}
     out = {}
     for product, sub in product_dirs.items():
-        rec = collect_product(Path(aligned_root) / sub / "aligned" / aoi, product)
+        s = by_value.get(product)
+        if s is not None and s.is_stacked_data:
+            # DATA product: gather across its per-source trees (globbed, so config-registered
+            # sources are covered), keyed by the source TAG (the `<source>` dir name). The
+            # merged record carries `sources_by_tag`, so `build` can attribute a per-source
+            # channel (`airtemp_hrrr`) to its ONE source unambiguously rather than the union.
+            base = Path(aligned_root) / sub
+            by_tag = {sd.parent.name: r
+                      for sd in (sorted(base.glob("*/aligned")) if base.exists() else [])
+                      if (r := collect_product(sd / aoi, product)) is not None}
+            rec = _merge_records(by_tag, product) if by_tag else None
+        else:
+            rec = collect_product(Path(aligned_root) / sub / "aligned" / aoi, product)
         if rec is not None:
             out[product] = rec
-    # The datum stage writes a JSON sidecar, not a NetCDF; pick it up so water-level
-    # fields can name the resolution that produced their offset.
-    dj = Path(aligned_root) / "DATUM" / "aligned" / aoi / f"{aoi}_datum.json"
-    if dj.exists():
-        import json
-        try:
-            rec = json.loads(dj.read_text())
-            out["datum"] = {"product": "datum",
-                            "sources": [str(rec.get("method", "unknown"))],
-                            "n_files": 1,
-                            "accessed_first": rec.get("resolved_at"),
-                            "accessed_last": rec.get("resolved_at"),
-                            "basis": STAMPED}
-        except ValueError:
-            pass
     return out
+
+
+def _merge_records(by_tag: dict[str, dict], product: str) -> dict:
+    """Fold one DATA product's per-source records into one (union window), keeping the
+    per-source-tag source list so a channel can be attributed to its exact source."""
+    recs = list(by_tag.values())
+    accessed_first = [r["accessed_first"] for r in recs if r["accessed_first"]]
+    accessed_last = [r["accessed_last"] for r in recs if r["accessed_last"]]
+    return {
+        "product": product,
+        "sources": sorted({s for r in recs for s in r["sources"]}),
+        "sources_by_tag": {tag: r["sources"] for tag, r in by_tag.items()},
+        "n_files": sum(r["n_files"] for r in recs),
+        "accessed_first": min(accessed_first) if accessed_first else None,
+        "accessed_last": max(accessed_last) if accessed_last else None,
+        "basis": STAMPED if all(r["basis"] == STAMPED for r in recs) else FILE_MTIME,
+    }
 
 
 def build(project, fields, products: dict) -> dict:
@@ -313,9 +313,16 @@ def build(project, fields, products: dict) -> dict:
         recs = [products[p] for p in inputs if p in products]
         accessed = [r["accessed_last"] for r in recs if r["accessed_last"]]
         bases = {r["basis"] for r in recs}
+        # Per-source PRECISION: a `<var>_<source>` channel attributes to its ONE source, not
+        # the product's union. Where an input product records `sources_by_tag`, narrow to the
+        # tag the channel name ends with (longest match, so `eo_tides` beats a shorter tag).
+        sources: set = set()
+        for r in recs:
+            tag = _matching_source_tag(name, r.get("sources_by_tag") or {})
+            sources |= set(r["sources_by_tag"][tag]) if tag else set(r["sources"])
         per_field[name] = {
             "inputs": inputs,
-            "sources": sorted({s for r in recs for s in r["sources"]}),
+            "sources": sorted(sources),
             "accessed": max(accessed) if accessed else None,
             "basis": (STAMPED if bases == {STAMPED} else FILE_MTIME) if bases else None,
         }

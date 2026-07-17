@@ -3,7 +3,9 @@ output tree, assembles them, and asserts the knit result: channel layout, the
 clearest-overpass pick, the land-cover water mask + MUR fill, and that the Zarr
 was written with the expected chunking/compressor. No network, no real data."""
 
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -106,9 +108,12 @@ def write_modis(project, g, day, temp=287.0):
     _write(project, "MODIS", f"{AOI}_{day.strftime('%Y%m%d')}T210000.nc", ds)
 
 
-def write_cmems(project, g, days, *, land_cols):
-    """CMEMS daily files. The ~9 km model's land mask swallows `land_cols` (NaN there)."""
+def write_cmems(project, g, days, *, land_cols, src="my_global"):
+    """One CMEMS source tag's daily files (CMEMS/<src>/aligned/<aoi>). The ~9 km model's land
+    mask swallows `land_cols` (NaN there)."""
     H, W, xs, ys = _grid_hw(g)
+    d = project.output_dir / "CMEMS" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
     for day in days:
         arr = np.full((H, W), 284.0, "float32")
         arr[:, land_cols] = np.nan                     # model never resolved these cells
@@ -116,17 +121,23 @@ def write_cmems(project, g, days, *, land_cols):
                          "valid": (("time", "y", "x"),
                                    np.isfinite(arr)[None].astype("uint8"))},
                         coords={"time": [day], "y": ys, "x": xs})
-        _write(project, "CMEMS", f"{AOI}_{day.strftime('%Y%m%d')}.nc", ds)
+        ds.to_netcdf(d / f"{AOI}_{day.strftime('%Y%m%d')}.nc")
 
 
-def write_bathymetry(project, g):
+def write_bathymetry(project, g, src="cudem", *, datum_offset_m=1.3, datum_status="ok"):
+    """One DEM source's aligned output (BATHYMETRY/<src>/aligned/<aoi>), datum stamped on."""
     H, W, xs, ys = _grid_hw(g)
     ds = xr.Dataset({"elevation": (("y", "x"), np.full((H, W), -10.0, "float32")),
                      "depth": (("y", "x"), np.full((H, W), 10.0, "float32")),
                      "depth_p25": (("y", "x"), np.full((H, W), 8.0, "float32")),
                      "depth_p75": (("y", "x"), np.full((H, W), 12.0, "float32"))},
                     coords={"y": ys, "x": xs})
-    _write(project, "BATHYMETRY", f"{AOI}.nc", ds)
+    ds.attrs.update(bathy_source=src, datum_offset_m=datum_offset_m, datum_status=datum_status,
+                    datum_method="stub",
+                    dem_vertical_datum="NAVD88" if src == "cudem" else "MSL_APPROX")
+    d = project.output_dir / "BATHYMETRY" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}.nc")
 
 
 def write_landcover(project, g, *, land_cols):
@@ -147,104 +158,68 @@ def test_channel_layout_and_dims(project, grids, days):
     write_mur(project, g, days, water_hole_cols=slice(0, 3))
     write_bathymetry(project, g)
     write_landcover(project, g, land_cols=slice(0, 5))
+    write_tides(project, g, days)
+    write_met_daily(project, g, days, prefix="ref_")
     eff = datacube._build_eff(project)
     ds = datacube.assemble_aoi(g, eff, days)
 
     assert ds.sizes == {"time": len(days), "y": g.height, "x": g.width}
-    for v in ["mur_sst", "eco_sst", "lst_sst", "modis_sst", "airtemp",
-              "depth", "landmask", "landcover_water", "tide", "doy_sin"]:
+    for v in ["mur_sst", "eco_sst", "lst_sst", "modis_sst", "airtemp_hrrr",
+              "elevation_cudem", "depth_cudem", "landcover_water", "tide_coops", "doy_sin"]:
         assert v in ds.data_vars
+    # S1 removed these derived/fill channels; S3 made bathymetry per-source (no bare names).
+    for gone in ["landmask", "mur_valid", "mur_filled", "eco_water_elev", "eco_tide",
+                 "elevation", "depth"]:
+        assert gone not in ds.data_vars
+    # Each DEM source's datum offset rides on its own elevation channel (S3).
+    assert ds["elevation_cudem"].attrs["datum_offset_m"] == pytest.approx(1.3)
     assert ds["mur_sst"].dtype == np.float32
-    assert ds["landmask"].dtype == np.uint8
+    assert ds["landcover_water"].dtype == np.uint8
     assert list(pd.to_datetime(ds["time"].values)) == list(days)
 
 
-def test_landmask_from_landcover(project, grids, days):
+def test_mur_ships_raw_observed_values_with_honest_nan_gaps(project, grids, days):
+    """Goal 3 / S1: the cube no longer NN-fills MUR. A hole in the input stays NaN in the
+    cube, and there is no mur_valid / mur_filled channel -- filling is a downstream call."""
     g = grids[AOI]
-    write_mur(project, g, days, water_hole_cols=slice(0, 0))
-    write_bathymetry(project, g)
-    write_landcover(project, g, land_cols=slice(0, 5))     # cols 0-4 are land
-    eff = datacube._build_eff(project)
-    ds = datacube.assemble_aoi(g, eff, days)
-    lm = ds["landmask"].values
-    assert (lm[:, :5] == 1).all()                          # land strip
-    assert (lm[:, 5:] == 0).all()                          # water elsewhere
-
-
-def test_mur_filled_over_landcover_water_only(project, grids, days):
-    g = grids[AOI]
-    # MUR hole spans cols 0-6; land-cover marks cols 0-4 land, 5+ water.
     write_mur(project, g, days, water_hole_cols=slice(0, 7))
     write_bathymetry(project, g)
     write_landcover(project, g, land_cols=slice(0, 5))
-    eff = datacube._build_eff(project)
-    ds = datacube.assemble_aoi(g, eff, days)
-    mur0 = ds["mur_sst"].isel(time=0).values
-    assert np.isfinite(mur0[:, 5:7]).all()                 # water hole filled
-    assert np.isnan(mur0[:, :5]).all()                     # land hole NOT filled
-
-
-def test_nn_filled_mur_is_flagged_filled_and_not_valid(project, grids, days):
-    """`valid` must mean OBSERVED. A filled pixel's value was invented by copying the
-    nearest offshore cell -- flagging it valid tells a model a fabrication is data."""
-    g = grids[AOI]
-    write_mur(project, g, days, water_hole_cols=slice(0, 7))
-    write_bathymetry(project, g)
-    write_landcover(project, g, land_cols=slice(0, 5))      # cols 5,6 = water hole
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-
-    valid = ds["mur_valid"].isel(time=0).values
-    filled = ds["mur_filled"].isel(time=0).values
-    sst = ds["mur_sst"].isel(time=0).values
-
-    assert (valid[:, 5:7] == 0).all()       # filled water: NOT observed
-    assert (filled[:, 5:7] == 1).all()      # ...and explicitly flagged as filled
-    assert np.isfinite(sst[:, 5:7]).all()   # ...while still carrying a usable value
-    assert (valid[:, 7:] == 1).all()        # genuinely observed water
-    assert (filled[:, 7:] == 0).all()
-    assert (filled[:, :5] == 0).all()       # land was never filled
-    # and the two are disjoint: no pixel is both observed and invented
-    assert not (valid & filled).any()
+    mur0 = ds["mur_sst"].isel(time=0).values
+    assert np.isnan(mur0[:, :7]).all()                     # the hole is untouched
+    assert np.isfinite(mur0[:, 7:]).all()                  # observed cells survive
+    assert "mur_valid" not in ds.data_vars
+    assert "mur_filled" not in ds.data_vars
 
 
-def test_mur_filled_is_all_zero_when_the_fill_is_disabled(project, grids, days):
-    g = grids[AOI]
-    write_mur(project, g, days, water_hole_cols=slice(0, 7))
-    write_bathymetry(project, g)
-    write_landcover(project, g, land_cols=slice(0, 5))
-    eff = datacube._build_eff(project)
-    eff["fill_mur_water"] = False
-    ds = datacube.assemble_aoi(g, eff, days)
-    assert (ds["mur_filled"].values == 0).all()
-
-
-def test_missing_bathymetry_gives_nan_depth_not_a_fabricated_sea_level(project, grids, days,
-                                                                       caplog):
-    """The worst bug in the audit: with no DEM, `np.where(elev < 0, -elev, 0.0)` took the
-    0.0 branch for every cell (np.nan < 0 is False) and shipped a flawless, NaN-free
-    'everything is exactly at sea level' bathymetry that looked entirely real."""
+def test_no_bathymetry_means_no_channels_not_a_fabricated_sea_level(project, grids, days):
+    """With no DEM acquired, the cube ships NO bathymetry channels -- an ABSENT product, not a
+    fabricated one. (The old bug shipped a flawless 'everything at sea level' DEM.)"""
     g = grids[AOI]
     write_mur(project, g, days, water_hole_cols=slice(0, 0))
     write_landcover(project, g, land_cols=slice(0, 5))
     # deliberately NO write_bathymetry(...)
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert not [v for v in ds.data_vars if v.startswith(("elevation", "depth"))]
+
+
+def test_a_dem_without_usable_elevation_gives_nan_not_zeros(project, grids, days, caplog):
+    """The worst audit bug: `np.where(elev < 0, -elev, 0.0)` took the 0.0 branch for every
+    cell when elev was all-NaN, fabricating a NaN-free sea-level DEM. A per-source file that
+    lacks a usable elevation must yield NaN, not zeros."""
+    g = grids[AOI]
+    H, W, xs, ys = _grid_hw(g)
+    d = project.output_dir / "BATHYMETRY" / "cudem" / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    # a file with NO usable elevation (and no depth) -> nothing to derive depth from
+    xr.Dataset({"junk": (("y", "x"), np.zeros((H, W), "float32"))},
+               coords={"y": ys, "x": xs}).to_netcdf(d / f"{AOI}.nc")
     with caplog.at_level("WARNING"):
         ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-
-    for v in ("depth", "depth_p25", "depth_p75"):
-        assert np.isnan(ds[v].values).all(), f"{v} was fabricated, not NaN"
-    assert "no bathymetry file" in caplog.text        # and the user is TOLD
-
-
-def test_mur_fill_disabled(project, grids, days):
-    g = grids[AOI]
-    write_mur(project, g, days, water_hole_cols=slice(0, 7))
-    write_bathymetry(project, g)
-    write_landcover(project, g, land_cols=slice(0, 5))
-    eff = datacube._build_eff(project)
-    eff["fill_mur_water"] = False
-    ds = datacube.assemble_aoi(g, eff, days)
-    mur0 = ds["mur_sst"].isel(time=0).values
-    assert np.isnan(mur0[:, :7]).all()                     # nothing filled
+    assert np.isnan(ds["elevation_cudem"].values).all()
+    assert np.isnan(ds["depth_cudem"].values).all(), "depth was fabricated, not NaN"
+    assert "no usable `elevation`" in caplog.text
 
 
 def test_clearest_overpass_is_kept(project, grids, days):
@@ -406,7 +381,7 @@ def test_assemble_writes_zarr_with_compression(project, grids, days):
     assert zpath.exists()
     cube = xr.open_zarr(zpath)
     assert cube.sizes["time"] == len(days)
-    assert cube["mur_sst"].dtype == np.float32 and cube["landmask"].dtype == np.uint8
+    assert cube["mur_sst"].dtype == np.float32 and cube["landcover_water"].dtype == np.uint8
 
     import zarr
     zg = zarr.open(str(zpath), mode="r")
@@ -515,9 +490,12 @@ def test_write_zarr_safe_sweeps_scratch_left_by_an_earlier_crash(tmp_path, caplo
 # --------------------------------------------------------------------------- #
 # Met: reference time of day, and forcing at each sensor's own overpass
 # --------------------------------------------------------------------------- #
-def write_met_daily(project, g, days, *, temp=280.0, prefix=""):
-    """Met daily-mean (prefix='') or reference-time (prefix='ref_') files."""
+def write_met_daily(project, g, days, *, temp=280.0, prefix="", src="hrrr"):
+    """One met FORCING source's daily-mean (prefix='') or reference (prefix='ref_') files,
+    under MET/<src>/aligned/<aoi>."""
     H, W, xs, ys = _grid_hw(g)
+    d = project.output_dir / "MET" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
     for day in days:
         ds = xr.Dataset(
             {"airtemp": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
@@ -525,20 +503,31 @@ def write_met_daily(project, g, days, *, temp=280.0, prefix=""):
              "swrad": (("time", "y", "x"), np.full((1, H, W), 500.0, "float32")),
              "cloud_cover": (("time", "y", "x"), np.full((1, H, W), 10.0, "float32"))},
             coords={"time": [day], "y": ys, "x": xs})
-        _write(project, "MET", f"{AOI}_{prefix}{day.strftime('%Y%m%d')}.nc", ds)
+        ds.to_netcdf(d / f"{AOI}_{prefix}{day.strftime('%Y%m%d')}.nc")
 
 
-def write_met_snapshot(project, g, day, hour, *, temp):
-    """A met snapshot at one overpass instant."""
+def write_met_snapshot(project, g, day, hour, *, temp, src="hrrr"):
+    """One met_overpass source's snapshot at one overpass instant, under
+    MET_OVERPASS/<src>/aligned/<aoi>."""
     H, W, xs, ys = _grid_hw(g)
     stamp = day.strftime("%Y%m%d") + f"T{hour:02d}0000"
+    d = project.output_dir / "MET_OVERPASS" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
     ds = xr.Dataset(
         {"airtemp": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
          "wind_speed": (("time", "y", "x"), np.full((1, H, W), 7.0, "float32")),
          "swrad": (("time", "y", "x"), np.full((1, H, W), 800.0, "float32")),
          "cloud_cover": (("time", "y", "x"), np.full((1, H, W), 20.0, "float32"))},
         coords={"time": [day], "y": ys, "x": xs})
-    _write(project, "MET", f"{AOI}_{stamp}.nc", ds)
+    ds.to_netcdf(d / f"{AOI}_{stamp}.nc")
+
+
+def _eff_with_overpass(project, met=(("eco", "hrrr"), ("lst", "hrrr"), ("modis", "hrrr"))):
+    """Build a datacube eff and inject overpass-met combos (the test project doesn't select
+    the met_overpass product, so its combos would otherwise be empty)."""
+    eff = datacube._build_eff(project)
+    eff["met_overpass_combos"] = list(met)
+    return eff
 
 
 def test_met_comes_from_the_reference_snapshot_not_the_daily_mean(project, grids, days):
@@ -546,7 +535,7 @@ def test_met_comes_from_the_reference_snapshot_not_the_daily_mean(project, grids
     write_met_daily(project, g, days, temp=280.0)                 # daily mean
     write_met_daily(project, g, days, temp=291.0, prefix="ref_")  # 10:30 reference
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(291.0)
+    assert np.nanmean(ds["airtemp_hrrr"].isel(time=0).values) == pytest.approx(291.0)
     assert ds.attrs["met_time"] == "reference"
 
 
@@ -557,7 +546,7 @@ def test_daily_mean_can_still_be_selected(project, grids, days):
     eff = datacube._build_eff(project)
     eff["met_time"] = "daily_mean"
     ds = datacube.assemble_aoi(g, eff, days)
-    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(280.0)
+    assert np.nanmean(ds["airtemp_hrrr"].isel(time=0).values) == pytest.approx(280.0)
     assert ds.attrs["met_time"] == "daily_mean"
 
 
@@ -568,7 +557,7 @@ def test_met_falls_back_when_no_reference_files_exist(project, grids, days, capl
     write_met_daily(project, g, days, temp=280.0)
     with caplog.at_level("WARNING"):
         ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(280.0)
+    assert np.nanmean(ds["airtemp_hrrr"].isel(time=0).values) == pytest.approx(280.0)
     assert ds.attrs["met_time"] == "daily_mean"
 
 
@@ -581,13 +570,13 @@ def test_each_sensor_gets_the_forcing_from_its_own_overpass(project, grids, days
     write_met_snapshot(project, g, days[0], 20, temp=286.0)   # the ECOSTRESS instant
     write_met_snapshot(project, g, days[0], 18, temp=299.0)   # the Landsat instant
 
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert np.nanmean(ds["eco_airtemp"].isel(time=0).values) == pytest.approx(286.0)
-    assert np.nanmean(ds["lst_airtemp"].isel(time=0).values) == pytest.approx(299.0)
-    # ...and the daily channel is still the reference time, independent of both.
-    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(291.0)
+    ds = datacube.assemble_aoi(g, _eff_with_overpass(project), days)
+    assert np.nanmean(ds["eco_airtemp_hrrr"].isel(time=0).values) == pytest.approx(286.0)
+    assert np.nanmean(ds["lst_airtemp_hrrr"].isel(time=0).values) == pytest.approx(299.0)
+    # ...and the daily forcing channel is still the reference time, independent of both.
+    assert np.nanmean(ds["airtemp_hrrr"].isel(time=0).values) == pytest.approx(291.0)
     # a day with no scene has no overpass forcing (not a stale value)
-    assert np.isnan(ds["eco_airtemp"].isel(time=1).values).all()
+    assert np.isnan(ds["eco_airtemp_hrrr"].isel(time=1).values).all()
 
 
 def test_overpass_met_follows_the_scene_the_cube_actually_kept(project, grids, days):
@@ -597,29 +586,29 @@ def test_overpass_met_follows_the_scene_the_cube_actually_kept(project, grids, d
     write_ecostress_two_scenes(project, g, days[0])           # 18:00 (half NaN), 20:00 (clear)
     write_met_snapshot(project, g, days[0], 18, temp=270.0)   # discarded scene
     write_met_snapshot(project, g, days[0], 20, temp=295.0)   # kept scene
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    ds = datacube.assemble_aoi(g, _eff_with_overpass(project), days)
     assert ds["eco_hour"].isel(time=0).item() == pytest.approx(20.0)
-    assert np.nanmean(ds["eco_airtemp"].isel(time=0).values) == pytest.approx(295.0)
+    assert np.nanmean(ds["eco_airtemp_hrrr"].isel(time=0).values) == pytest.approx(295.0)
 
 
-def test_overpass_met_is_configurable(project, grids, days):
+def test_overpass_met_is_configurable_via_combinations(project, grids, days):
+    """Which `<sensor>_<var>_<src>` channels appear is exactly the (sensor, source) combos."""
     g = grids[AOI]
     write_ecostress_two_scenes(project, g, days[0])
-    write_met_snapshot(project, g, days[0], 20, temp=295.0)
+    write_met_snapshot(project, g, days[0], 20, temp=295.0, src="hrrr")
 
-    eff = datacube._build_eff(project)
-    eff["overpass_met"] = ["airtemp"]                         # only this one
+    eff = _eff_with_overpass(project, met=[("eco", "hrrr")])
     ds = datacube.assemble_aoi(g, eff, days)
-    assert "eco_airtemp" in ds.data_vars
-    assert "eco_swrad" not in ds.data_vars
+    assert "eco_airtemp_hrrr" in ds.data_vars
+    assert "lst_airtemp_hrrr" not in ds.data_vars            # lst not in the combos
 
-    eff["overpass_met"] = []                                  # disabled entirely
+    eff = _eff_with_overpass(project, met=[])                # no combos -> no overpass channels
     ds = datacube.assemble_aoi(g, eff, days)
     assert not [v for v in ds.data_vars if v.startswith("eco_") and "airtemp" in v]
 
-def test_nn_filled_cmems_gets_its_own_filled_flag(project, grids, days):
-    """Each CMEMS variable carries its OWN filled mask -- the model's land mask deepens
-    with depth, so two levels are not filled in the same cells."""
+def test_cmems_ships_raw_observed_values_with_honest_nan_gaps(project, grids, days):
+    """Goal 3 / S1: CMEMS is no longer NN-filled and carries no `_filled` mask. Cells the
+    ~9 km model never resolved stay NaN; downstream fills as it sees fit."""
     g = grids[AOI]
     write_mur(project, g, days, water_hole_cols=slice(0, 0))
     write_bathymetry(project, g)
@@ -627,56 +616,12 @@ def test_nn_filled_cmems_gets_its_own_filled_flag(project, grids, days):
     write_cmems(project, g, days, land_cols=slice(0, 4))        # model has no data cols 0-3
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
-    assert "cmems_thetao_0m_filled" in ds.data_vars
-    filled = ds["cmems_thetao_0m_filled"].isel(time=0).values
-    val = ds["cmems_thetao_0m"].isel(time=0).values
-    assert (filled[:, :4] == 1).all()        # cells the model never resolved -> filled
-    assert (filled[:, 4:] == 0).all()        # cells it did resolve -> not filled
-    assert np.isfinite(val).all()            # ...and all cells carry a usable value
-
-
-def _write_cmems_day(project, g, day, source):
-    """One CMEMS day stamped with the source that produced it."""
-    H, W, xs, ys = _grid_hw(g)
-    ds = xr.Dataset({"thetao_0m": (("time", "y", "x"), np.full((1, H, W), 284.0, "float32")),
-                     "valid": (("time", "y", "x"), np.ones((1, H, W), "uint8"))},
-                    coords={"time": [day], "y": ys, "x": xs})
-    ds.attrs["source"] = source
-    _write(project, "CMEMS", f"{AOI}_{day.strftime('%Y%m%d')}.nc", ds)
-
-
-def test_cmems_source_is_recorded_PER_DAY_not_unioned(project, grids, days, caplog):
-    """A CMEMS product with reanalysis days and forecast days used to report `[both]` as a
-    set, which says nothing about the day you are actually looking at."""
-    g = grids[AOI]
-    write_mur(project, g, days, water_hole_cols=slice(0, 0))
-    write_bathymetry(project, g)
-    write_landcover(project, g, land_cols=slice(0, 0))
-    # day 0 + 1 from the reanalysis; day 2 fell back to the forecast
-    _write_cmems_day(project, g, days[0], "cmems_mod_glo_phy_my_0.083deg_P1D-m")
-    _write_cmems_day(project, g, days[1], "cmems_mod_glo_phy_my_0.083deg_P1D-m")
-    _write_cmems_day(project, g, days[2], "cmems_mod_glo_phy_anfc_0.083deg_P1D-m")
-
-    with caplog.at_level("WARNING"):
-        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-
-    assert "cmems_source" in ds.data_vars
-    codes = ds["cmems_source"].values
-    legend = json.loads(ds["cmems_source"].attrs["legend"])
-
-    assert legend[0] == "none"                       # code 0 always means "no file"
-    assert codes[0] == codes[1] != codes[2]          # the switch is visible per DAY
-    assert "my" in legend[codes[0]] and "anfc" in legend[codes[2]]
-    assert "changed source mid-series" in caplog.text   # ...and the user is told
-
-
-def test_source_channel_is_absent_when_the_product_never_ran(project, grids, days):
-    g = grids[AOI]
-    write_mur(project, g, days, water_hole_cols=slice(0, 0))
-    write_bathymetry(project, g)
-    write_landcover(project, g, land_cols=slice(0, 0))
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert "cmems_source" not in ds.data_vars    # no CMEMS files -> no channel to explain
+    assert "cmems_thetao_0m_my_global" in ds.data_vars
+    assert "cmems_thetao_0m_my_global_filled" not in ds.data_vars
+    assert "cmems_source" not in ds.data_vars                   # per-day source code is gone
+    val = ds["cmems_thetao_0m_my_global"].isel(time=0).values
+    assert np.isnan(val[:, :4]).all()        # unresolved cells stay NaN, not filled
+    assert np.isfinite(val[:, 4:]).all()     # resolved cells survive
 
 
 # --------------------------------------------------------------------------- #
@@ -735,6 +680,199 @@ def test_overpass_sensors_are_not_judged_on_daily_coverage(project, grids, days)
     write_ecostress_two_scenes(project, g, days[0])          # a scene on ONE day of three
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
     assert "ecostress" not in json.loads(ds.attrs["coverage"])
+
+# --------------------------------------------------------------------------- #
+# GOLDEN CUBE (refactor safety net, plan stage S0)
+#
+# Assemble ONE richly-populated AoI -- every product written -- and snapshot every
+# channel's values + attrs into a committed JSON golden. The whole assembler refactor
+# (docs/refactor-plan-assembler-and-sources.md) is gated on this: the contributor-protocol
+# migration (S2) must keep it BYTE-IDENTICAL, and the deletions (S1) / per-source emission
+# (S3-S4) regenerate it as a REVIEWED diff -- the git diff of the golden IS the review
+# artifact (channel set + attrs are human-readable; bulk float values are fingerprinted).
+#
+# The comparator EXCLUDES the run-stamp attrs, because any working-tree edit flips
+# `code_version` to `...-dirty` and rewrites `created_at`, so a naive full-attr snapshot
+# would fail on every phase for reasons unrelated to the cube's data.
+# --------------------------------------------------------------------------- #
+GOLDEN = Path(__file__).parent / "golden" / "datacube_golden.json"
+
+# provenance / run-stamp attrs: excluded from the snapshot (they change on every tree edit).
+RUNSTAMP_ATTRS = ("created_at", "code_version", "package_version",
+                  "config_yaml", "config_sha256", "config_path",
+                  "provenance", "provenance_products")
+
+
+def write_tides(project, g, days, *, amplitude=1.0, src="coops"):
+    """One tide source's hourly series (TIDE/<src>/aligned/<aoi>): a 12 h sinusoid."""
+    hours = pd.date_range(days[0], periods=24 * len(days), freq="h")
+    tide = amplitude * np.sin(2 * np.pi * np.arange(len(hours)) / 12.0)
+    ds = xr.Dataset({"tide": (("time",), tide.astype("float32"))}, coords={"time": hours})
+    d = project.output_dir / "TIDE" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}_tides.nc")
+
+
+def write_insitu(project, g, times, values):
+    """One in-situ station at the AoI centre, with a value at each of `times`."""
+    ds = xr.Dataset(
+        {"sst": (("station", "time"), np.array([values], "float32")),
+         "qc": (("station", "time"), np.ones((1, len(times)), "uint8"))},
+        coords={"station": [0], "time": pd.DatetimeIndex(times),
+                "station_id": ("station", ["s1"]), "station_name": ("station", ["Test Station"]),
+                "lat": ("station", [45.5]), "lon": ("station", [-123.9])})
+    _write(project, "INSITU", f"{AOI}_insitu.nc", ds)
+
+
+def _write_full_fixture(project, g, days):
+    """Every product written, chosen so as many channels as possible carry real values:
+    MUR (+ a water hole to fill), bathymetry, land-cover (a land strip), all three thermal
+    sensors, CMEMS (+ a model-land hole), met (daily + reference + per-overpass snapshots),
+    tides, and one in-situ station. Deterministic: all synthetic values are constants and
+    dates are fixed, so every derived channel (fills, water level, coverage, doy) is stable.
+    """
+    write_mur(project, g, days, water_hole_cols=slice(0, 3))
+    write_bathymetry(project, g, "cudem", datum_offset_m=1.3, datum_status="ok")
+    write_bathymetry(project, g, "gmrt", datum_offset_m=0.0, datum_status="ok")  # stacked (D10)
+    write_landcover(project, g, land_cols=slice(0, 5))
+    write_ecostress_two_scenes(project, g, days[0])      # clearest scene 20:00
+    write_landsat(project, g, days[0], hour=18)
+    write_modis(project, g, days[1], temp=287.0)         # overpass 21:00
+    write_cmems(project, g, days, land_cols=slice(0, 4), src="my_global")
+    write_cmems(project, g, days, land_cols=slice(0, 4), src="anfc_global")  # stacked (D10)
+    write_met_daily(project, g, days, temp=280.0)                 # daily mean
+    write_met_daily(project, g, days, temp=291.0, prefix="ref_")  # reference snapshot
+    write_met_snapshot(project, g, days[0], 20, temp=286.0)       # eco overpass
+    write_met_snapshot(project, g, days[0], 18, temp=299.0)       # lst overpass
+    write_met_snapshot(project, g, days[1], 21, temp=285.0)       # modis overpass
+    write_insitu(project, g, ["2026-06-01T18:00", "2026-06-01T20:00", "2026-06-02T21:00"],
+                 [12.5, 13.0, 14.0])
+    write_tides(project, g, days)
+
+
+def _fingerprint(arr) -> str:
+    """A NaN-aware content hash of an array: value-level, not bit-payload-level.
+
+    NaN positions are hashed separately from the (NaN-zeroed) values, so two arrays that
+    agree on which cells are missing and on every finite value fingerprint identically --
+    regardless of the particular NaN bit pattern a given code path happened to produce.
+    """
+    b = np.ascontiguousarray(np.asarray(arr))
+    if b.dtype.kind == "M":                    # datetime64 -> integer ns
+        b = b.astype("int64")
+    h = hashlib.sha256()
+    h.update(str(b.dtype).encode()); h.update(str(b.shape).encode())
+    if b.dtype.kind == "f":
+        b = b.copy()
+        nan = np.isnan(b)
+        b[nan] = 0.0
+        h.update(nan.tobytes())
+    h.update(b.tobytes())
+    return h.hexdigest()
+
+
+def _stats(arr) -> dict:
+    """Human-readable summary (finite count + range) so the golden diff is legible."""
+    a = np.asarray(arr)
+    if a.dtype.kind not in "fiu":
+        return {}
+    af = a.astype("float64")
+    finite = np.isfinite(af)
+    n = int(finite.sum())
+    if not n:
+        return {"n_finite": 0}
+    return {"n_finite": n, "min": round(float(np.nanmin(af)), 6),
+            "max": round(float(np.nanmax(af)), 6), "mean": round(float(np.nanmean(af)), 6)}
+
+
+def _jsonify(obj):
+    """Make attrs JSON-comparable: numpy scalars -> python, numpy arrays -> lists."""
+    if isinstance(obj, dict):
+        return {k: _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_jsonify(v) for v in obj.tolist()]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+def _snapshot(ds: xr.Dataset) -> dict:
+    """Snapshot a cube: dims, stripped global attrs, and per coord/channel dtype + shape +
+    attrs + stats + value fingerprint. Everything here is deterministic for a fixed fixture."""
+    attrs = {k: v for k, v in ds.attrs.items() if k not in RUNSTAMP_ATTRS}
+    snap = {"dims": {k: int(v) for k, v in ds.sizes.items()},
+            "global_attrs": _jsonify(attrs), "coords": {}, "data_vars": {}}
+    for name, c in ds.coords.items():
+        snap["coords"][str(name)] = {"dtype": str(c.dtype), "shape": list(c.shape),
+                                     "fingerprint": _fingerprint(c.values)}
+    for name in ds.data_vars:
+        da = ds[name]
+        snap["data_vars"][str(name)] = {
+            "dims": list(da.dims), "dtype": str(da.dtype), "shape": list(da.shape),
+            "attrs": _jsonify(dict(da.attrs)), "stats": _stats(da.values),
+            "fingerprint": _fingerprint(da.values)}
+    return snap
+
+
+def _diff_snapshots(golden: dict, actual: dict) -> list[str]:
+    """A human-readable list of every way `actual` drifts from `golden` (empty == identical)."""
+    out = []
+    if golden["dims"] != actual["dims"]:
+        out.append(f"dims: {golden['dims']} -> {actual['dims']}")
+    ga, aa = golden["global_attrs"], actual["global_attrs"]
+    for k in sorted(set(ga) - set(aa)):
+        out.append(f"global attr REMOVED: {k}")
+    for k in sorted(set(aa) - set(ga)):
+        out.append(f"global attr ADDED: {k} = {aa[k]!r}")
+    for k in sorted(set(ga) & set(aa)):
+        if ga[k] != aa[k]:
+            out.append(f"global attr CHANGED {k}: {ga[k]!r} -> {aa[k]!r}")
+    for sect in ("coords", "data_vars"):
+        gs, as_ = golden[sect], actual[sect]
+        for k in sorted(set(gs) - set(as_)):
+            out.append(f"{sect}: channel REMOVED: {k}")
+        for k in sorted(set(as_) - set(gs)):
+            out.append(f"{sect}: channel ADDED: {k}")
+        for k in sorted(set(gs) & set(as_)):
+            gk, ak = gs[k], as_[k]
+            for field in ("dtype", "shape", "dims"):
+                if gk.get(field) != ak.get(field):
+                    out.append(f"{sect}[{k}].{field}: {gk.get(field)} -> {ak.get(field)}")
+            if gk.get("attrs") != ak.get("attrs"):
+                out.append(f"{sect}[{k}].attrs: {gk.get('attrs')} -> {ak.get('attrs')}")
+            if gk.get("fingerprint") != ak.get("fingerprint"):
+                out.append(f"{sect}[{k}] VALUES changed: stats {gk.get('stats')} -> {ak.get('stats')}")
+    return out
+
+
+def test_golden_cube_is_unchanged(project, grids, days):
+    """The refactor safety net. Assemble the full fixture and assert the cube matches the
+    committed golden, channel for channel (run-stamp attrs excluded). Set UPDATE_GOLDEN=1 to
+    regenerate after an INTENDED change, then review the golden's git diff."""
+    g = grids[AOI]
+    _write_full_fixture(project, g, days)
+    # Exercise the overpass products too (the minimal project fixture doesn't select them):
+    # met_overpass snapshots and tide_overpass, for a couple of (sensor, source) combos.
+    eff = datacube._build_eff(project)
+    eff["met_overpass_combos"] = [("eco", "hrrr"), ("lst", "hrrr")]
+    eff["tide_overpass_combos"] = [("eco", "coops"), ("lst", "coops")]
+    ds = datacube.assemble_aoi(g, eff, days)
+    actual = _snapshot(ds)
+
+    existed = GOLDEN.exists()
+    if os.environ.get("UPDATE_GOLDEN") or not existed:
+        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
+        GOLDEN.write_text(json.dumps(actual, indent=2, sort_keys=True) + "\n")
+        pytest.skip(f"golden {'regenerated' if existed else 'created'} at {GOLDEN}; "
+                    "review its git diff and re-run")
+
+    problems = _diff_snapshots(json.loads(GOLDEN.read_text()), actual)
+    assert not problems, (
+        "datacube drifted from the golden snapshot:\n  " + "\n  ".join(problems) +
+        "\n\nIf this change is intended, regenerate with UPDATE_GOLDEN=1 and review the diff.")
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

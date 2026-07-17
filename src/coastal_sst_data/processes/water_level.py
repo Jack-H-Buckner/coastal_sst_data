@@ -46,14 +46,10 @@ Two caveats worth knowing:
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-
-from ..config import Project
-from . import datum
 
 log = logging.getLogger(__name__)
 
@@ -64,63 +60,11 @@ UNKNOWN = 255     # no DEM here, or no overpass on this day (so no tide time)
 
 DEFAULT_DATUM_OFFSET_M = 0.0
 
-
-def resolve_datum_offset(project: Project, aoi_name: str,
-                         *, bathy_attrs: dict | None = None) -> tuple[float, dict]:
-    """(offset_m, provenance) for one AoI. Provenance is stamped onto the cube.
-
-    Precedence:
-      1. The `datum` stage's sidecar (which has already honoured any region override
-         and validated it against the DEM that actually ran) -- unless it is STALE.
-      2. A region override, if the stage never ran.
-      3. 0.0, flagged `unresolved_assumed_zero`.
-
-    STALENESS is the top silent-wrong-answer risk: bathymetry rewrites <aoi>.nc in
-    place, so a DEM re-run that falls back cudem->gmrt leaves an old NAVD88 offset
-    sitting beside an MSL DEM -- applying it would bias every pixel by ~1.3 m while
-    looking perfectly healthy. The sidecar records the DEM's `source` attr verbatim;
-    if it no longer matches the file we just read, the sidecar is REFUSED.
-
-    Case 3 keeps the cube complete rather than blocking, but stamps a status the
-    downstream user can see -- a warning in a log scrolls away; an attr does not.
-    """
-    root = Path(project.output_dir)
-    rec = datum.load_sidecar(root, aoi_name)
-    fingerprint = str((bathy_attrs or {}).get("source", ""))
-
-    if rec is not None and fingerprint:
-        stamped = rec.get("dem_fingerprint")
-        if stamped and stamped != fingerprint:
-            log.error(
-                "%s: the datum sidecar was resolved for a different DEM (%r, now %r); "
-                "refusing it. Re-run `coastal-sst-data datum` to resolve the offset for "
-                "the DEM that is actually on disk.", aoi_name, stamped, fingerprint)
-            rec = None
-
-    if rec is not None:
-        return float(rec.get("datum_offset_m", 0.0)), {
-            "datum_offset_m": float(rec.get("datum_offset_m", 0.0)),
-            "datum_method": str(rec.get("method", "unknown")),
-            "datum_status": str(rec.get("status", "unknown")),
-            "datum_uncertainty_m": rec.get("uncertainty_m"),
-            "dem_source": str(rec.get("dem_source", "unknown")),
-            "dem_vertical_datum": str(rec.get("dem_vertical_datum", "unknown")),
-            "tidal_datum_epoch": str(rec.get("tidal_datum_epoch", "")),
-        }
-
-    override = datum.resolve_override(project, aoi_name)
-    if override is not None:
-        return float(override), {"datum_offset_m": float(override),
-                                 "datum_method": "config_override", "datum_status": "ok"}
-
-    log.error(
-        "%s: no datum offset resolved -- assuming 0.0 m, i.e. the DEM is MSL-referenced. "
-        "If it is a NAVD88 DEM (CUDEM) the water level will be biased by ~1 m on the "
-        "Pacific coast. Run `coastal-sst-data datum --config <cfg>` to resolve it.",
-        aoi_name)
-    return DEFAULT_DATUM_OFFSET_M, {"datum_offset_m": DEFAULT_DATUM_OFFSET_M,
-                                    "datum_method": "none",
-                                    "datum_status": "unresolved_assumed_zero"}
+# NOTE: `resolve_datum_offset` was REMOVED. The DEM->MSL offset is resolved by the datum
+# library INSIDE the bathymetry module now (per DEM source, as it is acquired) and ships as
+# attributes on each `elevation_<source>` cube channel -- there is no sidecar to read here.
+# The functions below stay as the reference/downstream water-level computation (they are what
+# a downstream process uses to reconstruct water level from the cube's raw ingredients).
 
 
 def load_tide_series(d, aoi_id) -> pd.Series | None:

@@ -21,8 +21,8 @@ def test_load_config():
     # products is a mapping: keys = selection, values = global options.
     assert list(cfg.products) == [DataProduct.bathymetry, DataProduct.ecostress,
                                   DataProduct.mur, DataProduct.cmems, DataProduct.landsat,
-                                  DataProduct.met, DataProduct.tides, DataProduct.insitu,
-                                  DataProduct.landcover]
+                                  DataProduct.met, DataProduct.met_overpass, DataProduct.tides,
+                                  DataProduct.insitu, DataProduct.landcover]
     # a bare `bathymetry:` -> default (empty) global options
     assert cfg.products[DataProduct.bathymetry].model_dump() == {}
     # global options land on the product's ProductOptions bag (extra=allow)
@@ -32,7 +32,7 @@ def test_load_config():
     assert all(isinstance(d, (int, float)) for d in cfg.products[DataProduct.cmems].depths)
     assert cfg.products[DataProduct.landsat].source == "pc"
     # region-dependent source options live under the region's `sources`
-    assert cfg.regions[0].sources[DataProduct.bathymetry].dem_source == "cudem"
+    assert cfg.regions[0].sources[DataProduct.bathymetry].sources == ["cudem"]
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +240,7 @@ def test_grid_spec_rejects_non_positive_resolution(bad):
 # ---------------------------------------------------------------------------
 def test_datacube_defaults_when_omitted(base_project):
     cfg = parse_config(base_project)                       # no datacube block
-    assert cfg.datacube.fill_mur_water is True
+    assert cfg.datacube.met_time == "reference"
     assert cfg.datacube.output_subdir == "datacube"
     assert cfg.datacube.compression.codec == "zstd"
     assert cfg.datacube.compression.shuffle == "shuffle"
@@ -248,6 +248,16 @@ def test_datacube_defaults_when_omitted(base_project):
 
 def test_datacube_rejects_unknown_key(base_project):
     base_project["datacube"] = {"bogus": 1}
+    with pytest.raises(ValidationError):
+        parse_config(base_project)
+
+
+@pytest.mark.parametrize("removed", ["fill_mur_water", "fill_cmems_water", "water_level"])
+def test_datacube_rejects_removed_raw_output_keys(base_project, removed):
+    """S1 removed these keys; an un-migrated config must FAIL loudly (extra='forbid'), never
+    be silently ignored -- the cube now ships raw ingredients and downstream owns the fill /
+    mask / water-level determinations."""
+    base_project["datacube"] = {removed: True}
     with pytest.raises(ValidationError):
         parse_config(base_project)
 
@@ -464,7 +474,7 @@ def test_earthdata_auth_invalid_strategy_rejected():
 def test_source_for_selected_product_ok(base_project):
     """Control: a source for a product that IS in `products` validates."""
     cfg = parse_config(base_project)                  # bathymetry is selected
-    assert cfg.regions[0].sources[DataProduct.bathymetry].dem_source == "cudem"
+    assert cfg.regions[0].sources[DataProduct.bathymetry].sources == ["cudem"]
 
 
 def test_source_for_unselected_product_rejected(base_project):
@@ -539,35 +549,90 @@ def test_a_typo_gets_a_suggestion(base_project):
         parse_config(_cfg(base_project, "bathymetry", {"stats_subgrid": 10}))
 
 
-def test_bathymetry_source_is_now_a_recognised_option(base_project):
-    """It was documented, settable, and silently discarded -- the module read
-    `default_source`, so `source: cudem` quietly produced ~100 m GMRT."""
-    p = parse_config(_cfg(base_project, "bathymetry", {"source": "cudem"}))
-    assert p.products[DataProduct.bathymetry].source == "cudem"
-
-
-def test_source_wins_over_default_source(base_project):
+def test_bathymetry_sources_is_a_list_read_by_the_module(base_project):
+    """Distinct-data sources are a STACKED list (D10): the config lists the DEMs, and the
+    module reads exactly that list (no `source`/`fallback`/`default_source` any more)."""
     from coastal_sst_data.processes import bathymetry
-    p = parse_config(_cfg(base_project, "bathymetry", {"source": "cudem"}))
-    assert bathymetry._build_eff(p)["ds"]["a1"]["source"] == "cudem"    # the config is OBEYED
+    cfg = _cfg(base_project, "bathymetry", {"sources": ["cudem", "gmrt"]})
+    cfg["regions"][0]["sources"] = None      # no region override -> the global list flows through
+    p = parse_config(cfg)
+    assert bathymetry._build_eff(p)["ds"]["a1"]["sources"] == ["cudem", "gmrt"]
 
 
-def test_default_source_still_works(base_project):
-    from coastal_sst_data.processes import bathymetry
-    p = parse_config(_cfg(base_project, "bathymetry", {"default_source": "cudem"}))
-    assert bathymetry._build_eff(p)["ds"]["a1"]["source"] == "cudem"
+@pytest.mark.parametrize("removed", ["source", "fallback", "default_source", "dem_source"])
+def test_removed_bathymetry_source_keys_are_rejected(base_project, removed):
+    """S3 removed pick-one/fallback for bathymetry. An un-migrated config setting any of these
+    fails loudly (pointing at `sources`) rather than being silently ignored."""
+    with pytest.raises(ValidationError, match="SILENTLY IGNORED"):
+        parse_config(_cfg(base_project, "bathymetry", {removed: "cudem"}))
+
+
+def test_empty_or_unknown_stacked_sources_are_rejected(base_project):
+    with pytest.raises(ValidationError, match="is empty"):
+        parse_config(_cfg(base_project, "bathymetry", {"sources": []}))
+    with pytest.raises(ValidationError, match="unknown source"):
+        parse_config(_cfg(base_project, "bathymetry", {"sources": ["gebco"]}))
+
+
+# S4 removed pick-one/fallback for cmems, met, tides too -- an un-migrated config setting any
+# of these must FAIL loudly (extra="forbid"), never be silently ignored (§6.2).
+@pytest.mark.parametrize("product,removed", [
+    ("cmems", "source"), ("cmems", "fallback"), ("cmems", "dataset_id"),
+    ("met", "source"), ("met", "fallback"), ("met", "overpass_from"),
+    ("tides", "source"), ("tides", "default_source"), ("tides", "fallback"),
+    ("tides", "fallback_distance_km"),
+])
+def test_removed_source_keys_are_rejected(base_project, product, removed):
+    base_project.setdefault("auth", {})["copernicus"] = {"auth_strategy": "netrc"}  # cmems
+    with pytest.raises(ValidationError, match="SILENTLY IGNORED"):
+        parse_config(_cfg(base_project, product, {removed: "x"}))
+
+
+def test_datacube_overpass_met_key_is_rejected(base_project):
+    """`datacube.overpass_met` moved to the `met_overpass` product (D14). An old config still
+    setting it fails loudly rather than quietly producing no overpass channels."""
+    base_project["datacube"] = {"overpass_met": ["airtemp"]}
+    with pytest.raises(ValidationError):
+        parse_config(base_project)
+
+
+def test_bad_met_overpass_combinations_are_rejected(base_project):
+    """A combo naming an unloaded sensor or a bad source fails at load, not silently as an
+    empty overpass channel (the sharpest regression risk in the met split)."""
+    base_project["products"]["met_overpass"] = {"combinations": [["eco", "hrrr"]]}
+    # ecostress isn't selected in base_project -> combo names an unloaded sensor
+    with pytest.raises(ValidationError, match="not selected"):
+        parse_config(base_project)
+    # a good sensor but a bad source
+    base_project["products"]["ecostress"] = None
+    base_project["products"]["met_overpass"] = {"combinations": [["eco", "gfs"]]}
+    with pytest.raises(ValidationError, match="not valid here"):
+        parse_config(base_project)
+
+
+def test_bad_tide_overpass_combinations_are_rejected(base_project):
+    """tide_overpass (D17) combos live on the tides product and are validated against TIDE
+    sources -- a bad source or unloaded sensor fails at load."""
+    base_project["products"]["ecostress"] = None
+    base_project["products"]["tides"] = {"overpass_combinations": [["eco", "gfs"]]}
+    with pytest.raises(ValidationError, match="not valid here"):
+        parse_config(base_project)
+    # a source that is valid for MET but not for TIDES must still be rejected here
+    base_project["products"]["tides"] = {"overpass_combinations": [["eco", "hrrr"]]}
+    with pytest.raises(ValidationError, match="not valid here"):
+        parse_config(base_project)
 
 
 def test_unknown_region_source_key_is_rejected(base_project):
     cfg = copy.deepcopy(base_project)
-    cfg["regions"][0]["sources"] = {"bathymetry": {"dem_sauce": "cudem"}}
-    with pytest.raises(ValidationError, match="did you mean 'dem_source'"):
+    cfg["regions"][0]["sources"] = {"bathymetry": {"sourcez": ["cudem"]}}
+    with pytest.raises(ValidationError, match="did you mean 'sources'"):
         parse_config(cfg)
 
 
 def test_known_region_source_key_is_accepted(base_project):
     cfg = copy.deepcopy(base_project)
-    cfg["regions"][0]["sources"] = {"bathymetry": {"dem_source": "cudem",
+    cfg["regions"][0]["sources"] = {"bathymetry": {"sources": ["cudem"],
                                                    "datum_offset_m": 1.3}}
     parse_config(cfg)          # must not raise
 
