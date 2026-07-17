@@ -613,37 +613,37 @@ Stages per §4 (**deletions-first** branch). For the deletions-last branch, move
 end and build **S2** in the §5.3a 4-slot shape instead of §5.3b.
 
 **S0 — safety net**
-- [ ] **S0** Golden-cube test (run-stamp attrs excluded from the snapshot).
+- [x] **S0** Golden-cube test (run-stamp attrs excluded from the snapshot).
 
 **S1 — raw-output simplification** *(⚠ downstream-gated; the reviewed deletions diff)*
-- [ ] **S1.1** Delete fills (`fill_water_nn`, `fill_mur_water`/`fill_cmems_water`), `landmask`, in-situ snapping (`station_pixels(..., water=None)`), `water_level` channels, `daily_sources`/`_source` channels.
-- [ ] **S1.2** Ship raw ingredients (`elevation`, `tide`, `<s>_hour`) in place of the derived channels; retain the datum stage, publish `datum_offset_m`/`datum_status` as attrs, and re-gate the datum stage off the removed `water_level` flag.
-- [ ] **S1.3** Regenerate the golden snapshot with review (deletions diff).
+- [x] **S1.1** Delete fills (`fill_water_nn`, `fill_mur_water`/`fill_cmems_water`), `landmask`, in-situ snapping (`station_pixels(..., water=None)`), `water_level` channels, `daily_sources`/`_source` channels.
+- [x] **S1.2** Ship raw ingredients (`elevation`, `tide`, `<s>_hour`) in place of the derived channels; retain the datum stage, publish `datum_offset_m`/`datum_status` as attrs, and re-gate the datum stage off the removed `water_level` flag.
+- [x] **S1.3** Regenerate the golden snapshot with review (deletions diff).
 
 **S2 — contributor protocol** *(byte-identical vs the S1 baseline; built in the §5.3b 2-slot shape)*
-- [ ] **S2.1** Extract inline blocks to `_contribute_*`; the two surviving locals become `ctx.slots` (`sensor_times`, `ref_utc`).
-- [ ] **S2.2** `AssemblyContext` + `Contributor` + `CONTRIBUTORS` + topo-sort orchestrator.
-- [ ] **S2.3** `cube_opt_out` + `_check_contributors`; wire every product's contributor.
-- [ ] **S2.4** `test_add_a_covariate.py` acid test.
-- [ ] **S2.5** DEVELOPMENT.md §2/§3c: a non-sensor covariate now needs a registered contributor, not a hand-edited `assemble_aoi`.
+- [x] **S2.1** Extract inline blocks to `_contribute_*`; the two surviving locals become `ctx.slots` (`sensor_times`, `ref_utc`).
+- [x] **S2.2** `AssemblyContext` + `Contributor` + `CONTRIBUTORS` + topo-sort orchestrator.
+- [x] **S2.3** `cube_opt_out` + `_check_contributors`; wire every product's contributor.
+- [x] **S2.4** `test_add_a_covariate.py` acid test.
+- [x] **S2.5** DEVELOPMENT.md §2/§3c: a non-sensor covariate now needs a registered contributor, not a hand-edited `assemble_aoi`.
 
 **S3 — multi-source vertical slice: bathymetry end-to-end**
-- [ ] **S3.1** `access`/`data` split in `products.py`; `bathymetry` `module=` → `sources={}`; remove its internal fallback chain.
-- [ ] **S3.2** Per-source layout for bathymetry across `store.done`, **`store.scan`/`REQUIRED_VARS`**, `product_dirs`, `provenance.collect`; config `sources: [..]` with empty/unknown rejection.
-- [ ] **S3.3** Bathymetry per-source channels (`depth_<src>`, `elevation_<src>`, `depth_p25/p75_<src>`) + provenance — proving the whole pattern on one product.
+- [x] **S3.1** `access`/`data` split in `products.py`; `bathymetry` `module=` → `sources={}`; remove its internal fallback chain.
+- [x] **S3.2** Per-source layout for bathymetry across `store.done`, **`store.scan`/`REQUIRED_VARS`**, `product_dirs`, `provenance.collect`; config `sources: [..]` with empty/unknown rejection.
+- [x] **S3.3** Bathymetry per-source channels (`depth_<src>`, `elevation_<src>`, `depth_p25/p75_<src>`) + provenance — proving the whole pattern on one product.
 
 **S4 — replicate the slice.** The bundled S4.2 is split into per-source *layering* (mechanical S3
 replication) and the *new overpass products*, each its own reviewed golden diff.
-- [ ] **S4.1** `cmems` per-source (data sources: reanalysis/forecast + regional models); remove its internal fallback chain. Golden diff.
-- [ ] **S4.2** `tides` per-source (data sources: co-ops / model); remove its internal fallback chain. Golden diff.
-- [ ] **S4.3** `met` FORCING per-source (`<var>_<src>`), drop `depends_on=(sensors)`; keep the existing overpass-met contributor unchanged for now. Golden diff.
-- [ ] **S4.4** `met_overpass` as a real product (D14): `DataProduct` + `ProductSpec` (`kind=Kind.OVERPASS_ALIGNED`), module split, its OWN `combinations: [(sensor, met_source)]` config (D15), `<sensor>_<var>_<src>` for user combos only (D13). Golden diff.
-- [ ] **S4.5** `tide_overpass` (D17): a DERIVED contributor emitting `<sensor>_tide_<src>` for its OWN `combinations: [(sensor, tide_source)]` (interpolate the per-source tide series to `<s>_hour` via `water_level.tide_at_overpass`). Golden diff.
+- [x] **S4.1** `cmems` per-source (data sources: reanalysis/forecast + regional models); remove its internal fallback chain. Golden diff.
+- [x] **S4.2** `tides` per-source (data sources: co-ops / model); remove its internal fallback chain. Golden diff.
+- [x] **S4.3** `met` FORCING per-source (`<var>_<src>`), drop `depends_on=(sensors)`; keep the existing overpass-met contributor unchanged for now. Golden diff.
+- [x] **S4.4** `met_overpass` as a real product (D14): `DataProduct` + `ProductSpec` (`kind=Kind.OVERPASS_ALIGNED`), module split, its OWN `combinations: [(sensor, met_source)]` config (D15), `<sensor>_<var>_<src>` for user combos only (D13). Golden diff.
+- [x] **S4.5** `tide_overpass` (D17): a DERIVED contributor emitting `<sensor>_tide_<src>` for its OWN `combinations: [(sensor, tide_source)]` (interpolate the per-source tide series to `<s>_hour` via `water_level.tide_at_overpass`). Golden diff.
 - **Combos are PER PRODUCT (S4-review decision):** `met_overpass` and `tide_overpass` each carry their own `combinations` list referencing their own product's sources (met vs tide) — independent pairings, not one shared sensor list (which would recreate the sensor×source cross-product D13 rejects). A combo's sensor must be loaded and its source must be one of that product's sources (validated at config load).
-- [ ] **S4.6** Config migration: loudly reject removed `source`/`fallback`/`default_source`/`overpass_met` keys (§6.2) + a test per key; add the `met_overpass`/`tide_overpass` combos config.
-- [ ] **S4.7** Update `coverage_channel`/`coverage()` to "any loaded source finite".
+- [x] **S4.6** Config migration: loudly reject removed `source`/`fallback`/`default_source`/`overpass_met` keys (§6.2) + a test per key; add the `met_overpass`/`tide_overpass` combos config.
+- [x] **S4.7** Update `coverage_channel`/`coverage()` to "any loaded source finite".
 
 **S5 — finish**
-- [ ] **S5.1** Provenance per-source (`<var>_<source>` field mapping; delete `daily_sources`).
-- [ ] **S5.2** README source-coverage gap table.
-- [ ] **S5.3** Final golden snapshot regeneration with review (per-source emission diff).
+- [x] **S5.1** Provenance per-source (`<var>_<source>` field mapping; delete `daily_sources`).
+- [x] **S5.2** README source-coverage gap table.
+- [x] **S5.3** Final golden snapshot regeneration with review (per-source emission diff).

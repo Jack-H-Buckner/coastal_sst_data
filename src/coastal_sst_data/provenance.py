@@ -165,6 +165,17 @@ _EXACT = {
 _MET_VARS = ("airtemp", "wind_u", "wind_v", "wind_speed", "swrad", "cloud_cover")
 
 
+def _matching_source_tag(name: str, sources_by_tag: dict) -> str | None:
+    """The source tag a per-source channel belongs to: the longest tag `t` such that `name`
+    ends with `_<t>` (longest wins, so `tide_range_eo_tides` picks `eo_tides`, not a stray
+    shorter tag). None when the channel names no known source tag."""
+    best = None
+    for tag in sources_by_tag:
+        if name.endswith("_" + tag) and (best is None or len(tag) > len(best)):
+            best = tag
+    return best
+
+
 def field_inputs(name: str) -> list[str]:
     """The product(s) a cube field was built from.
 
@@ -258,13 +269,14 @@ def collect(aligned_root: Path, aoi: str, product_dirs: dict) -> dict:
         s = by_value.get(product)
         if s is not None and s.is_stacked_data:
             # DATA product: gather across its per-source trees (globbed, so config-registered
-            # sources are covered) into one merged record. (The per-source <var>_<source>
-            # attribution in field_inputs is a later refinement; here we only need the product
-            # to appear as PRESENT with its combined window.)
+            # sources are covered), keyed by the source TAG (the `<source>` dir name). The
+            # merged record carries `sources_by_tag`, so `build` can attribute a per-source
+            # channel (`airtemp_hrrr`) to its ONE source unambiguously rather than the union.
             base = Path(aligned_root) / sub
-            recs = [r for sd in (sorted(base.glob("*/aligned")) if base.exists() else [])
-                    if (r := collect_product(sd / aoi, product)) is not None]
-            rec = _merge_records(recs, product) if recs else None
+            by_tag = {sd.parent.name: r
+                      for sd in (sorted(base.glob("*/aligned")) if base.exists() else [])
+                      if (r := collect_product(sd / aoi, product)) is not None}
+            rec = _merge_records(by_tag, product) if by_tag else None
         else:
             rec = collect_product(Path(aligned_root) / sub / "aligned" / aoi, product)
         if rec is not None:
@@ -272,13 +284,16 @@ def collect(aligned_root: Path, aoi: str, product_dirs: dict) -> dict:
     return out
 
 
-def _merge_records(recs: list[dict], product: str) -> dict:
-    """Fold one product's per-source records into a single record (union sources / window)."""
+def _merge_records(by_tag: dict[str, dict], product: str) -> dict:
+    """Fold one DATA product's per-source records into one (union window), keeping the
+    per-source-tag source list so a channel can be attributed to its exact source."""
+    recs = list(by_tag.values())
     accessed_first = [r["accessed_first"] for r in recs if r["accessed_first"]]
     accessed_last = [r["accessed_last"] for r in recs if r["accessed_last"]]
     return {
         "product": product,
         "sources": sorted({s for r in recs for s in r["sources"]}),
+        "sources_by_tag": {tag: r["sources"] for tag, r in by_tag.items()},
         "n_files": sum(r["n_files"] for r in recs),
         "accessed_first": min(accessed_first) if accessed_first else None,
         "accessed_last": max(accessed_last) if accessed_last else None,
@@ -298,9 +313,16 @@ def build(project, fields, products: dict) -> dict:
         recs = [products[p] for p in inputs if p in products]
         accessed = [r["accessed_last"] for r in recs if r["accessed_last"]]
         bases = {r["basis"] for r in recs}
+        # Per-source PRECISION: a `<var>_<source>` channel attributes to its ONE source, not
+        # the product's union. Where an input product records `sources_by_tag`, narrow to the
+        # tag the channel name ends with (longest match, so `eo_tides` beats a shorter tag).
+        sources: set = set()
+        for r in recs:
+            tag = _matching_source_tag(name, r.get("sources_by_tag") or {})
+            sources |= set(r["sources_by_tag"][tag]) if tag else set(r["sources"])
         per_field[name] = {
             "inputs": inputs,
-            "sources": sorted({s for r in recs for s in r["sources"]}),
+            "sources": sorted(sources),
             "accessed": max(accessed) if accessed else None,
             "basis": (STAMPED if bases == {STAMPED} else FILE_MTIME) if bases else None,
         }

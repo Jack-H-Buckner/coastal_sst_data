@@ -249,7 +249,6 @@ There are five subcommands:
 | `grids` | Show the target grid (CRS, size, bounding box) computed for each AOI | no |
 | `verify` | Connect to every credentialed service the selected products need and confirm the credentials work | yes |
 | `run` | Run the pipeline: compute the shared grid once, then acquire each selected product in order | yes |
-| `datum` | Resolve each AOI's DEM→MSL vertical-datum offset (runs inside `run`; standalone for backfill) | yes (small) |
 | `assemble` | Knit the aligned per-product outputs into one analysis-ready datacube (`.zarr`) per AOI | no |
 | `provenance` | Print a built cube's provenance: the config that made it, each field's sources, access dates | no |
 
@@ -296,9 +295,9 @@ Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `m
 - `--overwrite` — rebuild cubes that already exist.
 - `--dry-run` — report what would be assembled; write nothing.
 
-Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, `overpass_met`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision.
+Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision. (Met-at-overpass is configured on the `met_overpass` product, not here — see below.)
 
-> **Note (raw-output simplification).** The cube ships **raw ingredients** on a common grid and daily axis; masking, water-filling, station snapping, and multi-input derivations are downstream modelling determinations. The `fill_mur_water`, `fill_cmems_water`, and `water_level` keys were **removed** — MUR/CMEMS ship observed values with honest NaN gaps, there is no derived `landmask`, and water level is reconstructed downstream from the raw `elevation` + `depth` + `tide` channels plus the `datum_offset_m` / `datum_status` cube attributes. An old config that still sets any of these three keys now **fails validation** rather than being silently ignored.
+> **Note (raw-output simplification).** The cube ships **raw ingredients** on a common grid and daily axis; masking, water-filling, station snapping, and multi-input derivations are downstream modelling determinations. The `fill_mur_water`, `fill_cmems_water`, and `water_level` keys were **removed** — MUR/CMEMS ship observed values with honest NaN gaps, there is no derived `landmask`, and water level is reconstructed downstream from the raw per-source `elevation_<dem>` + `depth_<dem>` + `tide_<src>` channels plus each DEM's `datum_offset_m` / `datum_status` attributes. An old config that still sets any of these three keys now **fails validation** rather than being silently ignored.
 
 #### Provenance: what produced each field, and when
 
@@ -329,57 +328,46 @@ Two things this is careful about:
 
 **A guessed date is never passed off as a recorded one.** Acquisition stamps `acquired_at` into every file it writes. Data acquired *before* this existed has no stamp, so the access date falls back to the file's **mtime** — and every record says which basis it used. An mtime is wrong the moment a tree is rsynced or restored from backup, so that has to be legible rather than silent. Re-acquire (or `--overwrite`) to replace a guessed date with a recorded one.
 
-**Derived fields list all of their inputs.** `eco_airtemp` (the forcing at the ECOSTRESS overpass) is met *and* the ECOSTRESS overpass that set the instant; `insitu_sst` is the in-situ network *and* the met reference time it is sampled at. Picking one to report would be tidy and wrong. A channel with no mapping is logged loudly rather than shipping blank.
+**Derived fields list all of their inputs.** `eco_airtemp_hrrr` (the forcing at the ECOSTRESS overpass) is met_overpass *and* the ECOSTRESS overpass that set the instant; `insitu_sst` is the in-situ network *and* the met reference time it is sampled at. Picking one to report would be tidy and wrong. A channel with no mapping is logged loudly rather than shipping blank.
 
-Because the config is embedded, `provenance` also **detects drift**: if the config on disk has changed since the cube was built, it says so and prints both hashes. That matters here because several products switch source underneath you — CMEMS falls back reanalysis→forecast, met falls back HRRR→ERA5, bathymetry falls back CUDEM→GMRT — so "which source produced this number" has a real, per-run answer.
+Because the config is embedded, `provenance` also **detects drift**: if the config on disk has changed since the cube was built, it says so and prints both hashes. And because every distinct-data product now ships **one channel per source** (`depth_cudem` vs `depth_gmrt`, `airtemp_hrrr` vs `airtemp_era5`), each channel attributes to exactly **one** source — provenance names it unambiguously, with no "which source produced this day" guesswork.
 
-#### Met in the cube: reference time, and per-overpass
+#### Met in the cube: forcing (per source) and per-overpass products
 
-**A day gets one met value per channel, taken at a fixed *time of day* — not a daily mean.** A mean over `[0, 6, 12, 18]` UTC averages pre-dawn and mid-afternoon forcing together, which is the wrong thing to hand a model of a sensor that flew at one instant. The cube's `airtemp` / `wind_u` / `wind_v` / `wind_speed` / `swrad` / `cloud_cover` therefore come from the **reference-time snapshot**: by default **10:30 local solar time**, Landsat's overpass.
+**A day gets one met value per channel, taken at a fixed *time of day* — not a daily mean.** A mean over `[0, 6, 12, 18]` UTC averages pre-dawn and mid-afternoon forcing together, which is the wrong thing to hand a model of a sensor that flew at one instant. The cube's forcing channels — `airtemp_<src>` / `wind_u_<src>` / `wind_speed_<src>` / `swrad_<src>` / `cloud_cover_<src>`, **one per stacked met source** (`airtemp_hrrr`, `airtemp_era5`, …) — therefore come from the **reference-time snapshot**: by default **10:30 local solar time**, Landsat's overpass.
 
 The basis is *solar*, not UTC, because a fixed UTC hour is a different time of day in every AOI — mid-morning in Oregon, the middle of the night in Maine — so cross-AOI forcing would not be like-for-like. Each AOI's reference instant is derived from its own longitude (`UTC = local − lon/15`, rounded to the hour, rolling the date where it crosses midnight). Change it with `products.met.reference_time` / `reference_basis`, or set `datacube.met_time: daily_mean` to get the old averaging behavior back. If no reference files exist (an older MET tree), the assembler falls back to the daily mean rather than emitting an empty channel, and records which it used in the cube's `met_time` attribute.
 
-**Each sensor additionally carries the forcing at its own overpass.** Where `products.met.overpass_from` made met snapshot the thermal scenes, the cube emits `<sensor>_<var>` — `eco_airtemp`, `lst_wind_speed`, `modis_swrad`, and so on — so an ECOSTRESS scene at 03:00 and a Landsat scene at 19:00 on the same day see *different* air temperature and wind, rather than sharing one value. Pick the variables with `datacube.overpass_met` (default `[airtemp, wind_speed, swrad, cloud_cover]`; `[]` disables). These are matched to the **exact scene the cube kept** — when a sensor flies twice in a day, only the clearest scene survives, and the forcing follows *that* scene's timestamp, not merely its date. Days with no scene from a sensor stay NaN rather than carrying a stale value.
+**Met at each sensor's own overpass is a separate product, `met_overpass`.** A weather model's value at 14:32 is *not* reconstructable from a daily sample, so it is a real acquisition (not a downstream derivation). It snapshots the thermal scenes and the cube emits `<sensor>_<var>_<src>` — `lst_airtemp_hrrr`, `eco_wind_speed_era5`, and so on — so an ECOSTRESS scene at 03:00 and a Landsat scene at 19:00 on the same day see *different* forcing rather than sharing one value. You name exactly which pairings to produce with `products.met_overpass.combinations` (a list of `[sensor, source]`), so the channel count is what you opt into, not a sensor×source cross-product. These follow the **exact scene the cube kept** — when a sensor flies twice in a day, only the clearest scene survives, and the forcing follows *that* scene's timestamp. Days with no scene stay NaN.
+
+**Tide at each sensor's overpass is `tide_overpass`** (`<sensor>_tide_<src>`, e.g. `eco_tide_coops`), configured with `products.tides.overpass_combinations`. Unlike met, tide *is* reconstructable — it is the smooth tide series interpolated to the scene's hour — so it is a derived cube channel, not a separate acquisition. It is what a downstream process needs to put a scene's ground on the tide-adjusted waterline.
 
 #### Water level: reconstructed downstream from raw ingredients
 
-Water level (and the submerged/exposed classification of a tidal flat) is a **modelling determination**, so the cube no longer ships a pre-derived `<sensor>_water_elev` / `<sensor>_water_class` / `<sensor>_tide`. It ships instead the **raw ingredients** to reconstruct any of them per-process:
+Water level (and the submerged/exposed classification of a tidal flat) is a **modelling determination**, so the cube no longer ships a pre-derived `<sensor>_water_elev` / `<sensor>_water_class`. It ships instead the **raw ingredients** to reconstruct any of them per-process — all *per source*, so a downstream model chooses which DEM and which tide source to combine:
 
 | Ingredient | Dims | Role |
 | --- | --- | --- |
-| `elevation` | (y, x) | the DEM's ground/seafloor elevation, in its native vertical datum (+ up) |
-| `depth` (+ `depth_p25`/`depth_p75`) | (y, x) | mean water depth where the DEM is known |
-| `tide`, `tide_range` | (time,) | the daily tide statistics from the 1D series |
+| `elevation_<dem>` | (y, x) | that DEM's ground/seafloor elevation, in its native vertical datum (+ up); carries its own `datum_offset_m` / `datum_status` attributes |
+| `depth_<dem>` (+ `depth_p25`/`depth_p75`) | (y, x) | mean water depth where the DEM is known |
+| `tide_<src>`, `tide_range_<src>` | (time,) | the daily tide statistics from that source's series |
+| `<sensor>_tide_<src>` | (time,) | *ready-made:* the tide already interpolated to that sensor's overpass instant (the `tide_overpass` product) |
 | `<sensor>_hour` | (time,) | the exact overpass hour of the scene the cube kept (NaN where none) |
 
-A downstream process interpolates the tide series to a sensor's `<sensor>_hour`, references `elevation` to MSL with the datum offset below, and classifies each cell — exactly the computation the assembler used to hard-code, now made per-process.
+A downstream process references `elevation_<dem>` to MSL with **that DEM's** `datum_offset_m` attribute, takes the tide at the scene from `<sensor>_tide_<src>` (or interpolates `tide_<src>` to `<sensor>_hour` itself), and classifies each cell — exactly the computation the assembler used to hard-code, now made per-process.
 
-**Datum.** Tides are relative to **MSL** (a *tidal* datum — the 19-year mean of observed water level at a gauge), but a DEM need not be: CUDEM is **NAVD88** (a *geodetic* datum). The gap between the two surfaces is **local** and far from negligible — MSL sits roughly **1.0–1.4 m above NAVD88 in the Pacific Northwest** (vs. ~0.1–0.3 m on the Gulf coast), which is comparable to the entire intertidal range, so ignoring it misclassifies much of a tidal flat. This offset is **resolved automatically** by the [`datum` stage](#datum) and ships with the cube as the `datum_offset_m` / `datum_status` attributes — you do not configure it, and downstream adds it to `elevation` to put the DEM and the tide on one surface.
+**Datum.** Tides are relative to **MSL** (a *tidal* datum — the 19-year mean of observed water level at a gauge), but a DEM need not be: CUDEM is **NAVD88** (a *geodetic* datum). The gap between the two surfaces is **local** and far from negligible — MSL sits roughly **1.0–1.4 m above NAVD88 in the Pacific Northwest** (vs. ~0.1–0.3 m on the Gulf coast), which is comparable to the entire intertidal range, so ignoring it misclassifies much of a tidal flat. Each DEM source's offset is **resolved automatically as it is acquired** (NOAA VDatum for CUDEM/NAVD88, cross-checked against the nearest CO-OPS gauge; 0 for GMRT, which is already ~MSL) and ships as attributes on that source's `elevation_<dem>` channel. It can't be a config constant: the right value depends on **which DEM** it belongs to (CUDEM and GMRT on the same AOI need different offsets), which is exactly why it rides per-source rather than as one cube-wide number. Re-run `bathymetry --overwrite` to re-resolve it.
 
-### `datum`
+How each source resolves (during the bathymetry acquisition of *that* source):
 
-Resolves each AOI's **DEM→MSL vertical-datum offset** — the number a downstream process needs to put the DEM (`elevation`) and the tide on one surface when [reconstructing water level](#water-level-reconstructed-downstream-from-raw-ingredients). It ships with the cube as the `datum_offset_m` / `datum_status` attributes. It runs automatically inside `run` (after bathymetry, before the assembler) whenever bathymetry is selected; the subcommand exists to **backfill an existing data tree** without re-downloading a single DEM tile, since it reads the bathymetry output off disk rather than re-fetching it.
-
-Why it can't be a config constant: the right offset depends on **which DEM actually ran**, and bathymetry silently falls back CUDEM→GMRT where CUDEM has no coverage. So two AOIs in one region can legitimately need different offsets, and a project-wide number would be wrong for one of them.
-
-How each case resolves:
-
-| DEM that ran | Vertical datum | Offset |
+| DEM source | Vertical datum | Offset |
 | --- | --- | --- |
 | **CUDEM** | NAVD88 | looked up from [NOAA VDatum](https://vdatum.noaa.gov/) (NAVD88 → LMSL), **cross-checked** against the nearest CO-OPS gauge's published datums |
 | **GMRT** | ~sea level | `0.0` — no network call; GMRT is already sea-level referenced |
 
-VDatum is sampled at **several points spread across the AOI's waterline band**, not at its centroid: coverage is patchy at point scale (the Padilla Bay centroid falls in a hole while points a few km away resolve fine), and out-of-coverage comes back as a `-999999` sentinel rather than an error. The median is taken; if the samples span more than 0.5 m the AOI straddles tidal zones and a single scalar is refused rather than averaged into something wrong everywhere.
+VDatum is sampled at **several points spread across the AOI's waterline band**, not at its centroid: coverage is patchy at point scale (the Padilla Bay centroid falls in a hole while points a few km away resolve fine), and out-of-coverage comes back as a `-999999` sentinel rather than an error. The median is taken; if the samples span more than 0.5 m the AOI straddles tidal zones and a single scalar is refused rather than averaged into something wrong everywhere. The result (method, sample count, spread, uncertainty, the gauge it was cross-checked against) is stamped onto that DEM source's `elevation_<dem>` cube channel — there is no separate stage or sidecar, so `assemble` stays entirely offline and the offset can never go stale against the DEM it belongs to. Re-run `bathymetry --overwrite` to re-resolve.
 
-The result is written to `<output_dir>/DATUM/aligned/<aoi>/<aoi>_datum.json` with its full provenance (method, sample count, spread, uncertainty, the gauge it was cross-checked against, and a fingerprint of the DEM it was resolved for). The assembler reads that sidecar — so `assemble` stays entirely offline — and **refuses a stale one** whose fingerprint no longer matches the DEM on disk.
-
-- `--aoi <name> …` — resolve only specific AOIs (default: all).
-- `--overwrite` — re-resolve offsets already on disk (otherwise it's a no-op, zero requests).
-- `--dry-run` — report what would be resolved; write nothing, call nothing.
-
-**Override.** If you know better than VDatum for a region, assert it under `regions[].sources.bathymetry.datum_offset_m` (the elevation of MSL in the DEM's datum, in metres). It wins — but it is still validated: a >0.5 m offset on a DEM that turned out to be GMRT is rejected as a NAVD88 number applied to an MSL DEM, which is exactly the silent-metre error this stage exists to prevent.
-
-**If it cannot be resolved** (VDatum has no coverage and no NAVD88 gauge is within 30 km), the offset falls back to `0.0` with a loud error, and the cube is stamped `datum_status = "unresolved_assumed_zero"` so the bias is visible in the artifact and not only in a log line that scrolls away.
+**Override.** If you know better than VDatum for a region, assert it under `regions[].sources.bathymetry.datum_offset_m` (the elevation of MSL in the DEM's datum, in metres). It wins — but it is still validated: a >0.5 m offset on a DEM that is GMRT is rejected as a NAVD88 number applied to an MSL DEM, the silent-metre error this exists to prevent. **If it cannot be resolved** (VDatum has no coverage and no NAVD88 gauge within 30 km), the offset falls back to `0.0` with a loud error and `datum_status = "unresolved_assumed_zero"`, so the bias is visible in the artifact and not only in a log line that scrolls away.
 
 ### `validate` and `grids`
 
@@ -480,6 +468,28 @@ Two options are shared by every product's project-level block:
 
 Products that read from NASA Earthdata (ECOSTRESS, MODIS, MUR) also require an `auth.earthdata` block; see [Authenticating to data services](#authenticating-to-data-services).
 
+### Source coverage & stacking
+
+Several products draw the *same* variable from more than one provider, and **no single provider covers the whole globe**. A U.S.-only tide network, a North-America-only weather model, a CONUS-only DEM — each is authoritative where it reaches and absent everywhere else. Older versions of this package resolved that with a **source *chain***: a primary provider and a `fallback`, merged per day, so a channel might silently switch providers mid-record and a single `mur_sst` column could be two different models stitched together.
+
+That is gone. Products that read one variable from several providers now **STACK** them: one channel *per source*, named for its source, side by side, **no fallback and no merging**. `airtemp_hrrr` and `airtemp_era5` ride in the cube together; where HRRR doesn't reach, `airtemp_hrrr` is simply NaN and `airtemp_era5` carries the value. The consumer chooses — the cube never chooses for you, and provenance for `airtemp_hrrr` names **only** HRRR. Each source writes to its own tree, `<PRODUCT>/<source>/aligned/<aoi>/`, and the channel suffix is the source tag.
+
+The catch every consumer must know: **which sources actually cover which regions and windows.** A stacked channel is honest about its gaps (they read as NaN), but you have to expect them.
+
+| Product | Source (tag) | Spatial coverage | Temporal window | Native resolution |
+|---|---|---|---|---|
+| **bathymetry** | `cudem` | U.S. coasts (CONUS + territories) only | static | ~1/9″ (≈3 m) |
+| | `gmrt` | global | static | ~coarser, variable (100 m–1 km near shore) |
+| **met** / **met_overpass** | `hrrr` | North America only (CONUS + fringe) | 2014→present | 3 km, hourly |
+| | `era5` | global | 1940→present (~5-day lag) | ~31 km, hourly |
+| **cmems** | `my_global` (GLORYS12 reanalysis) | global ocean | 1993→~present (reanalysis lag) | 1/12° (~9 km), daily |
+| | `anfc_global` (global forecast) | global ocean | ~recent → +10 day forecast | 1/12° (~9 km), daily |
+| | regional tags (e.g. `anfc_med`, `anfc_nws`, `anfc_bal`) | one regional sea only | forecast window | ~2–4 km, daily |
+| **tides** | `coops` (CO-OPS gauges) | U.S. tide stations only | station record | observed, sub-hourly |
+| | `eo_tides` (global tide model) | global | any date (harmonic prediction) | model, arbitrary sampling |
+
+Rule of thumb: **`cudem`, `hrrr`, and `coops` are the U.S./North-America high-resolution sources; `gmrt`, `era5`, `my_global`/`anfc_global`, and `eo_tides` are the global fallbacks you stack alongside them.** Outside their coverage the high-resolution channel is all-NaN by design — that is the gap the table documents, not a bug. Pick the `sources` list per region accordingly (see each product's **Region-level options**).
+
 ### ECOSTRESS
 ECOSTRESS provides the core high resolution thermal images used in the analysis. ECOSTRESS has overpasses every 1 to 5 days with overpasses occuring at differnt times of day providing a unique data set for capturing ocean temperatures under a range of conditions.
 
@@ -550,9 +560,10 @@ MUR is the always-present, gap-free SST backbone the high-resolution products ad
 ### CMEMS (Copernicus Marine global physics)
 CMEMS supplies the **offshore ocean state at depth** — the water column the nearshore exchanges with. Where MUR gives one skin temperature at the surface, this gives temperature (and optionally salinity and currents) *through the water column*, so a model can see the stratification and the offshore water mass that upwelling and tidal exchange draw into an estuary.
 
-- **Where it comes from**: the Copernicus Marine global physics models (1/12°, daily means, ~50 depth levels), streamed with the `copernicusmarine` toolbox. `open_dataset` subsets the AOI window **server-side and lazily**, so the global model is never downloaded. Two products form a **source chain**, like met's HRRR→ERA5:
-    - **`my`** (default) — `cmems_mod_glo_phy_my_0.083deg_P1D-m`, the **GLORYS12 reanalysis** (hindcast). Best quality, but it stops a year or two behind the present.
-    - **`anfc`** — `cmems_mod_glo_phy_anfc_0.083deg_P1D-m`, the **analysis/forecast** product, which reaches the present and backfills whatever days the reanalysis cannot cover. Each aligned output file records which product produced it in its `source` attribute, so a reanalysis day and a forecast day are never silently conflated.
+- **Where it comes from** — two (or more) STACKED Copernicus Marine physics models (1/12°, daily means, ~50 depth levels), streamed with the `copernicusmarine` toolbox. `open_dataset` subsets the AOI window **server-side and lazily**, so the global model is never downloaded. One channel per source tag, no fallback (D10):
+    - **`my_global`** — `cmems_mod_glo_phy_my_0.083deg_P1D-m`, the **GLORYS12 reanalysis** (hindcast). Best quality, but it stops a year or two behind the present; outside its window the channel is simply NaN.
+    - **`anfc_global`** — `cmems_mod_glo_phy_anfc_0.083deg_P1D-m`, the **analysis/forecast** product, which reaches the present and out to a ~10-day forecast. It rides *alongside* the reanalysis rather than backfilling it, so `cmems_thetao_0m_my_global` and `cmems_thetao_0m_anfc_global` are never silently conflated — the consumer picks per day.
+    - **regional tags** (register in `datasets`) — higher-resolution seas like `anfc_med` / `anfc_nws` / `anfc_bal` (~2–4 km) that a region stacks in place of, or alongside, the global tags.
 - **What it measures**: whichever `variables` you select (default `thetao`, sea-water potential temperature; also `so` salinity, `uo`/`vo` currents, and the 2D `zos` / `mlotst`), emitted **once per requested depth**.
 
 **Depths.** The model has ~50 *fixed* levels (0.494, 1.541, 2.646, 5.078 m …), so a requested depth is snapped to the **nearest level** — never interpolated. Every value is therefore one the model actually computed. The channel is named for what you asked for; the level actually used is recorded in the variable's `model_depth_m` attr:
@@ -566,16 +577,15 @@ gives `thetao_0m` (level 0.494 m), `thetao_10m` (level **9.573** m), `thetao_30m
 
 **Project-level options** (`products.cmems`):
 
-- `source`: primary product, `my` (default) or `anfc`.
-- `fallback`: product used for days the primary does not cover, `anfc` (default) or `none` to disable the chain.
-- `dataset_id`: an explicit CMEMS dataset id, which **overrides the chain entirely** — the escape hatch for any other Copernicus physics product.
+- `sources`: the source TAGS to STACK, one channel per tag (default `[my_global, anfc_global]` — GLORYS12 reanalysis + global forecast). There is no `source`/`fallback` chain any more.
+- `datasets`: register extra tags → dataset ids for regional models, e.g. `{anfc_med: cmems_mod_med_phy-tem_anfc_4.2km_P1D-m}`; a region then lists that tag in its `sources`. The tag is the provenance identity, so a channel is self-describing.
 - `variables`: which fields to acquire (default `[thetao]`).
 - `depths`: depths in metres, each snapped to the nearest model level (default `[0]`).
 - `pad_deg`: padding around the AOI window (default `0.15`, ≥ one 1/12° cell).
 
-**Region-level options**: none.
+**Region-level options** (`regions[].sources.cmems`): `sources` (which tags to stack here) and `datasets` (register a regional tag).
 
-**In the cube** the channels arrive prefixed — `cmems_thetao_0m`, `cmems_thetao_30m` — and ship the model's **observed values with honest NaN gaps**, like MUR. At ~9 km the model's land mask can swallow an entire estuary, so expect NaN over cells it never resolved; filling those from the nearest resolved water column is a downstream determination the model makes per-process, not something the cube bakes in.
+**In the cube** the channels arrive prefixed and per-source — `cmems_thetao_0m_my_global`, `cmems_thetao_30m_anfc_global` — and ship the model's **observed values with honest NaN gaps**, like MUR. At ~9 km the model's land mask can swallow an entire estuary, so expect NaN over cells it never resolved; filling those from the nearest resolved water column is a downstream determination, not something the cube bakes in.
 
 **Credentials**: a free [Copernicus Marine](https://data.marine.copernicus.eu) account, declared as `auth.copernicus`. The toolbox reads `~/.netrc` natively, so the secret lives there like every other one:
 
@@ -618,16 +628,14 @@ All are sparse — NaN everywhere except station cells — which costs almost no
 ### Bathymetry
 Bathymetry is a static (time-invariant) covariate: one file per AOI describing water depth, used both as a model input and to build the land mask.
 
-- **Where it comes from**: the NOAA NCEI CUDEM 1/9 arc-second (~3 m) seamless topobathy DEM, read straight from its `/vsicurl` tiles, with the GMRT GridServer (~100 m, global) as a fallback where CUDEM has no coverage (e.g. SE Alaska). **No credentials required.** The fine CUDEM pixels are aggregated to depth statistics within each grid cell; CUDEM is referenced to NAVD88 rather than MSL, so its 0 contour is not the mean waterline — set `datum_offset_m` (below) to reconcile the two.
-- **What it measures** (all in metres): `elevation` (mean, negative below sea level — drives the land mask), `depth` (mean water depth over the cell), and `depth_p25` / `depth_p75` (sub-grid depth variability). For GMRT there is no sub-grid, so `depth_p25 = depth_p75 = depth`.
+- **Where it comes from**: the NOAA NCEI CUDEM 1/9 arc-second (~3 m) seamless topobathy DEM (`cudem`, U.S. coasts only), read straight from its `/vsicurl` tiles, and the GMRT GridServer (`gmrt`, ~100 m, global). **No credentials required.** These STACK — where CUDEM has no coverage (e.g. SE Alaska) its channel is NaN and GMRT's carries; the cube does not merge them. The fine CUDEM pixels are aggregated to depth statistics within each grid cell; CUDEM is referenced to NAVD88 rather than MSL, so its 0 contour is not the mean waterline — set `datum_offset_m` (below) to reconcile the two.
+- **Stacked, one channel per DEM source** (D10): list the DEMs you want and each is acquired independently into `depth_<dem>` / `elevation_<dem>` — no fallback. **What it measures** (all in metres): `elevation_<dem>` (mean, negative below sea level; carries that DEM's `datum_offset_m` attributes), `depth_<dem>` (mean water depth over the cell), and `depth_p25_<dem>` / `depth_p75_<dem>` (sub-grid depth variability). For GMRT there is no sub-grid, so `depth_p25 = depth_p75 = depth`. A source with no coverage here simply contributes no channel — stack another to fill the gap.
 
 **Project-level options** (`products.bathymetry`):
 
-- `default_source`: DEM source used when a region does not override it (default `gmrt`).
-- `fallback`: source tried when the chosen source lacks coverage (default `gmrt`).
-*(There is no project-level datum option: the DEM→MSL offset is resolved per AOI by the [`datum` stage](#datum), because it follows the DEM that actually ran.)*
+- `sources`: the DEMs to STACK (default `[cudem, gmrt]`); e.g. `[cudem]` for a CONUS-only project, or `[gmrt]` outside it. There is no `source`/`fallback`/`dem_source` any more.
 - `stats_subgrid_m`: fine sub-grid resolution for CUDEM depth statistics (default `10.0`).
-- `min_cudem_cover`: minimum fraction of the AOI CUDEM must cover before falling back (default `0.5`).
+- `min_cudem_cover`: minimum fraction of the AOI CUDEM must cover before it declines (default `0.5`).
 - `pad_deg`: padding around the AOI bbox in degrees (default `0.02`).
 - `layer`: GMRT layer (default `topo`).
 - `resolution`: GMRT resolution (default `max`).
@@ -636,58 +644,55 @@ Bathymetry is a static (time-invariant) covariate: one file per AOI describing w
 
 **Region-level options** (`regions[].sources.bathymetry`):
 
-- `dem_source`: the DEM source (`cudem` or `gmrt`) to use for the AOIs in this region, overriding the project-level `default_source`. This is the option to set when different parts of the study area have different DEM coverage.
-- `datum_offset_m`: **optional** override of the automatically-resolved DEM→MSL offset (the elevation of MSL in the DEM's vertical datum, in metres). Leave it unset unless you know better than VDatum for this region; see [`datum`](#datum).
+- `sources`: the DEMs to stack for the AOIs in this region, overriding the project list (e.g. `[gmrt]` for a region outside CUDEM coverage). Each DEM's DEM→MSL datum offset is resolved automatically *as it is acquired* (see [Water level](#water-level-reconstructed-downstream-from-raw-ingredients)).
+- `datum_offset_m`: **optional** override of the automatically-resolved DEM→MSL offset (the elevation of MSL in the DEM's vertical datum, in metres). Leave it unset unless you know better than VDatum for this region.
 
-### Met
-Met provides the gap-free meteorological forcing that drives nearshore ocean temperatures — air temperature, wind, shortwave radiation and cloud cover — used both as model inputs and for the skin-to-bulk SST correction. Unlike the SST products these are complete driver channels, so there is no `valid`/mask layer.
+### Met (forcing) and Met overpass
 
-- **Where it comes from**: two sources are tried in order (the "source chain"), so the output is gap-free everywhere. Each field is unit-harmonized to a single convention regardless of which source supplied it, and every output file records its provenance in the `source` attribute.
-    - **HRRR** — NOAA's 3 km High-Resolution Rapid Refresh surface analysis, fetched with [Herbie](https://github.com/blaylockbk/Herbie). The CONUS domain (`hrrr`) is used below 50°N and the Alaska domain (`hrrrak`) at/above it. HRRR is a curvilinear grid, so it is regridded with nearest-neighbour resampling (`pyresample`). **No credentials required.**
-    - **ERA5** — ECMWF's 0.25° hourly reanalysis, streamed from Google's public [ARCO-ERA5](https://github.com/google-research/arco-era5) Zarr store on GCS. It is global, so it backfills any AOI, date, or cycle HRRR cannot cover (e.g. AOIs outside North America). ERA5 is a regular lat/lon grid, so it is bilinearly reprojected. **No credentials required** (anonymous GCS access).
-- **What it measures** (harmonized units): `airtemp` (2 m air temperature, K or °C), `wind_u` / `wind_v` (10 m wind components) and the derived `wind_speed` (m s⁻¹), `swrad` (downward shortwave, W m⁻²), and `cloud_cover` (%). For each AOI it writes a daily-mean file per day plus an instantaneous snapshot at each thermal-scene overpass time (discovered from the `overpass_from` products' aligned outputs), so forcing can be matched to each SST scene.
+Met provides the meteorological forcing that drives nearshore ocean temperatures — air temperature, wind, shortwave radiation and cloud cover. These are complete driver channels, so there is no `valid`/mask layer. Two products: **`met`** is the daily FORCING (no sensor dependency); **`met_overpass`** is the same fields snapshotted at each thermal sensor's overpass instant (see [met in the cube](#met-in-the-cube-forcing-per-source-and-per-overpass-products)).
 
-**Project-level options** (`products.met`):
+- **Where it comes from** — two STACKED sources (D10), one channel per source, no fallback. Each field is unit-harmonized to a single convention regardless of source.
+    - **HRRR** — NOAA's 3 km High-Resolution Rapid Refresh surface analysis, fetched with [Herbie](https://github.com/blaylockbk/Herbie). CONUS (`hrrr`) below 50°N, Alaska (`hrrrak`) at/above it. Curvilinear grid → nearest-neighbour resampling (`pyresample`). **North America only.** No credentials.
+    - **ERA5** — ECMWF's 0.25° hourly reanalysis, streamed from Google's public [ARCO-ERA5](https://github.com/google-research/arco-era5) Zarr on GCS. **Global**, so it covers any AOI HRRR cannot (e.g. outside North America). Regular lat/lon grid → bilinear reproject. No credentials (anonymous GCS).
+- **What it measures** (harmonized units): `airtemp_<src>` (2 m air temperature, K or °C), `wind_u_<src>` / `wind_v_<src>` + derived `wind_speed_<src>` (m s⁻¹), `swrad_<src>` (downward shortwave, W m⁻²), `cloud_cover_<src>` (%). `met` writes a reference-time (and optional daily-mean) file per day, per source; `met_overpass` writes an instantaneous snapshot at each configured sensor's overpass time.
 
-- `source`: primary source, `auto` (default), `hrrr`, or `era5`. `auto` is equivalent to `hrrr` as the primary with the fallback appended.
-- `fallback`: source used where the primary misses, `era5` (default) or `none` to disable. With the defaults (`source: auto`, `fallback: era5`) the chain is `hrrr → era5`.
+**Project-level options** (`products.met` — the forcing):
+
+- `sources`: the met sources to STACK (default `[hrrr, era5]`); outside North America a region stacks only `[era5]`. There is no `source`/`fallback` any more.
 - `variables`: which fields to acquire (default `airtemp`, `wind`, `swrad`, `cloud`).
-- `reference_time`: the **time of day** the daily snapshot is taken at (default `"10:30"`, Landsat's overpass); `null` to skip it. This is the cube's default met channel — see [met in the cube](#met-in-the-cube-reference-time-and-per-overpass).
-- `reference_basis`: how `reference_time` is interpreted — `solar` (default; **local** solar time, converted per AOI from its longitude) or `utc` (taken literally).
-- `daily_mean_hours`: UTC hours averaged into the daily-mean field (default `[0, 6, 12, 18]`; set `[]` to skip it and save the four fetches per day).
-- `overpass_from`: SST products whose aligned scenes set the instantaneous snapshot times, e.g. `[ecostress, landsat]` (default none — daily means only). Run met *after* these products so their outputs exist.
-- `regrid_radius_m`: nearest-neighbour search radius for HRRR regridding in metres (default `6000`).
-- `pad_deg`: degrees of padding around the AOI window for the ERA5 subset (default `0.25`, i.e. ≥ one ERA5 cell).
-- `fxx`: HRRR forecast hour (default `0` = analysis; use `1` if `DSWRF` reads 0 at the analysis time).
-- `product`: HRRR product/level (default `sfc`, the 2D surface fields).
-- `model`: force an HRRR domain, `auto` (default), `hrrr`, or `hrrrak`, instead of choosing it by latitude.
-- `era5_zarr`: override the ARCO-ERA5 store URI (defaults to the public GCS Zarr).
+- `reference_time`: the **time of day** the daily snapshot is taken at (default `"10:30"`, Landsat's overpass); `null` to skip.
+- `reference_basis`: how `reference_time` is interpreted — `solar` (default; **local** solar time, per AOI longitude) or `utc`.
+- `daily_mean_hours`: UTC hours averaged into the daily-mean field (default `[0, 6, 12, 18]`; `[]` to skip).
+- `regrid_radius_m` (default `6000`), `pad_deg` (ERA5 subset pad, default `0.25`), `fxx` (HRRR forecast hour, default `0`), `product` (HRRR level, default `sfc`), `model` (force an HRRR domain), `era5_zarr` (ARCO store URI).
 
-**Region-level options**: none.
+**Project-level options** (`products.met_overpass` — the overpass documentation):
+
+- `sources`: the met sources to stack for the snapshots (default `[hrrr, era5]`).
+- `combinations`: the `[sensor, source]` pairings to produce, e.g. `[[lst, hrrr], [eco, era5]]` → cube channels `lst_<var>_hrrr`, `eco_<var>_era5`. You opt into exactly the pairings you want. A combo naming an unloaded sensor or a bad source fails config validation.
+- `variables` and the HRRR/ERA5 fetch knobs, as for `met`. Run `met_overpass` *after* the sensor stages (it reads their overpass times).
+
+**Region-level options** (`met` / `met_overpass`): `sources`, `model`; `met_overpass` also takes `combinations`.
 
 ### Tides
 Tide height is a forcing channel for nearshore temperature (mixing, exchange with cooler/warmer offshore water). Because tide is essentially spatially uniform over a small AOI, this is a single 1D time series per AOI rather than a gridded product — the datacube assembler broadcasts it across the AOI grid and samples it at the daily/overpass times.
 
-- **Where it comes from**: tides is a `source`-selector product with a `SOURCES` registry and fallback (like bathymetry), so an AOI is served from whichever source has coverage:
-    - **`coops`** (default) — NOAA CO-OPS (Tides & Currents). Finds the nearest CO-OPS water-level station to the AOI centroid, fetches that station's published **harmonic constituents** (one small, fast metadata request), and synthesizes the series **locally** with `pytides2` (nodal corrections included). Public, **no credentials required**, works for any date range — but CO-OPS gauges only exist in **U.S. waters**. Needs `requests` + `pytides2`.
-    - **`eo_tides`** — a **global** ocean-tide model (**EOT20** by default) sampled at the AOI centroid via the [eo-tides](https://geoscienceaustralia.github.io/eo-tides/) package (pyTMD under the hood). Works **anywhere**, so it is the natural **backup** for AOIs outside the U.S. Needs `eo-tides` plus a downloaded tide-model directory (see the eo-tides "Setting up tide models" docs), pointed at via `model_directory` or the `EO_TIDES_TIDE_MODELS` environment variable.
-- **How the backup kicks in**: with the defaults (`default_source: coops`, `fallback: eo_tides`) an AOI falls through to the global model when the nearest CO-OPS gauge is farther than `fallback_distance_km`, **or** when the CO-OPS fetch fails. Set `fallback: none` to disable the backup, or select a source explicitly per region (below).
-- **What it measures**: `tide` — tide height in metres, relative to mean sea level, on a `time` dimension. CO-OPS files record the station id/name, its distance from the AOI centroid, and the number of constituents; global-model files record the model name and sample point. The `source` attribute records which source actually produced the file. Always written as NetCDF (a 1D series, so `geotiff` does not apply).
+- **Where it comes from** — two STACKED sources (D10), one channel per source, no fallback:
+    - **`coops`** — NOAA CO-OPS (Tides & Currents). Finds the nearest CO-OPS water-level station to the AOI centroid, fetches that station's published **harmonic constituents** (one small, fast metadata request), and synthesizes the series **locally** with `pytides2` (nodal corrections included). Public, **no credentials required**, any date range — but CO-OPS gauges only exist in **U.S. waters**, so where the nearest gauge is farther than `max_distance_km` it contributes no channel here. Needs `requests` + `pytides2`.
+    - **`eo_tides`** — a **global** ocean-tide model (**EOT20** by default) sampled at the AOI centroid via the [eo-tides](https://geoscienceaustralia.github.io/eo-tides/) package (pyTMD under the hood). Works **anywhere**. Needs `eo-tides` plus a downloaded tide-model directory (see the eo-tides "Setting up tide models" docs), pointed at via `model_directory` or the `EO_TIDES_TIDE_MODELS` environment variable.
+- **What it measures**: `tide_<src>` — tide height in metres, relative to mean sea level, on a `time` dimension — and `tide_range_<src>`. CO-OPS files record the station id/name, distance, and constituent count; global-model files record the model name and sample point. Always written as NetCDF (a 1D series). The cube's `tide_overpass` channels (`<sensor>_tide_<src>`) are derived from these by interpolating to each sensor's overpass hour.
 
 **Project-level options** (`products.tides`):
 
-- `default_source`: primary source, `coops` (default) or `eo_tides`.
-- `fallback`: source used when the primary has no coverage/fails, `eo_tides` (default) or `none` to disable.
-- `fallback_distance_km`: fall back to the global model when the nearest CO-OPS gauge is farther than this (default `150`).
+- `sources`: the tide sources to STACK (default `[coops, eo_tides]`); a region outside U.S. waters stacks only `[eo_tides]`. There is no `source`/`default_source`/`fallback` any more.
+- `overpass_combinations`: the `[sensor, source]` pairings for the derived `tide_overpass` channels (`<sensor>_tide_<src>`), e.g. `[[eco, coops], [lst, eo_tides]]`. Default none.
+- `max_distance_km`: CO-OPS declines (no channel) when the nearest gauge is farther than this (default `150`).
 - `interval`: prediction step (default `h`, i.e. hourly).
-- `stations`: per-AOI CO-OPS gauge overrides as `{aoi_name: station id}`, for when the automatically chosen nearest gauge is not the right one (default none). An override is never distance-pre-empted to the backup.
+- `stations`: per-AOI CO-OPS gauge overrides as `{aoi_name: station id}`, for when the automatically chosen nearest gauge is not the right one (default none).
 - `warn_distance_km`: log a warning when the nearest gauge is farther than this from the AOI centroid (default `75`).
 - `model`: eo-tides global model to sample (default `EOT20`; e.g. `FES2022`, `TPXO10-atlas`).
 - `model_directory`: path to the downloaded tide-model files (default none → the `EO_TIDES_TIDE_MODELS` environment variable).
 
-**Region-level options** (`regions[].sources.tides`):
-
-- `source`: the tide source (`coops` or `eo_tides`) for the AOIs in this region, overriding the project-level `default_source`. Set `eo_tides` for a region outside CO-OPS coverage (e.g. an international study area) while U.S. regions keep `coops`.
+**Region-level options** (`regions[].sources.tides`): `sources` (which to stack here), `overpass_combinations`, `model`, `model_directory`, `stations`.
 
 ### Landcover
 Landcover is a static (time-invariant) covariate: one file per AOI giving a land-cover class and a binary water mask. The assembler uses `water` as an authoritative **land override** — pixels the classifier calls non-water are forced to land even when bathymetry is below sea level, which fixes diked/reclaimed farmland (negative elevation but not actually water).
