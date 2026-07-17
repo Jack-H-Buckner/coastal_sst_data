@@ -40,8 +40,7 @@ def _two_continent_project(tmp_path):
         "time": {"start_date": "2026-06-01", "end_date": "2026-06-03"},
         "products": {
             # Project-wide defaults are the North American ones...
-            "met": {"source": "auto", "fallback": "era5",
-                    "variables": ["airtemp", "wind"]},
+            "met": {"sources": ["hrrr", "era5"], "variables": ["airtemp", "wind"]},
             "cmems": {"sources": ["my_global", "anfc_global"],
                       "variables": ["thetao"], "depths": [0.0, 10.0]},
             "insitu": {"source": "ioos", "qc_flags": [1, 2]},
@@ -57,7 +56,7 @@ def _two_continent_project(tmp_path):
             {"name": "medit",
              # ...and the Mediterranean region says, per source, what actually reaches it.
              "sources": {
-                 "met": {"source": "era5", "fallback": "none"},
+                 "met": {"sources": ["era5"]},
                  "cmems": {"sources": ["anfc_med"],
                            "datasets": {"anfc_med": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"}},
                  "insitu": {"source": "ioos", "exclude_stations": ["bogus1"]},
@@ -73,12 +72,12 @@ def _two_continent_project(tmp_path):
 # --------------------------------------------------------------------------- #
 # Coverage: each product resolves a DIFFERENT source per region
 # --------------------------------------------------------------------------- #
-def test_met_chain_differs_per_region(tmp_path):
-    """The one that matters most: HRRR does not reach the Mediterranean, so that region's
-    chain must START at ERA5 rather than silently falling back to it every single fetch."""
+def test_met_sources_differ_per_region(tmp_path):
+    """The one that matters most: HRRR does not reach the Mediterranean, so that region stacks
+    only ERA5 -- a deliberate choice, not a silent fallback."""
     ds = met._build_eff(_two_continent_project(tmp_path))["ds"]
-    assert ds["tillamook"]["chain"] == ["hrrr", "era5"]   # HRRR, with ERA5 to backfill
-    assert ds["ligurian"]["chain"] == ["era5"]            # ERA5 only -- deliberate, not a fallback
+    assert ds["tillamook"]["sources"] == ["hrrr", "era5"]   # both stacked
+    assert ds["ligurian"]["sources"] == ["era5"]            # ERA5 only
 
 
 def test_cmems_sources_differ_per_region(tmp_path):
@@ -213,7 +212,7 @@ def test_resolve_opts_layers_region_over_global(tmp_path):
     pnw = resolve_opts(project, "tillamook", DataProduct.met)
     med = resolve_opts(project, "ligurian", DataProduct.met)
     # region override wins where it is set...
-    assert opt(pnw, "source") == "auto" and opt(med, "source") == "era5"
+    assert opt(pnw, "sources") == ["hrrr", "era5"] and opt(med, "sources") == ["era5"]
     # ...and the project-global value shows through where it is not.
     assert opt(pnw, "variables") == opt(med, "variables") == ["airtemp", "wind"]
 

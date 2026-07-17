@@ -23,7 +23,7 @@
     }
   },
   "data_vars": {
-    "airtemp": {
+    "airtemp_hrrr": {
       "attrs": {},
       "dims": [
         "time",
@@ -44,7 +44,7 @@
         "n_finite": 5292
       }
     },
-    "cloud_cover": {
+    "cloud_cover_hrrr": {
       "attrs": {},
       "dims": [
         "time",
@@ -255,9 +255,9 @@
         "n_finite": 3
       }
     },
-    "eco_airtemp": {
+    "eco_airtemp_hrrr": {
       "attrs": {
-        "long_name": "airtemp at the eco overpass"
+        "long_name": "airtemp at the eco overpass (hrrr)"
       },
       "dims": [
         "time",
@@ -299,9 +299,9 @@
         "n_finite": 1764
       }
     },
-    "eco_cloud_cover": {
+    "eco_cloud_cover_hrrr": {
       "attrs": {
-        "long_name": "cloud_cover at the eco overpass"
+        "long_name": "cloud_cover at the eco overpass (hrrr)"
       },
       "dims": [
         "time",
@@ -402,9 +402,9 @@
         "n_finite": 1764
       }
     },
-    "eco_swrad": {
+    "eco_swrad_hrrr": {
       "attrs": {
-        "long_name": "swrad at the eco overpass"
+        "long_name": "swrad at the eco overpass (hrrr)"
       },
       "dims": [
         "time",
@@ -423,6 +423,26 @@
         "mean": 800.0,
         "min": 800.0,
         "n_finite": 1764
+      }
+    },
+    "eco_tide_coops": {
+      "attrs": {
+        "long_name": "tide at the eco overpass (coops), rel. MSL",
+        "units": "m"
+      },
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "c6b44048a3999d91dd6bf4a7d3c613ee4f678bb56e556ce5fd60e8fddbaeaee0",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": -0.866025,
+        "mean": -0.866025,
+        "min": -0.866025,
+        "n_finite": 1
       }
     },
     "eco_valid": {
@@ -446,9 +466,9 @@
         "n_finite": 5292
       }
     },
-    "eco_wind_speed": {
+    "eco_wind_speed_hrrr": {
       "attrs": {
-        "long_name": "wind_speed at the eco overpass"
+        "long_name": "wind_speed at the eco overpass (hrrr)"
       },
       "dims": [
         "time",
@@ -603,9 +623,9 @@
         "n_finite": 1764
       }
     },
-    "lst_airtemp": {
+    "lst_airtemp_hrrr": {
       "attrs": {
-        "long_name": "airtemp at the lst overpass"
+        "long_name": "airtemp at the lst overpass (hrrr)"
       },
       "dims": [
         "time",
@@ -647,9 +667,9 @@
         "n_finite": 1764
       }
     },
-    "lst_cloud_cover": {
+    "lst_cloud_cover_hrrr": {
       "attrs": {
-        "long_name": "cloud_cover at the lst overpass"
+        "long_name": "cloud_cover at the lst overpass (hrrr)"
       },
       "dims": [
         "time",
@@ -750,9 +770,9 @@
         "n_finite": 1764
       }
     },
-    "lst_swrad": {
+    "lst_swrad_hrrr": {
       "attrs": {
-        "long_name": "swrad at the lst overpass"
+        "long_name": "swrad at the lst overpass (hrrr)"
       },
       "dims": [
         "time",
@@ -771,6 +791,26 @@
         "mean": 800.0,
         "min": 800.0,
         "n_finite": 1764
+      }
+    },
+    "lst_tide_coops": {
+      "attrs": {
+        "long_name": "tide at the lst overpass (coops), rel. MSL",
+        "units": "m"
+      },
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "a2ed5efbf2f82dda3fc690502e47de69f016756415d568cdaaf87c1edd5b476c",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1
       }
     },
     "lst_valid": {
@@ -794,9 +834,9 @@
         "n_finite": 5292
       }
     },
-    "lst_wind_speed": {
+    "lst_wind_speed_hrrr": {
       "attrs": {
-        "long_name": "wind_speed at the lst overpass"
+        "long_name": "wind_speed at the lst overpass (hrrr)"
       },
       "dims": [
         "time",
@@ -814,52 +854,6 @@
         "max": 7.0,
         "mean": 7.0,
         "min": 7.0,
-        "n_finite": 1764
-      }
-    },
-    "modis_airtemp": {
-      "attrs": {
-        "long_name": "airtemp at the modis overpass"
-      },
-      "dims": [
-        "time",
-        "y",
-        "x"
-      ],
-      "dtype": "float32",
-      "fingerprint": "9a886aa3c74692b300b5c98a346d9134c5164d45e3e6c2791b3530a9fce4097e",
-      "shape": [
-        3,
-        42,
-        42
-      ],
-      "stats": {
-        "max": 285.0,
-        "mean": 285.0,
-        "min": 285.0,
-        "n_finite": 1764
-      }
-    },
-    "modis_cloud_cover": {
-      "attrs": {
-        "long_name": "cloud_cover at the modis overpass"
-      },
-      "dims": [
-        "time",
-        "y",
-        "x"
-      ],
-      "dtype": "float32",
-      "fingerprint": "20cb9282cc50bce444c56b41ca3d01bbb2bf2c2451236884b69376cc4a151643",
-      "shape": [
-        3,
-        42,
-        42
-      ],
-      "stats": {
-        "max": 20.0,
-        "mean": 20.0,
-        "min": 20.0,
         "n_finite": 1764
       }
     },
@@ -943,29 +937,6 @@
         "n_finite": 1764
       }
     },
-    "modis_swrad": {
-      "attrs": {
-        "long_name": "swrad at the modis overpass"
-      },
-      "dims": [
-        "time",
-        "y",
-        "x"
-      ],
-      "dtype": "float32",
-      "fingerprint": "66a54feba7a7158f6953eaefa476aa4f34be4810c6a4d34e43726c8d4265e9be",
-      "shape": [
-        3,
-        42,
-        42
-      ],
-      "stats": {
-        "max": 800.0,
-        "mean": 800.0,
-        "min": 800.0,
-        "n_finite": 1764
-      }
-    },
     "modis_valid": {
       "attrs": {},
       "dims": [
@@ -985,29 +956,6 @@
         "mean": 0.333333,
         "min": 0.0,
         "n_finite": 5292
-      }
-    },
-    "modis_wind_speed": {
-      "attrs": {
-        "long_name": "wind_speed at the modis overpass"
-      },
-      "dims": [
-        "time",
-        "y",
-        "x"
-      ],
-      "dtype": "float32",
-      "fingerprint": "e46674838465038ed2a37bd3b7d8aab46b5443c6c4dcc20d854afa587fda5ab9",
-      "shape": [
-        3,
-        42,
-        42
-      ],
-      "stats": {
-        "max": 7.0,
-        "mean": 7.0,
-        "min": 7.0,
-        "n_finite": 1764
       }
     },
     "mur_sst": {
@@ -1031,7 +979,7 @@
         "n_finite": 4914
       }
     },
-    "swrad": {
+    "swrad_hrrr": {
       "attrs": {},
       "dims": [
         "time",
@@ -1086,7 +1034,7 @@
         "n_finite": 3
       }
     },
-    "wind_speed": {
+    "wind_speed_hrrr": {
       "attrs": {},
       "dims": [
         "time",
@@ -1107,7 +1055,7 @@
         "n_finite": 5292
       }
     },
-    "wind_u": {
+    "wind_u_hrrr": {
       "attrs": {},
       "dims": [
         "time",
@@ -1125,7 +1073,7 @@
         "n_finite": 0
       }
     },
-    "wind_v": {
+    "wind_v_hrrr": {
       "attrs": {},
       "dims": [
         "time",
@@ -1151,7 +1099,7 @@
   },
   "global_attrs": {
     "aoi_id": "aoi1",
-    "coverage": "{\"cmems\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"met\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"mur\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}}",
+    "coverage": "{\"cmems\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"met\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"mur\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"tides\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}}",
     "crs": "EPSG:32610",
     "insitu_stations": "[{\"index\": 1, \"id\": \"s1\", \"name\": \"Test Station\", \"lat\": 45.5, \"lon\": -123.9, \"row\": 21, \"col\": 20}]",
     "met_time": "reference"

@@ -21,8 +21,8 @@ def test_load_config():
     # products is a mapping: keys = selection, values = global options.
     assert list(cfg.products) == [DataProduct.bathymetry, DataProduct.ecostress,
                                   DataProduct.mur, DataProduct.cmems, DataProduct.landsat,
-                                  DataProduct.met, DataProduct.tides, DataProduct.insitu,
-                                  DataProduct.landcover]
+                                  DataProduct.met, DataProduct.met_overpass, DataProduct.tides,
+                                  DataProduct.insitu, DataProduct.landcover]
     # a bare `bathymetry:` -> default (empty) global options
     assert cfg.products[DataProduct.bathymetry].model_dump() == {}
     # global options land on the product's ProductOptions bag (extra=allow)
@@ -572,6 +572,55 @@ def test_empty_or_unknown_stacked_sources_are_rejected(base_project):
         parse_config(_cfg(base_project, "bathymetry", {"sources": []}))
     with pytest.raises(ValidationError, match="unknown source"):
         parse_config(_cfg(base_project, "bathymetry", {"sources": ["gebco"]}))
+
+
+# S4 removed pick-one/fallback for cmems, met, tides too -- an un-migrated config setting any
+# of these must FAIL loudly (extra="forbid"), never be silently ignored (§6.2).
+@pytest.mark.parametrize("product,removed", [
+    ("cmems", "source"), ("cmems", "fallback"), ("cmems", "dataset_id"),
+    ("met", "source"), ("met", "fallback"), ("met", "overpass_from"),
+    ("tides", "source"), ("tides", "default_source"), ("tides", "fallback"),
+    ("tides", "fallback_distance_km"),
+])
+def test_removed_source_keys_are_rejected(base_project, product, removed):
+    base_project.setdefault("auth", {})["copernicus"] = {"auth_strategy": "netrc"}  # cmems
+    with pytest.raises(ValidationError, match="SILENTLY IGNORED"):
+        parse_config(_cfg(base_project, product, {removed: "x"}))
+
+
+def test_datacube_overpass_met_key_is_rejected(base_project):
+    """`datacube.overpass_met` moved to the `met_overpass` product (D14). An old config still
+    setting it fails loudly rather than quietly producing no overpass channels."""
+    base_project["datacube"] = {"overpass_met": ["airtemp"]}
+    with pytest.raises(ValidationError):
+        parse_config(base_project)
+
+
+def test_bad_met_overpass_combinations_are_rejected(base_project):
+    """A combo naming an unloaded sensor or a bad source fails at load, not silently as an
+    empty overpass channel (the sharpest regression risk in the met split)."""
+    base_project["products"]["met_overpass"] = {"combinations": [["eco", "hrrr"]]}
+    # ecostress isn't selected in base_project -> combo names an unloaded sensor
+    with pytest.raises(ValidationError, match="not selected"):
+        parse_config(base_project)
+    # a good sensor but a bad source
+    base_project["products"]["ecostress"] = None
+    base_project["products"]["met_overpass"] = {"combinations": [["eco", "gfs"]]}
+    with pytest.raises(ValidationError, match="not valid here"):
+        parse_config(base_project)
+
+
+def test_bad_tide_overpass_combinations_are_rejected(base_project):
+    """tide_overpass (D17) combos live on the tides product and are validated against TIDE
+    sources -- a bad source or unloaded sensor fails at load."""
+    base_project["products"]["ecostress"] = None
+    base_project["products"]["tides"] = {"overpass_combinations": [["eco", "gfs"]]}
+    with pytest.raises(ValidationError, match="not valid here"):
+        parse_config(base_project)
+    # a source that is valid for MET but not for TIDES must still be rejected here
+    base_project["products"]["tides"] = {"overpass_combinations": [["eco", "hrrr"]]}
+    with pytest.raises(ValidationError, match="not valid here"):
+        parse_config(base_project)
 
 
 def test_unknown_region_source_key_is_rejected(base_project):

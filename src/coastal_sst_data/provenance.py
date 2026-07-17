@@ -190,8 +190,21 @@ def field_inputs(name: str) -> list[str]:
             return [sensor]
         if rest.startswith("insitu"):
             return ["insitu", sensor]
-        if rest in _MET_VARS:
-            return ["met", sensor]
+        # overpass met `<sensor>_<metvar>_<src>` (e.g. eco_airtemp_hrrr) -- from met_overpass.
+        if any(rest.startswith(v + "_") for v in _MET_VARS):
+            return ["met_overpass", sensor]
+        # overpass tide `<sensor>_tide_<src>` (e.g. eco_tide_coops) -- derived from the tides
+        # series interpolated to this sensor's overpass (tide_overpass contributor).
+        if rest.startswith("tide_"):
+            return ["tides", sensor]
+
+    # Per-source forcing met `<metvar>_<src>` (airtemp_hrrr) and tides `tide_<src>` /
+    # `tide_range_<src>` (D4/D5). Match by PREFIX -- a source token can itself contain an
+    # underscore (`eo_tides`), so splitting off the last token would misread the base.
+    if any(name.startswith(v + "_") for v in _MET_VARS):
+        return ["met"]
+    if name.startswith("tide_"):
+        return ["tides"]
 
     log.warning("provenance: no source mapping for field %r; it will be recorded with an "
                 "empty input list. Add it to provenance.field_inputs.", name)

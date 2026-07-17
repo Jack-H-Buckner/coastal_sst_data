@@ -70,6 +70,7 @@ class DataProduct(str, Enum):
     landsat = "landsat"
     modis = "modis"
     met = "met"
+    met_overpass = "met_overpass"
     tides = "tides"
     landcover = "landcover"
     insitu = "insitu"
@@ -84,6 +85,10 @@ class Kind(str, Enum):
     """
     DAILY_RASTER = "daily_raster"        # <aoi>_<YYYYMMDD>.nc      -- MUR, CMEMS, met
     OVERPASS_SENSOR = "overpass_sensor"  # <aoi>_<YYYYMMDDThhmmss>.nc -- ECOSTRESS, Landsat, MODIS
+    # Timestamped rasters like a sensor, but NOT an instrument: read at ANOTHER product's
+    # chosen overpass times (no clearest-scene pick, no SensorSpec). `met_overpass` documents
+    # a weather model's value at each thermal sensor's overpass instant.
+    OVERPASS_ALIGNED = "overpass_aligned"  # <aoi>_<YYYYMMDDThhmmss>.nc -- met_overpass
     STATIC_RASTER = "static_raster"      # <aoi>.nc, no time dim    -- bathymetry, land-cover
     SERIES_1D = "series_1d"              # <aoi>_tides.nc, dims (time,) -- tides
     STATION_TABLE = "station_table"      # <aoi>_insitu.nc, dims (station, time) -- in-situ
@@ -365,20 +370,47 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.met,
         dir="MET",
         kind=Kind.DAILY_RASTER,
-        module="coastal_sst_data.processes.met",
+        # FORCING only now (D14): daily reference-time / daily-mean fields, NO sensor
+        # dependency. The overpass documentation split out to `met_overpass`. DISTINCT-DATA
+        # sources STACKED per channel (D10): `airtemp_hrrr`, `airtemp_era5`, ... no fallback.
+        sources={
+            "hrrr": "coastal_sst_data.processes.met",
+            "era5": "coastal_sst_data.processes.met",
+        },
+        source_kind=SourceKind.DATA,
         options=_COMMON | {
-            "source", "fallback", "variables", "model", "product", "fxx", "era5_zarr",
+            "sources", "variables", "model", "product", "fxx", "era5_zarr",
             "regrid_radius_m", "pad_deg", "reference_time", "reference_basis",
-            "daily_mean_hours", "overpass_from"},
-        # HRRR is North America only: outside it the chain MUST start at ERA5, and saying so
-        # per region is the difference between a deliberate choice and a silent fallback.
-        region_options=frozenset({"source", "fallback", "model"}),
+            "daily_mean_hours"},
+        # HRRR is North America only: outside it a region stacks only ERA5.
+        region_options=frozenset({"sources", "model"}),
         required_vars=(),          # channel set is config-dependent (see ProductSpec)
-        # Its overpass snapshots are taken at times read from the sensors' aligned dirs, so
-        # every sensor must have run first.
-        depends_on=(DataProduct.ecostress, DataProduct.landsat, DataProduct.modis),
         coverage_channel="airtemp",
         provenance_inputs=("met",),
+    ),
+
+    ProductSpec(
+        product=DataProduct.met_overpass,
+        dir="MET_OVERPASS",
+        # Timestamped snapshots read at each thermal sensor's overpass instant -- NOT a
+        # sensor itself, so a distinct Kind (see Kind.OVERPASS_ALIGNED). DISTINCT-DATA sources
+        # STACKED (same hrrr/era5 as forcing), but the CUBE emits `<sensor>_<var>_<src>` only
+        # for the user's `(sensor, source)` combinations (D13), not the full cross-product.
+        kind=Kind.OVERPASS_ALIGNED,
+        sources={
+            "hrrr": "coastal_sst_data.processes.met_overpass",
+            "era5": "coastal_sst_data.processes.met_overpass",
+        },
+        source_kind=SourceKind.DATA,
+        options=_COMMON | {
+            "sources", "combinations", "variables", "model", "product", "fxx", "era5_zarr",
+            "regrid_radius_m", "pad_deg"},
+        region_options=frozenset({"sources", "combinations", "model"}),
+        required_vars=(),          # channel set is config-dependent
+        # Snapshots are taken at times read from the sensors' aligned dirs, so the sensors
+        # must have run first.
+        depends_on=(DataProduct.ecostress, DataProduct.landsat, DataProduct.modis),
+        provenance_inputs=("met_overpass",),
     ),
 
     ProductSpec(
@@ -395,10 +427,11 @@ REGISTRY: tuple[ProductSpec, ...] = (
         source_kind=SourceKind.DATA,
         options=_COMMON | {
             "sources", "model", "model_directory", "interval",
-            "stations", "warn_distance_km", "max_distance_km"},
+            "stations", "warn_distance_km", "max_distance_km", "overpass_combinations"},
         # CO-OPS gauges exist only in U.S. waters -> elsewhere, stack the global model, whose
         # downloaded directory is a property of the machine and the region.
-        region_options=frozenset({"sources", "model", "model_directory", "stations"}),
+        region_options=frozenset({"sources", "model", "model_directory", "stations",
+                                  "overpass_combinations"}),
         required_vars=("tide",),
         coverage_channel="tide",
         provenance_inputs=("tides",),

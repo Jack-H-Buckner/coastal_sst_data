@@ -108,7 +108,7 @@ def test_provenance_maps_every_channel_it_will_produce(registered):
     assert provenance.field_inputs("viirs_sst") == ["viirs"]
     assert provenance.field_inputs("viirs_valid") == ["viirs"]
     assert provenance.field_inputs("viirs_insitu_sst") == ["insitu", "viirs"]
-    assert provenance.field_inputs("viirs_airtemp") == ["met", "viirs"]
+    assert provenance.field_inputs("viirs_airtemp_hrrr") == ["met_overpass", "viirs"]
 
 
 def test_the_pipeline_orders_it(registered):

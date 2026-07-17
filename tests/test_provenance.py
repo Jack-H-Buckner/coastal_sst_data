@@ -138,12 +138,14 @@ def test_stamp_records_the_time_and_the_config_it_ran_under():
     ("eco_sst", ["ecostress"]),
     ("lst_valid", ["landsat"]),
     ("cmems_thetao_10m", ["cmems"]),
-    ("airtemp", ["met"]),
-    ("tide", ["tides"]),
-    ("depth_p25", ["bathymetry"]),
-    ("elevation", ["bathymetry"]),                          # raw ingredient (S1)
+    ("airtemp_hrrr", ["met"]),                              # per-source forcing (D5)
+    ("tide_coops", ["tides"]),                              # per-source tide (D5)
+    ("tide_range_eo_tides", ["tides"]),
+    ("depth_p25_cudem", ["bathymetry"]),
+    ("elevation_cudem", ["bathymetry"]),                    # raw ingredient, per source
     # the derived ones: several genuine inputs, all of them load-bearing
-    ("lst_airtemp", ["met", "landsat"]),
+    ("lst_airtemp_hrrr", ["met_overpass", "landsat"]),      # overpass met (D13)
+    ("eco_tide_coops", ["tides", "ecostress"]),             # overpass tide (D17)
     ("modis_insitu_sst", ["insitu", "modis"]),
     ("landcover_water", ["landcover"]),
     ("doy_sin", []),                                        # computed; no data source

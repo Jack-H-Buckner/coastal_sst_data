@@ -41,9 +41,10 @@ products:
     depths: [0, 10]      # metres; each SNAPPED to the nearest model level
   landsat:
     source: "pc"        # pc (default) | aws | gee
-  met:
-    source: auto              # auto (HRRR -> ERA5) | hrrr | era5
-    fallback: era5            # era5 | none  (backfill where the primary misses)
+  met:                        # daily FORCING (no sensor dependency)
+    # DISTINCT-DATA sources STACKED (one <var>_<src> channel each): hrrr (N. America), era5
+    # (global). No fallback -- a region outside HRRR stacks only era5.
+    sources: [hrrr, era5]
     variables: [airtemp, wind, swrad, cloud]
     # One snapshot per day at a fixed TIME OF DAY -- the cube's default met channel.
     # 10:30 is Landsat's overpass; the basis is LOCAL SOLAR, so it is the same time of
@@ -51,7 +52,11 @@ products:
     reference_time: "10:30"
     reference_basis: solar    # solar (local, per-AOI longitude) | utc
     daily_mean_hours: [0, 6, 12, 18]   # UTC hours averaged for the daily field ([] = skip)
-    overpass_from: [ecostress, landsat]  # snapshot forcing at these scenes' times
+  met_overpass:               # met matched to each thermal sensor's overpass instant
+    sources: [hrrr, era5]
+    variables: [airtemp, wind, swrad, cloud]
+    # Which (sensor, source) pairings to produce -> cube channels <sensor>_<var>_<src>.
+    combinations: [[lst, hrrr], [eco, hrrr]]
   tides:
     interval: h               # prediction step (h = hourly)
     # Optional per-AOI gauge overrides (else nearest CO-OPS water-level station):
@@ -79,8 +84,7 @@ datacube:
   met_time: reference        # reference (products.met.reference_time) | daily_mean
   insitu: true               # buoy value at the reference time + a matchup per overpass
   insitu_max_dt_min: 60      # matchup tolerance; beyond it an overpass gets NaN
-  # Met also emitted at each sensor's own overpass, as <sensor>_<var> ([] to disable):
-  overpass_met: [airtemp, wind_speed, swrad, cloud_cover]
+  # (Met-at-overpass moved to the `met_overpass` product above; overpass_met was removed.)
 
 regions:
   - name: pnw_estuaries

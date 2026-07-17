@@ -25,10 +25,10 @@ Design (locked with the maintainer):
     ships raw (no opinionated land mask), and bathymetry ships `elevation` + `depth` for a
     downstream water-level computation rather than a pre-derived water_level channel.
 
-  * Met is taken at a REFERENCE time of day (default 10:30 local solar -- Landsat's
-    overpass), not as a daily mean, which would smear the diurnal cycle. Each sensor
-    additionally carries the forcing at ITS OWN overpass (datacube.overpass_met), so
-    two sensors that flew hours apart on one day do not share one value.
+  * Met FORCING (per source) is taken at a REFERENCE time of day (default 10:30 local solar --
+    Landsat's overpass), not a daily mean, which would smear the diurnal cycle. Met matched to
+    each sensor's OWN overpass is the separate `met_overpass` product, emitted only for the
+    user's `(sensor, source)` combinations so two sensors hours apart don't share one value.
 
   * CMEMS gives the offshore water column at the requested depths (its ~9 km land mask can
     swallow a whole estuary, so expect NaN gaps a downstream process may choose to fill).
@@ -37,24 +37,24 @@ Design (locked with the maintainer):
     grid cell it sits in, at the INSTANT each satellite flew, so a scene can be validated
     against a buoy pixel-for-pixel and minute-for-minute (see processes.insitu).
 
-  * The DEM->MSL datum offset ships as the cube attributes `datum_offset_m` / `datum_status`
-    so a downstream user can reference `elevation` to MSL and reconstruct water level.
+  * DISTINCT-DATA products SHIP ONE CHANNEL PER SOURCE (D10): bathymetry (`depth_<dem>`), CMEMS
+    (`cmems_<var>_<tag>`), met forcing (`airtemp_<src>`), tides (`tide_<src>`). Each DEM's
+    DEM->MSL datum offset ships as attributes on its own `elevation_<dem>` channel.
 
-Channel layout in each <aoi>.zarr. `<s>` ranges over the per-overpass thermal SENSORS, which
-are not a fixed list: they are every product declaring a SensorSpec in the registry
-(coastal_sst_data.products), today {eco, lst, modis}. Every `<s>_*` channel below is
-generated from that spec, so registering a fourth sensor produces its full set without an
-edit here.
+Channel layout in each <aoi>.zarr. `<s>` ranges over the per-overpass thermal SENSORS (every
+product declaring a SensorSpec, today {eco, lst, modis}); `<src>` over a product's stacked
+sources; `(<s>,<src>)` over the user's overpass COMBINATIONS.
 
   3D (time,y,x): mur_sst,
                  <s>_sst, <s>_valid, <s>_cloud (where the sensor publishes a cloud layer),
-                 airtemp, wind_u, wind_v, wind_speed, swrad, cloud_cover,
-                 <s>_{airtemp,wind_speed,swrad,cloud_cover},
-                 cmems_<var>_<depth>m,
+                 <metvar>_<src>  (forcing: airtemp/wind_u/wind_v/wind_speed/swrad/cloud_cover),
+                 <s>_<metvar>_<src>  (met_overpass, per combo),
+                 cmems_<var>_<depth>m_<tag>,
                  insitu_sst, insitu_n, <s>_insitu_sst, <s>_insitu_dt_min
-  2D (y,x) static: elevation, depth, depth_p25, depth_p75, landcover_water,
-                   insitu_station (index into the insitu_stations attr)
-  1D (time): tide, tide_range, <s>_hour, doy_sin, doy_cos
+  2D (y,x) static: elevation_<dem>, depth_<dem>, depth_p25_<dem>, depth_p75_<dem>,
+                   landcover_water, insitu_station (index into the insitu_stations attr)
+  1D (time): tide_<src>, tide_range_<src>, <s>_tide_<src> (tide_overpass, per combo),
+             <s>_hour, doy_sin, doy_cos
 
 Usage:
     python -m coastal_sst_data.processes.datacube --config config.yaml
@@ -77,7 +77,7 @@ import xarray as xr
 from ..config import CompressionSpec, DataProduct, Project
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, naming, products, provenance, report, store
-from . import insitu, met as met_mod
+from . import insitu, met as met_mod, water_level
 
 log = logging.getLogger(__name__)
 
@@ -551,32 +551,60 @@ def _contribute_mur(ctx: AssemblyContext) -> None:
     ctx.emit("mur_sst", T3, load_daily_sensor(ctx.adir("mur"), ctx.aid, ctx.days, ctx.H, ctx.W, "sst"))
 
 
+_MET_FORCING_VARS = ("airtemp", "wind_u", "wind_v", "wind_speed", "swrad", "cloud_cover")
+
+
 def _contribute_met(ctx: AssemblyContext) -> None:
-    """Met FORCING: one snapshot per day at the REFERENCE time of day (default 10:30 local
-    solar, Landsat's overpass) rather than a daily mean, which would smear the diurnal cycle.
-    Also writes `ref_utc` -- the daily reference instant the in-situ channel samples against.
+    """Met FORCING per source (D10): one snapshot per day at the REFERENCE time of day (default
+    10:30 local solar) rather than a daily mean, emitted as `<var>_<source>` per stacked source
+    (`MET/<src>/aligned`). Also writes `ref_utc` -- the daily reference instant the in-situ
+    channel samples against (source-independent, so always written).
     """
-    d = ctx.adir("met")
-    mprefix, mlabel = met_prefix(d, ctx.aid, ctx.days, ctx.eff["met_time"])
-    for var in ("airtemp", "wind_u", "wind_v", "wind_speed", "swrad", "cloud_cover"):
-        ctx.emit(var, T3, load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var, prefix=mprefix))
-    ctx.global_attrs["met_time"] = mlabel
     lon_c = 0.5 * (ctx.g.search_bbox[0] + ctx.g.search_bbox[2])
     ctx.slots[SLOT_REF_UTC] = [
         met_mod.reference_time_utc(dd, lon_c, ctx.eff["ref_hours"], ctx.eff["ref_basis"])
         if ctx.eff["ref_hours"] is not None else None for dd in ctx.days]
 
+    base = ctx.eff["aligned_root"] / PRODUCT_DIRS["met"]
+    label = "reference" if ctx.eff["met_time"] == "reference" else "daily_mean"
+    if base.exists():
+        for src in sorted(dd.name for dd in base.iterdir() if dd.is_dir()):
+            d = ctx.adir("met", src)
+            mprefix, mlabel = met_prefix(d, ctx.aid, ctx.days, ctx.eff["met_time"])
+            label = mlabel
+            for var in _MET_FORCING_VARS:
+                ctx.emit(f"{var}_{src}", T3,
+                         load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var, prefix=mprefix))
+    ctx.global_attrs["met_time"] = label
+
+
+def _overpass_met_vars(d: Path, aoi_id) -> list[str]:
+    """The output variables in a met_overpass source's snapshot files (discovered from disk,
+    like CMEMS -- so the channel set is exactly what was acquired)."""
+    if not d.exists():
+        return []
+    for f in sorted(d.glob(f"{aoi_id}_*T*.nc")):
+        with xr.open_dataset(f) as ds:
+            return list(ds.data_vars)
+    return []
+
 
 def _contribute_met_overpass(ctx: AssemblyContext) -> None:
-    """Met at each sensor's OWN overpass, so a pre-dawn ECOSTRESS scene and a mid-morning
-    Landsat scene on the same day do not share one value -- keyed on the CHOSEN scene's
-    timestamp, not merely its day. Reads `sensor_times`.
+    """Met at each sensor's OWN overpass, for the user's `(sensor, source)` COMBINATIONS only
+    (D13). Emits `<sensor>_<var>_<source>` -- the source's snapshot read at that sensor's chosen
+    scene time (`sensor_times`), so a pre-dawn ECOSTRESS scene and a mid-morning Landsat scene
+    on the same day do not share one value. Reads `sensor_times`.
     """
-    d = ctx.adir("met")
-    for pre, tt in ctx.slots[SLOT_SENSOR_TIMES].items():
-        for var in ctx.eff["overpass_met"]:
-            ctx.emit(f"{pre}_{var}", T3, load_at_times(d, ctx.aid, tt, ctx.H, ctx.W, var),
-                     long_name=f"{var} at the {pre} overpass")
+    sensor_times = ctx.slots[SLOT_SENSOR_TIMES]
+    for sensor, src in ctx.eff["met_overpass_combos"]:
+        tt = sensor_times.get(sensor)
+        if tt is None:                    # a combo naming an unloaded sensor -> nothing to align
+            continue
+        d = ctx.adir("met_overpass", src)
+        for var in _overpass_met_vars(d, ctx.aid):
+            ctx.emit(f"{sensor}_{var}_{src}", T3,
+                     load_at_times(d, ctx.aid, tt, ctx.H, ctx.W, var),
+                     long_name=f"{var} at the {sensor} overpass ({src})")
 
 
 def _contribute_tides(ctx: AssemblyContext) -> None:
@@ -593,6 +621,28 @@ def _contribute_tides(ctx: AssemblyContext) -> None:
         tide, tide_range = load_tide_daily(d, ctx.aid, ctx.days)
         ctx.emit(f"tide_{src}", ("time",), tide)
         ctx.emit(f"tide_range_{src}", ("time",), tide_range)
+
+
+def _contribute_tide_overpass(ctx: AssemblyContext) -> None:
+    """Tide at each sensor's OWN overpass, for the user's `(sensor, tide_source)` COMBINATIONS
+    (D17): the per-source hourly tide series interpolated to the sensor's chosen scene hour.
+    A DERIVED contributor -- the tide series is smooth and already on disk, so this is an
+    interpolation, not a re-acquisition (unlike met_overpass). Emits `<sensor>_tide_<src>`.
+    Reads `sensor_times`.
+    """
+    combos = ctx.eff["tide_overpass_combos"]
+    if not combos:
+        return
+    sensor_times = ctx.slots[SLOT_SENSOR_TIMES]
+    for sensor, src in combos:
+        tt = sensor_times.get(sensor)
+        if tt is None:                    # a combo naming an unloaded sensor -> nothing to align
+            continue
+        series = water_level.load_tide_series(ctx.adir("tides", src), ctx.aid)
+        hours = [t.hour + t.minute / 60.0 if t is not None else np.nan for t in tt]
+        th = water_level.tide_at_overpass(series, ctx.days, hours)
+        ctx.emit(f"{sensor}_tide_{src}", ("time",), th,
+                 units="m", long_name=f"tide at the {sensor} overpass ({src}), rel. MSL")
 
 
 def _contribute_cmems(ctx: AssemblyContext) -> None:
@@ -661,6 +711,7 @@ CONTRIBUTORS: tuple[Contributor, ...] = (
     Contributor("met", (), (SLOT_REF_UTC,), _contribute_met),
     Contributor("met_overpass", (SLOT_SENSOR_TIMES,), (), _contribute_met_overpass),
     Contributor("tides", (), (), _contribute_tides),
+    Contributor("tide_overpass", (SLOT_SENSOR_TIMES,), (), _contribute_tide_overpass),
     Contributor("cmems", (), (), _contribute_cmems),
     Contributor("landcover", (), (), _contribute_landcover),
     Contributor("insitu", (SLOT_SENSOR_TIMES, SLOT_REF_UTC), (), _contribute_insitu),
@@ -828,24 +879,29 @@ def coverage(ds: xr.Dataset, days, present=None) -> dict:
     really are thin under noise about products nobody asked for.
     """
     out = {}
-    channels = dict(DAILY_CHANNELS)
-    cm = [v for v in ds.data_vars if v.startswith("cmems_") and not v.endswith("_filled")]
-    if cm:
-        channels["cmems"] = sorted(cm)[0]
+    # Coverage-channel PREFIXES. A per-source product (D5) has no single channel any more, so
+    # judge it present on a day if ANY of its per-source channels is finite (S4.7): met's
+    # `airtemp` prefix matches `airtemp_hrrr`/`airtemp_era5`, tides' `tide` matches
+    # `tide_<src>`/`tide_range_<src>`, mur's `mur_sst` is still the bare channel. `cmems` is
+    # discovered (its channels are config-dependent). A stacked source with NO regional coverage
+    # is all-NaN by design, so "any source finite" is the honest presence test.
+    prefixes = dict(DAILY_CHANNELS)
+    prefixes["cmems"] = "cmems"
 
-    for product, var in channels.items():
-        # `present` is keyed by the product's own name, and so is `channels` -- one registry,
+    for product, c in prefixes.items():
+        # `present` is keyed by the product's own name, and so is `prefixes` -- one registry,
         # one name. The alias table that used to reconcile `tide` with `tides` is gone.
         if present is not None and product not in present:
             continue
-        if var not in ds:
+        chans = [v for v in ds.data_vars
+                 if (v == c or v.startswith(c + "_")) and "time" in ds[v].dims]
+        if not chans:
             continue
-        da = ds[var]
-        if "time" not in da.dims:
-            continue
-        finite = np.isfinite(da.values)
-        axes = tuple(range(1, finite.ndim))          # everything but time
-        has = finite.any(axis=axes) if axes else finite
+        has = np.zeros(len(days), dtype=bool)
+        for v in chans:
+            finite = np.isfinite(ds[v].values)
+            axes = tuple(range(1, finite.ndim))       # everything but time
+            has |= (finite.any(axis=axes) if axes else finite)
         n = int(has.sum())
         out[product] = {"days_with_data": n, "days_expected": len(days),
                         "fraction": (n / len(days)) if len(days) else 0.0}
@@ -912,6 +968,28 @@ def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
+def _combos_from(opts) -> list[tuple[str, str]]:
+    raw = (getattr(opts, "model_extra", None) or {}).get("combinations", []) or [] if opts else []
+    return [(str(a), str(b)) for a, b in raw]
+
+
+def _met_overpass_combos(project: Project) -> list[tuple[str, str]]:
+    """The (sensor, source) overpass-met combinations the cube emits, from the met_overpass
+    product's config (D14/D15). Empty when met_overpass is not selected."""
+    return _combos_from(project.products.get(DataProduct.met_overpass))
+
+
+def _tide_overpass_combos(project: Project) -> list[tuple[str, str]]:
+    """The (sensor, tide_source) overpass-tide combinations (D17), from the tides product's
+    `overpass_combinations` option -- tide_overpass is a derived contributor, not a product,
+    so its combos live with the tide data. Empty when tides is not selected."""
+    opts = project.products.get(DataProduct.tides)
+    if opts is None:
+        return []
+    raw = (getattr(opts, "model_extra", None) or {}).get("overpass_combinations", []) or []
+    return [(str(a), str(b)) for a, b in raw]
+
+
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     dc = project.datacube
@@ -921,7 +999,11 @@ def _build_eff(project: Project) -> dict:
         "out_dir": root / dc.output_subdir,
         "chunks": dict(dc.chunks),
         "met_time": str(dc.met_time),
-        "overpass_met": list(dc.overpass_met),
+        # The (sensor, source) overpass-met combos come from the met_overpass PRODUCT now
+        # (D14/D15), not datacube.overpass_met. The cube emits <sensor>_<var>_<src> for these.
+        "met_overpass_combos": _met_overpass_combos(project),
+        # ...and the (sensor, tide_source) overpass-tide combos from the tides product (D17).
+        "tide_overpass_combos": _tide_overpass_combos(project),
         "insitu": bool(dc.insitu),
         "insitu_max_dt_min": float(dc.insitu_max_dt_min),
         # The in-situ reference-time channel is sampled at the same instant as met.

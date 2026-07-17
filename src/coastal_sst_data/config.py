@@ -340,12 +340,11 @@ class DataCubeSpec(BaseModel):
     #                   which smears the diurnal cycle.
     # Falls back to the other if the chosen file is absent.
     met_time: Literal["reference", "daily_mean"] = "reference"
-    # Met variables ALSO emitted at each sensor's own overpass, as <sensor>_<var>
-    # (e.g. eco_airtemp, lst_wind_speed) -- so a scene is paired with the forcing that
-    # was actually present when it was taken. [] disables. Needs products.met.overpass_from
-    # to include the sensor, so the snapshots exist.
-    overpass_met: list[str] = Field(
-        default_factory=lambda: ["airtemp", "wind_speed", "swrad", "cloud_cover"])
+    # NOTE: `overpass_met` was REMOVED. Met-at-overpass is now the `met_overpass` PRODUCT
+    # (D14): the cube emits <sensor>_<var>_<src> for that product's `(sensor, source)`
+    # combinations. `extra="forbid"` makes an old config still setting `datacube.overpass_met`
+    # fail loudly (pointing the user at the met_overpass product) rather than be ignored.
+    #
     # Emit the in-situ channels: the buoy value at the reference time, plus a matchup at
     # each sensor's own overpass (the ground truth a satellite scene is validated against).
     insitu: bool = True
@@ -626,6 +625,57 @@ class Project(BaseModel):
 
         if problems:
             raise ValueError("invalid stacked-source list(s):\n  " + "\n  ".join(problems))
+        return self
+
+    @model_validator(mode="after")
+    def _overpass_combinations_are_valid(self):
+        """Overpass `(sensor, source)` combinations must pair a LOADED sensor with a valid
+        source of the RIGHT product -- `met_overpass.combinations` against met sources,
+        `tides.overpass_combinations` (D17) against tide sources.
+
+        This is the sharpest silent-regression risk in the met/tide split: a combo naming a
+        sensor that isn't selected, or a source typo, would otherwise quietly produce an empty
+        overpass channel. Fail at load instead. (Absent = no overpass channels, which is fine.)
+        """
+        from .products import sensors as _sensors
+        sensor_of = {s.sensor.prefix: s.product for s in _sensors()}    # prefix -> DataProduct
+        problems: list[str] = []
+
+        def check(where: str, opts, key: str, valid_sources: set):
+            raw = (getattr(opts, "model_extra", None) or {}).get(key)
+            if raw is None:
+                return
+            for combo in raw:
+                try:
+                    sensor, source = str(combo[0]), str(combo[1])
+                except (TypeError, IndexError, KeyError):
+                    problems.append(f"{where}: {combo!r} is not a [sensor, source] pair.")
+                    continue
+                if sensor not in sensor_of:
+                    problems.append(f"{where}: sensor {sensor!r} is not a sensor "
+                                    f"(choose from {sorted(sensor_of)}).")
+                elif sensor_of[sensor] not in self.products:
+                    problems.append(f"{where}: sensor {sensor!r} names product "
+                                    f"{sensor_of[sensor].value!r}, which is not selected.")
+                if source not in valid_sources:
+                    problems.append(f"{where}: source {source!r} is not valid here "
+                                    f"(choose from {sorted(valid_sources)}).")
+
+        # (product, option key, the product whose sources the combo's source must belong to)
+        for host, key, src_product in (
+                (DataProduct.met_overpass, "combinations", DataProduct.met_overpass),
+                (DataProduct.tides, "overpass_combinations", DataProduct.tides)):
+            if host not in self.products:
+                continue
+            valid = set(spec(src_product).known_sources)
+            check(f"products.{host.value}.{key}", self.products[host], key, valid)
+            for r in self.regions:
+                if host in r.sources:
+                    check(f"regions[{r.name}].sources.{host.value}.{key}",
+                          r.sources[host], key, valid)
+
+        if problems:
+            raise ValueError("invalid overpass combinations:\n  " + "\n  ".join(problems))
         return self
 
     # What this project was LOADED FROM. Kept so an assembled datacube can embed the

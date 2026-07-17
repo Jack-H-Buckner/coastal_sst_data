@@ -208,6 +208,24 @@ def test_cube_ships_raw_water_level_ingredients_not_derived_channels(project, gr
     assert ds["elevation_cudem"].attrs["datum_status"] == "ok"
 
 
+def test_tide_overpass_interpolates_the_series_to_the_sensor_hour(project, grids, days):
+    """S4.5 (D17): `<sensor>_tide_<src>` is the per-source tide series interpolated to the
+    sensor's overpass hour -- the reconstructable overpass tide, materialised for the user's
+    (sensor, source) combos so downstream can compute water level from the cube alone."""
+    g = grids[AOI]
+    write_tides(project, days, src="coops")                    # 12 h sinusoid, hourly
+    write_ecostress(project, g, days[0], hour=3)               # eco flew at 03:00 -> tide = +1 m
+
+    eff = datacube._build_eff(project)
+    eff["tide_overpass_combos"] = [("eco", "coops")]
+    ds = datacube.assemble_aoi(g, eff, days)
+
+    assert "eco_tide_coops" in ds.data_vars
+    assert ds["eco_tide_coops"].isel(time=0).item() == pytest.approx(
+        np.sin(2 * np.pi * 3 / 12.0), abs=1e-5)                # tide at 03:00
+    assert np.isnan(ds["eco_tide_coops"].isel(time=1).values).all()   # no scene -> no tide
+
+
 def test_datum_offset_ships_on_the_elevation_channel(project, grids, days):
     """The datum offset is bathymetry-owned now -- it publishes as an attr on elevation_<src>
     regardless of whether tides ran (water level moved downstream, but MSL referencing needs it)."""

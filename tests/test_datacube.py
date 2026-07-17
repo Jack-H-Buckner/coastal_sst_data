@@ -159,11 +159,12 @@ def test_channel_layout_and_dims(project, grids, days):
     write_bathymetry(project, g)
     write_landcover(project, g, land_cols=slice(0, 5))
     write_tides(project, g, days)
+    write_met_daily(project, g, days, prefix="ref_")
     eff = datacube._build_eff(project)
     ds = datacube.assemble_aoi(g, eff, days)
 
     assert ds.sizes == {"time": len(days), "y": g.height, "x": g.width}
-    for v in ["mur_sst", "eco_sst", "lst_sst", "modis_sst", "airtemp",
+    for v in ["mur_sst", "eco_sst", "lst_sst", "modis_sst", "airtemp_hrrr",
               "elevation_cudem", "depth_cudem", "landcover_water", "tide_coops", "doy_sin"]:
         assert v in ds.data_vars
     # S1 removed these derived/fill channels; S3 made bathymetry per-source (no bare names).
@@ -489,9 +490,12 @@ def test_write_zarr_safe_sweeps_scratch_left_by_an_earlier_crash(tmp_path, caplo
 # --------------------------------------------------------------------------- #
 # Met: reference time of day, and forcing at each sensor's own overpass
 # --------------------------------------------------------------------------- #
-def write_met_daily(project, g, days, *, temp=280.0, prefix=""):
-    """Met daily-mean (prefix='') or reference-time (prefix='ref_') files."""
+def write_met_daily(project, g, days, *, temp=280.0, prefix="", src="hrrr"):
+    """One met FORCING source's daily-mean (prefix='') or reference (prefix='ref_') files,
+    under MET/<src>/aligned/<aoi>."""
     H, W, xs, ys = _grid_hw(g)
+    d = project.output_dir / "MET" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
     for day in days:
         ds = xr.Dataset(
             {"airtemp": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
@@ -499,20 +503,31 @@ def write_met_daily(project, g, days, *, temp=280.0, prefix=""):
              "swrad": (("time", "y", "x"), np.full((1, H, W), 500.0, "float32")),
              "cloud_cover": (("time", "y", "x"), np.full((1, H, W), 10.0, "float32"))},
             coords={"time": [day], "y": ys, "x": xs})
-        _write(project, "MET", f"{AOI}_{prefix}{day.strftime('%Y%m%d')}.nc", ds)
+        ds.to_netcdf(d / f"{AOI}_{prefix}{day.strftime('%Y%m%d')}.nc")
 
 
-def write_met_snapshot(project, g, day, hour, *, temp):
-    """A met snapshot at one overpass instant."""
+def write_met_snapshot(project, g, day, hour, *, temp, src="hrrr"):
+    """One met_overpass source's snapshot at one overpass instant, under
+    MET_OVERPASS/<src>/aligned/<aoi>."""
     H, W, xs, ys = _grid_hw(g)
     stamp = day.strftime("%Y%m%d") + f"T{hour:02d}0000"
+    d = project.output_dir / "MET_OVERPASS" / src / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
     ds = xr.Dataset(
         {"airtemp": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
          "wind_speed": (("time", "y", "x"), np.full((1, H, W), 7.0, "float32")),
          "swrad": (("time", "y", "x"), np.full((1, H, W), 800.0, "float32")),
          "cloud_cover": (("time", "y", "x"), np.full((1, H, W), 20.0, "float32"))},
         coords={"time": [day], "y": ys, "x": xs})
-    _write(project, "MET", f"{AOI}_{stamp}.nc", ds)
+    ds.to_netcdf(d / f"{AOI}_{stamp}.nc")
+
+
+def _eff_with_overpass(project, met=(("eco", "hrrr"), ("lst", "hrrr"), ("modis", "hrrr"))):
+    """Build a datacube eff and inject overpass-met combos (the test project doesn't select
+    the met_overpass product, so its combos would otherwise be empty)."""
+    eff = datacube._build_eff(project)
+    eff["met_overpass_combos"] = list(met)
+    return eff
 
 
 def test_met_comes_from_the_reference_snapshot_not_the_daily_mean(project, grids, days):
@@ -520,7 +535,7 @@ def test_met_comes_from_the_reference_snapshot_not_the_daily_mean(project, grids
     write_met_daily(project, g, days, temp=280.0)                 # daily mean
     write_met_daily(project, g, days, temp=291.0, prefix="ref_")  # 10:30 reference
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(291.0)
+    assert np.nanmean(ds["airtemp_hrrr"].isel(time=0).values) == pytest.approx(291.0)
     assert ds.attrs["met_time"] == "reference"
 
 
@@ -531,7 +546,7 @@ def test_daily_mean_can_still_be_selected(project, grids, days):
     eff = datacube._build_eff(project)
     eff["met_time"] = "daily_mean"
     ds = datacube.assemble_aoi(g, eff, days)
-    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(280.0)
+    assert np.nanmean(ds["airtemp_hrrr"].isel(time=0).values) == pytest.approx(280.0)
     assert ds.attrs["met_time"] == "daily_mean"
 
 
@@ -542,7 +557,7 @@ def test_met_falls_back_when_no_reference_files_exist(project, grids, days, capl
     write_met_daily(project, g, days, temp=280.0)
     with caplog.at_level("WARNING"):
         ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(280.0)
+    assert np.nanmean(ds["airtemp_hrrr"].isel(time=0).values) == pytest.approx(280.0)
     assert ds.attrs["met_time"] == "daily_mean"
 
 
@@ -555,13 +570,13 @@ def test_each_sensor_gets_the_forcing_from_its_own_overpass(project, grids, days
     write_met_snapshot(project, g, days[0], 20, temp=286.0)   # the ECOSTRESS instant
     write_met_snapshot(project, g, days[0], 18, temp=299.0)   # the Landsat instant
 
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert np.nanmean(ds["eco_airtemp"].isel(time=0).values) == pytest.approx(286.0)
-    assert np.nanmean(ds["lst_airtemp"].isel(time=0).values) == pytest.approx(299.0)
-    # ...and the daily channel is still the reference time, independent of both.
-    assert np.nanmean(ds["airtemp"].isel(time=0).values) == pytest.approx(291.0)
+    ds = datacube.assemble_aoi(g, _eff_with_overpass(project), days)
+    assert np.nanmean(ds["eco_airtemp_hrrr"].isel(time=0).values) == pytest.approx(286.0)
+    assert np.nanmean(ds["lst_airtemp_hrrr"].isel(time=0).values) == pytest.approx(299.0)
+    # ...and the daily forcing channel is still the reference time, independent of both.
+    assert np.nanmean(ds["airtemp_hrrr"].isel(time=0).values) == pytest.approx(291.0)
     # a day with no scene has no overpass forcing (not a stale value)
-    assert np.isnan(ds["eco_airtemp"].isel(time=1).values).all()
+    assert np.isnan(ds["eco_airtemp_hrrr"].isel(time=1).values).all()
 
 
 def test_overpass_met_follows_the_scene_the_cube_actually_kept(project, grids, days):
@@ -571,23 +586,23 @@ def test_overpass_met_follows_the_scene_the_cube_actually_kept(project, grids, d
     write_ecostress_two_scenes(project, g, days[0])           # 18:00 (half NaN), 20:00 (clear)
     write_met_snapshot(project, g, days[0], 18, temp=270.0)   # discarded scene
     write_met_snapshot(project, g, days[0], 20, temp=295.0)   # kept scene
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    ds = datacube.assemble_aoi(g, _eff_with_overpass(project), days)
     assert ds["eco_hour"].isel(time=0).item() == pytest.approx(20.0)
-    assert np.nanmean(ds["eco_airtemp"].isel(time=0).values) == pytest.approx(295.0)
+    assert np.nanmean(ds["eco_airtemp_hrrr"].isel(time=0).values) == pytest.approx(295.0)
 
 
-def test_overpass_met_is_configurable(project, grids, days):
+def test_overpass_met_is_configurable_via_combinations(project, grids, days):
+    """Which `<sensor>_<var>_<src>` channels appear is exactly the (sensor, source) combos."""
     g = grids[AOI]
     write_ecostress_two_scenes(project, g, days[0])
-    write_met_snapshot(project, g, days[0], 20, temp=295.0)
+    write_met_snapshot(project, g, days[0], 20, temp=295.0, src="hrrr")
 
-    eff = datacube._build_eff(project)
-    eff["overpass_met"] = ["airtemp"]                         # only this one
+    eff = _eff_with_overpass(project, met=[("eco", "hrrr")])
     ds = datacube.assemble_aoi(g, eff, days)
-    assert "eco_airtemp" in ds.data_vars
-    assert "eco_swrad" not in ds.data_vars
+    assert "eco_airtemp_hrrr" in ds.data_vars
+    assert "lst_airtemp_hrrr" not in ds.data_vars            # lst not in the combos
 
-    eff["overpass_met"] = []                                  # disabled entirely
+    eff = _eff_with_overpass(project, met=[])                # no combos -> no overpass channels
     ds = datacube.assemble_aoi(g, eff, days)
     assert not [v for v in ds.data_vars if v.startswith("eco_") and "airtemp" in v]
 
@@ -838,7 +853,12 @@ def test_golden_cube_is_unchanged(project, grids, days):
     regenerate after an INTENDED change, then review the golden's git diff."""
     g = grids[AOI]
     _write_full_fixture(project, g, days)
-    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    # Exercise the overpass products too (the minimal project fixture doesn't select them):
+    # met_overpass snapshots and tide_overpass, for a couple of (sensor, source) combos.
+    eff = datacube._build_eff(project)
+    eff["met_overpass_combos"] = [("eco", "hrrr"), ("lst", "hrrr")]
+    eff["tide_overpass_combos"] = [("eco", "coops"), ("lst", "coops")]
+    ds = datacube.assemble_aoi(g, eff, days)
     actual = _snapshot(ds)
 
     existed = GOLDEN.exists()
