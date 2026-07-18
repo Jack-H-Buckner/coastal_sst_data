@@ -26,7 +26,7 @@ def test_load_config():
     # a bare `bathymetry:` -> default (empty) global options
     assert cfg.products[DataProduct.bathymetry].model_dump() == {}
     # global options land on the product's ProductOptions bag (extra=allow)
-    assert cfg.products[DataProduct.ecostress].version == "002"
+    assert cfg.products[DataProduct.ecostress].versions == ["v003", "v002"]
     assert cfg.products[DataProduct.mur].variable == "analysed_sst"
     # depths is a user-tunable list; assert its shape, not one particular choice.
     assert all(isinstance(d, (int, float)) for d in cfg.products[DataProduct.cmems].depths)

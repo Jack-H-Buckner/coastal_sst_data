@@ -1,8 +1,16 @@
 # Design — per-version ECOSTRESS channels
 
-**Status:** draft for review
+**Status:** implemented (2026-07-18); this document is the design of record
 **Author:** drafted with Claude, 2026-07-18
 **Issue / branch:** `26-add-each-ecostress-version-as-a-unique-channel`
+
+> **Implementation note.** One detail beyond this plan: because the config names the stacked
+> sources `versions` (not `sources`), a `sources_option` field was added to `ProductSpec`
+> (default `"sources"`, ECOSTRESS sets `"versions"`), and `config._stacked_source_lists_are_valid`
+> reads that key. A second, non-obvious touch-point surfaced during implementation: the
+> `met_overpass` acquisition also discovers sensor overpass times from disk, so its
+> `_sensor_dirs` now expands a stacked-data sensor to its per-version trees (§5 covered only the
+> datacube assembler). Everything else matches the plan below.
 **Scope:** ship ECOSTRESS collection versions (v002, v003) as **distinct stacked channels** in the
 datacube, mirroring the D10 "one channel per source" pattern already used by CMEMS, bathymetry,
 tides, and met — while keeping a single overpass identity so the met/tide/in-situ matchup surface

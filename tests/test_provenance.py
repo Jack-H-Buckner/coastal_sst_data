@@ -157,7 +157,8 @@ def test_a_per_source_channel_attributes_to_its_ONE_source(tmp_path):
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("field,inputs", [
     ("mur_sst", ["mur"]),
-    ("eco_sst", ["ecostress"]),
+    ("eco_sst_v002", ["ecostress"]),                       # stacked-data sensor: per version
+    ("eco_valid_v003", ["ecostress"]),
     ("lst_valid", ["landsat"]),
     ("cmems_thetao_10m", ["cmems"]),
     ("airtemp_hrrr", ["met"]),                              # per-source forcing (D5)

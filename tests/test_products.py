@@ -155,6 +155,23 @@ def test_sensor_specs_carry_the_validity_rules_the_assembler_needs():
     assert by_prefix["modis"].trust_valid is True
 
 
+def test_ecostress_is_a_stacked_data_sensor_keyed_on_versions():
+    """ECOSTRESS is the first SENSOR that is also STACKED-DATA (D10): its sources are collection
+    version tags, named by `versions` in the config, and it keeps its SensorSpec."""
+    s = products.spec(DataProduct.ecostress)
+    assert s.is_stacked_data is True                 # stacked, one channel-set per version
+    assert s.sensor is not None                      # ...but still a sensor
+    assert s.sources_option == "versions"            # config names them `versions`, not `sources`
+    assert s.sources_option in s.options             # ...and it is a recognised option
+    assert set(s.known_sources) == {"v002", "v003"}
+    assert s.default_source is None                  # stacked products have no pick-one default
+    assert s.one_module() == "coastal_sst_data.processes.ecostress"
+    # sources_option only means anything for a stacked-data product.
+    for other in REGISTRY:
+        if not other.is_stacked_data:
+            assert other.sources_option == "sources"
+
+
 def test_kinds_are_assigned_as_the_assembler_expects():
     kind = {s.product: s.kind for s in REGISTRY}
     assert kind[DataProduct.mur] == Kind.DAILY_RASTER

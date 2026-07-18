@@ -50,6 +50,15 @@ def _write(project, sub, fname, ds):
     ds.to_netcdf(d / fname)
 
 
+def _write_eco(project, fname, ds, tag="v002"):
+    """ECOSTRESS is STACKED per collection version (D10): each writes its own
+    ECOSTRESS/<tag>/aligned/<aoi> tree, and the cube ships one channel-set per version
+    (eco_sst_<tag>, ...). The default tag mirrors the single-collection behaviour."""
+    d = project.output_dir / "ECOSTRESS" / tag / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / fname)
+
+
 def _grid_hw(g):
     xs, ys = g.xy_centers()
     return g.height, g.width, xs, ys
@@ -70,7 +79,7 @@ def write_mur(project, g, days, *, water_hole_cols):
         _write(project, "MUR", f"{AOI}_{day.strftime('%Y%m%d')}.nc", ds)
 
 
-def write_ecostress_two_scenes(project, g, day):
+def write_ecostress_two_scenes(project, g, day, tag="v002"):
     """Two ECOSTRESS scenes on one day; the 20:00 scene is clearer (more valid)."""
     H, W, xs, ys = _grid_hw(g)
     for hh, nan_frac in [(18, 0.5), (20, 0.0)]:
@@ -85,7 +94,7 @@ def write_ecostress_two_scenes(project, g, day):
             "valid": (("time", "y", "x"), np.ones((1, H, W), "uint8")),
         }, coords={"time": [day], "y": ys, "x": xs})
         stamp = day.strftime("%Y%m%d") + f"T{hh:02d}0000"
-        _write(project, "ECOSTRESS", f"{AOI}_{stamp}.nc", ds)
+        _write_eco(project, f"{AOI}_{stamp}.nc", ds, tag=tag)
 
 
 def write_landsat(project, g, day, hour, temp=288.0):
@@ -156,7 +165,8 @@ def write_landcover(project, g, *, land_cols):
 def test_channel_layout_and_dims(project, grids, days):
     g = grids[AOI]
     write_mur(project, g, days, water_hole_cols=slice(0, 3))
-    write_bathymetry(project, g)
+    write_ecostress_two_scenes(project, g, days[0])   # stacked sensor: emits eco_sst_v002 only
+    write_bathymetry(project, g)                       # when a version tree is actually present
     write_landcover(project, g, land_cols=slice(0, 5))
     write_tides(project, g, days)
     write_met_daily(project, g, days, prefix="ref_")
@@ -164,9 +174,11 @@ def test_channel_layout_and_dims(project, grids, days):
     ds = datacube.assemble_aoi(g, eff, days)
 
     assert ds.sizes == {"time": len(days), "y": g.height, "x": g.width}
-    for v in ["mur_sst", "eco_sst", "lst_sst", "modis_sst", "airtemp_hrrr",
+    for v in ["mur_sst", "eco_sst_v002", "lst_sst", "modis_sst", "airtemp_hrrr",
               "elevation_cudem", "depth_cudem", "landcover_water", "tide_coops", "doy_sin"]:
         assert v in ds.data_vars
+    # A stacked-data sensor emits per-version channels, not a bare `eco_sst`.
+    assert "eco_sst" not in ds.data_vars
     # S1 removed these derived/fill channels; S3 made bathymetry per-source (no bare names).
     for gone in ["landmask", "mur_valid", "mur_filled", "eco_water_elev", "eco_tide",
                  "elevation", "depth"]:
@@ -230,9 +242,68 @@ def test_clearest_overpass_is_kept(project, grids, days):
     write_ecostress_two_scenes(project, g, days[0])        # 18:00 (half NaN) vs 20:00 (clear)
     eff = datacube._build_eff(project)
     ds = datacube.assemble_aoi(g, eff, days)
-    # The clearer 20:00 scene wins -> eco_hour == 20 and full valid coverage.
-    assert ds["eco_hour"].isel(time=0).item() == pytest.approx(20.0)
-    assert int(ds["eco_valid"].isel(time=0).values.sum()) == g.height * g.width
+    # The clearer 20:00 scene wins -> eco_hour_v002 == 20 and full valid coverage.
+    assert ds["eco_hour_v002"].isel(time=0).item() == pytest.approx(20.0)
+    assert int(ds["eco_valid_v002"].isel(time=0).values.sum()) == g.height * g.width
+
+
+# --------------------------------------------------------------------------- #
+# STACKED-DATA sensor: ECOSTRESS collection versions (D10) get one channel-set PER version,
+# but the matchups (met/tide/in-situ) key off ONE merged overpass identity (D5).
+# --------------------------------------------------------------------------- #
+def _eco_versions_project(tmp_path, versions):
+    """A one-AoI project selecting ECOSTRESS with an ordered `versions` list (the first-listed
+    version wins the merged overpass identity per day)."""
+    return parse_config({
+        "name": "dc", "output_dir": str(tmp_path),
+        "time": {"start_date": "2026-06-01", "end_date": "2026-06-03"},
+        "products": {"ecostress": {"versions": list(versions)}},
+        "auth": {"earthdata": {"auth_strategy": "netrc"}},
+        "regions": [{"name": "r", "areas": [
+            {"name": AOI, "center_lat": 45.5, "center_lon": -123.9,
+             "buffer_ns_km": 2, "buffer_ew_km": 2}]}],
+    })
+
+
+def test_each_ecostress_version_gets_its_own_channel_set(tmp_path, days):
+    """The whole point of the feature: v002 and v003 each ship their own eco_sst_<ver>/valid/
+    cloud/hour, discovered from their own tree -- a bare `eco_sst` never appears."""
+    project = _eco_versions_project(tmp_path, ["v003", "v002"])
+    g = grid.project_grids(project)[AOI]
+    write_ecostress(project, g, days[0], hour=20, sst=286.0, tag="v003")
+    write_ecostress(project, g, days[0], hour=18, sst=290.0, tag="v002")
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    for ver, sst, hour in [("v003", 286.0, 20.0), ("v002", 290.0, 18.0)]:
+        assert f"eco_sst_{ver}" in ds.data_vars
+        assert np.nanmean(ds[f"eco_sst_{ver}"].isel(time=0).values) == pytest.approx(sst)
+        assert ds[f"eco_hour_{ver}"].isel(time=0).item() == pytest.approx(hour)
+        assert int(ds[f"eco_valid_{ver}"].isel(time=0).values.sum()) == g.height * g.width
+    assert "eco_sst" not in ds.data_vars          # no bare (unversioned) sensor channel
+
+
+def test_versions_share_one_overpass_identity_preferring_the_first_listed(tmp_path, days):
+    """D5: the matchups (here overpass-met) key off ONE merged `eco` scene time -- the config's
+    first-listed version wins each day, later versions only fill days it did not cover."""
+    project = _eco_versions_project(tmp_path, ["v003", "v002"])
+    g = grid.project_grids(project)[AOI]
+    # day0: BOTH versions flew, at different hours -> v003 (first-listed) must win.
+    write_ecostress(project, g, days[0], hour=20, tag="v003")
+    write_ecostress(project, g, days[0], hour=18, tag="v002")
+    # day1: ONLY v002 flew -> it fills the gap in the merged identity.
+    write_ecostress(project, g, days[1], hour=16, tag="v002")
+    write_met_snapshot(project, g, days[0], 20, temp=295.0)   # v003's instant
+    write_met_snapshot(project, g, days[0], 18, temp=270.0)   # v002's instant (must be ignored)
+    write_met_snapshot(project, g, days[1], 16, temp=250.0)   # v002's instant, day1
+
+    ds = datacube.assemble_aoi(g, _eff_with_overpass(project, met=[("eco", "hrrr")]), days)
+
+    # one matchup channel, not per-version, taking v003's scene on day0 and v002's on day1.
+    assert "eco_airtemp_hrrr" in ds.data_vars
+    assert np.nanmean(ds["eco_airtemp_hrrr"].isel(time=0).values) == pytest.approx(295.0)
+    assert np.nanmean(ds["eco_airtemp_hrrr"].isel(time=1).values) == pytest.approx(250.0)
+    assert "eco_airtemp_hrrr_v003" not in ds.data_vars    # matchups are never per-version
 
 
 def test_modis_trusts_valid_layer(project, grids, days):
@@ -267,7 +338,8 @@ def test_modis_trusts_valid_layer(project, grids, days):
 # pin the behaviour first -- a mis-wired spec would silently change what counts as an
 # observation, which is exactly the kind of degradation that leaves no trace in the cube.
 # --------------------------------------------------------------------------- #
-def write_ecostress(project, g, day, hour=20, *, sst=286.0, water=0.0, cloud=0.0, quality=0):
+def write_ecostress(project, g, day, hour=20, *, sst=286.0, water=0.0, cloud=0.0, quality=0,
+                    tag="v002"):
     """One ECOSTRESS scene with every mask settable. Defaults are the all-clear case:
     water=0 (eco polarity: <0.5 IS water), no cloud, QC bits 0-1 = 0 (good)."""
     H, W, xs, ys = _grid_hw(g)
@@ -278,7 +350,7 @@ def write_ecostress(project, g, day, hour=20, *, sst=286.0, water=0.0, cloud=0.0
         "water": full(water, "float32"),
         "quality": full(quality, "float32"),
     }, coords={"time": [day], "y": ys, "x": xs})
-    _write(project, "ECOSTRESS", f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc", ds)
+    _write_eco(project, f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc", ds, tag=tag)
 
 
 def _bare_cube(project, g, days):
@@ -294,7 +366,7 @@ def test_ecostress_water_layer_is_read_with_INVERTED_polarity(project, grids, da
     g = grids[AOI]
     write_ecostress(project, g, days[0], water=1.0)         # eco polarity: 1 == LAND
     ds = _bare_cube(project, g, days)
-    assert int(ds["eco_valid"].isel(time=0).values.sum()) == 0
+    assert int(ds["eco_valid_v002"].isel(time=0).values.sum()) == 0
 
 
 def test_ecostress_validity_gates_on_QC_not_cloud(project, grids, days):
@@ -314,8 +386,8 @@ def test_ecostress_validity_gates_on_QC_not_cloud(project, grids, days):
     write_ecostress(project, g, days[1], quality=0, cloud=1.0)
     ds = _bare_cube(project, g, days)
 
-    assert int(ds["eco_valid"].isel(time=0).values.sum()) == 0                    # bad QC -> out
-    assert int(ds["eco_valid"].isel(time=1).values.sum()) == g.height * g.width   # cloudy -> KEPT
+    assert int(ds["eco_valid_v002"].isel(time=0).values.sum()) == 0                  # bad QC -> out
+    assert int(ds["eco_valid_v002"].isel(time=1).values.sum()) == g.height * g.width  # cloudy KEPT
 
 
 def test_landsat_validity_gates_on_CLOUD(project, grids, days):
@@ -587,7 +659,7 @@ def test_overpass_met_follows_the_scene_the_cube_actually_kept(project, grids, d
     write_met_snapshot(project, g, days[0], 18, temp=270.0)   # discarded scene
     write_met_snapshot(project, g, days[0], 20, temp=295.0)   # kept scene
     ds = datacube.assemble_aoi(g, _eff_with_overpass(project), days)
-    assert ds["eco_hour"].isel(time=0).item() == pytest.approx(20.0)
+    assert ds["eco_hour_v002"].isel(time=0).item() == pytest.approx(20.0)
     assert np.nanmean(ds["eco_airtemp_hrrr"].isel(time=0).values) == pytest.approx(295.0)
 
 

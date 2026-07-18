@@ -28,12 +28,14 @@ def _project(tmp_path, combinations, sources=("hrrr", "era5")):
 
 
 def _write_scene(project, g, sensor_dir, hour):
-    """A timestamped sensor scene (so met_overpass discovers its overpass time)."""
+    """A timestamped sensor scene (so met_overpass discovers its overpass time). ECOSTRESS is
+    STACKED per collection version, so its scenes live under a version subtree (D10)."""
     H, W = g.height, g.width
     xs, ys = g.xy_centers()
     ds = xr.Dataset({"sst": (("time", "y", "x"), np.full((1, H, W), 286.0, "float32"))},
                     coords={"time": [np.datetime64("2026-06-01")], "y": ys, "x": xs})
-    d = project.output_dir / sensor_dir / "aligned" / AOI
+    rel = f"{sensor_dir}/v002/aligned" if sensor_dir == "ECOSTRESS" else f"{sensor_dir}/aligned"
+    d = project.output_dir / rel / AOI
     d.mkdir(parents=True, exist_ok=True)
     ds.to_netcdf(d / f"{AOI}_20260601T{hour:02d}0000.nc")
 
