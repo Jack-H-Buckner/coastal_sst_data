@@ -36,8 +36,9 @@ products:
     # DISTINCT-DATA sources are STACKED (one cmems_<var>_<tag> channel each), not picked-one:
     # my_global (GLORYS12 reanalysis), anfc_global (analysis/forecast). Regional models
     # register a tag under `datasets` and a region lists it in `sources` (see below).
-    sources: [my_global, anfc_global]
     variables: [thetao]      # also: so, uo, vo, zos, mlotst
+    datasets: # for forecasts and recent years we need to point to the cmems data set directly
+      anfc_global: cmems_mod_glo_phy-thetao_anfc_0.083deg_P1D-m
     depths: [0, 10]      # metres; each SNAPPED to the nearest model level
   landsat:
     source: "pc"        # pc (default) | aws | gee
