@@ -49,16 +49,16 @@ dependencies:
   - h5netcdf            # xarray engine for the MUR SST backbone (mur.py)
 
   # ---- coastal_sst_data backend deps: keep only the products you use ----
-  - pystac-client       # landsat / landcover (Planetary Computer)
-  - planetary-computer  # landsat / landcover
-  - pyresample          # modis + met resampling
-  - netcdf4             # modis (reads MODIS L2P swaths, modis.py)
-  - herbie-data         # met (HRRR)
-  - gcsfs               # met (ERA5 fallback)
-  - copernicusmarine    # cmems (Copernicus Marine global physics; needs a free account)
-  - eo-tides            # global tide-model backup
-  - matplotlib          # grids --plot maps
-  - cartopy             # grids --plot coastlines (optional)
+  - pystac-client            # landsat / landcover (Planetary Computer)
+  - planetary-computer       # landsat / landcover
+  - pyresample               # modis + met resampling
+  - netcdf4                  # modis (reads MODIS L2P swaths, modis.py)
+  - herbie-data              # met (HRRR)
+  - gcsfs                    # met (ERA5 fallback)
+  - copernicusmarine>=2,<3   # cmems coastal_sst_data v0.0.1 needs the v2 login()
+  - eo-tides                 # global tide-model backup
+  - matplotlib               # grids --plot maps
+  - cartopy                   # grids --plot coastlines (optional)
 
   - pip
   - pip:
