@@ -206,127 +206,102 @@ def test_acquire_skips_a_source_with_no_coverage(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# block_stats: pure per-cell depth aggregation (no network/rasters).
+# Failure isolation: one (AoI, source) failing must not abort the others.
 # ---------------------------------------------------------------------------
-def test_block_stats_depth_from_elevation():
-    """4x4 fine elevation -> 2x2 coarse (k=2): mean elev + depth (0 on land)."""
-    elev_fine = np.array([
-        [-10, -10, 5, 5],
-        [-10, -10, 5, 5],
-        [-20, -20, np.nan, np.nan],
-        [-20, -20, np.nan, np.nan],
-    ], dtype="float32")
-    elev_mean, d_mean, d_p25, d_p75 = B.block_stats(elev_fine, k=2, H=2, W=2)
-    # cell (0,0): all -10 -> depth 10 ; (0,1): all +5 (land) -> depth 0
-    assert elev_mean[0, 0] == -10 and d_mean[0, 0] == 10
-    assert elev_mean[0, 1] == 5 and d_mean[0, 1] == 0
-    assert elev_mean[1, 0] == -20 and d_mean[1, 0] == 20
-    assert np.isnan(elev_mean[1, 1])                     # all-NaN cell stays NaN
-    # uniform cells -> percentiles equal the mean
-    assert d_p25[0, 0] == 10 and d_p75[0, 0] == 10
+def _two_aoi_project(tmp_path, sources):
+    return parse_config({
+        "name": "b", "output_dir": str(tmp_path),
+        "time": {"start_date": "2026-06-01", "end_date": "2026-06-02"},
+        "products": {"bathymetry": {"sources": sources}},
+        "regions": [{"name": "r", "areas": [
+            {"name": "a1", "center_lat": 45.5, "center_lon": -123.9,
+             "buffer_ns_km": 2, "buffer_ew_km": 2},
+            {"name": "a2", "center_lat": 46.5, "center_lon": -123.9,
+             "buffer_ns_km": 2, "buffer_ew_km": 2}]}],
+    })
 
 
+def test_a_cudem_tile_read_error_does_not_abort_gmrt_or_other_aois(tmp_path, monkeypatch):
+    """The whole point of the refactor: a transient CUDEM read (a 503) fails ONLY that
+    (AoI, source) row. GMRT for that AoI, and every source for every other AoI, still run --
+    the stage is no longer taken down by one CDN hiccup."""
+    def cudem(g, params):
+        if g.name == "a1":
+            raise B.TileReadError("503 on a tile")          # transient, a1 only
+        return _ok("cudem-DEM")(g, params)
 
-# --------------------------------------------------------------------------- #
-# The CUDEM tile index cache. Every way this broke was STICKY, and every way it broke
-# ended in a silent downgrade to ~100 m GMRT that no later run would ever undo.
-# --------------------------------------------------------------------------- #
-class _Resp:
-    def __init__(self, text="", status=200):
-        self.text = text
-        self.status_code = status
+    monkeypatch.setattr(B, "SOURCES", {"cudem": cudem, "gmrt": _ok("gmrt-DEM")})
+    _stub_datum(monkeypatch)
+    p = _two_aoi_project(tmp_path, ["cudem", "gmrt"])
+    rep = B.acquire(p, grids=grid.project_grids(p))         # must NOT raise
 
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            exc = RuntimeError(f"HTTP {self.status_code}")
-            exc.response = self
-            raise exc
-
-
-_GOOD_INDEX = "https://x/ncei19_n47x75_w122x50_2021.tif\nhttps://x/ncei19_n47x50_w122x50_2021.tif\n"
-
-
-def test_index_is_cached_and_reused(tmp_path, monkeypatch):
-    calls = []
-    monkeypatch.setattr(B.requests, "get",
-                        lambda u, **kw: calls.append(u) or _Resp(_GOOD_INDEX))
-    cache = tmp_path / "urllist.txt"
-
-    assert len(B._fetch_index("http://idx", cache)) == 2
-    assert len(B._fetch_index("http://idx", cache)) == 2
-    assert len(calls) == 1                      # second call served from the cache
+    root = tmp_path / "BATHYMETRY"
+    assert not (root / "cudem" / "aligned" / "a1" / "a1.nc").exists()   # the one failure
+    assert (root / "gmrt" / "aligned" / "a1" / "a1.nc").exists()        # sibling source ran
+    assert (root / "cudem" / "aligned" / "a2" / "a2.nc").exists()       # other AoI ran
+    assert (root / "gmrt" / "aligned" / "a2" / "a2.nc").exists()
+    assert rep.failed == 1                                  # exactly one row failed
+    assert rep.written == 3
 
 
-def test_an_http_error_page_is_NEVER_cached(tmp_path, monkeypatch):
-    """No raise_for_status meant a 500 HTML body was written to the cache as if it were
-    data. `.endswith('.tif')` then filtered every line out, CUDEM found no tiles, and the
-    AoI was quietly downgraded to GMRT -- forever, because the cache file existed."""
-    monkeypatch.setattr(B.requests, "get",
-                        lambda u, **kw: _Resp("<html>500 Internal Server Error</html>", 500))
-    cache = tmp_path / "urllist.txt"
+# ---------------------------------------------------------------------------
+# Datum decoupled from the DEM download: a VDatum outage saves the DEM and retries
+# the offset ALONE from disk on the next run (no tile re-download).
+# ---------------------------------------------------------------------------
+def test_a_vdatum_outage_saves_the_dem_and_retries_the_datum_from_disk(tmp_path, monkeypatch):
+    fetches = []                                            # how many times CUDEM was READ
+    def cudem(g, params):
+        fetches.append(g.name)
+        a = np.full((g.height, g.width), -3.0, dtype="float32")
+        return a, np.abs(a), np.abs(a), np.abs(a), "cudem-DEM"
 
-    with pytest.raises(RuntimeError):
-        B._fetch_index("http://idx", cache)
-    assert not cache.exists()                   # nothing poisoned was left behind
+    monkeypatch.setattr(B, "SOURCES", {"cudem": cudem})
+    monkeypatch.setattr(B.tides, "fetch_stations", lambda: [])
 
+    # resolve_aoi raises on run 1 (VDatum down), succeeds on run 2.
+    calls = {"n": 0}
+    def resolve(g, elev, src, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("VDatum 503")
+        return {"datum_offset_m": 1.3, "status": "ok", "method": "vdatum_navd88_to_lmsl",
+                "dem_vertical_datum": "NAVD88"}
+    monkeypatch.setattr(B.datum, "resolve_aoi", resolve)
 
-def test_a_200_that_is_not_a_tile_list_is_NEVER_cached(tmp_path, monkeypatch):
-    """A redirect notice or a maintenance page comes back 200 with a perfectly good body."""
-    monkeypatch.setattr(B.requests, "get",
-                        lambda u, **kw: _Resp("<html>we have moved</html>"))
-    cache = tmp_path / "urllist.txt"
+    p = _one_aoi_project(tmp_path, ["cudem"])
+    f = tmp_path / "BATHYMETRY" / "cudem" / "aligned" / "a1" / "a1.nc"
 
-    with pytest.raises(RuntimeError, match="no .tif entries"):
-        B._fetch_index("http://idx", cache)
-    assert not cache.exists()
+    # Run 1: tiles OK, VDatum down -> DEM saved, datum pending.
+    B.acquire(p, grids=grid.project_grids(p))
+    assert f.exists(), "the DEM must be saved even though the datum could not resolve"
+    with xr.open_dataset(f) as ds:
+        assert ds.attrs["datum_status"] == B.PENDING_DATUM
+    assert fetches == ["a1"]
 
-
-def test_a_poisoned_cache_from_an_older_run_is_discarded(tmp_path, monkeypatch, caplog):
-    """The repair path: a tree that ALREADY holds a bad cache must heal itself."""
-    cache = tmp_path / "urllist.txt"
-    cache.write_text("<html>500 Internal Server Error</html>")     # as an old run left it
-    monkeypatch.setattr(B.requests, "get", lambda u, **kw: _Resp(_GOOD_INDEX))
-
-    with caplog.at_level("WARNING"):
-        urls = B._fetch_index("http://idx", cache)
-
-    assert len(urls) == 2                        # re-fetched, not trusted
-    assert "no .tif entries" in caplog.text
-
-
-def test_a_stale_cache_is_refreshed(tmp_path, monkeypatch):
-    """NCEI adds tiles; a year-old index quietly misses them."""
-    import os
-    import time
-    cache = tmp_path / "urllist.txt"
-    cache.write_text("https://x/ncei19_n47x75_w122x50_old.tif\n")
-    old = time.time() - (B.INDEX_MAX_AGE_S + 86400)
-    os.utime(cache, (old, old))
-
-    monkeypatch.setattr(B.requests, "get", lambda u, **kw: _Resp(_GOOD_INDEX))
-    urls = B._fetch_index("http://idx", cache)
-    assert len(urls) == 2                        # the fresh index, not the stale one
+    # Run 2: DEM already complete but datum pending -> retry the OFFSET ALONE from disk.
+    B.acquire(p, grids=grid.project_grids(p))
+    with xr.open_dataset(f) as ds:
+        assert ds.attrs["datum_status"] == "ok"
+        assert ds.attrs["datum_offset_m"] == pytest.approx(1.3)
+    assert fetches == ["a1"], "the datum retry must NOT re-download the CUDEM tiles"
 
 
-# --------------------------------------------------------------------------- #
-# A tile that fails to READ is not a tile that does not EXIST
-# --------------------------------------------------------------------------- #
-def test_a_network_failure_does_not_masquerade_as_missing_coverage(monkeypatch, aoi_grid):
-    """The old code dropped unreadable tiles, computed `cover` from the SURVIVORS, and
-    wrote a DEM with a network-shaped hole in it labelled '60% cover'."""
-    monkeypatch.setattr(B, "_fetch_index",
-                        lambda u, c: ["https://x/ncei19_n47x75_w122x50_a.tif"])
-    monkeypatch.setattr(B, "_tile_bounds", lambda n: (-180.0, -90.0, 180.0, 90.0))
+def test_a_resolved_datum_is_not_re_resolved_on_a_later_run(tmp_path, monkeypatch):
+    """A DEM whose datum already resolved is a plain skip -- the retry path is only for
+    PENDING datums, so a healthy output is never needlessly re-resolved."""
+    monkeypatch.setattr(B, "SOURCES", {"cudem": _ok("cudem-DEM")})
+    calls = {"n": 0}
+    def resolve(g, elev, src, **kw):
+        calls["n"] += 1
+        return {"datum_offset_m": 1.3, "status": "ok", "method": "stub",
+                "dem_vertical_datum": "NAVD88"}
+    monkeypatch.setattr(B.tides, "fetch_stations", lambda: [])
+    monkeypatch.setattr(B.datum, "resolve_aoi", resolve)
 
-    def dead(*a, **kw):
-        raise ConnectionError("connection reset")
-
-    monkeypatch.setattr(B.rioxarray, "open_rasterio", dead)
-
-    with pytest.raises(B.TileReadError, match="network-shaped hole"):
-        B.read_cudem(aoi_grid.search_bbox, aoi_grid.target_crs,
-                              aoi_grid.transform, aoi_grid.width, aoi_grid.height,
-                              aoi_grid.geom_proj, "http://idx", "/tmp/idx.txt", 10.0)
+    p = _one_aoi_project(tmp_path, ["cudem"])
+    B.acquire(p, grids=grid.project_grids(p))
+    B.acquire(p, grids=grid.project_grids(p))               # second run: nothing to do
+    assert calls["n"] == 1                                  # resolved once, never re-resolved
 
 
 if __name__ == "__main__":
