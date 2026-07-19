@@ -156,6 +156,11 @@ class ProductSpec:
     # channel, one directory) or DISTINCT DATA (stacked, one channel + one directory PER
     # source). Only meaningful when `sources` is set; ignored for `module=` singletons.
     source_kind: SourceKind = SourceKind.ACCESS
+    # The config option key that NAMES a stacked-DATA product's sources. Almost always
+    # "sources"; ECOSTRESS names its stacked collections "versions", because that is what
+    # they are (v002/v003 of the same product), not distinct providers. Only meaningful for
+    # a stacked-DATA product; it must be one of that product's `options`.
+    sources_option: str = "sources"
 
     # --- config surface -------------------------------------------------- #
     # Which options the module actually READS. A key not listed here does NOTHING, and
@@ -310,9 +315,21 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.ecostress,
         dir="ECOSTRESS",
         kind=Kind.OVERPASS_SENSOR,
-        module="coastal_sst_data.processes.ecostress",
+        # DISTINCT-DATA collection VERSIONS, STACKED one channel-set per version (D10) -- the
+        # first (and so far only) SENSOR that is also stacked-data. v002/v003 have asymmetric
+        # temporal coverage (v002 starts earlier, v003 reaches the present), so the user stacks
+        # the versions needed to span their range; each writes its own `ECOSTRESS/<ver>/aligned`
+        # tree and its own `eco_sst_<ver>` cube channel. No fallback, no default_source; the one
+        # ecostress module fans out over the configured `versions` internally. The config names
+        # them `versions` (see `sources_option`), because that is what they are.
+        sources={
+            "v002": "coastal_sst_data.processes.ecostress",
+            "v003": "coastal_sst_data.processes.ecostress",
+        },
+        source_kind=SourceKind.DATA,
+        sources_option="versions",
         auth="earthdata",
-        options=_COMMON | {"short_name", "version", "layers", "categorical"},
+        options=_COMMON | {"short_name", "versions", "layers", "categorical"},
         required_vars=("sst", "water", "cloud", "valid"),
         # ECOSTRESS's water layer has inverted polarity, and its cloud mask over-masks cold
         # water -- so validity is gated on the QC mandatory-QA bits instead.
@@ -544,6 +561,18 @@ def _check_registry() -> None:
                 raise RuntimeError(
                     f"{s.product.value}: DATA sources must all map to ONE implemented module "
                     f"(it fans out over sources internally); got {s.sources}.")
+            # The key that names the stacked sources must be an option the config accepts and
+            # the module reads -- otherwise a `versions:`/`sources:` list would be rejected as
+            # unknown (or worse, silently ignored) at validation.
+            if s.sources_option not in s.options:
+                raise RuntimeError(
+                    f"{s.product.value}: sources_option {s.sources_option!r} is not in "
+                    f"`options`; add it so the stacked-source list is a recognised key.")
+        elif s.sources_option != "sources":
+            # Only a stacked-DATA product has a stacked-source list to name.
+            raise RuntimeError(
+                f"{s.product.value}: sources_option is only meaningful for a stacked-DATA "
+                "product; leave it at the default for everything else.")
         # Auth keyed by source must cover exactly the declared sources, or a config naming a
         # valid source would fail auth resolution with a confusing "not recognized".
         if isinstance(s.auth, dict):

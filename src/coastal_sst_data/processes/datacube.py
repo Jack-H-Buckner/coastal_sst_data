@@ -43,10 +43,14 @@ Design (locked with the maintainer):
 
 Channel layout in each <aoi>.zarr. `<s>` ranges over the per-overpass thermal SENSORS (every
 product declaring a SensorSpec, today {eco, lst, modis}); `<src>` over a product's stacked
-sources; `(<s>,<src>)` over the user's overpass COMBINATIONS.
+sources; `(<s>,<src>)` over the user's overpass COMBINATIONS. A STACKED-DATA sensor (ECOSTRESS)
+forks its data channels per collection version tag `<ver>` (`eco_sst_v002`, `eco_sst_v003`),
+but the matchup channels (met_overpass, tide_overpass, in-situ) key off ONE overpass identity
+per sensor, so they stay unqualified (`eco_insitu_sst`, not per-version) -- see D5.
 
   3D (time,y,x): mur_sst,
                  <s>_sst, <s>_valid, <s>_cloud (where the sensor publishes a cloud layer),
+                   -- for a stacked-data sensor: <s>_sst_<ver>, <s>_valid_<ver>, <s>_cloud_<ver>,
                  <metvar>_<src>  (forcing: airtemp/wind_u/wind_v/wind_speed/swrad/cloud_cover),
                  <s>_<metvar>_<src>  (met_overpass, per combo),
                  cmems_<var>_<depth>m_<tag>,
@@ -54,7 +58,7 @@ sources; `(<s>,<src>)` over the user's overpass COMBINATIONS.
   2D (y,x) static: elevation_<dem>, depth_<dem>, depth_p25_<dem>, depth_p75_<dem>,
                    landcover_water, insitu_station (index into the insitu_stations attr)
   1D (time): tide_<src>, tide_range_<src>, <s>_tide_<src> (tide_overpass, per combo),
-             <s>_hour, doy_sin, doy_cos
+             <s>_hour (or <s>_hour_<ver> for a stacked-data sensor), doy_sin, doy_cos
 
 Usage:
     python -m coastal_sst_data.processes.datacube --config config.yaml
@@ -519,29 +523,90 @@ def _contribute_bathymetry(ctx: AssemblyContext) -> None:
         ctx.emit(f"depth_p75_{src}", ("y", "x"), depth_p75)
 
 
+def _load_sensor(ctx: AssemblyContext, sp, adir):
+    """Read one sensor scene-stream from one aligned dir, applying the sensor's validity
+    rules. Factored out so a flat sensor and one per-version tree share exactly one path."""
+    return load_clearest_overpass(
+        adir, ctx.aid, ctx.days, ctx.H, ctx.W,
+        water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
+        qc_levels=list(sp.qc_levels) if sp.qc_levels is not None else None,
+        trust_valid=sp.trust_valid)
+
+
+def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None:
+    """A single-collection sensor (Landsat, MODIS): one flat `<DIR>/aligned/<aoi>` tree, one
+    channel-set under the bare prefix, one entry in `sensor_times`."""
+    sp = s.sensor
+    sst, cloud, valid, hour, _water_union, times = _load_sensor(
+        ctx, sp, ctx.adir(s.product.value))
+    pre = sp.prefix
+    ctx.emit(f"{pre}_sst", T3, sst)
+    if sp.has_cloud:          # MODIS arrives pre-filtered with no cloud layer; an all-zero
+        ctx.emit(f"{pre}_cloud", T3, cloud)   # channel would falsely read "never cloudy"
+    ctx.emit(f"{pre}_valid", T3, valid)
+    ctx.emit(f"{pre}_hour", ("time",), hour)
+    sensor_times[pre] = times
+
+
+def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None:
+    """A STACKED-DATA sensor (ECOSTRESS collection versions, D10): one channel-set PER source
+    tag, discovered from the per-source dirs on disk (`ECOSTRESS/<tag>/aligned/<aoi>`), emitted
+    tag-last (`eco_sst_v002`, `eco_sst_v003`) like every other per-source channel.
+
+    Downstream matchups (met_overpass, tide_overpass, in-situ) key off ONE overpass identity
+    per sensor, so a single `sensor_times[prefix]` is built by merging the per-version chosen
+    scenes, preferring the config-listed version order per day (D5) -- the versions describe the
+    same physical overpasses, so a per-day preference is honest, and the raw DATA channels stay
+    fallback-free (one per version).
+    """
+    sp = s.sensor
+    base = ctx.eff["aligned_root"] / PRODUCT_DIRS[s.product.value]
+    if not base.exists():
+        sensor_times[sp.prefix] = [None] * len(ctx.days)
+        return
+    # Preference order: config-listed versions first (in that order), then any other tag found
+    # on disk (sorted), so a version acquired but dropped from the config still contributes a
+    # channel and merges last rather than vanishing.
+    pref = ctx.eff["sensor_version_pref"].get(s.product.value, [])
+    on_disk = {d.name for d in base.iterdir() if d.is_dir()}
+    ordered = [t for t in pref if t in on_disk] + sorted(on_disk - set(pref))
+
+    per_tag_times: dict[str, list] = {}
+    for tag in ordered:
+        sst, cloud, valid, hour, _wu, times = _load_sensor(ctx, sp, ctx.adir(s.product.value, tag))
+        pre = sp.prefix
+        ctx.emit(f"{pre}_sst_{tag}", T3, sst)
+        if sp.has_cloud:
+            ctx.emit(f"{pre}_cloud_{tag}", T3, cloud)
+        ctx.emit(f"{pre}_valid_{tag}", T3, valid)
+        ctx.emit(f"{pre}_hour_{tag}", ("time",), hour)
+        per_tag_times[tag] = times
+
+    # Single overpass identity: first-listed version wins each day, later versions fill gaps.
+    merged: list = [None] * len(ctx.days)
+    for tag in ordered:
+        for i, t in enumerate(per_tag_times[tag]):
+            if merged[i] is None and t is not None:
+                merged[i] = t
+    sensor_times[sp.prefix] = merged
+
+
 def _contribute_sensors(ctx: AssemblyContext) -> None:
     """THE PER-OVERPASS THERMAL SENSORS -- one COLLECTIVE contributor over the registry.
 
     Each sensor's validity rules (inverted water polarity, gate-on-QC-not-cloud, trust-the-
     valid-layer) live on its ProductSpec.sensor, so a fourth sensor gets its full channel set
     -- `_sst`, `_cloud`, `_valid`, `_hour`, plus overpass-met and in-situ matchups downstream
-    -- from its spec alone. Writes each sensor's chosen scene time into `sensor_times`.
+    -- from its spec alone. A STACKED-DATA sensor (ECOSTRESS) forks its DATA channels per
+    version (`eco_sst_v002/_v003`) while keeping ONE overpass identity for the matchups. Writes
+    each sensor's chosen scene time into `sensor_times`.
     """
     sensor_times: dict[str, list] = {}
     for s in products.sensors():
-        sp = s.sensor
-        sst, cloud, valid, hour, _water_union, times = load_clearest_overpass(
-            ctx.adir(s.product.value), ctx.aid, ctx.days, ctx.H, ctx.W,
-            water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
-            qc_levels=list(sp.qc_levels) if sp.qc_levels is not None else None,
-            trust_valid=sp.trust_valid)
-        pre = sp.prefix
-        ctx.emit(f"{pre}_sst", T3, sst)
-        if sp.has_cloud:      # MODIS arrives pre-filtered with no cloud layer; an all-zero
-            ctx.emit(f"{pre}_cloud", T3, cloud)   # channel would falsely read "never cloudy"
-        ctx.emit(f"{pre}_valid", T3, valid)
-        ctx.emit(f"{pre}_hour", ("time",), hour)
-        sensor_times[pre] = times
+        if s.is_stacked_data:
+            _contribute_stacked_sensor(ctx, s, sensor_times)
+        else:
+            _contribute_flat_sensor(ctx, s, sensor_times)
     ctx.slots[SLOT_SENSOR_TIMES] = sensor_times
 
 
@@ -990,12 +1055,31 @@ def _tide_overpass_combos(project: Project) -> list[tuple[str, str]]:
     return [(str(a), str(b)) for a, b in raw]
 
 
+def _sensor_version_pref(project: Project) -> dict[str, list[str]]:
+    """Config-declared version order for each STACKED-DATA sensor, so the single overpass
+    identity prefers the first-listed version per day (D5). Only products whose config sets
+    the stacked-source key are listed; the rest fall back to sorted on-disk order in the
+    contributor. Keyed by the product's own name (matches PRODUCT_DIRS)."""
+    out: dict[str, list[str]] = {}
+    for s in products.sensors():
+        if not s.is_stacked_data:
+            continue
+        opts = project.products.get(s.product)
+        raw = (getattr(opts, "model_extra", None) or {}).get(s.sources_option) if opts else None
+        if raw is None:
+            continue
+        out[s.product.value] = [raw] if isinstance(raw, str) else [str(x) for x in raw]
+    return out
+
+
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     dc = project.datacube
     root = Path(project.output_dir)
     return {
         "aligned_root": root,                         # per-product <DIR>/aligned/<aoi>
+        # Version preference order for stacked-DATA sensors (ECOSTRESS), for the D5 merge.
+        "sensor_version_pref": _sensor_version_pref(project),
         "out_dir": root / dc.output_subdir,
         "chunks": dict(dc.chunks),
         "met_time": str(dc.met_time),

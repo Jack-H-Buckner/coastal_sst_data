@@ -29,15 +29,19 @@ grid:
 products:
   bathymetry:              # a bare product -> default options
   ecostress:
-    version: "002"
+    # DISTINCT-DATA collection VERSIONS are STACKED (one eco_sst_<ver> channel-set each), not
+    # picked-one: v002 starts earlier, v003 reaches the present -- stack both to span a range
+    # no single collection covers. Absent -> v002 only. (The old scalar `version:` is gone.)
+    versions: [v003, v002]
   mur:
     variable: analysed_sst
   cmems:                     # Copernicus Marine global physics (offshore water column)
     # DISTINCT-DATA sources are STACKED (one cmems_<var>_<tag> channel each), not picked-one:
     # my_global (GLORYS12 reanalysis), anfc_global (analysis/forecast). Regional models
     # register a tag under `datasets` and a region lists it in `sources` (see below).
-    sources: [my_global, anfc_global]
     variables: [thetao]      # also: so, uo, vo, zos, mlotst
+    datasets: # for forecasts and recent years we need to point to the cmems data set directly
+      anfc_global: cmems_mod_glo_phy-thetao_anfc_0.083deg_P1D-m
     depths: [0, 10]      # metres; each SNAPPED to the nearest model level
   landsat:
     source: "pc"        # pc (default) | aws | gee

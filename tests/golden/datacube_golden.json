@@ -278,27 +278,6 @@
         "n_finite": 1764
       }
     },
-    "eco_cloud": {
-      "attrs": {},
-      "dims": [
-        "time",
-        "y",
-        "x"
-      ],
-      "dtype": "float32",
-      "fingerprint": "95f4e7bdcf925c0e0e50cd44f1c13117f8cecaba554ecee5da3d60af781cc0b0",
-      "shape": [
-        3,
-        42,
-        42
-      ],
-      "stats": {
-        "max": 0.0,
-        "mean": 0.0,
-        "min": 0.0,
-        "n_finite": 1764
-      }
-    },
     "eco_cloud_cover_hrrr": {
       "attrs": {
         "long_name": "cloud_cover at the eco overpass (hrrr)"
@@ -322,7 +301,28 @@
         "n_finite": 1764
       }
     },
-    "eco_hour": {
+    "eco_cloud_v002": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "95f4e7bdcf925c0e0e50cd44f1c13117f8cecaba554ecee5da3d60af781cc0b0",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1764
+      }
+    },
+    "eco_hour_v002": {
       "attrs": {},
       "dims": [
         "time"
@@ -381,7 +381,7 @@
         "n_finite": 1
       }
     },
-    "eco_sst": {
+    "eco_sst_v002": {
       "attrs": {},
       "dims": [
         "time",
@@ -445,7 +445,7 @@
         "n_finite": 1
       }
     },
-    "eco_valid": {
+    "eco_valid_v002": {
       "attrs": {},
       "dims": [
         "time",

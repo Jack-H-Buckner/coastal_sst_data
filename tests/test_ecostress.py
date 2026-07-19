@@ -57,7 +57,7 @@ def test_build_eff_maps_example_config():
 
     # product constants (module defaults) + config overrides
     assert _ds(eff)["short_name"] == "ECO_L2T_LSTE"
-    assert _ds(eff)["version"] == "002"              # from ecostress options
+    assert _ds(eff)["versions"] == ["v003", "v002"]  # STACKED collection versions (D10)
     assert _ds(eff)["layers"] == ecostress.LAYERS
     assert _ds(eff)["categorical"] == ecostress.CATEGORICAL
 
@@ -66,7 +66,8 @@ def test_build_eff_maps_example_config():
     assert eff["fmt"] == "netcdf"                      # default output format
     assert eff["time"] == {"start_date": "2026-06-01", "end_date": "2026-06-30"}
     assert eff["grid"]["resolution_m"] == 100.0
-    assert eff["out_dir"] == Path("path/to/data") / "ECOSTRESS" / "aligned"
+    # Per-version trees hang under eco_root: ECOSTRESS/<tag>/aligned/<aoi>.
+    assert eff["eco_root"] == Path("path/to/data") / "ECOSTRESS"
 
     # AoI geometry now lives in the shared grid (grid.py), not in eff.
     assert "aois" not in eff
@@ -205,10 +206,13 @@ def test_process_granule(tmp_path, aoi_grid, base_project):
     # in-place dict mutation, so the model would be left in an invalid state (and the
     # options bag, being a plain dict, would silently read back as defaults anyway).
     cfg = copy.deepcopy(base_project)
-    cfg["products"]["ecostress"] = {"version": "002"}
+    cfg["products"]["ecostress"] = {"versions": ["v002"]}
     eff = ecostress._build_eff(parse_config(cfg))
     role_to_file = make_granule_cogs(tmp_path, aoi_grid)
-    out = ecostress.process_granule(role_to_file, _ds(eff), eff["grid"], aoi_grid,
+    # run() processes ONE version at a time, injecting its collection number as `version`; a
+    # direct process_granule call mirrors that.
+    vcfg = {**_ds(eff), "version": "002"}
+    out = ecostress.process_granule(role_to_file, vcfg, eff["grid"], aoi_grid,
                                     "test-aoi", "12:00pm")
     v = out["valid"].isel(time=0).values          # (y, x), uint8
     assert out["valid"].dtype == "uint8"
@@ -221,9 +225,10 @@ def test_process_granule(tmp_path, aoi_grid, base_project):
 
 def _granule_args(tmp_path, aoi_grid, base_project):
     cfg = copy.deepcopy(base_project)
-    cfg["products"]["ecostress"] = {"version": "002"}
+    cfg["products"]["ecostress"] = {"versions": ["v002"]}
     eff = ecostress._build_eff(parse_config(cfg))
-    return (_ds(eff), eff["grid"], aoi_grid, "test-aoi", "12:00pm")
+    # process_granule works on ONE version -> inject its collection number, as run() does.
+    return ({**_ds(eff), "version": "002"}, eff["grid"], aoi_grid, "test-aoi", "12:00pm")
 
 
 @pytest.mark.parametrize("lost", ["cloud", "water"])
@@ -277,14 +282,15 @@ _GRANULE_TSTR = "20230105T123623"
 
 
 def _eff(tmp_path, *, overwrite=False, fmt="netcdf"):
-    """A minimal `eff` dict for run(); out_dir points at a temp dir."""
+    """A minimal `eff` dict for run(); eco_root points at a temp dir. One version (v002) keeps
+    the run-orchestration tests single-collection; per-version fan-out is covered separately."""
     return {
-        "ds": UniformDs({"short_name": "ECO_L2T_LSTE", "version": "002",
+        "ds": UniformDs({"short_name": "ECO_L2T_LSTE", "versions": ["v002"],
                          "layers": ecostress.LAYERS,
                          "categorical": ecostress.CATEGORICAL}),
         "grid": {"resampling_continuous": "bilinear",
                  "resampling_categorical": "nearest", "to_celsius": False},
-        "out_dir": tmp_path,
+        "eco_root": tmp_path,
         "fmt": fmt,
         "overwrite": overwrite,
         "earthdata": {"auth_strategy": "netrc"},
@@ -333,8 +339,9 @@ def test_run_dry_run_searches_but_does_not_open(tmp_path, aoi_grid, run_stubs):
 
 
 # --- 2. skip-if-exists vs overwrite ---
-def _aligned_path(tmp_path, name):
-    aoi_out = tmp_path / name
+def _aligned_path(tmp_path, name, tag="v002"):
+    # Per-version tree: <eco_root>/<tag>/aligned/<aoi> (eco_root == tmp_path in these tests).
+    aoi_out = tmp_path / tag / "aligned" / name
     aoi_out.mkdir(parents=True, exist_ok=True)
     return aoi_out / f"{name}_{_GRANULE_TSTR}.nc"
 
@@ -409,6 +416,58 @@ def test_run_no_granules_skips_cleanly(tmp_path, aoi_grid, run_stubs):
     assert run_stubs["search"]               # searched
     assert run_stubs["open"] == []           # nothing to open, no crash
     assert run_stubs["write"] == []
+
+
+# --- 5. STACKED collection versions (D10) ---
+@pytest.fixture
+def version_stubs(monkeypatch):
+    """Spies that record the collection version each search ran and the per-version write dir."""
+    calls = {"searched": [], "written": []}
+    monkeypatch.setattr(ecostress, "login", lambda strategy: None)
+    monkeypatch.setattr(ecostress, "search_granules",
+                        lambda ds_cfg, bbox, start, end:
+                        calls["searched"].append(ds_cfg["version"]) or
+                        [FakeGranule(*_GRANULE_SUFFIXES)])
+    monkeypatch.setattr(ecostress.earthaccess, "open", lambda urls: [None] * len(list(urls)))
+    monkeypatch.setattr(ecostress, "process_granule", lambda *a, **k: xr.Dataset())
+    monkeypatch.setattr(ecostress.store, "write_output",
+                        lambda ds, out_dir, stem, fmt, **k: calls["written"].append(Path(out_dir)))
+    return calls
+
+
+def _multi_eff(tmp_path, versions):
+    eff = _eff(tmp_path)
+    eff["ds"] = UniformDs({"short_name": "ECO_L2T_LSTE", "versions": list(versions),
+                           "layers": ecostress.LAYERS, "categorical": ecostress.CATEGORICAL})
+    return eff
+
+
+def test_run_fans_out_over_versions_into_per_version_trees(tmp_path, aoi_grid, version_stubs):
+    """Each configured version searches its OWN collection (Earthdata number, `v` stripped) and
+    writes its OWN ECOSTRESS/<tag>/aligned tree, in config order."""
+    ecostress.run(_multi_eff(tmp_path, ["v003", "v002"]),
+                  {aoi_grid.name: aoi_grid}, None, False, False)
+    assert version_stubs["searched"] == ["003", "002"]       # v-stripped, config order
+    # write dir is <eco_root>/<tag>/aligned/<aoi> -> the tag is two levels up from the aoi dir.
+    tags = {p.parent.parent.name for p in version_stubs["written"]}
+    assert tags == {"v002", "v003"}
+
+
+def test_run_only_source_narrows_to_one_version(tmp_path, aoi_grid, version_stubs):
+    """`only_source` (the pipeline/CLI narrower) restricts the fan-out to one version tag."""
+    ecostress.run(_multi_eff(tmp_path, ["v003", "v002"]),
+                  {aoi_grid.name: aoi_grid}, None, False, False, only_source="v002")
+    assert version_stubs["searched"] == ["002"]
+    assert {p.parent.parent.name for p in version_stubs["written"]} == {"v002"}
+
+
+def test_acquire_rejects_an_unknown_version(base_project):
+    """A version tag no code recognises fails loudly rather than silently dropping a collection
+    (config validation catches it at load; acquire guards directly too)."""
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["ecostress"] = {"versions": ["v999"]}
+    with pytest.raises(ValueError, match="version not recognized|unknown source"):
+        ecostress.acquire(parse_config(cfg), grids={}, dry_run=True)
 
         
 if __name__ == "__main__":

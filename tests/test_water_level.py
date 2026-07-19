@@ -94,7 +94,10 @@ def write_ecostress(project, g, day, hour):
         "quality": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
     }, coords={"time": [day], "y": ys, "x": xs})
     stamp = day.strftime("%Y%m%d") + f"T{hour:02d}0000"
-    _write(project, "ECOSTRESS", f"{AOI}_{stamp}.nc", ds)
+    # ECOSTRESS is STACKED per collection version (D10): ECOSTRESS/<tag>/aligned/<aoi>.
+    d = project.output_dir / "ECOSTRESS" / "v002" / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}_{stamp}.nc")
 
 
 # --------------------------------------------------------------------------- #
@@ -201,7 +204,7 @@ def test_cube_ships_raw_water_level_ingredients_not_derived_channels(project, gr
     # the daily tide series, and each sensor's overpass hour.
     assert ds["elevation_cudem"].isel(y=0, x=0).item() == pytest.approx(-0.5)
     assert np.isfinite(ds["tide_coops"].isel(time=0).item())                # daily tide ships (per source)
-    assert ds["eco_hour"].isel(time=0).item() == pytest.approx(9.0)         # overpass hour
+    assert ds["eco_hour_v002"].isel(time=0).item() == pytest.approx(9.0)    # overpass hour (per version)
 
     # The DEM->MSL offset travels PER SOURCE, as attrs on that source's elevation channel.
     assert ds["elevation_cudem"].attrs["datum_offset_m"] == pytest.approx(1.3)

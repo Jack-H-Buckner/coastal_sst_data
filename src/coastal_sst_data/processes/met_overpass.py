@@ -40,9 +40,17 @@ log = logging.getLogger(__name__)
 SOURCE = "met_overpass"
 
 
-def _sensor_dirs(root: Path) -> dict[str, Path]:
-    """{sensor prefix -> its aligned dir}: eco -> ECOSTRESS/aligned, lst -> LANDSAT/aligned, ..."""
-    return {s.sensor.prefix: root / s.dir / "aligned" for s in products.sensors()}
+def _sensor_dirs(root: Path) -> dict[str, list[Path]]:
+    """{sensor prefix -> its aligned dir(s)}: a flat sensor has one (lst -> [LANDSAT/aligned]);
+    a STACKED-DATA sensor (ECOSTRESS) has one per collection-version tree on disk
+    (eco -> [ECOSTRESS/v002/aligned, ECOSTRESS/v003/aligned]). The sensor 'flew' if ANY version
+    recorded a scene, so overpass discovery searches every version's tree."""
+    out: dict[str, list[Path]] = {}
+    for s in products.sensors():
+        base = root / s.dir
+        out[s.sensor.prefix] = (sorted(base.glob("*/aligned")) if s.is_stacked_data
+                                else [base / "aligned"])
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -76,7 +84,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
         for src in sorted(by_source):
             if only_source is not None and src != only_source:
                 continue
-            dirs = [sensor_dirs[pre] for pre in sorted(by_source[src]) if pre in sensor_dirs]
+            dirs = [d for pre in sorted(by_source[src]) if pre in sensor_dirs
+                    for d in sensor_dirs[pre]]
             log.info("=== AOI: %s | source=%s | sensors=%s ===",
                      name, src, sorted(by_source[src]))
             aoi_out = mo_root / src / "aligned" / name

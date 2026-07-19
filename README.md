@@ -478,6 +478,8 @@ The catch every consumer must know: **which sources actually cover which regions
 
 | Product | Source (tag) | Spatial coverage | Temporal window | Native resolution |
 |---|---|---|---|---|
+| **ecostress** | `v002` | global | 2018→ (older reprocessing) | ~70 m, per overpass |
+| | `v003` | global | 2019→present (newer reprocessing) | ~70 m, per overpass |
 | **bathymetry** | `cudem` | U.S. coasts (CONUS + territories) only | static | ~1/9″ (≈3 m) |
 | | `gmrt` | global | static | ~coarser, variable (100 m–1 km near shore) |
 | **met** / **met_overpass** | `hrrr` | North America only (CONUS + fringe) | 2014→present | 3 km, hourly |
@@ -495,11 +497,12 @@ ECOSTRESS provides the core high resolution thermal images used in the analysis.
 
 - **Where it comes from**: the `ECO_L2T_LSTE` tiled Land Surface Temperature & Emissivity product from the NASA Earthdata catalog, streamed with `earthaccess` (windowed HTTP range reads — the full ~110 km tile is never downloaded).
 - **What it measures**: ~70 m land surface temperature (LST, which approximates skin SST over water), plus the accompanying `cloud`, `water`, and `QC` masks. Outputs `sst` (K or °C), `cloud`, `water`, and a derived `valid` layer (water & clear & finite SST).
+- **Collection versions are STACKED, not picked-one** (like CMEMS/bathymetry sources). ECOSTRESS ships in two overlapping collections with **asymmetric coverage**: `v002` starts earlier (back to 2018) while `v003` is the newer reprocessing that reaches the present. Neither alone spans the full record, so you list the `versions` you need and each is acquired into its own `ECOSTRESS/<ver>/aligned/` tree and shipped as its **own cube channel-set** — `eco_sst_v002`, `eco_sst_v003`, and likewise `eco_valid_<ver>`, `eco_cloud_<ver>`, `eco_hour_<ver>`. A day a version doesn't cover is an honest NaN slice in that version's channel, which you fill by stacking the other. The per-overpass **matchup** channels (met at overpass, tide at overpass, in-situ) stay unqualified (`eco_airtemp_hrrr`, `eco_tide_coops`, `eco_insitu_sst`): the versions describe the same physical overpasses, so they share one overpass identity, taking the first-listed version's scene each day and falling back to later ones.
 
 **Project-level options** (`products.ecostress`):
 
 - `short_name`: Earthdata collection short name (default `ECO_L2T_LSTE`).
-- `version`: collection version (default `002`).
+- `versions`: list of collection version tags to stack (default `[v002]`; e.g. `[v003, v002]` to span 2018→present). The **first-listed** version wins the shared overpass identity per day. (The old scalar `version:` was removed — a config still setting it fails validation with a pointer to `versions`.)
 - `layers`: mapping of output role → COG asset suffix (default `sst`/`lst`→`LST`, `cloud`→`cloud`, `water`→`water`, `quality`→`QC`).
 - `categorical`: which layers are resampled with the categorical method (default `cloud`, `water`, `quality`).
 

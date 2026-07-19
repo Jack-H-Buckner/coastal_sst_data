@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-OCEANSR — ECOSTRESS L2T LSTE (V3) acquisition.
+OCEANSR — ECOSTRESS L2T LSTE acquisition (collection versions STACKED, D10).
 
 Reads the common project config (configs/config.yaml): AOIs, grid, dates and
-paths are shared; ECOSTRESS-specific settings come from `sources.ecostress`.
-For each AOI it searches ECO_L2T_LSTE by bbox + dates, then for every overpass
-*streams a windowed read* of the SST + cloud/water/QC COGs (HTTP range requests
-via earthaccess.open -- no full-tile download to disk), reprojects the AOI window
-onto the AOI grid, clips to the AOI polygon, and writes one aligned file per
-overpass into data/ECOSTRESS/aligned/. A later stage bins these to a daily cube.
+paths are shared; ECOSTRESS-specific settings come from `products.ecostress`.
 
-Because only the AOI window is read and only the small aligned outputs are kept,
-there is no multi-GB raw tile cache.
+DISTINCT-DATA collection VERSIONS, STACKED (D10) -- the config lists the collection
+`versions` to acquire (source tags `v002`, `v003`), and each is fetched INDEPENDENTLY into
+its own tree. There is no fallback: v002 and v003 have asymmetric temporal coverage (v002
+starts earlier, v003 reaches the present), so the user stacks the versions needed to span
+their range, and the datacube ships one channel-set per version (`eco_sst_v002`,
+`eco_sst_v003`). A granule present in both collections lands under each rather than colliding:
+
+    data/ECOSTRESS/<version>/aligned/<aoi>/<aoi>_<YYYYMMDDThhmmss>.nc
+
+For each (AOI, version) it searches ECO_L2T_LSTE by bbox + dates (Earthdata wants the bare
+collection number, so the tag's leading `v` is stripped at the search boundary), then for
+every overpass *streams a windowed read* of the SST + cloud/water/QC COGs (HTTP range
+requests via earthaccess.open -- no full-tile download to disk), reprojects the AOI window
+onto the AOI grid, clips to the AOI polygon, and writes one aligned file per overpass. A
+later stage bins these to a daily cube.
+
+Because only the AOI window is read and only the small aligned outputs are kept, there is no
+multi-GB raw tile cache.
 
 Usage (run from the OCEANSR project root):
     python src/acquire_ecostress.py --config configs/config.yaml
@@ -38,7 +49,7 @@ from rasterio.enums import Resampling
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
-from .. import entry, naming, net, provenance, report, store
+from .. import entry, naming, net, products, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +59,17 @@ log = logging.getLogger(__name__)
 # ecostress product options block.
 SOURCE = "ecostress"
 SHORT_NAME = "ECO_L2T_LSTE"
-DEFAULT_VERSION = "002"
+# STACKED collection VERSIONS (D10), as source TAGS. Each tag is the provenance identity: it
+# names the per-version output tree (`ECOSTRESS/<tag>/aligned`) and the cube channel suffix
+# (`eco_sst_<tag>`). Earthdata's search wants the bare collection NUMBER, so the leading `v`
+# is stripped only at the search boundary (`_collection_version`). Default preserves the
+# historical single-collection behaviour (v002); stack v003 to reach the present.
+DEFAULT_VERSIONS = ("v002",)
+
+
+def _collection_version(tag: str) -> str:
+    """The Earthdata collection number for a version TAG: 'v002' -> '002'."""
+    return tag[1:] if tag.startswith("v") else tag
 # role -> COG asset suffix (..._<suffix>.tif). sst uses the LST band (LST ~= SST
 # over water); cloud/water/quality are categorical masks.
 LAYERS = {"sst": "LST", "lst": "LST", "cloud": "cloud", "water": "water", "quality": "QC"}
@@ -213,16 +234,23 @@ def process_granule(role_to_file, ds_cfg, grid_cfg, g: AoiGrid, aoi_id,
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
-    """Acquire ECOSTRESS onto the pre-computed per-AoI grids.
+def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers,
+        only_source=None):
+    """Acquire ECOSTRESS onto the pre-computed per-AoI grids, STACKED per version (D10).
 
-    `grids` (from coastal_sst_data.grid) is the single source of truth for the
-    CRS + target grid, so ECOSTRESS lands on exactly the same grid as every
-    other product for the AoI.
+    Each configured collection version is acquired INDEPENDENTLY into its own
+    `ECOSTRESS/<tag>/aligned/<aoi>` tree, so a granule that exists in both v002 and v003
+    lands under each rather than colliding, and the cube ships one channel-set per version.
+    `only_source` narrows the run to one version tag (the pipeline dispatches the shared
+    module once and lets it fan out; a direct CLI run can restrict it).
+
+    `grids` (from coastal_sst_data.grid) is the single source of truth for the CRS + target
+    grid, so every version lands on exactly the same grid as every other product for the AoI.
     """
     grid_cfg = eff["grid"]
-    out_root = eff["out_dir"]
+    eco_root = eff["eco_root"]
     fmt, overwrite = eff["fmt"], eff["overwrite"]
+    start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
     login(eff["earthdata"]["auth_strategy"])
 
@@ -235,58 +263,63 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
         # ECOSTRESS is a GLOBAL product, so it has no region-varying options -- but its
         # settings are still resolved per AoI, so every product answers to one contract.
         ds_cfg = eff["ds"][name]
-        layers = dict(ds_cfg["layers"])
-        log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
-                 name, g.target_crs, g.width, g.height, g.resolution_m)
+        versions = [v for v in ds_cfg["versions"] if only_source is None or v == only_source]
+        log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) | versions=%s ===",
+                 name, g.target_crs, g.width, g.height, g.resolution_m, versions)
 
-        granules = search_granules(ds_cfg, g.search_bbox, eff["time"]["start_date"],
-                                   eff["time"]["end_date"])
-        if not granules:
-            continue
+        for tag in versions:
+            # The search + the source-attr stamp both read `version` (the bare collection
+            # number); the tag (with its `v`) names the output tree and the cube channel.
+            vcfg = {**ds_cfg, "version": _collection_version(tag)}
+            layers = dict(vcfg["layers"])
 
-        if list_layers:
-            links = granules[0].data_links()
-            tails = sorted({u.rsplit("_", 1)[-1] for u in links if u.endswith(".tif")})
-            log.info("  available COG suffixes: %s", tails)
-            continue
-        if dry_run:
-            log.info("  [dry-run] would process %d granule(s)", len(granules))
-            continue
-
-        aoi_out = out_root / name
-
-        for gi, granule in enumerate(granules, 1):
-            role_to_url = filter_links_for_granule(granule, layers)
-            if not role_to_url:
+            granules = search_granules(vcfg, g.search_bbox, start, end)
+            if not granules:
                 continue
-            t = parse_acq_time(granule_name(granule))
-            tstr = naming.time_stamp(t) if t else f"g{gi}"
-            stem = f"{name}_{tstr}"
-            if store.done(aoi_out / f"{stem}.nc", expected_vars(ds_cfg),
-                          shape=(g.height, g.width), overwrite=overwrite):
-                log.info("  [%d/%d] %s already processed, skipping", gi, len(granules), tstr)
-                rep.skip()
+            if list_layers:
+                links = granules[0].data_links()
+                tails = sorted({u.rsplit("_", 1)[-1] for u in links if u.endswith(".tif")})
+                log.info("  [%s] available COG suffixes: %s", tag, tails)
+                continue
+            if dry_run:
+                log.info("  [%s] [dry-run] would process %d granule(s)", tag, len(granules))
                 continue
 
-            log.info("  [%d/%d] streaming %d layer(s) for %s",
-                     gi, len(granules), len(role_to_url), tstr)
-            try:
-                fobjs = net.retry(lambda: earthaccess.open(list(role_to_url.values())),
-                                  what=f"ECOSTRESS open {tstr}")
-            except Exception as exc:
-                log.warning("    FAILED to open %s (%s)", tstr, exc)
-                rep.fail(f"{name} {tstr}", exc)
-                continue
-            role_to_file = dict(zip(role_to_url.keys(), fobjs))
+            aoi_out = eco_root / tag / "aligned" / name
 
-            ds = process_granule(role_to_file, ds_cfg, grid_cfg, g, name, t)
-            if ds is None:
-                # dropped as degraded (a mask layer was missing) -- a LOSS, not a no-op
-                rep.fail(f"{name} {tstr}", "granule dropped (missing core layer)")
-                continue
-            ds.attrs.update(**provenance.stamp(eff))
-            log.info("      wrote %s", store.write_output(ds, aoi_out, stem, fmt))
-            rep.wrote(source=ds.attrs.get("source"))
+            for gi, granule in enumerate(granules, 1):
+                role_to_url = filter_links_for_granule(granule, layers)
+                if not role_to_url:
+                    continue
+                t = parse_acq_time(granule_name(granule))
+                tstr = naming.time_stamp(t) if t else f"g{gi}"
+                stem = f"{name}_{tstr}"
+                if store.done(aoi_out / f"{stem}.nc", expected_vars(vcfg),
+                              shape=(g.height, g.width), overwrite=overwrite):
+                    log.info("  [%s %d/%d] %s already processed, skipping",
+                             tag, gi, len(granules), tstr)
+                    rep.skip()
+                    continue
+
+                log.info("  [%s %d/%d] streaming %d layer(s) for %s",
+                         tag, gi, len(granules), len(role_to_url), tstr)
+                try:
+                    fobjs = net.retry(lambda: earthaccess.open(list(role_to_url.values())),
+                                      what=f"ECOSTRESS open {tag} {tstr}")
+                except Exception as exc:
+                    log.warning("    FAILED to open %s %s (%s)", tag, tstr, exc)
+                    rep.fail(f"{name} {tag} {tstr}", exc)
+                    continue
+                role_to_file = dict(zip(role_to_url.keys(), fobjs))
+
+                ds = process_granule(role_to_file, vcfg, grid_cfg, g, name, t)
+                if ds is None:
+                    # dropped as degraded (a mask layer was missing) -- a LOSS, not a no-op
+                    rep.fail(f"{name} {tag} {tstr}", "granule dropped (missing core layer)")
+                    continue
+                ds.attrs.update(**provenance.stamp(eff))
+                log.info("      wrote %s", store.write_output(ds, aoi_out, stem, fmt))
+                rep.wrote(source=ds.attrs.get("source"))
 
     rep.log_summary()
     return rep
@@ -296,10 +329,21 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers):
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
 def _ds_cfg(opts) -> dict:
-    """One AoI's ECOSTRESS settings. ECOSTRESS is global -- nothing is region-overridable."""
+    """One AoI's ECOSTRESS settings. ECOSTRESS is global -- nothing is region-overridable.
+
+    The stacked collection VERSIONS (D10) are a per-project list of source TAGS; absent, it
+    defaults to the historical single collection (`DEFAULT_VERSIONS`). Each tag writes its own
+    tree + cube channel-set, so `versions: [v003, v002]` spans a range no single collection
+    covers. Validated against the registry's known versions by config._stacked_source_lists.
+    """
+    vers = _opt(opts, "versions", None)
+    if vers is None:
+        vers = list(DEFAULT_VERSIONS)
+    elif isinstance(vers, str):
+        vers = [vers]
     return {
         "short_name": _opt(opts, "short_name", SHORT_NAME),
-        "version": str(_opt(opts, "version", DEFAULT_VERSION)),
+        "versions": [str(v) for v in vers],
         "layers": dict(_opt(opts, "layers", LAYERS)),
         "categorical": list(_opt(opts, "categorical", CATEGORICAL)),
     }
@@ -328,7 +372,8 @@ def _build_eff(project: Project) -> dict:
         "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.ecostress))
                for a in project.all_areas},
         "grid": grid_cfg,
-        "out_dir": Path(project.output_dir) / "ECOSTRESS" / "aligned",
+        # Per-version trees hang under here: ECOSTRESS/<tag>/aligned/<aoi> (mirrors cmems_root).
+        "eco_root": Path(project.output_dir) / "ECOSTRESS",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
         "earthdata": {"auth_strategy": project.auth.earthdata.auth_strategy},
@@ -340,8 +385,14 @@ def _build_eff(project: Project) -> dict:
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
-            overwrite=False, list_layers=False) -> None:
+            overwrite=False, source=None, list_layers=False) -> None:
     """Acquire ECOSTRESS for a validated Project. Entry point for pipeline.py.
+
+    Every configured collection version is acquired and STACKED (D10); the pipeline
+    dispatches the shared module once and it fans out over the `versions` list internally.
+    `source` narrows to one version tag (unset on a pipeline run; available for a direct
+    CLI/test run) -- there is no fallback, a version with no coverage simply contributes no
+    channel.
 
     Parameters
     ----------
@@ -352,6 +403,7 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     aois         restrict to these AoI name(s); default all
     dry_run      search only, no download/write
     overwrite    reprocess overpasses even if the aligned file exists
+    source       restrict to one version tag (e.g. "v003"); default all configured
     list_layers  print available COG suffixes for the first granule and exit
     """
     eff = _build_eff(project)
@@ -359,8 +411,16 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["overwrite"] = True
     if grids is None:
         grids = project_grids(project)
+    # A version tag that no code recognises would silently drop a collection -- fail loudly,
+    # like bathymetry does for an unknown DEM source (config also checks this at load time).
+    known = set(products.spec(DataProduct.ecostress).known_sources)
+    bad = sorted(f"{n}:{v}" for n, c in eff["ds"].items() for v in c["versions"]
+                 if v not in known)
+    if bad:
+        raise ValueError(f"ecostress version not recognized ({', '.join(bad)}); "
+                         f"choose from {sorted(known)}.")
     net.setup_gdal_env()      # windowed COG reads: deadline + retries
-    return run(eff, grids, aois, dry_run, list_layers)
+    return run(eff, grids, aois, dry_run, list_layers, only_source=source)
 
 
 def main():

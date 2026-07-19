@@ -603,17 +603,21 @@ class Project(BaseModel):
             s = spec(product)
             if not s.is_stacked_data:
                 return
-            val = (getattr(opts, "model_extra", None) or {}).get("sources")
+            # The key naming the stacked list is usually `sources`, but a product may name it
+            # something truer to what its sources ARE (ECOSTRESS: `versions`). See
+            # ProductSpec.sources_option.
+            key = s.sources_option
+            val = (getattr(opts, "model_extra", None) or {}).get(key)
             if val is None:
                 return
             allowed = set(s.known_sources) | registered.get(product, set())
             names = [val] if isinstance(val, str) else list(val)
             if not names:
-                problems.append(f"{where}.{product.value}.sources is empty; list at least "
+                problems.append(f"{where}.{product.value}.{key} is empty; list at least "
                                 f"one of {sorted(allowed)}.")
             for name in names:
                 if name not in allowed:
-                    problems.append(f"{where}.{product.value}.sources has unknown source "
+                    problems.append(f"{where}.{product.value}.{key} has unknown source "
                                     f"{name!r}; choose from {sorted(allowed)} (register a "
                                     "regional tag with `datasets: {tag: dataset_id}`).")
 
