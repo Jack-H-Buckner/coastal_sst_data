@@ -111,18 +111,28 @@ def _datum_attrs(drec: dict) -> dict:
     }
 
 
-def _resolve_datum(g: AoiGrid, elev, source, override, stations) -> dict:
+def _resolve_datum(g: AoiGrid, elev, source, fallback, stations) -> dict:
     """Resolve THIS DEM source's DEM->MSL offset, best-effort.
 
     A failure here (VDatum/CO-OPS outage) must NOT discard a DEM we already downloaded, so it
     is caught and returned as a PENDING record: the DEM is saved and only the offset is
     retried on a later run. GMRT resolves to 0 with no network, so it never goes pending.
+
+    `fallback` is the region's `datum_offset_m`. On a transient outage we keep the record
+    PENDING (so the retry loop tries VDatum again next run for the authoritative value), but if
+    a fallback is set we stamp IT instead of 0.0 -- so the cube uses the user's best regional
+    estimate in the meantime rather than a ~1 m-biased zero. (A resolved VDatum/CO-OPS value
+    always wins over the fallback; that decision lives in datum._apply_fallback.)
     """
     try:
-        return datum.resolve_aoi(g, elev, source, override=override, stations=stations)
+        return datum.resolve_aoi(g, elev, source, fallback=fallback, stations=stations)
     except Exception as exc:
         log.warning("  %s: %s datum resolution failed (%s); saving the DEM with the datum "
                     "PENDING -- the offset alone is retried next run", g.name, source, exc)
+        if fallback is not None:
+            return {"datum_offset_m": float(fallback), "status": PENDING_DATUM,
+                    "method": "config_fallback_pending",
+                    "dem_vertical_datum": datum.DEM_DATUM.get(source, "unknown")}
         return {"datum_offset_m": 0.0, "status": PENDING_DATUM,
                 "method": "datum_fetch_failed",
                 "dem_vertical_datum": datum.DEM_DATUM.get(source, "unknown")}
@@ -137,7 +147,7 @@ def _datum_pending(path: Path) -> bool:
         return False
 
 
-def _reresolve_datum(path: Path, g: AoiGrid, source, override, stations) -> dict | None:
+def _reresolve_datum(path: Path, g: AoiGrid, source, fallback, stations) -> dict | None:
     """Re-resolve a pending datum from the ON-DISK elevation -- no tile re-download.
 
     Reads the DEM we already saved, resolves the offset against its `elevation`, restamps the
@@ -150,7 +160,7 @@ def _reresolve_datum(path: Path, g: AoiGrid, source, override, stations) -> dict
     except Exception as exc:
         log.warning("  %s: could not re-open %s to retry its datum (%s)", g.name, path.name, exc)
         return None
-    drec = _resolve_datum(g, ds["elevation"].values, source, override, stations)
+    drec = _resolve_datum(g, ds["elevation"].values, source, fallback, stations)
     ds.attrs.update(_datum_attrs(drec))
     ds = ds.rio.write_crs(g.target_crs)
     store.write_output(ds, path.parent, path.stem, _fmt_of(path))
@@ -181,9 +191,10 @@ def _ds_cfg(opts) -> dict:
         srcs = list(SOURCES)                     # default: stack every known DEM source
     elif isinstance(srcs, str):
         srcs = [srcs]
-    # `datum_offset_m` is the region-only override honoured per DEM source by the datum resolver.
+    # `datum_offset_m` is the region-only FALLBACK the datum resolver uses per DEM source only
+    # when VDatum/CO-OPS cannot resolve the offset (a resolved value wins over it).
     return {"sources": [str(s) for s in srcs],
-            "datum_override": (None if _opt(opts, "datum_offset_m", None) is None
+            "datum_fallback": (None if _opt(opts, "datum_offset_m", None) is None
                                else float(_opt(opts, "datum_offset_m")))}
 
 
@@ -253,7 +264,7 @@ def run(eff, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=None):
     for name in names:
         g = grids[name]
         ds_cfg = eff["ds"][name]
-        override = ds_cfg["datum_override"]
+        fallback = ds_cfg["datum_fallback"]
         sources = [s for s in ds_cfg["sources"] if only_source is None or s == only_source]
 
         for source in sources:
@@ -269,7 +280,7 @@ def run(eff, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=None):
                 if not dry_run and _datum_pending(out_path):
                     if datum.DEM_DATUM.get(source) == "NAVD88":
                         _stations()
-                    drec = _reresolve_datum(out_path, g, source, override, stations)
+                    drec = _reresolve_datum(out_path, g, source, fallback, stations)
                     if drec is not None and drec["status"] != PENDING_DATUM:
                         log.info("  datum retry succeeded: offset=%.3f m (%s)",
                                  drec["datum_offset_m"], drec["status"])
@@ -305,7 +316,7 @@ def run(eff, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=None):
             # NOT discard the DEM: it is saved with the offset pending and retried later.
             if datum.DEM_DATUM.get(source) == "NAVD88":
                 _stations()
-            drec = _resolve_datum(g, elev, source, override, stations)
+            drec = _resolve_datum(g, elev, source, fallback, stations)
 
             xs = g.transform.c + (np.arange(g.width) + 0.5) * g.transform.a
             ys = g.transform.f - (np.arange(g.height) + 0.5) * g.transform.a

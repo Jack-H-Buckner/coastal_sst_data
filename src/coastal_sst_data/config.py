@@ -330,8 +330,9 @@ class DataCubeSpec(BaseModel):
     #
     # The DEM->MSL datum offset still ships (as the cube attrs datum_offset_m/datum_status);
     # it is RESOLVED automatically by the `datum` stage (processes.datum) whenever bathymetry
-    # is selected, not configured. The only knob is an optional per-region override,
-    # regions[].sources.bathymetry.datum_offset_m.
+    # is selected, not configured. The only knob is an optional per-region FALLBACK,
+    # regions[].sources.bathymetry.datum_offset_m, used only when VDatum/CO-OPS cannot resolve
+    # it (a resolved value always wins).
     #
     # Which met file feeds the cube's met channels (airtemp, wind_*, swrad, cloud_cover):
     #   "reference"  -- the daily snapshot at products.met.reference_time (default 10:30

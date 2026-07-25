@@ -102,9 +102,6 @@ SPREAD_FAIL_M = 0.5              # ...this much -> the AoI straddles tidal zones
 COOPS_WARN_KM = 10.0
 COOPS_MAX_KM = 30.0
 XCHECK_WARN_M = 0.15             # VDatum vs CO-OPS disagreement -> loud warning
-OVERRIDE_WARN_M = 0.25           # config override vs resolved -> warn
-# A >0.5 m override on an already-MSL DEM is provably a NAVD88 number on an MSL DEM.
-OVERRIDE_MSL_SANITY_M = 0.5
 
 TIDE_DATUM = "MSL"
 TIDAL_DATUM_EPOCH = "1983-2001"  # NTDE that both VDatum LMSL and CO-OPS MSL are on
@@ -358,13 +355,14 @@ def coops_offset(lon: float, lat: float, stations=None) -> dict | None:
 # Resolve one AoI
 # --------------------------------------------------------------------------- #
 def resolve_aoi(g: AoiGrid, elev: np.ndarray, dem_source: str,
-                *, override: float | None = None, stations=None) -> dict:
+                *, fallback: float | None = None, stations=None) -> dict:
     """The full resolution chain for one AoI -> the sidecar record.
 
     Chain: GMRT is 0 by construction (no network). For a NAVD88 DEM, VDatum over the
     stratified waterline samples, cross-checked against the nearest CO-OPS gauge; if
-    VDatum has no coverage, CO-OPS alone. A region override wins, but is validated
-    against the DEM that actually ran. Unresolved -> 0.0, flagged `unresolved_assumed_zero`.
+    VDatum has no coverage, CO-OPS alone. If nothing resolves, the region's `datum_offset_m`
+    FALLBACK is used (`regional_default`); with no fallback, 0.0, flagged
+    `unresolved_assumed_zero`. A resolved VDatum/CO-OPS value always wins over the fallback.
     """
     datum = DEM_DATUM.get(dem_source, "UNKNOWN")
     rec = {
@@ -380,7 +378,7 @@ def resolve_aoi(g: AoiGrid, elev: np.ndarray, dem_source: str,
     if datum == "MSL_APPROX":
         rec.update(datum_offset_m=0.0, method="gmrt_msl_assumed", status="ok",
                    note="GMRT is already ~sea-level referenced; no offset needed")
-        return _apply_override(rec, override, g.name)
+        return _apply_fallback(rec, fallback, g.name)
 
     if datum != "NAVD88":
         rec.update(datum_offset_m=0.0, method="unknown_dem_datum",
@@ -388,7 +386,7 @@ def resolve_aoi(g: AoiGrid, elev: np.ndarray, dem_source: str,
         log.error("  %s: DEM source %r has no known vertical datum; assuming 0.0 m "
                   "-- water level will be biased if it is not MSL-referenced",
                   g.name, dem_source)
-        return _apply_override(rec, override, g.name)
+        return _apply_fallback(rec, fallback, g.name)
 
     # --- NAVD88 DEM: resolve it --------------------------------------------------- #
     lon_hint = 0.5 * (g.search_bbox[0] + g.search_bbox[2])
@@ -408,11 +406,12 @@ def resolve_aoi(g: AoiGrid, elev: np.ndarray, dem_source: str,
         if vd["spread_m"] > SPREAD_FAIL_M:
             log.error("  %s: VDatum offsets span %.2f m across the AoI (>%.2f m) -- it "
                       "straddles tidal zones; one scalar offset would be wrong everywhere. "
-                      "Refusing to resolve; set sources.bathymetry.datum_offset_m to assert one.",
+                      "Refusing to resolve; the region's sources.bathymetry.datum_offset_m "
+                      "fallback is used if set, else 0.0.",
                       g.name, vd["spread_m"], SPREAD_FAIL_M)
             rec.update(datum_offset_m=0.0, status="unresolved_assumed_zero",
                        method="vdatum_spread_too_large")
-            return _apply_override(rec, override, g.name)
+            return _apply_fallback(rec, fallback, g.name)
         if vd["spread_m"] > SPREAD_WARN_M:
             log.warning("  %s: VDatum offsets vary by %.2f m across the AoI",
                         g.name, vd["spread_m"])
@@ -433,7 +432,7 @@ def resolve_aoi(g: AoiGrid, elev: np.ndarray, dem_source: str,
         else:
             log.info("  %s: datum offset %.3f m (VDatum, no gauge to cross-check)",
                      g.name, vd["offset_m"])
-        return _apply_override(rec, override, g.name)
+        return _apply_fallback(rec, fallback, g.name)
 
     # --- VDatum had no coverage: the gauge is the fallback ------------------------ #
     if co is not None:
@@ -444,56 +443,52 @@ def resolve_aoi(g: AoiGrid, elev: np.ndarray, dem_source: str,
                    coops_offset_m=round(co["offset_m"], 3),
                    coops_station_id=co["station_id"],
                    coops_distance_km=co["distance_km"])
-        return _apply_override(rec, override, g.name)
+        return _apply_fallback(rec, fallback, g.name)
 
-    # --- nothing worked ----------------------------------------------------------- #
+    # --- nothing worked: the region's datum_offset_m fallback, or 0.0 ------------- #
     rec.update(datum_offset_m=0.0, method="none", status="unresolved_assumed_zero")
     log.error("  %s: COULD NOT RESOLVE the NAVD88->MSL offset (VDatum has no coverage "
-              "and no NAVD88 gauge within %.0f km). Assuming 0.0 m -- the water level "
-              "will be biased by roughly a metre on the Pacific coast. Set "
+              "and no NAVD88 gauge within %.0f km). Falling back to the region's "
+              "datum_offset_m if set; otherwise 0.0 -- and the water level will be biased "
+              "by roughly a metre on the Pacific coast. Set "
               "regions[].sources.bathymetry.datum_offset_m to fix this.",
               g.name, COOPS_MAX_KM)
-    return _apply_override(rec, override, g.name)
+    return _apply_fallback(rec, fallback, g.name)
 
 
-def _apply_override(rec: dict, override: float | None, aoi: str) -> dict:
-    """Honour a region-level override, but validate it against the DEM that ran.
+def _apply_fallback(rec: dict, fallback: float | None, aoi: str) -> dict:
+    """Honour a region-level `datum_offset_m` as a FALLBACK -- used only when VDatum (and the
+    CO-OPS cross-check) could NOT resolve the offset.
 
-    The override is a user's local assertion and normally wins. The one case where it
-    does not: a >0.5 m offset on an already-MSL DEM is provably a NAVD88 number applied
-    to the wrong DEM (bathymetry fell back cudem->gmrt underneath it) -- that is the
-    silent-1.3 m footgun this whole stage exists to remove, so the resolved value wins.
+    This is a fallback, not an override: a value VDatum resolved is authoritative and WINS, so
+    the config value is applied ONLY on the `unresolved_assumed_zero` paths (VDatum + CO-OPS had
+    no coverage, or the offsets straddle tidal zones, or the DEM's datum is unknown). Elsewhere
+    -- a resolved VDatum/CO-OPS value, or GMRT's structural 0.0, all `status="ok"` -- the config
+    value is ignored.
+
+    The old "NAVD88 number on an MSL DEM" footgun needs no special case any more: an MSL DEM
+    (GMRT) always resolves to `ok`, so the fallback never touches it -- the protection is now
+    structural rather than a magnitude check.
     """
-    if override is None:
+    if fallback is None or rec.get("status") != "unresolved_assumed_zero":
         return rec
 
-    resolved = rec.get("datum_offset_m")
-    rec["resolved_offset_m"] = resolved
-    rec["config_offset_m"] = float(override)
-
-    if (rec["dem_vertical_datum"] == "MSL_APPROX"
-            and abs(float(override)) > OVERRIDE_MSL_SANITY_M):
-        log.error("  %s: config datum_offset_m=%.3f m looks like a NAVD88 offset, but the "
-                  "DEM that actually ran is %s (already ~MSL). Ignoring the override and "
-                  "using %.3f m. Remove it, or set dem_source so CUDEM is used here.",
-                  aoi, float(override), rec["dem_source"], resolved)
-        rec["status"] = "override_rejected_msl_dem"
-        return rec
-
-    if resolved is not None and abs(float(override) - float(resolved)) > OVERRIDE_WARN_M:
-        log.warning("  %s: config datum_offset_m=%.3f m differs from the resolved %.3f m "
-                    "by %.3f m; using the config value.",
-                    aoi, float(override), resolved, abs(float(override) - float(resolved)))
-    rec.update(datum_offset_m=float(override), method="config_override", status="ok")
+    rec["resolved_offset_m"] = rec.get("datum_offset_m")     # the 0.0 the fallback replaces
+    rec["config_offset_m"] = float(fallback)
+    log.warning("  %s: offset could not be resolved; falling back to the region's "
+                "datum_offset_m=%.3f m", aoi, float(fallback))
+    rec.update(datum_offset_m=float(fallback), method="config_fallback",
+               status="regional_default")
     return rec
 
 
-def resolve_override(project: Project, aoi_name: str) -> float | None:
-    """The optional region-level `sources.bathymetry.datum_offset_m`, or None.
+def resolve_fallback(project: Project, aoi_name: str) -> float | None:
+    """The optional region-level `sources.bathymetry.datum_offset_m` fallback, or None.
 
     Region-level ONLY (it is in config.REGION_ONLY_OPTIONS, so it has no project-level
     counterpart): the offset follows the DEM, and which DEM wins is decided per AoI at
-    runtime, so a project-wide constant can never be right across a study area.
+    runtime, so a project-wide constant can never be right across a study area. Used only
+    when VDatum/CO-OPS cannot resolve the offset (see `_apply_fallback`).
     """
     val = opt(resolve_opts(project, aoi_name, DataProduct.bathymetry), "datum_offset_m")
     return None if val is None else float(val)

@@ -2,7 +2,8 @@
 network goes through the single seam `datum._http_json`, which is monkeypatched with
 table-driven fakes -- so every test here is offline. The emphasis is on the ways this can be
 silently WRONG (a bad offset biases every water-level pixel by ~1 m while the cube still looks
-healthy), not merely missing: the -999999 sentinel, the sign, region pinning, and the override."""
+healthy), not merely missing: the -999999 sentinel, the sign, region pinning, and the
+region fallback (datum_offset_m, used only when VDatum/CO-OPS cannot resolve the offset)."""
 
 import numpy as np
 import pytest
@@ -30,10 +31,10 @@ COOPS_NO_NAVD88 = {"units": "meters", "datums": [{"name": "MSL", "value": 4.443}
 STATIONS = [{"id": "9447130", "name": "Seattle", "lat": 45.52, "lon": -123.93}]
 
 
-def _project(tmp_path, override=None):
+def _project(tmp_path, fallback=None):
     sources = {"bathymetry": {"sources": ["cudem"]}}
-    if override is not None:
-        sources["bathymetry"]["datum_offset_m"] = override
+    if fallback is not None:
+        sources["bathymetry"]["datum_offset_m"] = fallback
     return parse_config({
         "name": "d", "output_dir": str(tmp_path),
         "time": {"start_date": "2026-06-01", "end_date": "2026-06-02"},
@@ -285,31 +286,61 @@ def test_a_wide_spread_refuses_a_single_scalar(monkeypatch, g, caplog):
 
 
 # --------------------------------------------------------------------------- #
-# The region override
+# The region FALLBACK (datum_offset_m): used ONLY when VDatum/CO-OPS can't resolve.
 # --------------------------------------------------------------------------- #
-def test_region_override_wins(monkeypatch, tmp_path):
-    p = _project(tmp_path, override=1.31)
+def test_a_resolved_vdatum_value_wins_over_the_config_fallback(monkeypatch, tmp_path):
+    # datum_offset_m is a fallback, not an override: a value VDatum resolved is authoritative,
+    # so the config value is IGNORED here (the semantic flip from the old override behaviour).
+    p = _project(tmp_path, fallback=1.31)
     gg = grid.project_grids(p)[AOI]
     monkeypatch.setattr(datum, "_http_json", FakeHTTP(vdatum=[VD_OK] * 30, coops=COOPS_OK))
     rec = datum.resolve_aoi(gg, _shore(gg), "cudem",
-                            override=datum.resolve_override(p, AOI), stations=STATIONS)
-    assert rec["datum_offset_m"] == pytest.approx(1.31)
-    assert rec["method"] == "config_override"
-    assert rec["resolved_offset_m"] == pytest.approx(1.278)   # kept for provenance
+                            fallback=datum.resolve_fallback(p, AOI), stations=STATIONS)
+    assert rec["datum_offset_m"] == pytest.approx(1.278)
+    assert rec["method"] == "vdatum_navd88_to_lmsl"
+    assert "config_offset_m" not in rec                   # the fallback was never applied
 
 
-def test_navd88_override_on_an_msl_dem_is_rejected(monkeypatch, tmp_path, caplog):
-    # The footgun: the region says cudem + 1.3, but CUDEM had no coverage so GMRT ran.
-    p = _project(tmp_path, override=1.3)
+def test_config_fallback_is_used_when_nothing_resolves(monkeypatch, tmp_path, caplog):
+    # VDatum out of coverage everywhere + no NAVD88 gauge -> the region's datum_offset_m is used.
+    p = _project(tmp_path, fallback=1.3)
     gg = grid.project_grids(p)[AOI]
-    fake = FakeHTTP()
-    monkeypatch.setattr(datum, "_http_json", fake)
-    with caplog.at_level("ERROR"):
-        rec = datum.resolve_aoi(gg, _shore(gg), "gmrt",
-                                override=datum.resolve_override(p, AOI))
-    assert rec["datum_offset_m"] == 0.0                   # the resolved value wins
-    assert rec["status"] == "override_rejected_msl_dem"
-    assert "looks like a NAVD88 offset" in caplog.text
+    monkeypatch.setattr(datum, "_http_json",
+                        FakeHTTP(vdatum=[VD_SENTINEL] * 40, coops=COOPS_NO_NAVD88))
+    with caplog.at_level("WARNING"):
+        rec = datum.resolve_aoi(gg, _shore(gg), "cudem",
+                                fallback=datum.resolve_fallback(p, AOI), stations=STATIONS)
+    assert rec["datum_offset_m"] == pytest.approx(1.3)
+    assert rec["status"] == "regional_default"
+    assert rec["method"] == "config_fallback"
+    assert rec["resolved_offset_m"] == 0.0                # the 0.0 it replaced, kept for provenance
+    assert "falling back to the region's datum_offset_m" in caplog.text
+
+
+def test_config_fallback_is_used_when_vdatum_straddles_tidal_zones(monkeypatch, tmp_path):
+    # A wide VDatum spread refuses a single scalar (unresolved_assumed_zero) -> the fallback fills it.
+    p = _project(tmp_path, fallback=0.9)
+    gg = grid.project_grids(p)[AOI]
+    spread = [{"t_z": f"-{v}", "uncertainty": "0.08"} for v in
+              (1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2)] * 5
+    monkeypatch.setattr(datum, "_http_json", FakeHTTP(vdatum=spread, coops=COOPS_OK))
+    rec = datum.resolve_aoi(gg, _shore(gg), "cudem",
+                            fallback=datum.resolve_fallback(p, AOI), stations=STATIONS)
+    assert rec["datum_offset_m"] == pytest.approx(0.9)
+    assert rec["status"] == "regional_default"
+
+
+def test_config_fallback_is_ignored_when_gmrt_resolves_structurally(monkeypatch, tmp_path):
+    # The old footgun (a NAVD88 number reaching an MSL DEM) is now avoided STRUCTURALLY: GMRT
+    # always resolves to ok, so the fallback -- which only fires on unresolved -- never touches it.
+    p = _project(tmp_path, fallback=1.3)
+    gg = grid.project_grids(p)[AOI]
+    monkeypatch.setattr(datum, "_http_json", FakeHTTP())     # no network expected for GMRT
+    rec = datum.resolve_aoi(gg, _shore(gg), "gmrt",
+                            fallback=datum.resolve_fallback(p, AOI))
+    assert rec["datum_offset_m"] == 0.0                      # GMRT's structural 0.0 stands
+    assert rec["status"] == "ok"
+    assert "config_offset_m" not in rec
 
 
 # --------------------------------------------------------------------------- #

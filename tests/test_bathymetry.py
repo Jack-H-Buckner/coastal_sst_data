@@ -304,5 +304,27 @@ def test_a_resolved_datum_is_not_re_resolved_on_a_later_run(tmp_path, monkeypatc
     assert calls["n"] == 1                                  # resolved once, never re-resolved
 
 
+def test_a_vdatum_outage_stamps_the_region_fallback_while_still_pending(tmp_path, monkeypatch):
+    """On a transient VDatum outage WITH a region datum_offset_m set, the offset stays PENDING
+    (so the retry loop tries VDatum again next run for the authoritative value) but the cube
+    uses the region fallback in the meantime rather than a ~1 m-biased 0.0."""
+    monkeypatch.setattr(B.datum, "resolve_aoi",
+                        lambda g, elev, src, **kw: (_ for _ in ()).throw(RuntimeError("VDatum 503")))
+    g = grid.project_grids(_one_aoi_project(tmp_path, ["cudem"]))["a1"]
+    elev = np.full((g.height, g.width), -3.0, "float32")
+
+    # With a fallback set: pending, but the fallback value is stamped (not 0.0).
+    rec = B._resolve_datum(g, elev, "cudem", 1.2, [])
+    assert rec["status"] == B.PENDING_DATUM                 # keeps retrying next run
+    assert rec["method"] == "config_fallback_pending"
+    assert rec["datum_offset_m"] == pytest.approx(1.2)
+
+    # Without a fallback: the old behaviour -- pending, biased 0.0.
+    rec0 = B._resolve_datum(g, elev, "cudem", None, [])
+    assert rec0["status"] == B.PENDING_DATUM
+    assert rec0["method"] == "datum_fetch_failed"
+    assert rec0["datum_offset_m"] == 0.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

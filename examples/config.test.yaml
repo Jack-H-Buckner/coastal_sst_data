@@ -102,7 +102,7 @@ preprocess:
     water_line: { dem_source: cudem, tide_source: coops, sensors: [eco, lst] }
     # Nearest-neighbour fill of the level-4 SST gaps over water (landcover_water==1), with a
     # <channel>_filled companion mask (1=invented, 0=observed).
-    fill_water: { sources: [mur, cmems] }
+    fill_water: { sources: [mur, cmems]}
 
 regions:
   - name: pnw_estuaries
@@ -115,7 +115,9 @@ regions:
         sources: [cudem]
         # Each DEM's DEM->MSL datum offset is resolved automatically as it is acquired (NOAA
         # VDatum for CUDEM/NAVD88, 0 for GMRT/MSL) and ships as per-source cube attributes.
-        # Uncomment only to assert a value you trust more for this region:
+        # datum_offset_m is a regional FALLBACK, used only when VDatum/CO-OPS cannot resolve
+        # the offset (no coverage / wide spread / while a transient outage retries); a resolved
+        # value always wins over it. Uncomment to give this region a best estimate:
         # datum_offset_m: 1.31   # elevation of MSL in the DEM's datum (m)
     # list aois in the region.
     areas:
