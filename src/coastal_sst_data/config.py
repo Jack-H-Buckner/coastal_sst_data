@@ -356,6 +356,46 @@ class DataCubeSpec(BaseModel):
     overwrite: bool = False                    # rebuild existing <aoi>.zarr cubes
 
 
+class PreprocessStepOptions(BaseModel):
+    """Per-step options for one post-assembly preprocessing step.
+
+    Kept open at the pydantic level (one bag serves every step), then CHECKED against the
+    step's declared `option_keys` INSIDE the preprocess stage -- not here. The step registry
+    lives in `processes/preprocess.py`, which imports `config`; importing it back here to
+    build a validation table would close an import cycle, so the check runs at stage time
+    (`preprocess._check_step_options`). This mirrors how PRODUCT_OPTIONS validates a product
+    bag, just deferred one hop to keep the registry the single source of truth.
+    """
+    model_config = {"extra": "allow"}
+
+
+class PreprocessSpec(BaseModel):
+    """Optional POST-ASSEMBLY preprocessing: derived channels computed from the raw cube.
+
+    The assembled datacube ships RAW ingredients (see DataCubeSpec); this stage reads each
+    `<output_dir>/<datacube.output_subdir>/<aoi>.zarr` and writes a SEPARATE derived cube
+    `<output_dir>/<output_subdir>/<aoi>.zarr`, leaving the raw cube untouched. It is opt-in
+    (`enabled`), so existing runs are unaffected. Each entry in `steps` selects a step from
+    the `preprocess.STEPS` registry (e.g. `water_line`, `fill_water`) and carries its
+    per-step options; unknown step keys / options fail loudly at stage time.
+    """
+    model_config = {"extra": "forbid"}
+    enabled: bool = False                      # opt-in; nothing runs unless set true
+    steps: dict[str, PreprocessStepOptions] = Field(default_factory=dict)
+    output_subdir: str = "preprocessed"        # derived-cube dir under output_dir
+    overwrite: bool = False                    # rebuild existing <aoi>.zarr derived cubes
+    compression: CompressionSpec = Field(default_factory=CompressionSpec)
+    chunks: dict[str, int] = Field(default_factory=lambda: {"time": 64, "y": 128, "x": 128})
+
+    @field_validator("steps", mode="before")
+    @classmethod
+    def _fill_step_defaults(cls, v):
+        """A bare `step:` (null value) means 'selected, default options' -> {}."""
+        if isinstance(v, dict):
+            return {k: (o if o is not None else {}) for k, o in v.items()}
+        return v
+
+
 # ---------------------------------------------------------------------------
 # Authentication (NON-SECRET settings only)
 # ---------------------------------------------------------------------------
@@ -474,6 +514,8 @@ class Project(BaseModel):
     grid: GridSpec = Field(default_factory=GridSpec)
     # Datacube assembler settings; all default, so the block is optional.
     datacube: DataCubeSpec = Field(default_factory=DataCubeSpec)
+    # Post-assembly preprocessing (opt-in); all default, so the block is optional.
+    preprocess: PreprocessSpec = Field(default_factory=PreprocessSpec)
     # Non-secret auth settings; required per selected product (see validator).
     auth: AuthConfig = Field(default_factory=AuthConfig)
 

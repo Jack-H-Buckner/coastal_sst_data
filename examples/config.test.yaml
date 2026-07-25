@@ -90,6 +90,20 @@ datacube:
   insitu_max_dt_min: 60      # matchup tolerance; beyond it an overpass gets NaN
   # (Met-at-overpass moved to the `met_overpass` product above; overpass_met was removed.)
 
+# Optional POST-ASSEMBLY preprocessing. Runs AFTER assembly, reads each datacube/<aoi>.zarr,
+# and writes a SEPARATE derived cube preprocessed/<aoi>.zarr -- the raw cube stays untouched.
+# Opt-in: nothing runs unless `enabled: true` AND you pass --preprocess (or the `preprocess`
+# subcommand). This is where the masking/filling/water-level the raw cube omits get a home.
+preprocess:
+  enabled: false
+  steps:
+    # Tide-adjusted waterline per thermal sensor, at its overpass -> <sensor>_water_elev /
+    # <sensor>_water_class. Source tags default to the sole DEM/tide present if unset.
+    water_line: { dem_source: cudem, tide_source: coops, sensors: [eco, lst] }
+    # Nearest-neighbour fill of the level-4 SST gaps over water (landcover_water==1), with a
+    # <channel>_filled companion mask (1=invented, 0=observed).
+    fill_water: { sources: [mur, cmems] }
+
 regions:
   - name: pnw_estuaries
     # Region-DEPENDENT source options (which source has coverage here, etc.).
