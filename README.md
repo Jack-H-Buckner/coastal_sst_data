@@ -250,6 +250,7 @@ There are five subcommands:
 | `verify` | Connect to every credentialed service the selected products need and confirm the credentials work | yes |
 | `run` | Run the pipeline: compute the shared grid once, then acquire each selected product in order | yes |
 | `assemble` | Knit the aligned per-product outputs into one analysis-ready datacube (`.zarr`) per AOI | no |
+| `preprocess` | Post-assembly: read each assembled cube and write a **separate** derived cube (waterline, water-filled level-4) | no |
 | `provenance` | Print a built cube's provenance: the config that made it, each field's sources, access dates | no |
 
 **A typical workflow** builds up from cheap, offline checks to the full run:
@@ -297,7 +298,7 @@ Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `m
 
 Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision. (Met-at-overpass is configured on the `met_overpass` product, not here — see below.)
 
-> **Note (raw-output simplification).** The cube ships **raw ingredients** on a common grid and daily axis; masking, water-filling, station snapping, and multi-input derivations are downstream modelling determinations. The `fill_mur_water`, `fill_cmems_water`, and `water_level` keys were **removed** — MUR/CMEMS ship observed values with honest NaN gaps, there is no derived `landmask`, and water level is reconstructed downstream from the raw per-source `elevation_<dem>` + `depth_<dem>` + `tide_<src>` channels plus each DEM's `datum_offset_m` / `datum_status` attributes. An old config that still sets any of these three keys now **fails validation** rather than being silently ignored.
+> **Note (raw-output simplification).** The cube ships **raw ingredients** on a common grid and daily axis; masking, water-filling, station snapping, and multi-input derivations are downstream modelling determinations. The `fill_mur_water`, `fill_cmems_water`, and `water_level` keys were **removed** — MUR/CMEMS ship observed values with honest NaN gaps, there is no derived `landmask`, and water level is reconstructed downstream from the raw per-source `elevation_<dem>` + `depth_<dem>` + `tide_<src>` channels plus each DEM's `datum_offset_m` / `datum_status` attributes. An old config that still sets any of these three keys now **fails validation** rather than being silently ignored. Those computations are not gone — they are the opt-in [`preprocess`](#preprocess) stage now, which runs *after* assembly and writes them to a **separate** derived cube, keeping the raw cube raw.
 
 #### Provenance: what produced each field, and when
 
@@ -354,7 +355,7 @@ Water level (and the submerged/exposed classification of a tidal flat) is a **mo
 | `<sensor>_tide_<src>` | (time,) | *ready-made:* the tide already interpolated to that sensor's overpass instant (the `tide_overpass` product) |
 | `<sensor>_hour` | (time,) | the exact overpass hour of the scene the cube kept (NaN where none) |
 
-A downstream process references `elevation_<dem>` to MSL with **that DEM's** `datum_offset_m` attribute, takes the tide at the scene from `<sensor>_tide_<src>` (or interpolates `tide_<src>` to `<sensor>_hour` itself), and classifies each cell — exactly the computation the assembler used to hard-code, now made per-process.
+A downstream process references `elevation_<dem>` to MSL with **that DEM's** `datum_offset_m` attribute, takes the tide at the scene from `<sensor>_tide_<src>` (or interpolates `tide_<src>` to `<sensor>_hour` itself), and classifies each cell — exactly the computation the assembler used to hard-code, now made per-process. The built-in [`preprocess`](#preprocess) stage's `water_line` step is exactly this computation, materialised into a derived cube for you.
 
 **Datum.** Tides are relative to **MSL** (a *tidal* datum — the 19-year mean of observed water level at a gauge), but a DEM need not be: CUDEM is **NAVD88** (a *geodetic* datum). The gap between the two surfaces is **local** and far from negligible — MSL sits roughly **1.0–1.4 m above NAVD88 in the Pacific Northwest** (vs. ~0.1–0.3 m on the Gulf coast), which is comparable to the entire intertidal range, so ignoring it misclassifies much of a tidal flat. Each DEM source's offset is **resolved automatically as it is acquired** (NOAA VDatum for CUDEM/NAVD88, cross-checked against the nearest CO-OPS gauge; 0 for GMRT, which is already ~MSL) and ships as attributes on that source's `elevation_<dem>` channel. It can't be a config constant: the right value depends on **which DEM** it belongs to (CUDEM and GMRT on the same AOI need different offsets), which is exactly why it rides per-source rather than as one cube-wide number. Re-run `bathymetry --overwrite` to re-resolve it.
 
@@ -368,6 +369,47 @@ How each source resolves (during the bathymetry acquisition of *that* source):
 VDatum is sampled at **several points spread across the AOI's waterline band**, not at its centroid: coverage is patchy at point scale (the Padilla Bay centroid falls in a hole while points a few km away resolve fine), and out-of-coverage comes back as a `-999999` sentinel rather than an error. The median is taken; if the samples span more than 0.5 m the AOI straddles tidal zones and a single scalar is refused rather than averaged into something wrong everywhere. The result (method, sample count, spread, uncertainty, the gauge it was cross-checked against) is stamped onto that DEM source's `elevation_<dem>` cube channel — there is no separate stage or sidecar, so `assemble` stays entirely offline and the offset can never go stale against the DEM it belongs to. Re-run `bathymetry --overwrite` to re-resolve.
 
 **Override.** If you know better than VDatum for a region, assert it under `regions[].sources.bathymetry.datum_offset_m` (the elevation of MSL in the DEM's datum, in metres). It wins — but it is still validated: a >0.5 m offset on a DEM that is GMRT is rejected as a NAVD88 number applied to an MSL DEM, the silent-metre error this exists to prevent. **If it cannot be resolved** (VDatum has no coverage and no NAVD88 gauge within 30 km), the offset falls back to `0.0` with a loud error and `datum_status = "unresolved_assumed_zero"`, so the bias is visible in the artifact and not only in a log line that scrolls away.
+
+### `preprocess`
+
+An **opt-in** stage that runs *after* `assemble` and turns the raw cube's ingredients into the
+**downstream determinations the cube deliberately does not bake in** (masking, water-filling, water
+level — see the note above). It reads each `datacube/<aoi>.zarr` and writes a **separate** derived cube
+`<output_dir>/preprocessed/<aoi>.zarr`, leaving the raw cube untouched, so the raw analysis-ready
+product and the "cleaned" modelling product live side by side. Like acquisition it is driven by a
+registry: each step declares what it reads/writes, and adding one is a single registration (see the
+[developer guide](docs/DEVELOPMENT.md#5b-adding-a-post-assembly-preprocess-step)).
+
+Two steps ship today:
+
+- **`water_line`** — the tide-adjusted waterline per thermal sensor, at that sensor's overpass. Emits
+  `<sensor>_water_elev` (metres relative to the waterline: 0 at it, + exposed, − submerged) and
+  `<sensor>_water_class` (submerged / exposed / unknown), reconstructed from `elevation_<dem>` (+ its
+  `datum_offset_m`) and the overpass tide — exactly the computation [Water level](#water-level-reconstructed-downstream-from-raw-ingredients)
+  describes, now materialised.
+- **`fill_water`** — nearest-neighbour fill of the level-4 SST products' (`mur_sst`, `cmems_*`) NaN gaps
+  over water (`landcover_water == 1`), with a `<channel>_filled` companion mask so a filled value never
+  passes for an observed one.
+
+Enable it in the config (nothing runs otherwise), then run it folded into a `run` or on its own:
+
+```yaml
+preprocess:
+  enabled: true
+  steps:
+    water_line: { dem_source: cudem, tide_source: coops, sensors: [eco, lst] }
+    fill_water: { sources: [mur, cmems] }
+```
+
+```bash
+coastal-sst-data run --config config.yaml --assemble --preprocess   # acquire, assemble, preprocess
+coastal-sst-data preprocess --config config.yaml --aoi tillamook_bay # just this stage
+```
+
+- `--aoi <name> …` — only specific AOIs. `--overwrite` — rebuild existing derived cubes. `--dry-run` —
+  report only. An AOI whose raw cube hasn't been assembled yet is skipped with a warning (run `assemble`
+  first). The derived cube carries the raw inputs each derived channel was built from, so it is legible
+  standalone; open it with `xr.open_zarr("data/preprocessed/<aoi>.zarr")`.
 
 ### `validate` and `grids`
 

@@ -9,11 +9,13 @@ A single entry point over the pieces of the package:
     coastal-sst-data validate --config config.yaml        # load + summarize the config
     coastal-sst-data grids    --config config.yaml        # show each AoI's target grid
     coastal-sst-data assemble --config config.yaml        # knit aligned outputs -> datacubes
+    coastal-sst-data preprocess --config config.yaml      # post-assembly derived cubes
     coastal-sst-data check    --config config.yaml        # find truncated/incomplete outputs
 
 (Equivalent to `python -m coastal_sst_data.cli <command> ...`.) Each subcommand
 just wires argparse to an existing function -- run_pipeline, auth.verify,
-load_config, compute_grids, datacube.assemble -- so the CLI stays a thin shell.
+load_config, compute_grids, datacube.assemble, preprocess.preprocess -- so the CLI
+stays a thin shell.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ def _cmd_run(args):
         overwrite=args.overwrite,
         verify_auth=False if args.no_verify else None,
         assemble=args.assemble,
+        preprocess=args.preprocess,
     )
 
 
@@ -61,6 +64,13 @@ def _cmd_assemble(args):
     project = load_config(args.config)
     datacube.assemble(project, aois=args.aois, dry_run=args.dry_run,
                       overwrite=args.overwrite)
+
+
+def _cmd_preprocess(args):
+    from .processes import preprocess
+    project = load_config(args.config)
+    preprocess.preprocess(project, aois=args.aois, dry_run=args.dry_run,
+                          overwrite=args.overwrite)
 
 
 def _cmd_provenance(args):
@@ -214,6 +224,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-verify", action="store_true", help="Skip the credential preflight.")
     p_run.add_argument("--assemble", action="store_true",
                        help="After acquisition, assemble the aligned outputs into datacubes.")
+    p_run.add_argument("--preprocess", action="store_true",
+                       help="After assembly, run post-assembly preprocessing into a separate "
+                            "derived cube (needs `preprocess.enabled` in the config).")
     p_run.set_defaults(func=_cmd_run)
 
     p_verify = sub.add_parser("verify", help="Verify configured credentials connect.")
@@ -243,6 +256,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_asm.add_argument("--overwrite", action="store_true", help="Rebuild existing .zarr cubes.")
     p_asm.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
     p_asm.set_defaults(func=_cmd_assemble)
+
+    p_pre = sub.add_parser(
+        "preprocess",
+        help="Post-assembly preprocessing: read each assembled cube and write a separate "
+             "derived cube (waterline, water-filled level-4). Needs `preprocess.enabled`.")
+    add_common(p_pre)
+    p_pre.add_argument("--aoi", nargs="+", dest="aois", help="Only these AoI name(s).")
+    p_pre.add_argument("--overwrite", action="store_true",
+                       help="Rebuild existing derived .zarr cubes.")
+    p_pre.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
+    p_pre.set_defaults(func=_cmd_preprocess)
 
     # The DEM->MSL datum offset is resolved INLINE by the bathymetry stage (per DEM source)
     # and stamped onto its output, so there is no separate `datum` subcommand -- re-run

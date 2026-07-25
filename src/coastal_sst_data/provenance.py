@@ -214,6 +214,11 @@ def field_inputs(name: str) -> list[str]:
         # series interpolated to this sensor's overpass (tide_overpass contributor).
         if rest.startswith("tide_"):
             return ["tides", sensor]
+        # POST-ASSEMBLY water line `<sensor>_water_elev` / `<sensor>_water_class` (the
+        # preprocess.water_line step): the DEM + this sensor's overpass tide. A DERIVED field,
+        # so it names ALL its inputs.
+        if rest.startswith("water_"):
+            return ["bathymetry", "tides", sensor]
 
     # Per-source forcing met `<metvar>_<src>` (airtemp_hrrr) and tides `tide_<src>` /
     # `tide_range_<src>` (D4/D5). Match by PREFIX -- a source token can itself contain an

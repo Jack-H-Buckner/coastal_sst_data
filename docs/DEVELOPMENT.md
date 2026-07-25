@@ -22,6 +22,7 @@ module.
   - [3e. Write a test](#3e-write-a-test)
 - [4. Adding a source to an existing product](#4-adding-a-source-to-an-existing-product)
 - [5. Adding a derived stage](#5-adding-a-derived-stage)
+- [5b. Adding a post-assembly preprocess step](#5b-adding-a-post-assembly-preprocess-step)
 - [6. The shared helpers you must use](#6-the-shared-helpers-you-must-use)
 - [7. Developing and debugging one process at a time](#7-developing-and-debugging-one-process-at-a-time)
 
@@ -388,6 +389,65 @@ directory the assembler and provenance must find, registered in
 Keep derived stages **idempotent and cheap to re-run**, and have them **read inputs off disk** rather
 than re-fetching, so they can backfill an existing tree — `datum` reads the bathymetry file rather
 than re-downloading a DEM tile, which is why it has its own subcommand.
+
+---
+
+## 5b. Adding a post-assembly preprocess step
+
+A **preprocess step** runs *after* the datacube is assembled, reading the raw `<aoi>.zarr` and writing
+a **separate** derived cube `<output_dir>/<preprocess.output_subdir>/<aoi>.zarr` — the raw cube stays
+untouched. This is where the *downstream modelling determinations* the assembler deliberately omits
+(masking, water-filling, water level — see [datacube.py](../src/coastal_sst_data/processes/datacube.py)'s
+design note and the raw-output refactor's D6/D7/D12) get a structured, opt-in home. All the machinery
+lives in one module, [`processes/preprocess.py`](../src/coastal_sst_data/processes/preprocess.py), and it
+**mirrors the datacube's contributor protocol** rather than the heavyweight product registry — a step
+reads an already-opened xarray cube and writes arrays, so it needs none of a product's auth / `dir` /
+`Kind` / `required_vars` machinery.
+
+Adding a step is **three things in one file** plus (if it emits genuinely new channel names) a
+provenance mapping:
+
+1. **Write a `_step_<name>(ctx)` function.** It receives a `PreprocessContext` and calls
+   `ctx.emit(name, dims, arr, **attrs)` to add derived channels and `ctx.carry(name)` to copy a raw
+   input forward (so the derived cube is self-describing). Read raw channels **defensively** with
+   `ctx.read(name, dims=...)` (returns `None` when a channel is absent or wrong-shaped) /
+   `ctx.has(name)` / `ctx.channels_with_prefix(...)` / `ctx.sensor_hours(prefix)` — a step must
+   **degrade** (emit nothing, or all-`UNKNOWN`) when an input product wasn't selected, never crash the
+   stage. `_step_water_line` and `_step_fill_water` are the two worked examples; both are thin glue
+   over existing math (`processes.water_level`, and a restored `fill_water_nn`).
+2. **Register a `PreprocessStep`** in the `STEPS` tuple: `key` (also the config selector), the
+   `option_keys` it reads, `depends_on` for ordering (topologically sorted like
+   `pipeline.process_order`), and documentary `reads`/`writes` channel families.
+3. **Nothing else for dispatch.** The stage loops over `STEPS`; the config surface is the open
+   `preprocess.steps.<key>` bag, validated against your `option_keys` at stage time by
+   `_check_step_options` (deferred out of `config.py` to avoid an import cycle — same rule and
+   `did you mean` hint as `config._option_keys_are_known`). Import-time `_check_steps()` rejects a
+   duplicate key, an unknown `depends_on`, or a dependency cycle.
+4. **Map any new channel names** in [`provenance.field_inputs`](../src/coastal_sst_data/provenance.py)
+   (§3d) — a *derived* channel lists **all** its inputs (e.g. `<sensor>_water_elev` →
+   `["bathymetry", "tides", sensor]`). Channels that keep a raw name (a filled `mur_sst`, a
+   `mur_sst_filled` mask) already resolve via the existing `mur_`/`cmems_` prefixes.
+
+Config, invocation, and testing:
+
+```yaml
+preprocess:
+  enabled: true                 # opt-in; the stage is a no-op otherwise
+  steps:
+    water_line: { dem_source: cudem, tide_source: coops, sensors: [eco, lst] }
+    fill_water: { sources: [mur, cmems] }
+```
+
+```bash
+coastal-sst-data run --config config.yaml --assemble --preprocess   # assemble, then preprocess
+coastal-sst-data preprocess --config config.yaml --aoi <one> --overwrite
+python -m coastal_sst_data.processes.preprocess --config config.yaml
+```
+
+Test it in [`tests/test_preprocess.py`](../tests/test_preprocess.py): assemble a synthetic raw cube
+(reusing the `test_datacube` writers), run `preprocess_aoi`, and assert the derived channels — plus the
+step invariants and a **separate** golden (`tests/golden/preprocessed_golden.json`) so the two stages
+don't couple. The raw cube must be left byte-unchanged (there's a test for exactly that).
 
 ---
 

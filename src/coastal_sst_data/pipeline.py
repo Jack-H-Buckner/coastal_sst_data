@@ -33,7 +33,7 @@ import logging
 from . import auth, products, report
 from .config import (DataProduct, DEFAULT_SOURCE, Project, load_config, opt, resolve_opts)
 from .grid import AoiGrid, compute_aoi_grid
-from .processes import datacube
+from .processes import datacube, preprocess as preprocess_stage
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +166,8 @@ def compute_grids(project: Project) -> dict[str, AoiGrid]:
 
 
 def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
-                 overwrite=False, verify_auth=None, assemble=False) -> dict:
+                 overwrite=False, verify_auth=None, assemble=False,
+                 preprocess=False) -> dict:
     """Run selected products for a project. Returns {product: outcome} summary.
 
     Products default to everything selected in the config; `products` restricts
@@ -180,6 +181,12 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     assemble: after acquisition, knit the aligned outputs into per-AoI datacubes
     (datacube.assemble). This is a terminal stage, not a product, so it always
     runs LAST and records its outcome under the "datacube" summary key.
+
+    preprocess: after assembly, run the post-assembly preprocessing steps
+    (preprocess.preprocess) on each assembled cube, writing a separate derived
+    cube. Runs AFTER assemble (so it sees a freshly-written raw cube) and is a
+    no-op unless the config's `preprocess.enabled` is set. Records its outcome
+    under the "preprocess" summary key.
     """
     if verify_auth is None:
         verify_auth = not dry_run
@@ -287,6 +294,25 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
             outcomes["datacube"] = f"failed: {exc}"
             run_report.add("datacube", None, outcome=f"stage raised: {exc}")
 
+    # Terminal stage (after assembly): post-assembly preprocessing into a separate derived
+    # cube. Opt-in via the config, and it runs AFTER assemble so it always sees a freshly
+    # written raw cube in the same invocation.
+    if preprocess and project.preprocess.enabled:
+        log.info("=== preprocess ===")
+        try:
+            rep = preprocess_stage.preprocess(project, grids=grids, aois=aois,
+                                              dry_run=dry_run, overwrite=overwrite)
+            outcomes["preprocess"] = rep.outcome if rep is not None else "ok"
+            run_report.add("preprocess", rep)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            log.error("=== preprocess FAILED: %s ===", exc)
+            outcomes["preprocess"] = f"failed: {exc}"
+            run_report.add("preprocess", None, outcome=f"stage raised: {exc}")
+    elif preprocess and not project.preprocess.enabled:
+        log.info("=== preprocess: skipped (set `preprocess.enabled: true` in the config) ===")
+
     # The run report: what was loaded, from which source, how long it took, and -- the part
     # that did not exist before -- what was ATTEMPTED AND LOST.
     log.info("")
@@ -313,6 +339,9 @@ def main():
                     help="verify credentials for the selected products and exit")
     ap.add_argument("--assemble", action="store_true",
                     help="after acquisition, assemble the aligned outputs into per-AoI datacubes")
+    ap.add_argument("--preprocess", action="store_true",
+                    help="after assembly, run the post-assembly preprocessing steps into a "
+                         "separate derived cube (needs `preprocess.enabled` in the config)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -341,7 +370,7 @@ def main():
     run_pipeline(project, aois=args.aois, products=products,
                  dry_run=args.dry_run, overwrite=args.overwrite,
                  verify_auth=None if not args.no_verify else False,
-                 assemble=args.assemble)
+                 assemble=args.assemble, preprocess=args.preprocess)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,455 @@
+{
+  "coords": {
+    "time": {
+      "dtype": "datetime64[ns]",
+      "fingerprint": "e563e9cda4f8aa2fa0d90b8447b357302a8358e24f9fb1cbc1a3ac646a008ab4",
+      "shape": [
+        3
+      ]
+    },
+    "x": {
+      "dtype": "float64",
+      "fingerprint": "6f74b0ea4d7122dfb3b3ce3e298e7a32ac5d054ffa44c0675bc40dc6eb3369d5",
+      "shape": [
+        42
+      ]
+    },
+    "y": {
+      "dtype": "float64",
+      "fingerprint": "73c81911d2ec89fc754d41911e1e18d0c1616d3980d0e82bfa28e066e3df7bdd",
+      "shape": [
+        42
+      ]
+    }
+  },
+  "data_vars": {
+    "cmems_thetao_0m_anfc_global": {
+      "attrs": {
+        "long_name": "cmems_thetao_0m_anfc_global (nearest-neighbour filled over water)",
+        "preprocess": "nn_filled over landcover_water"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "d46e7a8730f0dd1148aa75aaa8c1dae1e879171c3caf934ed0c79ee92633a696",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 284.0,
+        "mean": 284.0,
+        "min": 284.0,
+        "n_finite": 4788
+      }
+    },
+    "cmems_thetao_0m_anfc_global_filled": {
+      "attrs": {
+        "flag_meanings": "observed filled",
+        "flag_values": [
+          0,
+          1
+        ],
+        "long_name": "cmems_thetao_0m_anfc_global was nearest-neighbour filled over water the source did not observe (1 = invented, 0 = observed)"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "8ed4cd2c2acbb6cb4e1590eedf4f31c8d2395f6323e9283212f6096705a2ce3a",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "cmems_thetao_0m_my_global": {
+      "attrs": {
+        "long_name": "cmems_thetao_0m_my_global (nearest-neighbour filled over water)",
+        "preprocess": "nn_filled over landcover_water"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "d46e7a8730f0dd1148aa75aaa8c1dae1e879171c3caf934ed0c79ee92633a696",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 284.0,
+        "mean": 284.0,
+        "min": 284.0,
+        "n_finite": 4788
+      }
+    },
+    "cmems_thetao_0m_my_global_filled": {
+      "attrs": {
+        "flag_meanings": "observed filled",
+        "flag_values": [
+          0,
+          1
+        ],
+        "long_name": "cmems_thetao_0m_my_global was nearest-neighbour filled over water the source did not observe (1 = invented, 0 = observed)"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "8ed4cd2c2acbb6cb4e1590eedf4f31c8d2395f6323e9283212f6096705a2ce3a",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "eco_hour_v002": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "03d35281334e24fc2741cd3edf63d2567f874cc9e5d5ed119137c9ca250cc56f",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 20.0,
+        "mean": 20.0,
+        "min": 20.0,
+        "n_finite": 1
+      }
+    },
+    "eco_water_class": {
+      "attrs": {
+        "flag_meanings": "submerged exposed unknown",
+        "flag_values": [
+          0,
+          1,
+          255
+        ],
+        "long_name": "eco submerged/exposed at its overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "edbcc7e6eb3faee01bb643f9de6397ff83a6377a11e4d748a628d8d50dd4c1a4",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 255.0,
+        "mean": 170.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "eco_water_elev": {
+      "attrs": {
+        "datum_source": "cudem",
+        "long_name": "eco ground elevation relative to the overpass tide-adjusted waterline (0 at it, + exposed, - submerged)",
+        "tide_source": "coops",
+        "units": "m"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "2cf7f80c20c727cf35d0712474e2285078e10586ba7719af3acff63b4d1b7874",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": -10.433975,
+        "mean": -10.433975,
+        "min": -10.433975,
+        "n_finite": 1764
+      }
+    },
+    "elevation_cudem": {
+      "attrs": {
+        "datum_method": "stub",
+        "datum_offset_m": 1.3,
+        "datum_status": "ok",
+        "dem_vertical_datum": "NAVD88",
+        "long_name": "cudem DEM elevation in its native vertical datum (+ up); add datum_offset_m to reference it to MSL",
+        "units": "m"
+      },
+      "dims": [
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "fbf16dd5cad0cada2513984a4c8cec4ccf40ab2327a6abe31a1f0cd153db4bfd",
+      "shape": [
+        42,
+        42
+      ],
+      "stats": {
+        "max": -10.0,
+        "mean": -10.0,
+        "min": -10.0,
+        "n_finite": 1764
+      }
+    },
+    "landcover_water": {
+      "attrs": {},
+      "dims": [
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "5d9cb3df3c4a319d416c4b1f8664a0ef8a74a6da78578b7032b8fe6fc3828367",
+      "shape": [
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.880952,
+        "min": 0.0,
+        "n_finite": 1764
+      }
+    },
+    "lst_hour": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "d5fa64b7511ecb97dbbbcc1bff210778d7e982a4a182610c01687f74f6079988",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 18.0,
+        "mean": 18.0,
+        "min": 18.0,
+        "n_finite": 1
+      }
+    },
+    "lst_water_class": {
+      "attrs": {
+        "flag_meanings": "submerged exposed unknown",
+        "flag_values": [
+          0,
+          1,
+          255
+        ],
+        "long_name": "lst submerged/exposed at its overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "edbcc7e6eb3faee01bb643f9de6397ff83a6377a11e4d748a628d8d50dd4c1a4",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 255.0,
+        "mean": 170.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "lst_water_elev": {
+      "attrs": {
+        "datum_source": "cudem",
+        "long_name": "lst ground elevation relative to the overpass tide-adjusted waterline (0 at it, + exposed, - submerged)",
+        "tide_source": "coops",
+        "units": "m"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "1eb73ecb7dbeeb47f42b7550068c407366bbe42551a1caba88f5b90032bd4eba",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": -11.3,
+        "mean": -11.3,
+        "min": -11.3,
+        "n_finite": 1764
+      }
+    },
+    "modis_hour": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "7a6cdceefa0a8012668a5155acf50b5473bba617bd64a5881c3bb86f6c5fe403",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 21.0,
+        "mean": 21.0,
+        "min": 21.0,
+        "n_finite": 1
+      }
+    },
+    "modis_water_class": {
+      "attrs": {
+        "flag_meanings": "submerged exposed unknown",
+        "flag_values": [
+          0,
+          1,
+          255
+        ],
+        "long_name": "modis submerged/exposed at its overpass"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "0edb3fdd212d69a927abadb85e7ad091500276138ad8fa2f77eb6ed6b5a9f9e1",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 255.0,
+        "mean": 170.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "modis_water_elev": {
+      "attrs": {
+        "datum_source": "cudem",
+        "long_name": "modis ground elevation relative to the overpass tide-adjusted waterline (0 at it, + exposed, - submerged)",
+        "tide_source": "coops",
+        "units": "m"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "3dc6626f2ed23ffa908408ab0e9c9b1961d5b60f1efec976d153b31099ba1e92",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": -10.3,
+        "mean": -10.3,
+        "min": -10.3,
+        "n_finite": 1764
+      }
+    },
+    "mur_sst": {
+      "attrs": {
+        "long_name": "mur_sst (nearest-neighbour filled over water)",
+        "preprocess": "nn_filled over landcover_water"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "f4be454f6e13bb5c3a247f5c5b4ae1e3634ef36977679cef52a2cec29ca4d14e",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 287.0,
+        "mean": 286.0,
+        "min": 285.0,
+        "n_finite": 4914
+      }
+    },
+    "mur_sst_filled": {
+      "attrs": {
+        "flag_meanings": "observed filled",
+        "flag_values": [
+          0,
+          1
+        ],
+        "long_name": "mur_sst was nearest-neighbour filled over water the source did not observe (1 = invented, 0 = observed)"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "8ed4cd2c2acbb6cb4e1590eedf4f31c8d2395f6323e9283212f6096705a2ce3a",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    }
+  },
+  "dims": {
+    "time": 3,
+    "x": 42,
+    "y": 42
+  },
+  "global_attrs": {
+    "aoi_id": "aoi1",
+    "crs": "EPSG:32610",
+    "derived_from": "datacube/aoi1.zarr",
+    "preprocess": "{\"fill_water\": {}, \"water_line\": {}}"
+  }
+}
