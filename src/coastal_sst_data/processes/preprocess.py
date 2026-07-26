@@ -26,6 +26,14 @@ pushed downstream -- D6/D7/D12):
   * fill_water   -- nearest-neighbour fill of the level-4 SST products' (MUR, CMEMS) NaN gaps
                     over water (`landcover_water==1`), with a `<channel>_filled` companion
                     mask so an invented value stays distinguishable from an observed one.
+  * filter_clouds -- screen ECOSTRESS pixels against a gap-free baseline L4 SST (MUR/CMEMS):
+                    a fixed cold offset (`baseline - eco > threshold_k`) or a distribution-based,
+                    seasonally-aware outlier floor (`eco < mean - n_sigma*sigma`). Folds drops
+                    into `<sensor>_valid_<ver>`/`<sensor>_sst_<ver>` + a `*_cloudfiltered` flag.
+  * filter_cloud_cover -- gate ECOSTRESS on the met total-cloud-cover field (HRRR/ERA5, percent):
+                    a scene-level rejection and a per-pixel cutoff, with a `*_metcloudfiltered`
+                    flag and a `<sensor>_scene_cloud_pct_<src>` diagnostic. Composes with
+                    filter_clouds (both read the WORKING sst/valid, so drops union).
 
 The derived cube is self-describing: alongside each derived channel it carries the specific
 raw inputs it was built from (the DEM elevation + its datum attrs, the water mask, the tide /
@@ -55,6 +63,7 @@ from ..config import Project
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, products, provenance, report, store
 from . import datacube, water_level
+from .cloud_filter import _step_filter_clouds, _step_filter_cloud_cover
 from .datacube import build_encoding, write_zarr_safe
 from .water_level import EXPOSED, SUBMERGED, UNKNOWN
 
@@ -365,6 +374,26 @@ STEPS: tuple[PreprocessStep, ...] = (
         writes=("_filled",),
         fn=_step_fill_water,
         option_keys=frozenset({"sources", "mask_channel"}),
+    ),
+    PreprocessStep(
+        key="filter_clouds",
+        reads=("eco_sst", "eco_valid", "eco_cloud", "mur_sst", "cmems_", "doy_sin", "doy_cos"),
+        writes=("_sst", "_valid", "_cloudfiltered"),
+        fn=_step_filter_clouds,
+        depends_on=("fill_water",),        # so offset mode sees the gap-filled baseline
+        option_keys=frozenset({"method", "threshold_k", "n_sigma", "baseline", "stat_scope",
+                               "seasonality", "sensors", "mask_sst", "use_cloud_raster"}),
+        provenance_inputs=("ecostress", "mur"),
+    ),
+    PreprocessStep(
+        key="filter_cloud_cover",
+        reads=("eco_cloud_cover_", "cloud_cover_", "eco_sst", "eco_valid", "landcover_water"),
+        writes=("_sst", "_valid", "_metcloudfiltered", "_scene_cloud_pct"),
+        fn=_step_filter_cloud_cover,
+        depends_on=("filter_clouds",),     # deterministic order; drops compose via `_working`
+        option_keys=frozenset({"source", "scene_max_pct", "pixel_max_pct", "sensors",
+                               "mask_sst", "water_mask_channel"}),
+        provenance_inputs=("met_overpass", "met", "ecostress"),
     ),
 )
 

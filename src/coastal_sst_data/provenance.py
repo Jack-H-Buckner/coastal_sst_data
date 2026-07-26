@@ -219,6 +219,10 @@ def field_inputs(name: str) -> list[str]:
         # so it names ALL its inputs.
         if rest.startswith("water_"):
             return ["bathymetry", "tides", sensor]
+        # POST-ASSEMBLY met cloud gate `<sensor>_scene_cloud_pct_<src>` (the
+        # preprocess.filter_cloud_cover step): the AOI-mean of this sensor's overpass cloud cover.
+        if rest.startswith("scene_cloud_pct"):
+            return ["met_overpass", sensor]
 
     # Per-source forcing met `<metvar>_<src>` (airtemp_hrrr) and tides `tide_<src>` /
     # `tide_range_<src>` (D4/D5). Match by PREFIX -- a source token can itself contain an

@@ -144,6 +144,83 @@
         "n_finite": 1
       }
     },
+    "eco_sst_v002": {
+      "attrs": {
+        "cloud_baseline": "mur_sst",
+        "preprocess": "cloud-filtered: mur_sst - eco > 5.0 K"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "ca3778d576ced2de3e8010fcc0eb895e03f23541eea46370246c39316aeb8ef0",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 286.0,
+        "mean": 286.0,
+        "min": 286.0,
+        "n_finite": 1764
+      }
+    },
+    "eco_sst_v002_cloudfiltered": {
+      "attrs": {
+        "cloud_baseline": "mur_sst",
+        "flag_meanings": "kept dropped",
+        "flag_values": [
+          0,
+          1
+        ],
+        "preprocess": "cloud-filtered: mur_sst - eco > 5.0 K"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "8ed4cd2c2acbb6cb4e1590eedf4f31c8d2395f6323e9283212f6096705a2ce3a",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "eco_valid_v002": {
+      "attrs": {
+        "cloud_baseline": "mur_sst",
+        "preprocess": "cloud-filtered: mur_sst - eco > 5.0 K"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "bd2c2fe3964b53518c9c9b411aaffa7af70c94874a81f720931edad3b9a7786d",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.333333,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
     "eco_water_class": {
       "attrs": {
         "flag_meanings": "submerged exposed unknown",
@@ -450,6 +527,6 @@
     "aoi_id": "aoi1",
     "crs": "EPSG:32610",
     "derived_from": "datacube/aoi1.zarr",
-    "preprocess": "{\"fill_water\": {}, \"water_line\": {}}"
+    "preprocess": "{\"fill_water\": {}, \"filter_clouds\": {}, \"water_line\": {}}"
   }
 }
