@@ -58,6 +58,12 @@ ASSET = "map"                       # the classification COG asset
 DEFAULT_YEAR = 2021                 # WorldCover v200 (2021); 2020 -> v100
 DEFAULT_WATER_CLASSES = [80]        # 80 = permanent water bodies
 
+# `water` is a 0/1 mask where 0 means LAND -- a meaningful value, NOT nodata. It must be
+# written with NO _FillValue, or xarray's default mask_and_scale=True decodes every land
+# cell (0) to NaN on read, collapsing the mask to uniformly-water downstream. The COG read
+# leaks _FillValue: 0 onto `water` (rio.reproject(nodata=0)); we scrub it and pin uint8.
+WATER_ENCODING: dict = {"zlib": True, "complevel": 4, "dtype": "uint8", "_FillValue": None}
+
 
 # --------------------------------------------------------------------------- #
 # STAC discovery (Planetary Computer; lazy import so the module loads without the
@@ -119,6 +125,15 @@ def items_to_dataset(items, g: AoiGrid, water_classes, aoi_id: str) -> Optional[
 
     lc = lc.astype("int16")
     water = lc.isin(list(water_classes)).astype("uint8")
+    # `water` is a 0/1 mask -- 0 means LAND, not nodata. The COG read leaks CF decode attrs
+    # onto it (rio.reproject: _FillValue: 0, plus identity scale_factor/add_offset). Left on
+    # disk, xarray's default mask_and_scale=True decodes _FillValue -> land becomes NaN, and
+    # the scale/offset alone promote uint8 -> float64. Scrub all three from attrs and encoding
+    # (both must go: to_netcdf errors if the same key sits in each) so the mask reads back as
+    # a true uint8 0/1. The explicit WATER_ENCODING then pins uint8 with no fill on write.
+    for _k in ("_FillValue", "scale_factor", "add_offset"):
+        water.attrs.pop(_k, None)
+        water.encoding.pop(_k, None)
     ds = xr.Dataset({"landcover": lc, "water": water})
     ds["landcover"].attrs["long_name"] = "ESA WorldCover class code (0 = no data)"
     ds["water"].attrs["long_name"] = f"WorldCover water (class in {list(water_classes)})"
@@ -176,9 +191,12 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
         wf = float((ds["water"].values == 1).mean())
         ds.attrs.update(**provenance.stamp(eff))
+        # `water` needs an explicit fill-free uint8 encoding (see WATER_ENCODING); `landcover`
+        # keeps the zlib default -- there 0 IS genuine nodata and it never reaches the cube.
+        encoding = {"water": dict(WATER_ENCODING), "landcover": {"zlib": True, "complevel": 4}}
         # Static layer: the stem is the bare AoI name -- no time stamp to encode.
         log.info("  wrote %s  (water=%.0f%% of grid)",
-                 store.write_output(ds, aoi_out, name, fmt), 100 * wf)
+                 store.write_output(ds, aoi_out, name, fmt, encoding=encoding), 100 * wf)
         rep.wrote(source="ESA WorldCover (Planetary Computer)")
     rep.log_summary()
     return rep
