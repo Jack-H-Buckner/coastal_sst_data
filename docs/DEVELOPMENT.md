@@ -414,7 +414,14 @@ provenance mapping:
    `ctx.has(name)` / `ctx.channels_with_prefix(...)` / `ctx.sensor_hours(prefix)` — a step must
    **degrade** (emit nothing, or all-`UNKNOWN`) when an input product wasn't selected, never crash the
    stage. `_step_water_line` and `_step_fill_water` are the two worked examples; both are thin glue
-   over existing math (`processes.water_level`, and a restored `fill_water_nn`).
+   over existing math (`processes.water_level`, and a restored `fill_water_nn`). A step that needs
+   more than glue can live in its **own module** and be imported into the `STEPS` tuple — the two
+   cloud filters (`filter_clouds`, `filter_cloud_cover`) sit in
+   [`processes/cloud_filter.py`](../src/coastal_sst_data/processes/cloud_filter.py); it imports
+   nothing from `preprocess` at runtime (only a `TYPE_CHECKING` hint for `PreprocessContext`), so
+   there is no cycle. Two steps that mutate the **same** channel compose by reading the *working*
+   value (a channel already emitted this run wins over the raw cube — see `cloud_filter._working`),
+   so their edits stack regardless of run order.
 2. **Register a `PreprocessStep`** in the `STEPS` tuple: `key` (also the config selector), the
    `option_keys` it reads, `depends_on` for ordering (topologically sorted like
    `pipeline.process_order`), and documentary `reads`/`writes` channel families.
@@ -436,6 +443,17 @@ preprocess:
   steps:
     water_line: { dem_source: cudem, tide_source: coops, sensors: [eco, lst] }
     fill_water: { sources: [mur, cmems] }
+    # Screen cloud-contaminated ECOSTRESS pixels (ported from oceanSR's cold-deviation filter).
+    # method: offset -> drop where `baseline - eco > threshold_k`; sigma -> drop where eco is
+    # below the baseline climatology's `mean - n_sigma*sigma` (per-pixel or pooled; optional
+    # day-of-year harmonic seasonality).
+    filter_clouds: { method: sigma, baseline: mur_sst, n_sigma: 3.0,
+                     stat_scope: pixel, seasonality: harmonic }
+    # Gate ECOSTRESS on met total cloud cover (HRRR/ERA5, percent): reject a scene whose AOI-mean
+    # exceeds scene_max_pct, and/or drop individual pixels above pixel_max_pct. Needs the met
+    # `(eco, <src>)` overpass combo (or a `cloud_cover_<src>` forcing channel) in the cube.
+    # Composes with filter_clouds; either gate is disabled with a null / >=100 threshold.
+    filter_cloud_cover: { source: hrrr, scene_max_pct: 30, pixel_max_pct: 80 }
 ```
 
 ```bash

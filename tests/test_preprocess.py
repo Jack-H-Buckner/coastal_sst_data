@@ -44,7 +44,8 @@ def _project(tmp_path, **preprocess_cfg):
 
 @pytest.fixture
 def project(tmp_path):
-    return _project(tmp_path, steps={"water_line": None, "fill_water": None})
+    return _project(tmp_path, steps={"water_line": None, "fill_water": None,
+                                     "filter_clouds": None})
 
 
 @pytest.fixture
@@ -173,6 +174,264 @@ def test_fill_water_without_a_mask_channel_fills_nothing(project, grids, days, c
 
 
 # --------------------------------------------------------------------------- #
+# filter_clouds + filter_cloud_cover: cloud screening (see processes/cloud_filter.py).
+# These build the raw cube BY HAND (bypassing assembly) so the cold anomaly / cloud field is
+# exact, then run preprocess_aoi and assert the drops fold into sst/valid + the companion flags.
+# --------------------------------------------------------------------------- #
+def _setup(tmp_path, steps):
+    proj = _project(tmp_path, steps=steps)
+    return proj, grid.project_grids(proj)[AOI]
+
+
+def _hand_cube(g, times, **channels):
+    """A raw cube built by hand for a precise cloud-filter fixture. Arrays are keyed by name;
+    3-D -> (time,y,x), 2-D -> (y,x), 1-D -> (time,)."""
+    xs, ys = g.xy_centers()
+    dims = {3: ("time", "y", "x"), 2: ("y", "x"), 1: ("time",)}
+    data = {name: (dims[arr.ndim], arr) for name, arr in channels.items()}
+    return xr.Dataset(data, coords={"time": pd.DatetimeIndex(times), "y": ys, "x": xs},
+                      attrs={"crs": g.target_crs})
+
+
+def _pp(proj, g, cube):
+    return preprocess.preprocess_aoi(cube, g, preprocess._build_eff(proj))
+
+
+def _ones_valid(T, H, W):
+    return np.ones((T, H, W), "uint8")
+
+
+# ---- filter_clouds: offset method ---------------------------------------------------------- #
+def test_filter_clouds_offset_drops_cold_anomalies(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_clouds": None})       # offset, threshold_k=5 (default)
+    H, W = g.height, g.width
+    eco = np.full((1, H, W), 286.0, "float32")
+    eco[0, :, 5] = 278.0                                      # 7 K colder than MUR -> cloud
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
+                      mur_sst=np.full((1, H, W), 285.0, "float32"))
+    ds = _pp(proj, g, cube)
+
+    flag = ds["eco_sst_v002_cloudfiltered"].isel(time=0).values
+    assert (flag[:, 5] == 1).all() and flag.sum() == H        # only column 5 dropped
+    assert np.isnan(ds["eco_sst_v002"].isel(time=0).values[:, 5]).all()
+    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 6]).all()
+    assert (ds["eco_valid_v002"].isel(time=0).values[:, 5] == 0).all()
+    assert ds["eco_sst_v002_cloudfiltered"].dtype == np.uint8
+    assert ds["eco_valid_v002"].dtype == np.uint8
+    assert ds["eco_sst_v002"].dtype == np.float32
+
+
+def test_filter_clouds_threshold_zero_is_a_noop(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_clouds": {"threshold_k": 0}})
+    H, W = g.height, g.width
+    eco = np.full((1, H, W), 286.0, "float32"); eco[0, :, 5] = 278.0
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
+                      mur_sst=np.full((1, H, W), 285.0, "float32"))
+    ds = _pp(proj, g, cube)
+    # Disabled -> the step emits nothing (the derived cube carries only what steps emit).
+    assert "eco_sst_v002_cloudfiltered" not in ds.data_vars
+    assert "eco_sst_v002" not in ds.data_vars
+
+
+def test_filter_clouds_keeps_pixels_where_baseline_is_nan(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_clouds": None})
+    H, W = g.height, g.width
+    mur = np.full((1, H, W), 285.0, "float32"); mur[0, :, 5] = np.nan
+    eco = np.full((1, H, W), 286.0, "float32"); eco[0, :, 5] = 278.0
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W), mur_sst=mur)
+    ds = _pp(proj, g, cube)
+    # NaN baseline -> NaN diff -> kept, never flagged.
+    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 5] == 0).all()
+    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 5]).all()
+
+
+def test_filter_clouds_uses_fill_waters_filled_baseline(tmp_path):
+    """With fill_water selected first, a MUR water hole is NN-filled with a warm neighbour, so a
+    cold eco pixel there now trips the offset filter -- proving filter_clouds read the WORKING
+    (filled) baseline out of ctx.channels, and that depends_on ordered fill_water first."""
+    proj, g = _setup(tmp_path, {"fill_water": None, "filter_clouds": None})
+    H, W = g.height, g.width
+    mur = np.full((1, H, W), 285.0, "float32"); mur[0, :, 5] = np.nan
+    eco = np.full((1, H, W), 286.0, "float32"); eco[0, :, 5] = 278.0
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
+                      mur_sst=mur, landcover_water=np.ones((H, W), "float32"))
+    ds = _pp(proj, g, cube)
+    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 5] == 1).all()
+
+
+# ---- filter_clouds: sigma method (baseline-floor climatology) ------------------------------ #
+def _sigma_cube(g, times, cold_col=5, warm_col=6):
+    """A cube whose per-cell MUR climatology has mean 287, sample std ~1.58 over 5 days; eco on
+    day 0 has a cold outlier (280) in `cold_col` and an in-range value (285) in `warm_col`."""
+    H, W = g.height, g.width
+    T = len(times)
+    mur = np.stack([np.full((H, W), 285.0 + t, "float32") for t in range(T)])
+    eco = np.full((T, H, W), np.nan, "float32")
+    eco[0] = 287.0
+    eco[0, :, cold_col] = 280.0
+    eco[0, :, warm_col] = 285.0
+    return _hand_cube(g, times, eco_sst_v002=eco, eco_valid_v002=_ones_valid(T, H, W),
+                      mur_sst=mur)
+
+
+def test_filter_clouds_sigma_pixel_drops_below_floor(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_clouds": {"method": "sigma", "n_sigma": 3.0}})
+    ds = _pp(proj, g, _sigma_cube(g, pd.date_range("2026-06-01", periods=5)))
+    flag = ds["eco_sst_v002_cloudfiltered"].isel(time=0).values
+    # cutoff = 287 - 3*1.58 = 282.3: 280 < cutoff (drop), 285 > cutoff (keep).
+    assert (flag[:, 5] == 1).all()
+    assert (flag[:, 6] == 0).all()
+    assert flag[:, :5].sum() == 0 and flag[:, 7:].sum() == 0
+
+
+def test_filter_clouds_sigma_pooled_scope(tmp_path):
+    proj, g = _setup(tmp_path,
+                     {"filter_clouds": {"method": "sigma", "n_sigma": 3.0, "stat_scope": "pooled"}})
+    ds = _pp(proj, g, _sigma_cube(g, pd.date_range("2026-06-01", periods=5)))
+    flag = ds["eco_sst_v002_cloudfiltered"].isel(time=0).values
+    assert (flag[:, 5] == 1).all() and (flag[:, 6] == 0).all()
+
+
+def test_filter_clouds_sigma_keeps_nan_baseline_pixels(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_clouds": {"method": "sigma"}})
+    H, W = g.height, g.width
+    times = pd.date_range("2026-06-01", periods=5)
+    mur = np.stack([np.full((H, W), 285.0 + t, "float32") for t in range(5)])
+    mur[:, :, 7] = np.nan                                    # no climatology in column 7
+    eco = np.full((5, H, W), np.nan, "float32"); eco[0] = 287.0; eco[0, :, 7] = 280.0
+    cube = _hand_cube(g, times, eco_sst_v002=eco, eco_valid_v002=_ones_valid(5, H, W), mur_sst=mur)
+    ds = _pp(proj, g, cube)
+    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 7] == 0).all()
+    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 7]).all()
+
+
+def test_filter_clouds_sigma_harmonic_catches_seasonal_outlier(tmp_path):
+    """A summer-peak cloud pixel (8 K below the seasonal mean) is a global-mean INLIER but a
+    seasonal outlier: the day-of-year harmonic flags it; a constant climatology misses it."""
+    proj_h, g = _setup(tmp_path, {"filter_clouds": {"method": "sigma", "seasonality": "harmonic"}})
+    proj_o, _ = _setup(tmp_path, {"filter_clouds": {"method": "sigma", "seasonality": "off"}})
+    H, W = g.height, g.width
+    times = pd.date_range("2026-01-01", periods=365)
+    doy = np.arange(1, 366)
+    seasonal = 285.0 + 8.0 * np.sin(2 * np.pi * doy / 365.25) + 0.3 * np.sin(2 * np.pi * doy / 30)
+    mur = np.broadcast_to(seasonal[:, None, None], (365, H, W)).astype("float32")
+    day = 90                                                 # doy 91 ~ seasonal peak (~293)
+    eco = np.full((365, H, W), np.nan, "float32")
+    eco[day] = 295.0
+    eco[day, :, 5] = 283.0                                   # summer cloud pixel
+    cube = _hand_cube(g, times, eco_sst_v002=eco, eco_valid_v002=_ones_valid(365, H, W),
+                      mur_sst=mur)
+
+    fh = _pp(proj_h, g, cube)["eco_sst_v002_cloudfiltered"].isel(time=day).values
+    fo = _pp(proj_o, g, cube)["eco_sst_v002_cloudfiltered"].isel(time=day).values
+    assert (fh[:, 5] == 1).all() and (fh[:, 6] == 0).all()   # harmonic drops the seasonal outlier
+    assert (fo[:, 5] == 0).all()                             # constant climatology misses it
+
+
+def test_filter_clouds_harmonic_short_span_falls_back_to_constant(tmp_path, caplog):
+    proj, g = _setup(tmp_path, {"filter_clouds": {"method": "sigma", "seasonality": "harmonic"}})
+    with caplog.at_level("INFO"):
+        ds = _pp(proj, g, _sigma_cube(g, pd.date_range("2026-06-01", periods=5)))
+    assert "too short" in caplog.text                        # harmonic degraded to constant
+    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 5] == 1).all()
+
+
+# ---- filter_cloud_cover: meteorological total cloud cover ---------------------------------- #
+def test_filter_cloud_cover_scene_rejects_cloudy_overpass(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_cloud_cover": None})     # scene 30, pixel 80 (defaults)
+    H, W = g.height, g.width
+    tcc = np.full((2, H, W), 10.0, "float32"); tcc[0] = 40.0     # day 0 cloudy, day 1 clear
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=2),
+                      eco_sst_v002=np.full((2, H, W), 286.0, "float32"),
+                      eco_valid_v002=_ones_valid(2, H, W),
+                      eco_cloud_cover_hrrr=tcc, landcover_water=np.ones((H, W), "float32"))
+    ds = _pp(proj, g, cube)
+    assert (ds["eco_valid_v002"].isel(time=0).values == 0).all()
+    assert np.isnan(ds["eco_sst_v002"].isel(time=0).values).all()
+    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values == 1).all()
+    assert ds["eco_scene_cloud_pct_hrrr"].isel(time=0).item() == pytest.approx(40.0)
+    # the clear overpass is untouched
+    assert (ds["eco_valid_v002"].isel(time=1).values == 1).all()
+    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=1).values == 0).all()
+
+
+def test_filter_cloud_cover_pixel_gate_drops_only_cloudy_pixels(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_cloud_cover": None})
+    H, W = g.height, g.width
+    tcc = np.full((1, H, W), 10.0, "float32"); tcc[0, :, 5] = 90.0   # one very cloudy column
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=np.full((1, H, W), 286.0, "float32"),
+                      eco_valid_v002=_ones_valid(1, H, W),
+                      eco_cloud_cover_hrrr=tcc, landcover_water=np.ones((H, W), "float32"))
+    flag = _pp(proj, g, cube)["eco_sst_v002_metcloudfiltered"].isel(time=0).values
+    assert (flag[:, 5] == 1).all() and flag.sum() == H          # only column 5 (scene mean ~12<30)
+
+
+def test_filter_cloud_cover_disable_pixel_gate(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_cloud_cover": {"pixel_max_pct": None}})
+    H, W = g.height, g.width
+    tcc = np.full((1, H, W), 10.0, "float32"); tcc[0, :, 5] = 90.0
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=np.full((1, H, W), 286.0, "float32"),
+                      eco_valid_v002=_ones_valid(1, H, W),
+                      eco_cloud_cover_hrrr=tcc, landcover_water=np.ones((H, W), "float32"))
+    flag = _pp(proj, g, cube)["eco_sst_v002_metcloudfiltered"].isel(time=0).values
+    assert flag.sum() == 0                                       # pixel gate off, scene mean <30
+
+
+def test_filter_cloud_cover_works_with_era5(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_cloud_cover": {"source": "era5"}})
+    H, W = g.height, g.width
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=np.full((1, H, W), 286.0, "float32"),
+                      eco_valid_v002=_ones_valid(1, H, W),
+                      eco_cloud_cover_era5=np.full((1, H, W), 40.0, "float32"),
+                      landcover_water=np.ones((H, W), "float32"))
+    ds = _pp(proj, g, cube)
+    assert "eco_scene_cloud_pct_era5" in ds.data_vars
+    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values == 1).all()
+
+
+def test_filter_cloud_cover_no_met_channel_is_a_noop(tmp_path, caplog):
+    proj, g = _setup(tmp_path, {"filter_cloud_cover": None})
+    H, W = g.height, g.width
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=np.full((1, H, W), 286.0, "float32"),
+                      eco_valid_v002=_ones_valid(1, H, W))
+    with caplog.at_level("WARNING"):
+        ds = _pp(proj, g, cube)
+    assert "eco_sst_v002_metcloudfiltered" not in ds.data_vars
+    assert "filter_cloud_cover" in caplog.text
+
+
+def test_cloud_filters_compose(tmp_path):
+    """Both steps on: a baseline-cold pixel (col 3) and a met-cloudy pixel (col 8) are BOTH
+    invalid in the final cube -- filter_cloud_cover read filter_clouds' working sst/valid."""
+    proj, g = _setup(tmp_path, {"filter_clouds": None, "filter_cloud_cover": None})
+    H, W = g.height, g.width
+    eco = np.full((1, H, W), 286.0, "float32"); eco[0, :, 3] = 278.0
+    tcc = np.full((1, H, W), 10.0, "float32"); tcc[0, :, 8] = 90.0
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
+                      mur_sst=np.full((1, H, W), 285.0, "float32"),
+                      eco_cloud_cover_hrrr=tcc, landcover_water=np.ones((H, W), "float32"))
+    ds = _pp(proj, g, cube)
+    valid = ds["eco_valid_v002"].isel(time=0).values
+    sst = ds["eco_sst_v002"].isel(time=0).values
+    assert (valid[:, 3] == 0).all() and (valid[:, 8] == 0).all()
+    assert np.isnan(sst[:, 3]).all() and np.isnan(sst[:, 8]).all()
+    # each flag marks only its own gate's pixels
+    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 3] == 1).all()
+    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 8] == 0).all()
+    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values[:, 8] == 1).all()
+    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values[:, 3] == 0).all()
+
+
+# --------------------------------------------------------------------------- #
 # Import-time invariants (mirror test_add_a_covariate's technique)
 # --------------------------------------------------------------------------- #
 def test_duplicate_step_key_is_rejected(monkeypatch):
@@ -204,6 +463,14 @@ def test_unknown_step_or_option_is_rejected_at_stage_time(tmp_path):
         preprocess._check_step_options(eff)
     eff = preprocess._build_eff(
         _project(tmp_path, steps={"water_line": {"dem_sauce": "x"}}))
+    with pytest.raises(ValueError, match="not a recognised option"):
+        preprocess._check_step_options(eff)
+    eff = preprocess._build_eff(
+        _project(tmp_path, steps={"filter_clouds": {"n_sgima": 3}}))
+    with pytest.raises(ValueError, match="not a recognised option"):
+        preprocess._check_step_options(eff)
+    eff = preprocess._build_eff(
+        _project(tmp_path, steps={"filter_cloud_cover": {"scene_maxpct": 5}}))
     with pytest.raises(ValueError, match="not a recognised option"):
         preprocess._check_step_options(eff)
 

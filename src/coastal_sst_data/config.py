@@ -377,8 +377,9 @@ class PreprocessSpec(BaseModel):
     `<output_dir>/<datacube.output_subdir>/<aoi>.zarr` and writes a SEPARATE derived cube
     `<output_dir>/<output_subdir>/<aoi>.zarr`, leaving the raw cube untouched. It is opt-in
     (`enabled`), so existing runs are unaffected. Each entry in `steps` selects a step from
-    the `preprocess.STEPS` registry (e.g. `water_line`, `fill_water`) and carries its
-    per-step options; unknown step keys / options fail loudly at stage time.
+    the `preprocess.STEPS` registry (e.g. `water_line`, `fill_water`, `filter_clouds`,
+    `filter_cloud_cover`) and carries its per-step options; unknown step keys / options fail
+    loudly at stage time.
     """
     model_config = {"extra": "forbid"}
     enabled: bool = False                      # opt-in; nothing runs unless set true
