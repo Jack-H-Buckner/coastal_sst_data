@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import rasterio
+import xarray as xr
 from rasterio.transform import from_origin
 
 from coastal_sst_data.config import load_config, parse_config, DataProduct
@@ -139,6 +140,31 @@ def test_items_to_dataset_water_classes_configurable(aoi_grid, tmp_path):
     w = ds["water"].values
     assert w[:, : w.shape[1] // 4].sum() > 0           # west (class 10) now water
     assert w[:, 3 * w.shape[1] // 4:].sum() == 0       # east (class 80) now "land"
+
+
+# ---------------------------------------------------------------------------
+# Round-trip: `water` must survive a netcdf write + default read intact. The COG read
+# leaks _FillValue: 0 onto `water`, where 0 means LAND -- if it reaches disk, xarray's
+# default mask_and_scale=True decodes every land cell to NaN, collapsing the mask to
+# uniformly-water downstream. The tests above only see the in-memory array; this is the
+# read path every consumer (load_landcover, the skip guard) actually uses.
+# ---------------------------------------------------------------------------
+def test_water_roundtrips_without_fillvalue_corruption(aoi_grid, tmp_path):
+    from coastal_sst_data import store
+
+    href = write_worldcover_cog(tmp_path / "wc.tif", aoi_grid)
+    ds = landcover_esa.items_to_dataset([_Item({"map": href})], aoi_grid, [80], "test_aoi")
+    encoding = {"water": dict(landcover_esa.WATER_ENCODING),
+                "landcover": {"zlib": True, "complevel": 4}}
+    path = store.write_output(ds, tmp_path / "out", "test_aoi", "netcdf", encoding=encoding)
+
+    with xr.open_dataset(path) as re:                       # default read = mask_and_scale=True
+        w = re["water"]
+        assert w.dtype == np.dtype("uint8")                 # not promoted to float64
+        assert not np.isnan(w.values.astype("float64")).any()   # land (0) stayed 0, not NaN
+        assert set(np.unique(w.values)) <= {0, 1}
+        assert (w.values[:, : w.shape[1] // 4] == 0).all()      # deep west = land = 0
+        assert w.values[:, 3 * w.shape[1] // 4:].sum() > 0      # deep east = water = 1
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
