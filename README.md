@@ -380,7 +380,7 @@ product and the "cleaned" modelling product live side by side. Like acquisition 
 registry: each step declares what it reads/writes, and adding one is a single registration (see the
 [developer guide](docs/DEVELOPMENT.md#5b-adding-a-post-assembly-preprocess-step)).
 
-Two steps ship today:
+Four steps ship today:
 
 - **`water_line`** — the tide-adjusted waterline per thermal sensor, at that sensor's overpass. Emits
   `<sensor>_water_elev` (metres relative to the waterline: 0 at it, + exposed, − submerged) and
@@ -390,6 +390,29 @@ Two steps ship today:
 - **`fill_water`** — nearest-neighbour fill of the level-4 SST products' (`mur_sst`, `cmems_*`) NaN gaps
   over water (`landcover_water == 1`), with a `<channel>_filled` companion mask so a filled value never
   passes for an observed one.
+- **`filter_clouds`** — screens cloud-contaminated ECOSTRESS pixels against a **gap-free L4 baseline**
+  (`mur_sst` / a `cmems_*` analysis). Cloud biases thermal-IR SST **cold**, so a pixel far colder than
+  the baseline is treated as cloud. Two `method`s: **`offset`** (default) drops where
+  `baseline − eco > threshold_k` (default `5.0` K; `≤0` disables), using the co-located baseline —
+  the `fill_water` gap-filled one if present, which is why this step runs after `fill_water`; **`sigma`**
+  builds the baseline's **own climatology** (least-squares mean + residual σ) and drops any pixel colder
+  than `mean − n_sigma·σ` (default `3.0`), with `stat_scope: pixel` (per-cell, default) or `pooled` and
+  `seasonality: off` (default) or `harmonic` (a day-of-year annual cycle). Drops fold into
+  `<sensor>_valid_<ver>` and NaN the matching `<sensor>_sst_<ver>` (unless `mask_sst: false`), plus a
+  `<sensor>_sst_<ver>_cloudfiltered` flag (`1 = dropped`) so every drop stays auditable.
+- **`filter_cloud_cover`** — gates ECOSTRESS on the **met total-cloud-cover** field (HRRR/ERA5, in
+  percent). Two independent gates — a pixel drops if **either** fires: **scene-level** (`scene_max_pct`,
+  default `30`) drops the *whole* overpass when the AOI-mean cloud cover at the overpass exceeds it, and
+  **per-pixel** (`pixel_max_pct`, default `80`) drops individual pixels above it (a `null` / `≥100`
+  threshold disables that gate). Prefers the overpass-matched `<sensor>_cloud_cover_<src>`, falling back
+  to the daily forcing `cloud_cover_<src>`; `source` (default auto: overpass over forcing, `hrrr` over
+  `era5`) picks. Emits a `<sensor>_scene_cloud_pct_<src>` diagnostic and a `<sensor>_sst_<ver>_metcloudfiltered`
+  flag. It **composes** with `filter_clouds` — both read the working SST/valid, so their drops union
+  regardless of order.
+
+The two cloud filters require their inputs to be in the raw cube: `filter_clouds` needs a level-4
+baseline (`mur` or `cmems`) and the ECOSTRESS SST channels; `filter_cloud_cover` needs a `met` or
+`met_overpass` cloud-cover channel. Where an input is absent the step logs a warning and drops nothing.
 
 Enable it in the config (nothing runs otherwise), then run it folded into a `run` or on its own:
 
@@ -399,6 +422,12 @@ preprocess:
   steps:
     water_line: { dem_source: cudem, tide_source: coops, sensors: [eco, lst] }
     fill_water: { sources: [mur, cmems] }
+    # ECOSTRESS cloud screening vs the gap-free L4 baseline (cold-deviation).
+    filter_clouds: { method: offset, baseline: mur_sst, threshold_k: 5.0, sensors: [eco] }
+    #   ...or the distribution-based, seasonally-aware variant:
+    # filter_clouds: { method: sigma, baseline: mur_sst, n_sigma: 3.0, stat_scope: pixel, seasonality: harmonic }
+    # Meteorological cloud-cover gate (HRRR/ERA5, %): scene-level + per-pixel.
+    filter_cloud_cover: { scene_max_pct: 30, pixel_max_pct: 80, sensors: [eco] }
 ```
 
 ```bash

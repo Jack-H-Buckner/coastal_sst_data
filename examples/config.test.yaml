@@ -103,6 +103,24 @@ preprocess:
     # Nearest-neighbour fill of the level-4 SST gaps over water (landcover_water==1), with a
     # <channel>_filled companion mask (1=invented, 0=observed).
     fill_water: { sources: [mur, cmems]}
+    # ECOSTRESS cloud screening vs a gap-free L4 baseline (MUR/CMEMS). Cloud biases thermal-IR
+    # SST cold, so a pixel far COLDER than the baseline is likely cloud. Drops fold into
+    # eco_valid_<ver>/eco_sst_<ver> + a <channel>_cloudfiltered flag. Runs after fill_water so
+    # `offset` mode sees the gap-filled baseline.
+    #   method: offset -> drop where baseline - eco > threshold_k (K); <=0 disables.
+    #   method: sigma  -> drop where eco < climatology mean - n_sigma*sigma, fit from the
+    #                     baseline's OWN observed climatology (stat_scope: pixel|pooled,
+    #                     seasonality: off|harmonic).
+    filter_clouds: { method: offset, baseline: mur_sst, threshold_k: 5.0, sensors: [eco] }
+    #   ...or the distribution-based, seasonally-aware variant: drop where eco is colder than the
+    #   baseline's own climatology mean - n_sigma*sigma (stat_scope: pixel|pooled, seasonality: off|harmonic).
+    # filter_clouds: { method: sigma, baseline: mur_sst, n_sigma: 3.0, stat_scope: pixel, seasonality: harmonic, sensors: [eco] }
+    # Meteorological cloud-cover gate on ECOSTRESS using the HRRR/ERA5 total-cloud-cover field
+    # (percent). A pixel drops if EITHER gate fires: scene-level (AOI-mean cloud at overpass >
+    # scene_max_pct -> drop the whole overpass) or per-pixel (> pixel_max_pct). A null/>=100
+    # threshold disables that gate. Emits a <channel>_metcloudfiltered flag and a
+    # <sensor>_scene_cloud_pct_<src> diagnostic. Composes with filter_clouds (drops union).
+    filter_cloud_cover: { scene_max_pct: 30, pixel_max_pct: 80, sensors: [eco] }
 
 regions:
   - name: pnw_estuaries
