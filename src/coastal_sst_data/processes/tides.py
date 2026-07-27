@@ -328,7 +328,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
 
         for src in sources:
             out_path = tide_root / src / "aligned" / name / f"{name}_tides.nc"
-            if store.done(out_path, store.REQUIRED_VARS["TIDE"], overwrite=overwrite):
+            if store.done(out_path, store.REQUIRED_VARS["TIDE"],
+                          covers=(start, end), overwrite=overwrite):
                 log.info("  %s [%s]: already processed, skipping", name, src); rep.skip(); continue
 
             station = None
@@ -355,6 +356,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
             da.attrs.update(units="m", long_name="tide height (harmonic prediction, rel. MSL)")
             ds = da.to_dataset()
             ds.attrs.update(aoi_id=name, source=src, tide_source=src, **attrs,
+                            **provenance.requested_range(start, end),
                             **provenance.stamp(eff))
             log.info("  wrote %s (%d steps) [%s]",
                      write_output(ds, tide_root / src / "aligned" / name, name, fmt),

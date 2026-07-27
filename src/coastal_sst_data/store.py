@@ -42,6 +42,7 @@ import shutil
 import time
 from pathlib import Path
 
+import pandas as pd
 import xarray as xr
 
 from .products import REGISTRY
@@ -246,17 +247,46 @@ def is_complete(path: Path, expected_vars=(), *, shape=None, deep: bool = False)
     return True
 
 
-def done(path: Path, expected_vars=(), *, shape=None, overwrite: bool = False) -> bool:
+def _covers_range(path: Path, start, end) -> bool:
+    """Does this SINGLE-FILE span product already cover [start, end]?
+
+    Tides and insitu write one file for the whole window, so an extended date range yields
+    the same filename and `is_complete` still passes -- the extension would be silently
+    skipped. They stamp the window they were built for (`provenance.requested_range`), which
+    this reads back and compares to the currently-configured range.
+
+    A file that carries no `requested_start`/`requested_end` (built before this stamp, or
+    unreadable) is treated as NOT covering, so it is rebuilt once and gains the stamp.
+    """
+    try:
+        with xr.open_dataset(path) as ds:
+            rs = ds.attrs.get("requested_start")
+            re = ds.attrs.get("requested_end")
+    except Exception:
+        return False
+    if rs is None or re is None:
+        return False
+    return pd.Timestamp(rs) <= pd.Timestamp(start) and pd.Timestamp(re) >= pd.Timestamp(end)
+
+
+def done(path: Path, expected_vars=(), *, shape=None, covers=None, overwrite: bool = False) -> bool:
     """The skip guard. True -> this output is finished and can be skipped.
 
     A path that exists but is NOT complete is reported and returns False, so the caller
     re-fetches it: silently skipping a broken file is the failure this module exists to
     prevent, and silently overwriting one would hide that a run had died.
+
+    `covers=(start, end)` is for SINGLE-FILE span products (tides, insitu): a complete file
+    whose stamped requested range does not span the configured window is rebuilt, so extending
+    the project's date range is not silently skipped. Per-day/per-scene products leave it None.
     """
     path = Path(path)
     if overwrite or not path.exists():
         return False
     if is_complete(path, expected_vars, shape=shape):
+        if covers is not None and not _covers_range(path, *covers):
+            log.info("  %s covers a narrower date range than requested; rebuilding", path.name)
+            return False
         return True
     log.warning("  %s exists but is INCOMPLETE (missing layers, or a truncated write); "
                 "re-fetching", path.name)

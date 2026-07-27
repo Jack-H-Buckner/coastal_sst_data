@@ -5,6 +5,7 @@ import types
 import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
 from pathlib import Path
 
 from coastal_sst_data.config import load_config, parse_config, AreaOfInterest, GridSpec
@@ -210,6 +211,45 @@ def test_a_source_that_fails_yields_no_channel_no_fallback(monkeypatch, base_pro
     root = Path(proj.output_dir) / "TIDE"
     assert not (root / "coops" / "aligned" / "a1" / "a1_tides.nc").exists()   # failed -> no tree
     assert (root / "eo_tides" / "aligned" / "a1" / "a1_tides.nc").exists()    # the other is fine
+
+
+# --------------------------------------------------------------------------- #
+# Extending the date range (single-file span product)
+# --------------------------------------------------------------------------- #
+def test_extending_the_date_range_rebuilds_the_single_file_series(monkeypatch, base_project,
+                                                                  aoi_grid, tmp_path):
+    """Tides write ONE file for the whole window, so extending end_date must REBUILD it. The
+    plain exists/complete guard would skip the old, shorter series and the added dates would
+    silently be NaN in the cube -- the bug `covers=(start, end)` fixes."""
+    calls = []
+
+    def good(lon, lat, start, end, ds_cfg, station):
+        calls.append((start, end))
+        idx = pd.date_range(start, end, freq="D")
+        return pd.Series(np.ones(len(idx), "float32"), index=idx, name="tide"), {"method": "model"}
+
+    monkeypatch.setitem(tides.SOURCES, "eo_tides", good)
+    base_project["output_dir"] = str(tmp_path)
+    base_project["products"]["tides"] = {"sources": ["eo_tides"]}
+    out = tmp_path / "TIDE" / "eo_tides" / "aligned" / "a1" / "a1_tides.nc"
+
+    def run_for(end_date):
+        base_project["time"]["end_date"] = end_date
+        tides.acquire(parse_config(base_project), grids={"a1": aoi_grid})
+
+    run_for("2026-06-15")
+    with xr.open_dataset(out) as ds:
+        assert ds.attrs["requested_end"] == "2026-06-15"
+    assert len(calls) == 1
+
+    run_for("2026-06-15")                       # same window -> covered -> skipped, no rebuild
+    assert len(calls) == 1
+
+    run_for("2026-07-15")                       # extended -> old file no longer spans it -> rebuilt
+    assert len(calls) == 2
+    with xr.open_dataset(out) as ds:
+        assert ds.attrs["requested_end"] == "2026-07-15"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
