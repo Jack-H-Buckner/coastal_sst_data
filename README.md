@@ -380,7 +380,7 @@ product and the "cleaned" modelling product live side by side. Like acquisition 
 registry: each step declares what it reads/writes, and adding one is a single registration (see the
 [developer guide](docs/DEVELOPMENT.md#5b-adding-a-post-assembly-preprocess-step)).
 
-Five steps ship today:
+Seven steps ship today:
 
 - **`water_line`** — the tide-adjusted waterline per thermal sensor, at that sensor's overpass. Emits
   `<sensor>_water_elev` (metres relative to the waterline: 0 at it, + exposed, − submerged) and
@@ -421,12 +421,34 @@ Five steps ship today:
   into `<sensor>_valid_<ver>` / `<sensor>_sst_<ver>` plus a `<sensor>_sst_<ver>_landcloudfiltered` flag,
   and compose with the other two filters (all read the working SST/valid). This is the **land**
   counterpart to `filter_clouds`, which screens **water** against an L4 SST baseline.
+- **`flag_georef`** — diagnoses per-scene ECOSTRESS **georeferencing error**. Some granules are
+  geolocated wrong, contributing wrong SST at every coastal pixel with nothing to flag it. This step
+  registers the scene's **thermal coastline** (NaN-aware Canny edges) against the **static**
+  `landcover_water` coastline by brute-force **whole-cell translation**, scoring every candidate shift,
+  and classifies the scene. The fit runs on the **cloud-filtered** SST (cleaner edges → better fit), so
+  it runs *after* the cloud filters — but it **moves no pixels**. It emits per-sensor 1-D `("time",)`
+  diagnostics only: `<sensor>_georef_dy` / `_dx` (best-fit whole-cell offset), `_shift_m` (magnitude, m),
+  `_z` (peak significance vs the search surface), `_agree` / `_agree0` (edge/coast agreement at the peak
+  / at zero shift), `_n_edge`, `_coast_obs` (coastline cells observed), `_dt_k` (land–sea contrast,
+  diagnostic), and `<sensor>_georef_flag` — `0 = ok, 1 = displaced, 2 = suspect, 3 = unstable,
+  4 = unrecoverable, 5 = insufficient_signal`. **Quality gates run *before* the fit**: a scene observing
+  too little coastline / too few edges is `insufficient_signal` and never fitted (this is where most of
+  the discriminating power lives — see [`docs/plan-georef-preprocess-step.md`](docs/plan-georef-preprocess-step.md)).
+- **`correct_georef`** — applies `flag_georef`'s fitted `(dy,dx)` to the **raw** ECOSTRESS geometry, for
+  **`displaced` scenes only**, into `<field>_georef_corrected` channels (**SST + validity** by default).
+  It shifts the raw granule-native fields read from the raw cube — **not** the preprocess-derived masks:
+  the corrected geometry invalidates the cloud/water preprocessing, which must be **re-run** against the
+  corrected images (a separate later step). The shift is slice-based (never `np.roll`, which would
+  fabricate a coastline on the far edge); the vacated margin is **NaN-filled** for SST (`0` for masks).
+  A `<sensor>_georef_applied` flag (`1 = shifted`) marks which scenes were moved, and non-displaced
+  scenes are copied verbatim, so `<field>_georef_corrected` is a complete drop-in replacement.
 
 The three cloud filters require their inputs to be in the raw cube: `filter_clouds` needs a level-4
 baseline (`mur` or `cmems`) and the ECOSTRESS SST channels; `filter_cloud_cover` needs a `met` or
 `met_overpass` cloud-cover channel; `filter_land_clouds` needs a `met` / `met_overpass` **air-temp**
-channel and a land source (`landcover`, or the `water_line` step). Where an input is absent the step
-logs a warning and drops nothing.
+channel and a land source (`landcover`, or the `water_line` step). `flag_georef` needs a **non-degenerate
+`landcover_water`** channel (`landcover` product) and the ECOSTRESS SST; `correct_georef` needs
+`flag_georef` selected. Where an input is absent the step logs a warning and does nothing.
 
 Enable it in the config (nothing runs otherwise), then run it folded into a `run` or on its own:
 
@@ -447,6 +469,50 @@ preprocess:
     #   ...or gate on the tide-adjusted water line instead of the static landcover mask
     #   (needs the water_line step above):
     # filter_land_clouds: { threshold_k: 5.0, land_source: water_line, sensors: [eco] }
+    # Diagnose ECOSTRESS georeferencing error vs the static landcover coastline (flags only).
+    flag_georef: { sensors: [eco], tol_m: 200, max_shift_m: 10000, min_coast_obs: 500, min_edges: 300 }
+    # Apply the fitted shift to the RAW ECOSTRESS SST + validity (displaced scenes only).
+    correct_georef: { sensors: [eco], fields: [sst, valid] }
+```
+
+**`flag_georef` parameters** (defaults shown; every key is optional):
+
+| key | default | what it does |
+|---|---|---|
+| `sensors` | `[eco]` | sensor prefixes to diagnose |
+| `tol_m` | `200` | how close (m) a thermal edge counts as *on* the coast (200 m ≈ 2 cells at 100 m) |
+| `max_shift_m` | `10000` | half-width of the shift search (± metres) |
+| `coarse_stride` | `4` | coarse-pass stride (cells) before the fine refinement |
+| `n_refine` | `8` | number of top coarse peaks refined at ±`coarse_stride` (refining several, not just the winner, is required) |
+| `sigma` | `1.5` | Canny Gaussian σ (cells) |
+| `lo_pct` / `hi_pct` | `80` / `97` | Canny hysteresis low/high percentiles — **lower the LOW one** to recover faint coastal edges without admitting land clutter |
+| `min_coast_obs` | `500` | **gate:** skip a scene observing fewer coastline cells (an **absolute count** — coastlines differ ~10× in length between AOIs; the strongest predictor of a spurious fit). **Region-overridable.** |
+| `min_valid_pct` | `2.0` | **gate:** skip a scene with less than this % of the grid valid. Region-overridable. |
+| `min_edges` | `300` | **gate:** skip a scene with fewer thermal edges. Region-overridable. |
+| `z_min` | `4.5` | minimum peak significance (`z`) for an `ok` or `displaced` verdict |
+| `lift_min` | `2.5` | the peak must exceed `lift_min × surface-median` agreement, else `unrecoverable` (chance level is AOI-specific, so score on **lift**, not absolute agreement) |
+| `gain_min` | `0.10` | minimum agreement gain (peak − zero-shift) for `displaced` |
+| `ok_shift_m` | `300` | a fit no larger than this (with `z ≥ z_min`) is `ok`, not `displaced` |
+| `stability_windows_km` | `[5, 10, 20, 30]` | search half-widths swept for stability; a peak that drifts > 1–2 cells across them is `unstable` (never corrected) |
+
+**`correct_georef` parameters:**
+
+| key | default | what it does |
+|---|---|---|
+| `sensors` | `[eco]` | sensor prefixes to correct |
+| `fields` | `[sst, valid]` | which **raw ECOSTRESS-native** fields to shift; add `cloud` to also shift the granule cloud band. Preprocess-derived masks are never shifted |
+| `fill` | `NaN` | margin fill for float fields (SST); mask fields always fill `0` (unobserved) |
+
+The gates `min_coast_obs` / `min_edges` / `min_valid_pct` are **per-region tunable** — a dense
+archipelago coastline warrants a higher `min_coast_obs` than a short one. Override them per region
+(not globally) under `regions[].preprocess_steps`:
+
+```yaml
+regions:
+  - name: puget_sound
+    preprocess_steps:
+      flag_georef: { min_coast_obs: 1500 }     # denser coastline than the project default
+    areas: [ ... ]
 ```
 
 ```bash

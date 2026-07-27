@@ -241,6 +241,28 @@ def resolve_opts(project: "Project", aoi_name: str, product: DataProduct):
     return ProductOptions(**merged)
 
 
+def resolve_step_opts(project: "Project", aoi_name: str, key: str) -> dict:
+    """The options ONE AoI runs preprocess step `key` with: region overrides over the global bag.
+
+    The step analog of `resolve_opts`. Preprocess step bags (`preprocess.steps.<key>`) are
+    project-global; a region layers per-key overrides through `regions[].preprocess_steps.<key>`
+    for options that must vary geographically -- e.g. `flag_georef.min_coast_obs`, a gate counted
+    in absolute coastline CELLS, which is an order of magnitude stricter at an AoI whose coastline
+    is 10x shorter. Which keys a region may override is guarded per step at stage time
+    (`preprocess._check_step_options` against `PreprocessStep.region_option_keys`).
+
+    Returns a plain dict (steps read options straight off it, unlike products' ProductOptions bag).
+    A step not selected globally simply has an empty global bag; a region override on it is still
+    merged here but the stage never runs it (selection is global).
+    """
+    global_opts = project.preprocess.steps.get(key)
+    merged = dict(global_opts.model_extra or {}) if global_opts is not None else {}
+    region_opts = project.region_of(aoi_name).preprocess_steps.get(key)
+    if region_opts is not None:
+        merged.update(region_opts.model_extra or {})
+    return merged
+
+
 def _options_by_product(value: Any) -> Any:
     """Normalize a `{product: options}` mapping before validation.
 
@@ -252,12 +274,32 @@ def _options_by_product(value: Any) -> Any:
     return value
 
 
+class PreprocessStepOptions(BaseModel):
+    """Per-step options for one post-assembly preprocessing step.
+
+    Kept open at the pydantic level (one bag serves every step), then CHECKED against the
+    step's declared `option_keys` INSIDE the preprocess stage -- not here. The step registry
+    lives in `processes/preprocess.py`, which imports `config`; importing it back here to
+    build a validation table would close an import cycle, so the check runs at stage time
+    (`preprocess._check_step_options`). This mirrors how PRODUCT_OPTIONS validates a product
+    bag, just deferred one hop to keep the registry the single source of truth. The same bag
+    serves both the global `preprocess.steps.<key>` and a region's `preprocess_steps.<key>`
+    override; the latter is additionally checked against the step's `region_option_keys`.
+    """
+    model_config = {"extra": "allow"}
+
+
 class Region(BaseModel):
     """AoIs that share the same region-dependent data sources."""
     model_config = {"extra": "forbid"}
     name: str
     # Region-dependent, per-product source options (e.g. bathymetry.dem_source).
     sources: dict[DataProduct, SourceOptions] = Field(default_factory=dict)
+    # Region-dependent, per-preprocess-step option overrides (e.g. flag_georef.min_coast_obs).
+    # The step analog of `sources`: a gate counted in absolute cells needs per-region tuning.
+    # Resolved by `resolve_step_opts`, guarded by the step's `region_option_keys` at stage time
+    # (`preprocess._check_step_options`) -- regions tune coverage/thresholds, not the cube's meaning.
+    preprocess_steps: dict[str, PreprocessStepOptions] = Field(default_factory=dict)
     areas: list[AreaOfInterest] = Field(..., min_length=1)
 
     @field_validator("sources", mode="before")
@@ -269,6 +311,16 @@ class Region(BaseModel):
         if v is None:
             return {}
         return _options_by_product(v)
+
+    @field_validator("preprocess_steps", mode="before")
+    @classmethod
+    def _fill_step_defaults(cls, v):
+        # Mirror PreprocessSpec.steps: a blank section is {}, a bare `step:` (null) is {}.
+        if v is None:
+            return {}
+        if isinstance(v, dict):
+            return {k: (o if o is not None else {}) for k, o in v.items()}
+        return v
 
 
 class TimeWindow(BaseModel):
@@ -355,19 +407,6 @@ class DataCubeSpec(BaseModel):
     compression: CompressionSpec = Field(default_factory=CompressionSpec)
     output_subdir: str = "datacube"            # cube dir under output_dir
     overwrite: bool = False                    # rebuild existing <aoi>.zarr cubes
-
-
-class PreprocessStepOptions(BaseModel):
-    """Per-step options for one post-assembly preprocessing step.
-
-    Kept open at the pydantic level (one bag serves every step), then CHECKED against the
-    step's declared `option_keys` INSIDE the preprocess stage -- not here. The step registry
-    lives in `processes/preprocess.py`, which imports `config`; importing it back here to
-    build a validation table would close an import cycle, so the check runs at stage time
-    (`preprocess._check_step_options`). This mirrors how PRODUCT_OPTIONS validates a product
-    bag, just deferred one hop to keep the registry the single source of truth.
-    """
-    model_config = {"extra": "allow"}
 
 
 class PreprocessSpec(BaseModel):

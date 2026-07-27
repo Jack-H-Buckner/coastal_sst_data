@@ -63,12 +63,13 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from ..config import Project
+from ..config import Project, resolve_step_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, products, provenance, report, store
 from . import datacube, water_level
 from .cloud_filter import (_step_filter_clouds, _step_filter_cloud_cover,
                            _step_filter_land_clouds)
+from .georef import _step_flag_georef, _step_correct_georef
 from .datacube import build_encoding, write_zarr_safe
 from .water_level import EXPOSED, SUBMERGED, UNKNOWN
 
@@ -118,6 +119,7 @@ class PreprocessStep:
     fn: "Callable[[PreprocessContext], None]"
     depends_on: tuple[str, ...] = ()               # step keys that must run first
     option_keys: frozenset[str] = frozenset()      # per-step config options it reads
+    region_option_keys: frozenset[str] = frozenset()   # subset a region may override (<= option_keys)
     provenance_inputs: tuple[str, ...] = ()        # products a derived channel attributes to
 
 
@@ -211,7 +213,12 @@ class PreprocessContext:
                 / products.aligned_rel(datacube.PRODUCT_DIRS[product], source) / self.aid)
 
     def step_opts(self, key: str) -> dict:
-        return self.eff["steps"].get(key, {})
+        """This AoI's options for step `key`: region overrides over the global bag.
+
+        Resolved per-AoI (via `self.aid`) so a `regions[].preprocess_steps.<key>` override lands
+        for the AoIs in that region only -- the step analog of how products resolve `resolve_opts`.
+        """
+        return resolve_step_opts(self.eff["project"], self.aid, key)
 
     # ---- writing the derived cube ---------------------------------------------------- #
     def emit(self, name: str, dims, arr, **attrs) -> None:
@@ -414,6 +421,31 @@ STEPS: tuple[PreprocessStep, ...] = (
                                "sensors", "mask_sst"}),
         provenance_inputs=("met_overpass", "met", "ecostress"),
     ),
+    PreprocessStep(
+        key="flag_georef",
+        reads=("_sst", "landcover_water"),
+        writes=("_georef_",),
+        fn=_step_flag_georef,
+        # the fit must read the FILTERED sst -- cloud edges are the dominant noise source, and the
+        # cloud filters mutate `<pre>_sst` via `_working`. A depends_on to an unselected step is
+        # ignored, so flagging still runs (on the raw sst) if no cloud filter is selected.
+        depends_on=("filter_clouds", "filter_cloud_cover", "filter_land_clouds"),
+        option_keys=frozenset({"sensors", "tol_m", "max_shift_m", "coarse_stride", "n_refine",
+                               "sigma", "lo_pct", "hi_pct", "min_coast_obs", "min_valid_pct",
+                               "min_edges", "z_min", "lift_min", "gain_min", "ok_shift_m",
+                               "stability_windows_km"}),
+        region_option_keys=frozenset({"min_coast_obs", "min_edges", "min_valid_pct"}),
+        provenance_inputs=("ecostress", "landcover"),
+    ),
+    PreprocessStep(
+        key="correct_georef",
+        reads=("_sst", "_valid", "_georef_"),
+        writes=("_georef_corrected", "_georef_applied"),
+        fn=_step_correct_georef,
+        depends_on=("flag_georef",),        # applies the (dy,dx) flag_georef stored this run
+        option_keys=frozenset({"sensors", "fields", "fill"}),
+        provenance_inputs=("ecostress", "landcover"),
+    ),
 )
 
 BY_KEY: dict[str, PreprocessStep] = {s.key: s for s in STEPS}
@@ -453,6 +485,10 @@ def _check_steps() -> None:
             if d not in known:
                 raise RuntimeError(
                     f"preprocess step {s.key!r}: depends_on unknown step {d!r}.")
+        if not s.region_option_keys <= s.option_keys:
+            raise RuntimeError(
+                f"preprocess step {s.key!r}: region_option_keys "
+                f"{sorted(s.region_option_keys - s.option_keys)} are not in option_keys.")
     _topo_order(list(STEPS))            # raises on a dependency cycle
 
 
@@ -480,6 +516,31 @@ def _check_step_options(eff: dict) -> None:
             suggest = f" (did you mean {hint[0]!r}?)" if hint else ""
             problems.append(f"preprocess.steps.{key}.{opt_key} is not a recognised option"
                             f"{suggest}. Valid: {', '.join(sorted(allowed)) or '(none)'}")
+
+    # Region overrides (regions[].preprocess_steps.<key>): a known step, an option the step
+    # reads, AND one it declares region-overridable -- a region tunes coverage/thresholds, it
+    # cannot silently redefine a channel's meaning (the product `region_options` rule for steps).
+    for region in eff["project"].regions:
+        for key, step_opts in region.preprocess_steps.items():
+            opts = dict(step_opts.model_extra or {})
+            where = f"regions.{region.name}.preprocess_steps.{key}"
+            if key not in BY_KEY:
+                hint = get_close_matches(key, sorted(BY_KEY), n=1, cutoff=0.6)
+                suggest = f" (did you mean {hint[0]!r}?)" if hint else ""
+                problems.append(f"{where} is not a known step{suggest}. "
+                                f"Valid: {', '.join(sorted(BY_KEY))}")
+                continue
+            step = BY_KEY[key]
+            for opt_key in sorted(set(opts) - set(step.option_keys)):
+                hint = get_close_matches(opt_key, sorted(step.option_keys), n=1, cutoff=0.6)
+                suggest = f" (did you mean {hint[0]!r}?)" if hint else ""
+                problems.append(f"{where}.{opt_key} is not a recognised option{suggest}. "
+                                f"Valid: {', '.join(sorted(step.option_keys)) or '(none)'}")
+            for opt_key in sorted((set(opts) & set(step.option_keys)) - set(step.region_option_keys)):
+                problems.append(
+                    f"{where}.{opt_key} is not region-overridable (it would be SILENTLY IGNORED "
+                    f"per AoI). Region-overridable options for {key}: "
+                    f"{', '.join(sorted(step.region_option_keys)) or '(none)'}")
     if problems:
         raise ValueError(
             "unrecognised preprocess option(s) -- these would be SILENTLY IGNORED:\n  "
