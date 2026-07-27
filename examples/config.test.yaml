@@ -121,6 +121,14 @@ preprocess:
     # threshold disables that gate. Emits a <channel>_metcloudfiltered flag and a
     # <sensor>_scene_cloud_pct_<src> diagnostic. Composes with filter_clouds (drops union).
     filter_cloud_cover: { scene_max_pct: 30, pixel_max_pct: 80, sensors: [eco] }
+    # Over-land cloud screen: thermal-IR reads WARMER than air over land by day, so a land pixel
+    # far colder than the HRRR/ERA5 air temperature is likely cloud. Drops where
+    # airtemp - sst > threshold_k (a K difference == a degC one, so 5 means 5 K == 5 C). Gated to
+    # LAND cells by land_source: `landcover` (static landcover_water==0) or `water_line`
+    # (this sensor's <sensor>_water_class==exposed at overpass, which needs the water_line step).
+    filter_land_clouds: { threshold_k: 5.0, land_source: landcover, sensors: [eco] }
+    #   ...or gate on the tide-adjusted water line instead of the static landcover mask:
+    # filter_land_clouds: { threshold_k: 5.0, land_source: water_line, sensors: [eco] }
 
 regions:
   - name: pnw_estuaries

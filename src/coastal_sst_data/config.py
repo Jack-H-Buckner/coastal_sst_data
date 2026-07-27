@@ -378,8 +378,8 @@ class PreprocessSpec(BaseModel):
     `<output_dir>/<output_subdir>/<aoi>.zarr`, leaving the raw cube untouched. It is opt-in
     (`enabled`), so existing runs are unaffected. Each entry in `steps` selects a step from
     the `preprocess.STEPS` registry (e.g. `water_line`, `fill_water`, `filter_clouds`,
-    `filter_cloud_cover`) and carries its per-step options; unknown step keys / options fail
-    loudly at stage time.
+    `filter_cloud_cover`, `filter_land_clouds`) and carries its per-step options; unknown step
+    keys / options fail loudly at stage time.
     """
     model_config = {"extra": "forbid"}
     enabled: bool = False                      # opt-in; nothing runs unless set true

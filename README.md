@@ -380,7 +380,7 @@ product and the "cleaned" modelling product live side by side. Like acquisition 
 registry: each step declares what it reads/writes, and adding one is a single registration (see the
 [developer guide](docs/DEVELOPMENT.md#5b-adding-a-post-assembly-preprocess-step)).
 
-Four steps ship today:
+Five steps ship today:
 
 - **`water_line`** — the tide-adjusted waterline per thermal sensor, at that sensor's overpass. Emits
   `<sensor>_water_elev` (metres relative to the waterline: 0 at it, + exposed, − submerged) and
@@ -409,10 +409,24 @@ Four steps ship today:
   `era5`) picks. Emits a `<sensor>_scene_cloud_pct_<src>` diagnostic and a `<sensor>_sst_<ver>_metcloudfiltered`
   flag. It **composes** with `filter_clouds` — both read the working SST/valid, so their drops union
   regardless of order.
+- **`filter_land_clouds`** — screens cloud-contaminated pixels **over land** against the **near-surface
+  air temperature** (HRRR/ERA5). Over land the thermal-IR surface reads *warmer* than the air by day, so
+  a land pixel far colder than the air is likely cloud: it drops where `airtemp − sst > threshold_k`
+  (default `5.0`; a K difference equals a °C one, so `5` means 5 K ≡ 5 °C regardless of the cube's unit;
+  `≤0` disables). The drop is gated to **land** cells, chosen by `land_source`: **`landcover`** (default)
+  uses the static `landcover_water` mask (land = water == 0), or **`water_line`** uses this sensor's
+  `<sensor>_water_class == exposed` at its overpass (which requires the `water_line` step to be enabled).
+  Air temperature prefers the overpass-matched `<sensor>_airtemp_<src>` over the daily forcing
+  `airtemp_<src>`; `source` (default auto: overpass over forcing, `hrrr` over `era5`) picks. Drops fold
+  into `<sensor>_valid_<ver>` / `<sensor>_sst_<ver>` plus a `<sensor>_sst_<ver>_landcloudfiltered` flag,
+  and compose with the other two filters (all read the working SST/valid). This is the **land**
+  counterpart to `filter_clouds`, which screens **water** against an L4 SST baseline.
 
-The two cloud filters require their inputs to be in the raw cube: `filter_clouds` needs a level-4
+The three cloud filters require their inputs to be in the raw cube: `filter_clouds` needs a level-4
 baseline (`mur` or `cmems`) and the ECOSTRESS SST channels; `filter_cloud_cover` needs a `met` or
-`met_overpass` cloud-cover channel. Where an input is absent the step logs a warning and drops nothing.
+`met_overpass` cloud-cover channel; `filter_land_clouds` needs a `met` / `met_overpass` **air-temp**
+channel and a land source (`landcover`, or the `water_line` step). Where an input is absent the step
+logs a warning and drops nothing.
 
 Enable it in the config (nothing runs otherwise), then run it folded into a `run` or on its own:
 
@@ -428,6 +442,11 @@ preprocess:
     # filter_clouds: { method: sigma, baseline: mur_sst, n_sigma: 3.0, stat_scope: pixel, seasonality: harmonic }
     # Meteorological cloud-cover gate (HRRR/ERA5, %): scene-level + per-pixel.
     filter_cloud_cover: { scene_max_pct: 30, pixel_max_pct: 80, sensors: [eco] }
+    # Over-land screen vs the air temperature (drop where airtemp - sst > threshold_k).
+    filter_land_clouds: { threshold_k: 5.0, land_source: landcover, sensors: [eco] }
+    #   ...or gate on the tide-adjusted water line instead of the static landcover mask
+    #   (needs the water_line step above):
+    # filter_land_clouds: { threshold_k: 5.0, land_source: water_line, sensors: [eco] }
 ```
 
 ```bash
