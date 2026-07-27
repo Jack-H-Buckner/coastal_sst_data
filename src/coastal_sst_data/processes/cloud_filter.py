@@ -28,6 +28,7 @@ auditable.
 from __future__ import annotations
 
 import logging
+from collections import namedtuple
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -46,6 +47,10 @@ _STAT_SCOPES = ("pixel", "pooled")
 _SEASONALITY = ("off", "harmonic")
 _MET_SRC_PREF = ("hrrr", "era5")
 _LAND_SOURCES = ("landcover", "water_line")
+
+# The channel suffixes correct_georef writes and the corrected-pass filters produce.
+_CORR = "_georef_corrected"           # correct_georef's shifted raw fields
+_CLEAN = "_georef_corrected_clean"    # the re-filtered, corrected product (separate channel)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,31 +76,87 @@ def _working(ctx: "PreprocessContext", name: str, *, dims=T3, dtype="float32"):
     return ctx.read(name, dims=dims, dtype=dtype)
 
 
-def _fold_drop(ctx: "PreprocessContext", pre: str, suffix: str, dropped: np.ndarray, *,
+def _working_or(ctx: "PreprocessContext", name: str, seed: str | None = None, *,
+                dims=T3, dtype="float32"):
+    """The working value of `name`, or -- if absent and `seed` is given -- the working value of
+    `seed`. The seed initializes a fresh TARGET channel from its SOURCE the first time it is
+    written (the corrected pass seeds `<...>_clean` from `<...>_georef_corrected`); once the target
+    exists, later filters read it and compose onto it, exactly as the raw filters compose in place."""
+    arr = _working(ctx, name, dims=dims, dtype=dtype)
+    if arr is None and seed is not None:
+        arr = _working(ctx, seed, dims=dims, dtype=dtype)
+    return arr
+
+
+def _resolve_opts(ctx: "PreprocessContext", key: str, base_key: str | None) -> dict:
+    """A step's options, with a corrected-pass variant INHERITING its base filter's config: the
+    base key's bag first, the step's own bag layered on top (so `filter_clouds_corrected: {}` reuses
+    `filter_clouds`'s method/threshold, and any key it sets overrides)."""
+    opts = dict(ctx.step_opts(base_key)) if base_key else {}
+    opts.update(ctx.step_opts(key))
+    return opts
+
+
+# One ECOSTRESS version's channel names for a filter pass. `sst`/`valid` are the read-and-write
+# targets; `cloud` is the native cloud raster (for use_cloud_raster); `flag_base` names the audit
+# flag; `seed_*` initialize a fresh target from its source (corrected pass only).
+_ChannelSet = namedtuple("_ChannelSet", "sst valid cloud flag_base seed_sst seed_valid")
+
+
+def _emitted_channels(ctx: "PreprocessContext", prefix: str, suffix: str) -> list[str]:
+    """Names emitted THIS run (in `ctx.channels`) starting with `prefix` and ending with `suffix`.
+    Needed for the corrected pass because `channels_with_prefix` only sees the RAW cube, and the
+    `_georef_corrected` channels are produced this run by `correct_georef`."""
+    return sorted(n for n in ctx.channels if n.startswith(prefix) and n.endswith(suffix))
+
+
+def _channel_sets(ctx: "PreprocessContext", pre: str, mode: str) -> list[_ChannelSet]:
+    """The channel sets a filter operates on for sensor `pre`.
+
+      * "raw" (default): the raw `<pre>_sst<ver>` channels (from the raw cube), filtered IN PLACE.
+      * "corrected": the `<pre>_sst<ver>_georef_corrected` channels `correct_georef` emitted this
+        run, filtered into a SEPARATE `<pre>_sst<ver>_georef_corrected_clean` product, seeded from
+        the corrected source. The corrected filters compose onto the shared `_clean` target.
+    """
+    if mode == "corrected":
+        sets = []
+        for cor in _emitted_channels(ctx, f"{pre}_sst", _CORR):
+            ver = cor[len(f"{pre}_sst"):-len(_CORR)]            # e.g. "_v002"
+            sets.append(_ChannelSet(
+                sst=f"{pre}_sst{ver}{_CLEAN}", valid=f"{pre}_valid{ver}{_CLEAN}",
+                cloud=f"{pre}_cloud{ver}{_CORR}", flag_base=f"{pre}_sst{ver}{_CLEAN}",
+                seed_sst=f"{pre}_sst{ver}{_CORR}", seed_valid=f"{pre}_valid{ver}{_CORR}"))
+        return sets
+    return [_ChannelSet(sst=sst_name, valid=f"{pre}_valid{sst_name[len(f'{pre}_sst'):]}",
+                        cloud=f"{pre}_cloud{sst_name[len(f'{pre}_sst'):]}", flag_base=sst_name,
+                        seed_sst=None, seed_valid=None)
+            for sst_name in ctx.channels_with_prefix(f"{pre}_sst")]
+
+
+def _fold_drop(ctx: "PreprocessContext", cs: _ChannelSet, dropped: np.ndarray, *,
                flag_suffix: str, mask_sst: bool, attrs: dict) -> None:
-    """Fold a boolean drop mask (T,y,x) into ONE ECOSTRESS version's sst/valid, and emit the
-    companion flag. Reads the WORKING sst/valid (so a second cloud step composes with the first)
-    and re-emits: `<pre>_valid<suffix>` &= ~dropped, `<pre>_sst<suffix>` NaN'd (if mask_sst), and
-    `<pre>_sst<suffix><flag_suffix>` (uint8, 1 = dropped)."""
-    sst_name = f"{pre}_sst{suffix}"
-    valid = _working(ctx, f"{pre}_valid{suffix}", dtype="uint8")
+    """Fold a boolean drop mask (T,y,x) into one channel set's sst/valid, and emit the companion
+    flag. Reads the WORKING sst/valid (seeding from the source on first write, so filters compose)
+    and re-emits: `cs.valid` &= ~dropped, `cs.sst` NaN'd (if mask_sst), and
+    `cs.flag_base<flag_suffix>` (uint8, 1 = dropped)."""
+    valid = _working_or(ctx, cs.valid, cs.seed_valid, dtype="uint8")
     if valid is not None:
-        ctx.emit(f"{pre}_valid{suffix}", T3,
-                 (valid.astype(bool) & ~dropped).astype("uint8"), **attrs)
+        ctx.emit(cs.valid, T3, (valid.astype(bool) & ~dropped).astype("uint8"), **attrs)
     if mask_sst:
-        eco = _working(ctx, sst_name)
+        eco = _working_or(ctx, cs.sst, cs.seed_sst)
         if eco is not None:
             out = eco.copy()
             out[dropped] = np.nan
-            ctx.emit(sst_name, T3, out, **attrs)
-    ctx.emit(f"{sst_name}{flag_suffix}", T3, dropped.astype("uint8"),
+            ctx.emit(cs.sst, T3, out, **attrs)
+    ctx.emit(f"{cs.flag_base}{flag_suffix}", T3, dropped.astype("uint8"),
              flag_values=[0, 1], flag_meanings="kept dropped", **attrs)
 
 
 # --------------------------------------------------------------------------- #
 # Step: filter_clouds -- baseline cold-deviation filter (ported from oceanSR).
 # --------------------------------------------------------------------------- #
-def _step_filter_clouds(ctx: "PreprocessContext") -> None:
+def _step_filter_clouds(ctx: "PreprocessContext", *, key: str = "filter_clouds",
+                        base_key: str | None = None, mode: str = "raw") -> None:
     """Screen ECOSTRESS pixels against a gap-free baseline L4 SST (MUR/CMEMS).
 
     Cloud contamination biases thermal-IR SST COLD, so a pixel far COLDER than the baseline is
@@ -108,7 +169,7 @@ def _step_filter_clouds(ctx: "PreprocessContext") -> None:
         `harmonic`. The stats come from the OBSERVED baseline (never fill_water's invented cells).
     NaN operands are kept. One-sided (cold only).
     """
-    opts = ctx.step_opts("filter_clouds")
+    opts = _resolve_opts(ctx, key, base_key)
     method = str(opts.get("method", "offset")).lower()
     if method not in _CLOUD_METHODS:
         raise ValueError(f"filter_clouds.method {method!r} is invalid; "
@@ -149,9 +210,8 @@ def _step_filter_clouds(ctx: "PreprocessContext") -> None:
 
     emitted = False
     for pre in sensors:
-        for sst_name in ctx.channels_with_prefix(f"{pre}_sst"):
-            suffix = sst_name[len(f"{pre}_sst"):]
-            eco = _working(ctx, sst_name)
+        for cs in _channel_sets(ctx, pre, mode):
+            eco = _working_or(ctx, cs.sst, cs.seed_sst)
             if eco is None:
                 continue
             with np.errstate(invalid="ignore"):
@@ -161,10 +221,10 @@ def _step_filter_clouds(ctx: "PreprocessContext") -> None:
                     dropped = eco < cutoff
             dropped = np.asarray(dropped, bool) & np.isfinite(eco)
             if use_cloud:
-                cloud = ctx.read(f"{pre}_cloud{suffix}", dims=T3)
+                cloud = _working(ctx, cs.cloud, dims=T3)   # corrected pass: the shifted cloud band
                 if cloud is not None:
                     dropped |= np.nan_to_num(cloud, nan=0.0) > 0
-            _fold_drop(ctx, pre, suffix, dropped, flag_suffix="_cloudfiltered",
+            _fold_drop(ctx, cs, dropped, flag_suffix="_cloudfiltered",
                        mask_sst=mask_sst, attrs={"preprocess": note,
                                                  "cloud_baseline": str(baseline_name)})
             emitted = True
@@ -260,7 +320,8 @@ def _baseline_cutoff(ctx: "PreprocessContext", name: str, n_sigma: float,
 # --------------------------------------------------------------------------- #
 # Step: filter_cloud_cover -- meteorological total-cloud-cover gate.
 # --------------------------------------------------------------------------- #
-def _step_filter_cloud_cover(ctx: "PreprocessContext") -> None:
+def _step_filter_cloud_cover(ctx: "PreprocessContext", *, key: str = "filter_cloud_cover",
+                             base_key: str | None = None, mode: str = "raw") -> None:
     """Gate ECOSTRESS on the met total-cloud-cover field (HRRR/ERA5), in PERCENT (0-100).
 
     Two independent gates (a pixel is dropped if EITHER fires):
@@ -272,7 +333,7 @@ def _step_filter_cloud_cover(ctx: "PreprocessContext") -> None:
     (default auto: overpass over forcing, hrrr over era5) picks. Emits an
     `<sensor>_scene_cloud_pct_<src>` (time,) diagnostic. Composes with filter_clouds.
     """
-    opts = ctx.step_opts("filter_cloud_cover")
+    opts = _resolve_opts(ctx, key, base_key)
     sensors = _as_list(opts.get("sensors")) or ["eco"]
     mask_sst = bool(opts.get("mask_sst", True))
     source = opts.get("source")
@@ -301,14 +362,14 @@ def _step_filter_cloud_cover(ctx: "PreprocessContext") -> None:
             with np.errstate(invalid="ignore"):
                 dropped |= np.nan_to_num(tcc, nan=-1.0) > pixel_max
 
-        ctx.emit(f"{pre}_scene_cloud_pct_{src}", ("time",), scene_pct.astype("float32"),
-                 long_name=f"{pre} overpass AOI-mean cloud cover ({src})", units="%")
+        if mode == "raw":                                     # met field isn't shifted -> identical
+            ctx.emit(f"{pre}_scene_cloud_pct_{src}", ("time",), scene_pct.astype("float32"),
+                     long_name=f"{pre} overpass AOI-mean cloud cover ({src})", units="%")
         attrs = {"preprocess": (f"met cloud gate ({src}): "
                                 f"scene>{scene_max}% or pixel>{pixel_max}%"),
                  "cloud_cover_source": str(src)}
-        for sst_name in ctx.channels_with_prefix(f"{pre}_sst"):
-            suffix = sst_name[len(f"{pre}_sst"):]
-            _fold_drop(ctx, pre, suffix, dropped, flag_suffix="_metcloudfiltered",
+        for cs in _channel_sets(ctx, pre, mode):
+            _fold_drop(ctx, cs, dropped, flag_suffix="_metcloudfiltered",
                        mask_sst=mask_sst, attrs=attrs)
         ctx.carry(name)
         emitted = True
@@ -388,7 +449,8 @@ def _land_mask(ctx: "PreprocessContext", pre: str, land_source: str, mask_channe
     return np.nan_to_num(water, nan=1.0) < 0.5
 
 
-def _step_filter_land_clouds(ctx: "PreprocessContext") -> None:
+def _step_filter_land_clouds(ctx: "PreprocessContext", *, key: str = "filter_land_clouds",
+                             base_key: str | None = None, mode: str = "raw") -> None:
     """Screen cloud-contaminated OVER-LAND pixels against the near-surface air temperature.
 
     Over land the thermal-IR surface temperature runs WARMER than the air by day; cloud
@@ -405,7 +467,7 @@ def _step_filter_land_clouds(ctx: "PreprocessContext") -> None:
     fold into `<sensor>_valid_<ver>` / `<sensor>_sst_<ver>` + a `*_landcloudfiltered` flag and
     compose with the other cloud filters (all read the WORKING sst/valid). NaN operands are kept.
     """
-    opts = ctx.step_opts("filter_land_clouds")
+    opts = _resolve_opts(ctx, key, base_key)
     thr = float(opts.get("threshold_k", 5.0))
     sensors = _as_list(opts.get("sensors")) or ["eco"]
     mask_sst = bool(opts.get("mask_sst", True))
@@ -433,16 +495,15 @@ def _step_filter_land_clouds(ctx: "PreprocessContext") -> None:
                         pre, land_source)
             continue
         note = f"land cloud-filtered ({land_source}, {src}): airtemp - sst > {thr}"
-        for sst_name in ctx.channels_with_prefix(f"{pre}_sst"):
-            suffix = sst_name[len(f"{pre}_sst"):]
-            sst = _working(ctx, sst_name)
+        for cs in _channel_sets(ctx, pre, mode):
+            sst = _working_or(ctx, cs.sst, cs.seed_sst)
             if sst is None:
                 continue
             with np.errstate(invalid="ignore"):
                 dropped = (air - sst) > thr
             dropped = (np.asarray(dropped, bool)
                        & np.isfinite(sst) & np.isfinite(air) & land)
-            _fold_drop(ctx, pre, suffix, dropped, flag_suffix="_landcloudfiltered",
+            _fold_drop(ctx, cs, dropped, flag_suffix="_landcloudfiltered",
                        mask_sst=mask_sst, attrs={"preprocess": note,
                                                  "airtemp_source": str(src),
                                                  "land_source": land_source})

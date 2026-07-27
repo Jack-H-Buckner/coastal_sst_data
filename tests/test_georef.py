@@ -248,3 +248,126 @@ def test_region_override_rejects_unknown_option():
     eff = preprocess._build_eff(proj)
     with pytest.raises(ValueError, match="not a recognised option"):
         preprocess._check_step_options(eff)
+
+
+# --------------------------------------------------------------------------- #
+# RE-RUN the cloud filters on the corrected geometry (*_corrected step variants)
+# --------------------------------------------------------------------------- #
+# Water is 280 K (so it never trips the cold-deviation gate against a 280 K MUR baseline); land is
+# 290 K. Anomalies are painted AFTER, at known cells, so a filter's drop is unambiguous.
+_WATER_K, _LAND_K = 280.0, 290.0
+
+
+def _cloud_cube(g, *, water_anom=None, land_anom=None, mur=280.0, airtemp=None):
+    """A single well-registered scene (-> `ok`, corrected verbatim) with optional painted anomalies.
+    `water_anom`/`land_anom` = (value, (row, col-slice)); `airtemp` adds an `airtemp_hrrr` channel."""
+    H, W = g.height, g.width
+    water = _disk_water(H, W)
+    sst = np.where(water, _WATER_K, _LAND_K).astype("float32")
+    if water_anom is not None:
+        v, (r, cs) = water_anom; sst[r, cs] = v
+    if land_anom is not None:
+        v, (r, c) = land_anom; sst[r, c] = v
+    ch = dict(eco_sst_v002=sst[None], eco_valid_v002=_ones_valid(1, H, W),
+              landcover_water=water.astype("uint8"),
+              mur_sst=np.full((1, H, W), mur, "float32"))
+    if airtemp is not None:
+        ch["airtemp_hrrr"] = np.full((1, H, W), airtemp, "float32")
+    return _hand_cube(g, pd.date_range("2026-06-01", periods=1), **ch), water
+
+
+def test_corrected_refilter_writes_separate_clean_channel(tmp_path):
+    proj, g = _setup(tmp_path, {"flag_georef": _flag_opts(), "correct_georef": None,
+                                "filter_clouds_corrected": {"method": "offset",
+                                                            "baseline": "mur_sst",
+                                                            "threshold_k": 5.0}})
+    r, cs = g.height // 2, slice(g.width // 2 - 2, g.width // 2 + 2)
+    cube, _ = _cloud_cube(g, water_anom=(272.0, (r, cs)))     # 8 K below MUR -> cloud
+    ds = _pp(proj, g, cube)
+
+    assert ds["eco_georef_applied"].values[0] == 0           # aligned scene -> corrected verbatim
+    corr = ds["eco_sst_v002_georef_corrected"].isel(time=0).values
+    clean = ds["eco_sst_v002_georef_corrected_clean"].isel(time=0).values
+    flag = ds["eco_sst_v002_georef_corrected_clean_cloudfiltered"].isel(time=0).values
+
+    # The corrected-but-unfiltered channel keeps the anomaly; the clean channel removes it.
+    assert np.all(corr[r, cs] == 272.0)
+    assert np.all(np.isnan(clean[r, cs])) and np.all(flag[r, cs] == 1)
+    # Everywhere the filter did not drop, clean == corrected (it seeds from it).
+    keep = flag == 0
+    np.testing.assert_array_equal(np.nan_to_num(clean, nan=-9e9)[keep],
+                                  np.nan_to_num(corr, nan=-9e9)[keep])
+    assert ds["eco_sst_v002_georef_corrected_clean"].dtype == np.float32
+    assert ds["eco_valid_v002_georef_corrected_clean"].dtype == np.uint8
+    assert (ds["eco_valid_v002_georef_corrected_clean"].isel(time=0).values[r, cs] == 0).all()
+
+
+def test_corrected_filter_inherits_base_config(tmp_path):
+    # Base threshold 3 K; a 4 K anomaly. Inherited -> dropped; the default (5) would NOT drop it,
+    # so a drop proves `filter_clouds_corrected: {}` picked up the base config.
+    proj, g = _setup(tmp_path, {
+        "filter_clouds": {"method": "offset", "baseline": "mur_sst", "threshold_k": 3.0},
+        "flag_georef": _flag_opts(), "correct_georef": None, "filter_clouds_corrected": {}})
+    r, cs = g.height // 2, slice(g.width // 2 - 2, g.width // 2 + 2)
+    cube, _ = _cloud_cube(g, water_anom=(276.0, (r, cs)))     # 4 K below MUR
+    ds = _pp(proj, g, cube)
+    clean = ds["eco_sst_v002_georef_corrected_clean"].isel(time=0).values
+    assert np.all(np.isnan(clean[r, cs]))                    # inherited threshold_k=3 dropped it
+
+
+def test_corrected_filter_override_wins_over_base(tmp_path):
+    # Same 4 K anomaly, but the corrected pass overrides threshold to 5 -> NOT dropped in clean.
+    proj, g = _setup(tmp_path, {
+        "filter_clouds": {"method": "offset", "baseline": "mur_sst", "threshold_k": 3.0},
+        "flag_georef": _flag_opts(), "correct_georef": None,
+        "filter_clouds_corrected": {"threshold_k": 5.0}})
+    r, cs = g.height // 2, slice(g.width // 2 - 2, g.width // 2 + 2)
+    cube, _ = _cloud_cube(g, water_anom=(276.0, (r, cs)))
+    ds = _pp(proj, g, cube)
+    clean = ds["eco_sst_v002_georef_corrected_clean"].isel(time=0).values
+    assert np.all(np.isfinite(clean[r, cs]))                 # override 5 K > 4 K -> kept
+
+
+def test_corrected_filters_compose_on_clean_channel(tmp_path):
+    # A cold-water cloud (filter_clouds_corrected) AND a cold-land cloud (filter_land_clouds_corrected)
+    # both fold into the SAME clean channel, each leaving its own audit flag.
+    proj, g = _setup(tmp_path, {
+        "flag_georef": _flag_opts(), "correct_georef": None,
+        "filter_clouds_corrected": {"method": "offset", "baseline": "mur_sst", "threshold_k": 5.0},
+        "filter_land_clouds_corrected": {"threshold_k": 5.0, "land_source": "landcover"}})
+    r, cs = g.height // 2, slice(g.width // 2 - 2, g.width // 2 + 2)
+    cube, water = _cloud_cube(g, water_anom=(272.0, (r, cs)),
+                              land_anom=(283.0, (2, 2)), airtemp=290.0)   # land cell (2,2) cold
+    assert not water[2, 2]                                    # (2,2) really is land
+    ds = _pp(proj, g, cube)
+
+    clean = ds["eco_sst_v002_georef_corrected_clean"].isel(time=0).values
+    cloud_flag = ds["eco_sst_v002_georef_corrected_clean_cloudfiltered"].isel(time=0).values
+    land_flag = ds["eco_sst_v002_georef_corrected_clean_landcloudfiltered"].isel(time=0).values
+    assert np.all(cloud_flag[r, cs] == 1) and land_flag[2, 2] == 1     # each filter's own flag
+    assert np.all(np.isnan(clean[r, cs])) and np.isnan(clean[2, 2])    # union folded into clean
+
+
+def test_corrected_pipeline_end_to_end_write_path(tmp_path):
+    # Through preprocess() (assemble + zarr write), assert both channels land with right dtypes.
+    from coastal_sst_data import grid as _grid
+    from coastal_sst_data.processes import datacube
+    from tests.test_preprocess import _project, _write_full_fixture, AOI
+    proj = _project(tmp_path, steps={
+        "fill_water": None, "filter_clouds": None,
+        "flag_georef": {"min_edges": 10, "min_coast_obs": 5, "min_valid_pct": 0.0,
+                        "tol_m": 100, "max_shift_m": 1500, "stability_windows_km": [0.5, 1.0]},
+        "correct_georef": None, "filter_clouds_corrected": {}})
+    grids = _grid.project_grids(proj); g = grids[AOI]
+    days = pd.date_range(proj.time.start_date, proj.time.end_date, freq="D")
+    _write_full_fixture(proj, g, days)
+    datacube.assemble(proj, grids=grids)
+    rep = preprocess.preprocess(proj, grids=grids)
+    assert rep.written == 1
+
+    import xarray as xr
+    ds = xr.open_zarr(proj.output_dir / "preprocessed" / f"{AOI}.zarr")
+    corrected = [v for v in ds.data_vars if v.endswith("_georef_corrected")]
+    clean = [v for v in ds.data_vars if v.endswith("_georef_corrected_clean")]
+    assert corrected and clean                               # both stages materialised
+    assert ds["eco_sst_v002_georef_corrected_clean"].dtype == np.float32

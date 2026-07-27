@@ -224,3 +224,30 @@ Port the prototype self-tests (`_sign_test`, `self_test` shift recovery, gate ab
    07-09/07-01/06-05 → skipped by the gates.
 8. End-to-end: `coastal-sst-data preprocess --config <cfg> --aoi <one> --overwrite`, then
    `pytest tests/test_preprocess.py`.
+
+## Follow-on: re-filtering the corrected geometry (implemented)
+
+`correct_georef` shifts the **raw** (unfiltered) SST, so `<pre>_sst<ver>_georef_corrected` still
+contains clouds — and the pre-fit cloud-filter pass compared misregistered pixels against
+MUR/met/landcover. The correct clean product comes from **re-running the same filters on the
+corrected geometry**, not from shifting the stale drops. Implemented as three corrected-pass step
+variants that reuse the existing filter math:
+
+- **`cloud_filter.py`** — the drop math was already channel-agnostic; a channel-binding seam
+  (`_ChannelSet` / `_channel_sets(ctx, pre, mode)` / `_working_or` / `_emitted_channels`) and a
+  rewritten `_fold_drop` let each `_step_*(ctx, *, key, base_key, mode)` run against either the raw
+  `<pre>_sst<ver>` channels (`mode="raw"`, unchanged) or the emitted
+  `<pre>_sst<ver>_georef_corrected` channels (`mode="corrected"`), writing a **separate**
+  `<pre>_sst<ver>_georef_corrected_clean` product seeded from the corrected source.
+- **`preprocess.py`** — `filter_clouds_corrected` / `filter_cloud_cover_corrected` /
+  `filter_land_clouds_corrected`, registered via `functools.partial(..., base_key="filter_*",
+  mode="corrected")`, `depends_on` `correct_georef` (+ each other, mirroring the raw order). Each
+  **inherits** its base filter's config (`_resolve_opts` layers the step's own bag over the base
+  key's), so `filter_clouds_corrected: {}` reuses `filter_clouds`. Shared `option_keys` constants
+  (`_CLOUDS_OPTS` / `_CLOUD_COVER_OPTS` / `_LAND_OPTS`) keep the raw and corrected surfaces in lockstep.
+- **Provenance** — the `_clean` channels contain `"georef"`, so the existing branch maps them to
+  `[sensor, "landcover"]`; the baselines ride the step `provenance_inputs`.
+- **`use_cloud_raster` caveat** — set `correct_georef: { fields: [sst, valid, cloud] }` so the native
+  cloud band is shifted too; the corrected filter reads `<pre>_cloud<ver>_georef_corrected`.
+- Tested in `tests/test_georef.py` (re-filter + separate-channel, config inheritance + override,
+  multi-filter composition on the shared `_clean` channel, end-to-end write path).

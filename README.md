@@ -380,7 +380,7 @@ product and the "cleaned" modelling product live side by side. Like acquisition 
 registry: each step declares what it reads/writes, and adding one is a single registration (see the
 [developer guide](docs/DEVELOPMENT.md#5b-adding-a-post-assembly-preprocess-step)).
 
-Seven steps ship today:
+Ten steps ship today:
 
 - **`water_line`** — the tide-adjusted waterline per thermal sensor, at that sensor's overpass. Emits
   `<sensor>_water_elev` (metres relative to the waterline: 0 at it, + exposed, − submerged) and
@@ -442,6 +442,18 @@ Seven steps ship today:
   fabricate a coastline on the far edge); the vacated margin is **NaN-filled** for SST (`0` for masks).
   A `<sensor>_georef_applied` flag (`1 = shifted`) marks which scenes were moved, and non-displaced
   scenes are copied verbatim, so `<field>_georef_corrected` is a complete drop-in replacement.
+- **`filter_clouds_corrected`** / **`filter_cloud_cover_corrected`** / **`filter_land_clouds_corrected`**
+  — **re-run the cloud filters on the corrected geometry.** `correct_georef` shifts the *raw*
+  (unfiltered) SST, so `<pre>_sst<ver>_georef_corrected` still contains clouds; and the pre-fit filter
+  pass compared ECOSTRESS pixel-by-pixel against MUR/met/landcover while the scene was *misregistered*,
+  so those comparisons were wrong at the coast. Each corrected step reuses its base filter's **exact
+  math and config** (it **inherits** `filter_clouds` / `filter_cloud_cover` / `filter_land_clouds` —
+  list it empty, `{}`, or override any key) against the corrected channels, writing a **separate clean
+  product** `<pre>_sst<ver>_georef_corrected_clean` (+ `<pre>_valid<ver>_georef_corrected_clean` and
+  `..._georef_corrected_clean_{cloud,metcloud,landcloud}filtered` audit flags). They compose with each
+  other exactly like the raw filters, and leave `<pre>_sst<ver>_georef_corrected` intact so each stage
+  stays inspectable. Re-running the masking on the corrected geometry (rather than shifting the stale
+  drops) is the whole point — the clean channel is the correctly-georeferenced, cloud-screened product.
 
 The three cloud filters require their inputs to be in the raw cube: `filter_clouds` needs a level-4
 baseline (`mur` or `cmems`) and the ECOSTRESS SST channels; `filter_cloud_cover` needs a `met` or
@@ -473,6 +485,9 @@ preprocess:
     flag_georef: { sensors: [eco], tol_m: 200, max_shift_m: 10000, min_coast_obs: 500, min_edges: 300 }
     # Apply the fitted shift to the RAW ECOSTRESS SST + validity (displaced scenes only).
     correct_georef: { sensors: [eco], fields: [sst, valid] }
+    # Re-run the cloud filters on the corrected geometry -> *_georef_corrected_clean.
+    filter_clouds_corrected: {}          # inherits filter_clouds config (override any key here)
+    filter_land_clouds_corrected: {}     # inherits filter_land_clouds config
 ```
 
 **`flag_georef` parameters** (defaults shown; every key is optional):
@@ -514,6 +529,10 @@ regions:
       flag_georef: { min_coast_obs: 1500 }     # denser coastline than the project default
     areas: [ ... ]
 ```
+
+The corrected-pass filters shift only what `correct_georef` shifts. If `filter_clouds.use_cloud_raster`
+is on (it also drops on the native `<pre>_cloud<ver>` band), that band must be shifted too, so add it
+to `correct_georef`: `correct_georef: { fields: [sst, valid, cloud] }`.
 
 ```bash
 coastal-sst-data run --config config.yaml --assemble --preprocess   # acquire, assemble, preprocess

@@ -56,6 +56,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from difflib import get_close_matches
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -371,6 +372,14 @@ def _fill_channels(ctx: PreprocessContext, sources) -> list[str]:
 # The registry. Declaration order is the tie-break for the topological sort (see
 # `_topo_order`); it is NOT the run order, which honours `depends_on`.
 # --------------------------------------------------------------------------- #
+# Shared by each cloud filter and its corrected-pass variant, so their option surfaces can't drift.
+_CLOUDS_OPTS = frozenset({"method", "threshold_k", "n_sigma", "baseline", "stat_scope",
+                          "seasonality", "sensors", "mask_sst", "use_cloud_raster"})
+_CLOUD_COVER_OPTS = frozenset({"source", "scene_max_pct", "pixel_max_pct", "sensors",
+                               "mask_sst", "water_mask_channel"})
+_LAND_OPTS = frozenset({"threshold_k", "source", "land_source", "mask_channel",
+                        "sensors", "mask_sst"})
+
 STEPS: tuple[PreprocessStep, ...] = (
     PreprocessStep(
         key="water_line",
@@ -393,8 +402,7 @@ STEPS: tuple[PreprocessStep, ...] = (
         writes=("_sst", "_valid", "_cloudfiltered"),
         fn=_step_filter_clouds,
         depends_on=("fill_water",),        # so offset mode sees the gap-filled baseline
-        option_keys=frozenset({"method", "threshold_k", "n_sigma", "baseline", "stat_scope",
-                               "seasonality", "sensors", "mask_sst", "use_cloud_raster"}),
+        option_keys=_CLOUDS_OPTS,
         provenance_inputs=("ecostress", "mur"),
     ),
     PreprocessStep(
@@ -403,8 +411,7 @@ STEPS: tuple[PreprocessStep, ...] = (
         writes=("_sst", "_valid", "_metcloudfiltered", "_scene_cloud_pct"),
         fn=_step_filter_cloud_cover,
         depends_on=("filter_clouds",),     # deterministic order; drops compose via `_working`
-        option_keys=frozenset({"source", "scene_max_pct", "pixel_max_pct", "sensors",
-                               "mask_sst", "water_mask_channel"}),
+        option_keys=_CLOUD_COVER_OPTS,
         provenance_inputs=("met_overpass", "met", "ecostress"),
     ),
     PreprocessStep(
@@ -417,8 +424,7 @@ STEPS: tuple[PreprocessStep, ...] = (
         # cloud filters (deterministic order; every filter's drops union via `_working`). A
         # depends_on to an UNSELECTED step is ignored, so none of these are pulled in implicitly.
         depends_on=("water_line", "filter_clouds", "filter_cloud_cover"),
-        option_keys=frozenset({"threshold_k", "source", "land_source", "mask_channel",
-                               "sensors", "mask_sst"}),
+        option_keys=_LAND_OPTS,
         provenance_inputs=("met_overpass", "met", "ecostress"),
     ),
     PreprocessStep(
@@ -445,6 +451,40 @@ STEPS: tuple[PreprocessStep, ...] = (
         depends_on=("flag_georef",),        # applies the (dy,dx) flag_georef stored this run
         option_keys=frozenset({"sensors", "fields", "fill"}),
         provenance_inputs=("ecostress", "landcover"),
+    ),
+    # Re-run the cloud filters on the CORRECTED geometry (the pre-fit pass compared misregistered
+    # pixels). Each reuses its base filter's math + config (base_key), reads the `_georef_corrected`
+    # channels and writes a SEPARATE `_georef_corrected_clean` product, composing among themselves.
+    PreprocessStep(
+        key="filter_clouds_corrected",
+        reads=("_georef_corrected", "mur_sst", "cmems_"),
+        writes=("_georef_corrected_clean", "_cloudfiltered"),
+        fn=partial(_step_filter_clouds, key="filter_clouds_corrected",
+                   base_key="filter_clouds", mode="corrected"),
+        depends_on=("correct_georef",),
+        option_keys=_CLOUDS_OPTS,
+        provenance_inputs=("ecostress", "landcover", "mur"),
+    ),
+    PreprocessStep(
+        key="filter_cloud_cover_corrected",
+        reads=("eco_cloud_cover_", "cloud_cover_", "_georef_corrected", "landcover_water"),
+        writes=("_georef_corrected_clean", "_metcloudfiltered"),
+        fn=partial(_step_filter_cloud_cover, key="filter_cloud_cover_corrected",
+                   base_key="filter_cloud_cover", mode="corrected"),
+        depends_on=("correct_georef", "filter_clouds_corrected"),
+        option_keys=_CLOUD_COVER_OPTS,
+        provenance_inputs=("met_overpass", "met", "ecostress", "landcover"),
+    ),
+    PreprocessStep(
+        key="filter_land_clouds_corrected",
+        reads=("_georef_corrected", "eco_airtemp_", "airtemp_", "landcover_water", "_water_class"),
+        writes=("_georef_corrected_clean", "_landcloudfiltered"),
+        fn=partial(_step_filter_land_clouds, key="filter_land_clouds_corrected",
+                   base_key="filter_land_clouds", mode="corrected"),
+        depends_on=("correct_georef", "filter_clouds_corrected", "filter_cloud_cover_corrected",
+                    "water_line"),
+        option_keys=_LAND_OPTS,
+        provenance_inputs=("met_overpass", "met", "ecostress", "landcover"),
     ),
 )
 
