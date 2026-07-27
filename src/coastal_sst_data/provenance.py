@@ -197,6 +197,13 @@ def field_inputs(name: str) -> list[str]:
     if m:
         pre, rest = m.group(1), m.group(2)
         sensor = SENSORS[pre]
+        # POST-ASSEMBLY georeferencing (preprocess.flag_georef / correct_georef): the diagnostics
+        # `<sensor>_georef_*` and the corrected fields `<sensor>_<field>_georef_corrected`. The fit
+        # registers the thermal scene against the landcover coastline, so a DERIVED channel names
+        # BOTH inputs. Checked FIRST so `<sensor>_sst_<ver>_georef_corrected` is not mistaken for a
+        # plain `sst` channel by the base-token test below.
+        if "georef" in rest:
+            return [sensor, "landcover"]
         # The sensor's own DATA channels: `<pre>_sst`/`_cloud`/`_valid`/`_hour`, and -- for a
         # STACKED-DATA sensor (ECOSTRESS) -- their per-version forms `<pre>_sst_v002`, etc. The
         # exact source tag is narrowed later in `build` via sources_by_tag, so here it is enough
