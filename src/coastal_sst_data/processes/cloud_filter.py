@@ -15,10 +15,14 @@ the `PreprocessContext` it is handed -- so there is no import cycle.
                           (`eco < mean - n_sigma*sigma` from the baseline's own climatology).
   * filter_cloud_cover  -- gate on the meteorological total-cloud-cover field (HRRR/ERA5, in
                           percent): a scene-level rejection AND a per-pixel cutoff.
+  * filter_land_clouds  -- screen OVER-LAND pixels against the near-surface air temperature
+                          (HRRR/ERA5): drop where `airtemp - sst > threshold_k` on cells the
+                          land mask (landcover) or the tide-adjusted water line marks as land.
 
-Both mutate the SAME sst/valid channels, so they read the WORKING value (`_working`: a channel
-already emitted this run wins over the raw cube) and their drops UNION regardless of run order;
-the emitted `*_cloudfiltered` / `*_metcloudfiltered` flags keep each drop auditable.
+All three mutate the SAME sst/valid channels, so they read the WORKING value (`_working`: a channel
+already emitted this run wins over the raw cube) and their drops UNION regardless of run order; the
+emitted `*_cloudfiltered` / `*_metcloudfiltered` / `*_landcloudfiltered` flags keep each drop
+auditable.
 """
 
 from __future__ import annotations
@@ -27,6 +31,8 @@ import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
+
+from .water_level import EXPOSED         # land classification for the over-land air-temp filter
 
 if TYPE_CHECKING:                          # avoid an import cycle: only a type hint needs it
     from .preprocess import PreprocessContext
@@ -39,6 +45,7 @@ _CLOUD_METHODS = ("offset", "sigma")
 _STAT_SCOPES = ("pixel", "pooled")
 _SEASONALITY = ("off", "harmonic")
 _MET_SRC_PREF = ("hrrr", "era5")
+_LAND_SOURCES = ("landcover", "water_line")
 
 
 # --------------------------------------------------------------------------- #
@@ -317,14 +324,15 @@ def _gate_threshold(v):
     return None if v >= 100 else v
 
 
-def _met_cloud_channel(ctx: "PreprocessContext", pre: str, source):
-    """The met cloud-cover array for a sensor, preferring the overpass channel
-    `<pre>_cloud_cover_<src>` over the daily forcing `cloud_cover_<src>`, and (when `source` is
-    unset) hrrr over era5. Returns (arr (T,y,x), src_tag, channel_name) or (None, None, None)."""
-    overpass = {n[len(f"{pre}_cloud_cover_"):]: n
-                for n in ctx.channels_with_prefix(f"{pre}_cloud_cover_")}
-    forcing = {n[len("cloud_cover_"):]: n
-               for n in ctx.channels_with_prefix("cloud_cover_")}
+def _met_var_channel(ctx: "PreprocessContext", pre: str, source, var: str):
+    """The met `<var>` array for a sensor, preferring the overpass channel `<pre>_<var>_<src>`
+    over the daily forcing `<var>_<src>`, and (when `source` is unset) hrrr over era5. Returns
+    (arr (T,y,x), src_tag, channel_name) or (None, None, None). `var` is a met field root,
+    e.g. `cloud_cover` (percent) or `airtemp` (harmonized to the cube's K/degC)."""
+    overpass = {n[len(f"{pre}_{var}_"):]: n
+                for n in ctx.channels_with_prefix(f"{pre}_{var}_")}
+    forcing = {n[len(f"{var}_"):]: n
+               for n in ctx.channels_with_prefix(f"{var}_")}
     if source is not None:
         order = [source]
     else:
@@ -340,6 +348,11 @@ def _met_cloud_channel(ctx: "PreprocessContext", pre: str, source):
     return None, None, None
 
 
+def _met_cloud_channel(ctx: "PreprocessContext", pre: str, source):
+    """The met total-cloud-cover array for a sensor (see `_met_var_channel`)."""
+    return _met_var_channel(ctx, pre, source, "cloud_cover")
+
+
 def _scene_mean(tcc: np.ndarray, water) -> np.ndarray:
     """AOI spatial mean of the cloud field per time slice, over water cells (else all finite).
     Slices with no finite cell -> NaN (a day with no overpass), which never trips a gate."""
@@ -351,3 +364,91 @@ def _scene_mean(tcc: np.ndarray, water) -> np.ndarray:
     with np.errstate(invalid="ignore", divide="ignore"):
         out = np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Step: filter_land_clouds -- over-land air-temperature deviation filter.
+# --------------------------------------------------------------------------- #
+def _land_mask(ctx: "PreprocessContext", pre: str, land_source: str, mask_channel: str):
+    """A boolean LAND mask for a sensor -- `(y,x)` for `landcover`, `(T,y,x)` for `water_line`
+    (both broadcast against a `(T,y,x)` drop mask). None if the chosen source is absent.
+
+      * `landcover` -- the static land/water mask (land = `mask_channel` == 0). A NaN (unknown)
+        cell stays NOT-land, so an unknown mask never licenses a drop.
+      * `water_line` -- this sensor's `<pre>_water_class` == EXPOSED at its overpass (the
+        `water_line` step's output; per-day, since it tracks the tide). SUBMERGED / UNKNOWN
+        cells are not land.
+    """
+    if land_source == "water_line":
+        wc = _working(ctx, f"{pre}_water_class", dtype="uint8")
+        return None if wc is None else (wc == EXPOSED)
+    water = ctx.read(mask_channel, dims=("y", "x"))
+    if water is None:
+        return None
+    return np.nan_to_num(water, nan=1.0) < 0.5
+
+
+def _step_filter_land_clouds(ctx: "PreprocessContext") -> None:
+    """Screen cloud-contaminated OVER-LAND pixels against the near-surface air temperature.
+
+    Over land the thermal-IR surface temperature runs WARMER than the air by day; cloud
+    contamination biases it COLD, so a land pixel far colder than the air temperature is likely
+    cloud. Drop where `airtemp - sst > threshold_k` (`threshold_k` default 5.0; both operands are
+    the cube's harmonized temperature unit, and a K difference equals a degC one, so `5` means 5
+    K == 5 degC regardless; `<=0` disables). The drop applies only where the land mask marks the
+    cell as land (`land_source`):
+      * "landcover" (default): the static `landcover_water` mask (land = water == 0);
+      * "water_line": this sensor's `<pre>_water_class` == EXPOSED at its overpass -- needs the
+        `water_line` step enabled.
+    Air temperature prefers the overpass-matched `<pre>_airtemp_<src>` over the daily forcing
+    `airtemp_<src>`; `source` (default auto: overpass over forcing, hrrr over era5) picks. Drops
+    fold into `<sensor>_valid_<ver>` / `<sensor>_sst_<ver>` + a `*_landcloudfiltered` flag and
+    compose with the other cloud filters (all read the WORKING sst/valid). NaN operands are kept.
+    """
+    opts = ctx.step_opts("filter_land_clouds")
+    thr = float(opts.get("threshold_k", 5.0))
+    sensors = _as_list(opts.get("sensors")) or ["eco"]
+    mask_sst = bool(opts.get("mask_sst", True))
+    source = opts.get("source")
+    land_source = str(opts.get("land_source", "landcover")).lower()
+    mask_channel = opts.get("mask_channel", "landcover_water")
+    if land_source not in _LAND_SOURCES:
+        raise ValueError(f"filter_land_clouds.land_source {land_source!r} is invalid; "
+                         f"choose one of {list(_LAND_SOURCES)}")
+    if thr <= 0:
+        log.info("  filter_land_clouds: threshold_k<=0 -> disabled; nothing filtered")
+        return
+
+    emitted = False
+    for pre in sensors:
+        air, src, air_name = _met_var_channel(ctx, pre, source, "airtemp")
+        if air is None:
+            log.warning("  filter_land_clouds: no air-temp channel for sensor %r (source=%s); "
+                        "skipping (met not acquired?)", pre, source or "auto")
+            continue
+        land = _land_mask(ctx, pre, land_source, mask_channel)
+        if land is None:
+            log.warning("  filter_land_clouds: no land mask for sensor %r (land_source=%s); "
+                        "skipping (enable the water_line step, or acquire landcover)",
+                        pre, land_source)
+            continue
+        note = f"land cloud-filtered ({land_source}, {src}): airtemp - sst > {thr}"
+        for sst_name in ctx.channels_with_prefix(f"{pre}_sst"):
+            suffix = sst_name[len(f"{pre}_sst"):]
+            sst = _working(ctx, sst_name)
+            if sst is None:
+                continue
+            with np.errstate(invalid="ignore"):
+                dropped = (air - sst) > thr
+            dropped = (np.asarray(dropped, bool)
+                       & np.isfinite(sst) & np.isfinite(air) & land)
+            _fold_drop(ctx, pre, suffix, dropped, flag_suffix="_landcloudfiltered",
+                       mask_sst=mask_sst, attrs={"preprocess": note,
+                                                 "airtemp_source": str(src),
+                                                 "land_source": land_source})
+            emitted = True
+        ctx.carry(air_name)
+        if land_source == "landcover":
+            ctx.carry(mask_channel)
+    if not emitted:
+        log.info("  filter_land_clouds: nothing filtered")

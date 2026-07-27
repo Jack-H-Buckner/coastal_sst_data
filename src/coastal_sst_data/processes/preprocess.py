@@ -34,6 +34,10 @@ pushed downstream -- D6/D7/D12):
                     a scene-level rejection and a per-pixel cutoff, with a `*_metcloudfiltered`
                     flag and a `<sensor>_scene_cloud_pct_<src>` diagnostic. Composes with
                     filter_clouds (both read the WORKING sst/valid, so drops union).
+  * filter_land_clouds -- screen OVER-LAND pixels against the near-surface air temperature
+                    (HRRR/ERA5): drop where `airtemp - sst > threshold_k` on cells the landcover
+                    mask or the `water_line` step's tide-adjusted water line marks as land. Folds
+                    into `<sensor>_valid_<ver>`/`<sensor>_sst_<ver>` + a `*_landcloudfiltered` flag.
 
 The derived cube is self-describing: alongside each derived channel it carries the specific
 raw inputs it was built from (the DEM elevation + its datum attrs, the water mask, the tide /
@@ -63,7 +67,8 @@ from ..config import Project
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, products, provenance, report, store
 from . import datacube, water_level
-from .cloud_filter import _step_filter_clouds, _step_filter_cloud_cover
+from .cloud_filter import (_step_filter_clouds, _step_filter_cloud_cover,
+                           _step_filter_land_clouds)
 from .datacube import build_encoding, write_zarr_safe
 from .water_level import EXPOSED, SUBMERGED, UNKNOWN
 
@@ -393,6 +398,20 @@ STEPS: tuple[PreprocessStep, ...] = (
         depends_on=("filter_clouds",),     # deterministic order; drops compose via `_working`
         option_keys=frozenset({"source", "scene_max_pct", "pixel_max_pct", "sensors",
                                "mask_sst", "water_mask_channel"}),
+        provenance_inputs=("met_overpass", "met", "ecostress"),
+    ),
+    PreprocessStep(
+        key="filter_land_clouds",
+        reads=("eco_sst", "eco_valid", "eco_airtemp_", "airtemp_",
+               "landcover_water", "_water_class"),
+        writes=("_sst", "_valid", "_landcloudfiltered"),
+        fn=_step_filter_land_clouds,
+        # after water_line (its `<pre>_water_class` feeds land_source=water_line) and the other
+        # cloud filters (deterministic order; every filter's drops union via `_working`). A
+        # depends_on to an UNSELECTED step is ignored, so none of these are pulled in implicitly.
+        depends_on=("water_line", "filter_clouds", "filter_cloud_cover"),
+        option_keys=frozenset({"threshold_k", "source", "land_source", "mask_channel",
+                               "sensors", "mask_sst"}),
         provenance_inputs=("met_overpass", "met", "ecostress"),
     ),
 )

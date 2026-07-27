@@ -431,6 +431,87 @@ def test_cloud_filters_compose(tmp_path):
     assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values[:, 3] == 0).all()
 
 
+# ---- filter_land_clouds: over-land air-temperature deviation ------------------------------- #
+def test_filter_land_clouds_drops_cold_land_pixels(tmp_path):
+    """Over land (landcover), a pixel far COLDER than the air temp is dropped; a warm land pixel
+    is kept. Condition: airtemp - sst > threshold_k (default 5 K)."""
+    proj, g = _setup(tmp_path, {"filter_land_clouds": None})
+    H, W = g.height, g.width
+    eco = np.full((1, H, W), 300.0, "float32")
+    eco[0, :, 5] = 287.0                                      # air(295) - 287 = 8 K > 5 -> cloud
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
+                      eco_airtemp_hrrr=np.full((1, H, W), 295.0, "float32"),
+                      landcover_water=np.zeros((H, W), "float32"))   # all LAND
+    ds = _pp(proj, g, cube)
+    flag = ds["eco_sst_v002_landcloudfiltered"].isel(time=0).values
+    assert (flag[:, 5] == 1).all() and flag.sum() == H       # only column 5 dropped
+    assert np.isnan(ds["eco_sst_v002"].isel(time=0).values[:, 5]).all()
+    assert (ds["eco_valid_v002"].isel(time=0).values[:, 5] == 0).all()
+    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 6]).all()
+    assert ds["eco_sst_v002_landcloudfiltered"].dtype == np.uint8
+
+
+def test_filter_land_clouds_leaves_water_pixels_alone(tmp_path):
+    """The SAME cold anomaly over WATER (landcover_water==1) is NOT dropped -- the land gate is
+    exactly what separates this from the SST-baseline filter."""
+    proj, g = _setup(tmp_path, {"filter_land_clouds": None})
+    H, W = g.height, g.width
+    eco = np.full((1, H, W), 300.0, "float32"); eco[0, :, 5] = 287.0
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
+                      eco_airtemp_hrrr=np.full((1, H, W), 295.0, "float32"),
+                      landcover_water=np.ones((H, W), "float32"))    # all WATER
+    ds = _pp(proj, g, cube)
+    assert (ds["eco_sst_v002_landcloudfiltered"].isel(time=0).values == 0).all()
+    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 5]).all()
+
+
+def test_filter_land_clouds_water_line_source(tmp_path):
+    """land_source=water_line gates on `<pre>_water_class`==EXPOSED. Inject the class directly (it
+    is what the water_line step emits) so a cold EXPOSED cell drops and a cold SUBMERGED one is
+    kept -- the filter reads it through the WORKING channel."""
+    proj, g = _setup(tmp_path, {"filter_land_clouds": {"land_source": "water_line"}})
+    H, W = g.height, g.width
+    eco = np.full((1, H, W), 300.0, "float32")
+    eco[0, :, 5] = 287.0; eco[0, :, 6] = 287.0               # both cold
+    wc = np.full((1, H, W), SUBMERGED, "uint8"); wc[0, :, 5] = EXPOSED    # col 5 land, col 6 water
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
+                      eco_airtemp_hrrr=np.full((1, H, W), 295.0, "float32"),
+                      eco_water_class=wc)
+    ds = _pp(proj, g, cube)
+    flag = ds["eco_sst_v002_landcloudfiltered"].isel(time=0).values
+    assert (flag[:, 5] == 1).all()                           # EXPOSED + cold -> dropped
+    assert (flag[:, 6] == 0).all()                           # SUBMERGED + cold -> kept
+    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 6]).all()
+
+
+def test_filter_land_clouds_threshold_zero_is_a_noop(tmp_path):
+    proj, g = _setup(tmp_path, {"filter_land_clouds": {"threshold_k": 0}})
+    H, W = g.height, g.width
+    eco = np.full((1, H, W), 300.0, "float32"); eco[0, :, 5] = 287.0
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
+                      eco_airtemp_hrrr=np.full((1, H, W), 295.0, "float32"),
+                      landcover_water=np.zeros((H, W), "float32"))
+    ds = _pp(proj, g, cube)
+    assert "eco_sst_v002_landcloudfiltered" not in ds.data_vars
+
+
+def test_filter_land_clouds_no_air_temp_is_a_noop(tmp_path, caplog):
+    proj, g = _setup(tmp_path, {"filter_land_clouds": None})
+    H, W = g.height, g.width
+    cube = _hand_cube(g, pd.date_range("2026-06-01", periods=1),
+                      eco_sst_v002=np.full((1, H, W), 300.0, "float32"),
+                      eco_valid_v002=_ones_valid(1, H, W),
+                      landcover_water=np.zeros((H, W), "float32"))
+    with caplog.at_level("WARNING"):
+        ds = _pp(proj, g, cube)
+    assert "eco_sst_v002_landcloudfiltered" not in ds.data_vars
+    assert "filter_land_clouds" in caplog.text
+
+
 # --------------------------------------------------------------------------- #
 # Import-time invariants (mirror test_add_a_covariate's technique)
 # --------------------------------------------------------------------------- #
