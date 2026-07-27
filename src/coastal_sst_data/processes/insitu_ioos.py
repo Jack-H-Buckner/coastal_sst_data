@@ -266,7 +266,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         ds_cfg = eff["ds"][name]
         variables = ds_cfg["variables"]
         out_path = out_root / name / f"{name}_insitu.nc"
-        if store.done(out_path, store.REQUIRED_VARS["INSITU"], overwrite=overwrite):
+        if store.done(out_path, store.REQUIRED_VARS["INSITU"],
+                      covers=(start, end), overwrite=overwrite):
             log.info("=== %s: %s exists, skipping ===", name, out_path.name)
             rep.skip()
             continue
@@ -313,7 +314,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
         ds = build_dataset(records)
         ds.attrs.update(aoi_id=name, source="IOOS Sensors ERDDAP", erddap=ERDDAP,
-                        qc_flags=str(ds_cfg["qc_flags"]), **provenance.stamp(eff))
+                        qc_flags=str(ds_cfg["qc_flags"]),
+                        **provenance.requested_range(start, end),
+                        **provenance.stamp(eff))
         log.info("  wrote %s  (%d station(s), %d timestep(s))",
                  write_output(ds, out_root / name, name).name,
                  ds.sizes["station"], ds.sizes["time"])

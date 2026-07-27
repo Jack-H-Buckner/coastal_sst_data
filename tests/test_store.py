@@ -164,6 +164,51 @@ def test_done_is_false_under_overwrite(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# covers=(start, end) -- the range-aware guard for single-file span products
+# (tides, insitu), which write ONE file for the whole window. See store._covers_range.
+# --------------------------------------------------------------------------- #
+def _span(tmp_path, start, end):
+    """A complete file stamped with the requested date window it was built for."""
+    ds = _ds()
+    ds.attrs.update(requested_start=str(start), requested_end=str(end))
+    return store.write_netcdf(ds, tmp_path / "span.nc")
+
+
+def test_done_skips_when_the_stamped_range_spans_the_request(tmp_path):
+    p = _span(tmp_path, "2020-01-01", "2020-12-31")
+    assert store.done(p, ("sst",), covers=("2020-03-01", "2020-06-30")) is True
+    assert store.done(p, ("sst",), covers=("2020-01-01", "2020-12-31")) is True  # exact edges
+
+
+def test_done_rebuilds_when_the_request_extends_past_the_stamped_range(tmp_path, caplog):
+    """The bug this fixes: an old file built for a NARROWER window would be skipped, so an
+    extended date range silently became NaN in the cube."""
+    p = _span(tmp_path, "2020-01-01", "2020-06-30")
+    with caplog.at_level("INFO"):
+        assert store.done(p, ("sst",), covers=("2020-01-01", "2020-12-31")) is False  # end extended
+    assert "narrower date range" in caplog.text
+    # a start moved earlier must rebuild too
+    assert store.done(p, ("sst",), covers=("2019-06-01", "2020-06-30")) is False
+
+
+def test_done_rebuilds_a_complete_file_that_carries_no_range_stamp(tmp_path):
+    """Files written before range-stamping have no requested_start/end; rebuild once so they
+    gain the stamp rather than being trusted with an unknown window."""
+    p = store.write_netcdf(_ds(), tmp_path / "a.nc")            # complete, but unstamped
+    assert store.done(p, ("sst",)) is True                      # covers=None: unchanged behavior
+    assert store.done(p, ("sst",), covers=("2020-01-01", "2020-12-31")) is False
+
+
+def test_covers_is_ignored_for_an_incomplete_file(tmp_path, caplog):
+    """Incompleteness is reported first; a truncated file never reaches the range check."""
+    p = tmp_path / "a.nc"
+    p.touch()
+    with caplog.at_level("WARNING"):
+        assert store.done(p, ("sst",), covers=("2020-01-01", "2020-12-31")) is False
+    assert "INCOMPLETE" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
 # scan() / repair() -- the one-off pass over a tree written before atomicity
 # --------------------------------------------------------------------------- #
 def _aligned(root, product, aoi):

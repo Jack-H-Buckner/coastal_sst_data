@@ -108,6 +108,19 @@ def stamp(eff: dict | None = None) -> dict:
     return out
 
 
+def requested_range(start, end) -> dict:
+    """The attrs a SINGLE-FILE span product adds to record the date window it was built for.
+
+    Unlike per-day/per-scene products, tides and insitu write ONE file for the whole window,
+    so an extended date range produces the same filename and would be skipped as done. Stamping
+    the requested range lets the skip guard (`store.done(..., covers=...)`) tell that an existing
+    file covers a narrower window than currently configured and rebuild it. Stamp the plain
+    config values, not any internal +1-day/inclusive convention, so the guard compares like
+    with like.
+    """
+    return {"requested_start": str(start), "requested_end": str(end)}
+
+
 def access_of(path: Path) -> tuple[str, str]:
     """(when this file's data was acquired, on what basis).
 

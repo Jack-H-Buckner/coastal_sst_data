@@ -208,6 +208,17 @@ which your module must too:
    [store.py:1](../src/coastal_sst_data/store.py). `store.REQUIRED_VARS` is keyed by the ALLCAPS
    `dir`, and is itself derived from your spec's `required_vars`.
 
+   > **⚠️ Single-file span products need extra care.** Nearly every product writes **one file per
+   > day or per scene**, so the filename carries the date and extending the project's date range
+   > simply produces new filenames that don't exist yet and get fetched. **Tides** and **insitu**
+   > are the exceptions: each writes **one file spanning the whole window** (`<aoi>_tides.nc`,
+   > `<aoi>_insitu.nc`). For these, the plain skip guard is a trap — the same filename already
+   > exists and passes `is_complete`, so an *extended* date range is silently skipped and the new
+   > dates show up as NaN in the cube. The fix is a **range-aware guard**: stamp the window with
+   > `provenance.requested_range(start, end)` at write time and pass `covers=(start, end)` to
+   > `store.done`, which rebuilds a file whose stamped range no longer spans the configured one.
+   > Any future product that writes a single file for the whole window **must** do the same.
+
 4. **Wrap everything that touches the network in [`net.retry`](../src/coastal_sst_data/net.py)** —
    `net.retry(lambda: ..., what="CHL search {name}")`. Bare requests have no timeout or retry.
 

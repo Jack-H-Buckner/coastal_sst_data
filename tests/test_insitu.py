@@ -122,6 +122,42 @@ def test_a_station_that_never_reports_is_dropped_and_logged(monkeypatch, project
     assert "no QC-passing values" in caplog.text
 
 
+def test_extending_the_date_range_rebuilds_the_single_file_series(monkeypatch, tmp_path):
+    """Insitu writes ONE file for the whole window, so extending end_date must REBUILD it --
+    the file already exists and passes is_complete, so the added dates would silently stay NaN.
+    `covers=(start, end)` on the skip guard is what forces the rebuild."""
+    fake = FakeERDDAP(info={"noaa_nos_co_ops_9437540": INFO_WITH_SWT},
+                      data={"noaa_nos_co_ops_9437540": GOOD_CSV})
+    monkeypatch.setattr(insitu_ioos, "_get", fake)
+
+    def run_for(end):
+        proj = parse_config({
+            "name": "i", "output_dir": str(tmp_path),
+            "time": {"start_date": "2026-06-01", "end_date": end},
+            "products": {"insitu": {}},
+            "regions": [{"name": "r", "areas": [
+                {"name": AOI, "center_lat": LAT, "center_lon": LON,
+                 "buffer_ns_km": 5, "buffer_ew_km": 5}]}],
+        })
+        insitu_ioos.acquire(proj, grids={AOI: grid.project_grids(proj)[AOI]})
+        return proj.output_dir / "INSITU" / "aligned" / AOI / f"{AOI}_insitu.nc"
+
+    n_fetch = lambda: sum("/tabledap/" in u for u in fake.calls)
+
+    out = run_for("2026-06-02")
+    with xr.open_dataset(out) as ds:
+        assert ds.attrs["requested_end"] == "2026-06-02"
+    after_first = n_fetch()
+
+    run_for("2026-06-02")                       # same window -> covered -> skipped, no new fetch
+    assert n_fetch() == after_first
+
+    run_for("2026-06-30")                       # extended -> old file no longer spans it -> rebuilt
+    assert n_fetch() > after_first
+    with xr.open_dataset(out) as ds:
+        assert ds.attrs["requested_end"] == "2026-06-30"
+
+
 def test_a_station_lacking_the_variable_is_never_queried_for_it(monkeypatch, project, g):
     """Asking ERDDAP for a variable a station lacks is an HTTP 400, which would kill the
     station. So its variable list is read first, and it is simply not asked."""
