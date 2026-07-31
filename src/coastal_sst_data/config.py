@@ -525,11 +525,35 @@ DEFAULT_SOURCE: dict[DataProduct, str] = {
 def required_backend(product: DataProduct, opts) -> "str | None":
     """The auth backend a selected product needs, or None if it needs none.
 
-    For source-selectable products, resolves via the product's `source` option
-    (validated against the known set here, failing loudly on a typo).
+    For a PICK-ONE (ACCESS) product, resolves via its `source` option. For a STACKED (DATA)
+    product there is no single source to resolve -- it acquires every entry in its `sources`
+    list -- so the requirement is the union over that list. Both validate the names here,
+    failing loudly on a typo rather than at the first request.
     """
     req = AUTH_REQUIREMENTS.get(product)
     if isinstance(req, dict):
+        s = spec(product)
+        if s.is_stacked_data:
+            key = s.sources_option
+            names = getattr(opts, key, None) or list(req)   # unset -> every known source
+            if isinstance(names, str):
+                names = [names]
+            unknown = sorted(n for n in names if n not in req)
+            if unknown:
+                raise ValueError(
+                    f"{product.value}.{key} {unknown} is not recognized; "
+                    f"choose from {sorted(req)}.")
+            backends = {req[n] for n in names if req[n]}
+            if len(backends) > 1:
+                # No product does this yet. Say so plainly rather than picking one and
+                # leaving the other's credentials unverified until it fails mid-download.
+                raise ValueError(
+                    f"{product.value} stacks sources needing different credentials "
+                    f"({sorted(backends)}), and the auth preflight resolves ONE backend per "
+                    "product. Give them separate products, or widen required_backend(s) to "
+                    "return a set.")
+            return next(iter(backends), None)
+
         source = getattr(opts, "source", DEFAULT_SOURCE.get(product))
         if source not in req:
             raise ValueError(

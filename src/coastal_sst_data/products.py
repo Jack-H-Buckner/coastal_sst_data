@@ -475,17 +475,32 @@ REGISTRY: tuple[ProductSpec, ...] = (
         product=DataProduct.insitu,
         dir="INSITU",
         kind=Kind.STATION_TABLE,
-        # IOOS (ERDDAP) covers most of North America; another network registers here and
-        # honours the same output contract.
-        sources={"ioos": "coastal_sst_data.processes.insitu_ioos"},
-        default_source="ioos",
-        auth={"ioos": None},       # public: IOOS ERDDAP needs no key
+        # DISTINCT DATA, STACKED (D10): a public network and the user's own thermometers are
+        # not two pipes to the same observations -- they are different platforms, and a cube
+        # wants BOTH. Every source is served by `insitu_acquire`, which fans out over the
+        # configured `sources` list and delegates the fetch per network.
+        #
+        # DEVIATION from the usual DATA shape, and it is deliberate: the other stacked products
+        # emit ONE CHANNEL PER SOURCE (`depth_cudem`, `depth_gmrt`). In-situ merges every source
+        # into ONE channel set instead, because stations are ROWS, not channels -- they occupy
+        # disjoint pixels anyway, and splitting them would multiply the whole `<sensor>_insitu_*`
+        # family by the source count while making `insitu_sst` stop meaning "ground truth". Each
+        # platform records which source it came from in the cube's station table.
+        sources={"ioos": "coastal_sst_data.processes.insitu_acquire",
+                 "csv": "coastal_sst_data.processes.insitu_acquire"},
+        source_kind=SourceKind.DATA,
+        auth={"ioos": None, "csv": None},   # public network; local files
         options=_COMMON | {
-            "source", "variables", "stations", "exclude_stations", "qc_flags", "pad_deg",
-            "max_sensor_depth_m"},
-        # Station lists are inherently local; `variables` is a per-NETWORK naming preference
-        # (sea_water_temperature vs sea_surface_temperature), not a channel choice.
-        region_options=frozenset({"source", "stations", "exclude_stations", "variables"}),
+            "sources", "variables", "stations", "exclude_stations", "qc_flags", "pad_deg",
+            "max_sensor_depth_m", "max_position_drift_m",
+            # csv source: where the user's files are and how to read them.
+            "path", "columns", "time_zone", "units", "qc_pass_values", "default_station_id"},
+        # Station lists and FILE PATHS are inherently local; `variables` is a per-NETWORK naming
+        # preference (sea_water_temperature vs sea_surface_temperature), not a channel choice.
+        # `columns`/`units`/`qc_pass_values` decide what the channel MEANS and so stay global --
+        # a region that changed them would make two AoIs' cubes silently non-comparable.
+        region_options=frozenset({"sources", "stations", "exclude_stations", "variables",
+                                  "path"}),
         required_vars=("sst", "qc"),
         provenance_inputs=("insitu",),
     ),
