@@ -10,10 +10,10 @@ insitu_acquire): a cube can carry both.
 
 LONG FORMAT: one row per observation.
 
-    station_id,time,latitude,longitude,value
-    mooring_a,2026-06-01T18:00:00Z,45.52,-123.92,11.8
-    mooring_a,2026-06-01T18:10:00Z,45.52,-123.92,11.9
-    mooring_b,2026-06-01T18:00:00Z,45.48,-123.90,12.4
+    station_id,time,latitude,longitude,value,z
+    mooring_a,2026-06-01T18:00:00Z,45.52,-123.92,11.8,1.0
+    mooring_a,2026-06-01T18:10:00Z,45.52,-123.92,11.9,1.0
+    mooring_b,2026-06-01T18:00:00Z,45.48,-123.90,12.4,0.5
 
 ROWS ARE GROUPED BY `station_id`, so ONE FILE MAY HOLD ANY NUMBER OF STATIONS -- each
 becomes its own platform, with its own position, and lands in its own pixel. That is the
@@ -22,6 +22,22 @@ normal case, not an edge case: an export from a logger fleet is one file.
 Column NAMES are configurable (`columns:`), because asking a user to rewrite files they
 already have is a good way to have the feature go unused. Only the four required fields
 must be present under SOME name.
+
+TIME imposes no format -- pandas infers it, so ISO-8601 ("2026-06-01T18:00:00Z") and
+"2026-06-01 11:00:00" both read. A stamp CARRYING AN OFFSET is honoured and `time_zone` is
+moot for it; a NAIVE stamp means `time_zone` (default UTC). That last assumption is the one
+most likely to be wrong in a user's file -- a logger writes local time and says so nowhere --
+so it is configurable rather than hard-coded. Times are stored naive UTC, matching
+insitu_ioos, and a row whose stamp will not parse is counted and dropped, never guessed at.
+
+DEPTH: `z` is the sensor's depth in metres, kept when it is within `max_sensor_depth_m`
+(default 5) -- a profiling mooring's deep sensors are not surface truth. The comparison is on
+`abs(z)`, so it does not matter which sign convention the file uses, and a row with no `z`
+survives (an unstated depth is not evidence of a deep one). But `z` only FILTERS: it is not
+carried into the cube, whose in-situ model has no depth dimension. So the filter must leave
+ONE sensor per instant -- if several depths survive at the same timestamp, one row is kept
+arbitrarily and the rest are dropped, and `_reject_merged_stations` below cannot catch it
+because a mooring's depths all share one position.
 
 Two things this module is deliberately fussy about, because both fail silently otherwise:
 

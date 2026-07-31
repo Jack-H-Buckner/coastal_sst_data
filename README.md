@@ -782,10 +782,10 @@ In-situ sources **STACK**: `sources: [ioos, csv]` acquires both, each into its o
 #### Your own observations (`sources: [csv]`)
 
 ```csv
-station_id,time,latitude,longitude,value
-mooring_a,2026-06-01T18:00:00Z,45.52,-123.92,11.8
-mooring_a,2026-06-01T18:10:00Z,45.52,-123.92,11.9
-mooring_b,2026-06-01T18:00:00Z,45.48,-123.90,12.4
+station_id,time,latitude,longitude,value,z
+mooring_a,2026-06-01T18:00:00Z,45.52,-123.92,11.8,1.0
+mooring_a,2026-06-01T18:10:00Z,45.52,-123.92,11.9,1.0
+mooring_b,2026-06-01T18:00:00Z,45.48,-123.90,12.4,0.5
 ```
 
 Rows are **grouped by `station_id`**, so **one file may hold any number of stations** — each becomes its own platform, at its own position, in its own pixel. That is the normal case: a logger-fleet export is one file. The same id split across several files (per-year, per-deployment) merges into one platform, so you needn't pre-concatenate. `path` takes a file, a directory, or a glob, and one file can serve every AOI in the project — each AOI keeps the platforms that fall inside its grid.
@@ -799,12 +799,18 @@ products:
       station_id: platform
       time: datetime_utc
       value: temp_c
+      z: depth_m
     units: degC                 # degC | degF | K -> converted to degC
     time_zone: UTC              # what a stamp with no offset means
+    max_sensor_depth_m: 2       # drop rows whose z is deeper than this
     qc_pass_values: [1, 2]      # values of your qc column to keep; omit to keep every row
 ```
 
-Column names are configurable because rewriting files you already have is a good way to leave a feature unused; only the four required fields (`time`, `latitude`, `longitude`, `value`) must be present under *some* name. `z`, `qc` and `station_name` are picked up when present — with no `qc` column the rows assert QARTOD `2` (not evaluated), which the default `qc_flags` accept.
+Column names are configurable because rewriting files you already have is a good way to leave a feature unused; only the four required fields (`time`, `latitude`, `longitude`, `value`) must be present under *some* name. `z` (sensor depth in metres), `qc` and `station_name` are picked up when present — with no `qc` column the rows assert QARTOD `2` (not evaluated), which the default `qc_flags` accept.
+
+**Timestamps.** No format is imposed — `time` is parsed by inference, so ISO 8601 (`2026-06-01T18:00:00Z`), `2026-06-01 11:00:00` and `2026-06-01T11:00:00-07:00` all read; ISO 8601 is the safe choice. A stamp **carrying an offset is honoured**, and `time_zone` is ignored for it. A **naive** stamp means `time_zone` (default `UTC`) — set it to e.g. `America/Los_Angeles` for a logger that wrote local time, and daylight-saving gaps and repeats become unparseable rather than a wrong hour. Rows whose stamp will not parse are dropped, with a count in the log. The project window includes the whole final **day**, so `end_date: 2026-06-30` keeps observations through 23:59 that date.
+
+**Sensor depth.** Give a `z` column (or map your name onto it with `columns:`) and rows deeper than `max_sensor_depth_m` — default `5` — are dropped, so a profiling mooring contributes its surface sensor and not its thermocline. The comparison is on the absolute value, so either sign convention works: `2.0` and `-2.0` both mean 2 m down. A row with a blank `z` survives, since an unstated depth is not evidence of a deep one. Note that `z` only *filters* — the cube's in-situ model has no depth dimension, so **set the limit tight enough that one sensor per station survives**. If several depths remain at the same timestamp, one is kept arbitrarily and the rest are discarded; the merged-station check below won't catch it, because a mooring's depths share one position. Giving each depth its own `station_id` doesn't help either — they land in the same pixel and are averaged together.
 
 Three failures this loader refuses to make quiet, because a *wrong* ground-truth value doesn't look like an error — it looks like the truth:
 
@@ -822,7 +828,7 @@ Three failures this loader refuses to make quiet, because a *wrong* ground-truth
 
 - `sources`: which networks to **stack** (default `[ioos]`; `csv` must be opted into, since it needs a `path`).
 - `qc_flags`: QARTOD flags to keep (default `[1, 2]`).
-- `max_sensor_depth_m`: ignore sensors deeper than this on profiling moorings (default `5`).
+- `max_sensor_depth_m`: ignore sensors deeper than this on profiling moorings (default `5`) — the station's `z` variable for `ioos`, your `z` column for `csv`.
 - `stations` / `exclude_stations`: an allow-list (else auto-discovery for `ioos`, every platform for `csv`) and a deny-list. Both match on station id, in **either** source — so a 50-platform CSV can be narrowed to the 5 that matter without editing the file.
 - `max_position_drift_m`: how far a platform's observations may stray before it is rejected as moving (default: one grid cell).
 - `variables` *(ioos)*: preference order of ERDDAP variable names (default `[sea_water_temperature]`; `sea_surface_temperature` is tried as a fallback).

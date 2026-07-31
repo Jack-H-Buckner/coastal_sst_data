@@ -72,7 +72,8 @@ products:
     sources: [ioos]          # ioos (IOOS Sensors ERDDAP: NDBC + CO-OPS + CDIP + regionals) | csv
     variables: [sea_water_temperature]   # falls back to sea_surface_temperature per station
     qc_flags: [1, 2]         # QARTOD: 1 pass, 2 not-evaluated (3/4/9 dropped)
-    max_sensor_depth_m: 5    # ignore deep sensors on profiling moorings
+    max_sensor_depth_m: 5    # ignore deep sensors on profiling moorings (csv: your `z` column;
+                             # |z| is compared, so either sign convention works)
     # stations: [noaa_nos_co_ops_9437540]   # optional allow-list (else auto-discovered)
     # exclude_stations: []
     # --- the `csv` source: your own thermometers, in long format ----------------------
@@ -86,7 +87,9 @@ products:
     #   longitude: longitude
     #   value: value
     #   # optional, used when present: z, qc, station_name
-    # time_zone: UTC          # what a timestamp with no offset is assumed to be
+    # time_zone: UTC          # what a timestamp with no offset is assumed to be; a stamp that
+                              # CARRIES an offset is honoured regardless. No format imposed --
+                              # ISO 8601 ("2026-06-01T18:00:00Z") is the safe choice.
     # units: degC             # degC | degF | K -- converted to degC
     # qc_pass_values: [1, 2]  # values of the qc column to keep; omit to keep every row
     # default_station_id: null  # id for a single-platform file with no station_id column
