@@ -217,13 +217,14 @@ def field_inputs(name: str) -> list[str]:
         # plain `sst` channel by the base-token test below.
         if "georef" in rest:
             return [sensor, "landcover"]
-        # The sensor's own DATA channels: `<pre>_sst`/`_cloud`/`_valid`/`_hour`, and -- for a
-        # STACKED-DATA sensor (ECOSTRESS) -- their per-version forms `<pre>_sst_v002`, etc. The
-        # exact source tag is narrowed later in `build` via sources_by_tag, so here it is enough
-        # to attribute the channel to the sensor product. The base token (before any `_<ver>`)
-        # distinguishes these from the matchup channels (insitu/met/tide) handled below.
+        # The sensor's own DATA channels: `<pre>_sst`/`_cloud`/`_valid`/`_hour`/`_footprint_id`,
+        # and -- for a STACKED-DATA sensor (ECOSTRESS) -- their per-version forms
+        # `<pre>_sst_v002`, etc. The exact source tag is narrowed later in `build` via
+        # sources_by_tag, so here it is enough to attribute the channel to the sensor product.
+        # The base token (before any `_<ver>`) distinguishes these from the matchup channels
+        # (insitu/met/tide) handled below; `footprint_id` reduces to `footprint` under it.
         base = rest.split("_", 1)[0]
-        if base in ("sst", "cloud", "valid", "hour"):
+        if base in ("sst", "cloud", "valid", "hour", "footprint"):
             return [sensor]
         if rest.startswith("insitu"):
             return ["insitu", sensor]

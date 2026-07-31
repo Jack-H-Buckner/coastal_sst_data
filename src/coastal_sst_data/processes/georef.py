@@ -68,7 +68,10 @@ _DEFAULTS = dict(
 # Which raw ECOSTRESS-native spatial fields `correct_georef` shifts, and how to fill the vacated
 # margin. SST -> NaN (no observation); a mask -> 0 (unobserved). Fields not listed default to the
 # SST treatment. The granule-native cloud band would go here as ("cloud", (0, "uint8")) if selected.
-_FIELD_FILL = {"sst": (np.nan, "float32"), "valid": (0, "uint8"), "cloud": (0, "uint8")}
+# `footprint_id` is an INDEX: the default NaN/float32 treatment would silently turn it into floats
+# and invent a 0 id, so it is declared here even though no sensor lists it in `fields` today.
+_FIELD_FILL = {"sst": (np.nan, "float32"), "valid": (0, "uint8"), "cloud": (0, "uint8"),
+               "footprint_id": (-1, "int32")}
 
 
 # --------------------------------------------------------------------------- #

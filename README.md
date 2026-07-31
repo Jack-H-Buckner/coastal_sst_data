@@ -292,6 +292,8 @@ The terminal stage: once the products are acquired, it knits their per-AOI align
 
 Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `modis_sst`) so a downstream model can learn per-source offsets; each high-res sensor carries its own `valid` mask and overpass hour, and multiple scenes on a day collapse to the **clearest** one. The cube ships **raw ingredients** on a common grid and daily axis — MUR ships its observed values with honest NaN gaps (no fill), and the raw land-cover water layer ships as `landcover_water` rather than an opinionated derived land mask.
 
+MODIS additionally ships `modis_footprint_id` (`int32`, `-1` = no observation): the index of the native ~1 km swath pixel each grid cell was resampled from, so grouping by it gives exactly the fine-grid cells one MODIS reading covers — the grouping a Landsat-to-MODIS calibration needs. **The ids identify a pixel within one day's chosen scene only**: they restart at 0 in every granule, so group within a timestep, never across the time axis. The channel appears only when the aligned granules actually carried the layer (it is optional at acquisition via `products.modis.footprint_id`); granules acquired before it, or with it off, are not re-fetched automatically — use `modis --overwrite` to backfill.
+
 - `--aoi <name> …` — assemble only specific AOIs (default: all).
 - `--overwrite` — rebuild cubes that already exist.
 - `--dry-run` — report what would be assembled; write nothing.
@@ -705,7 +707,7 @@ Landsat contributes additional high-resolution thermal scenes and the water/clou
 MODIS provides a coarser, well-calibrated SST reference that downstream calibration can match Landsat/ECOSTRESS against, optionally restricted to overpasses coincident with a Landsat scene.
 
 - **Where it comes from**: the `MODIS_T-JPL-L2P-v2019.0` GHRSST MODIS Terra L2P skin-SST product from NASA OB.DAAC via `earthaccess`. It is a swath (2D curvilinear) product, so it is regridded with nearest-neighbour resampling (`pyresample`) to preserve the observed values rather than smoothing them.
-- **What it measures**: skin sea-surface temperature (`sst`, K or °C), quality-filtered on the GHRSST `quality_level` band, plus a derived `valid` layer. Optionally emits `footprint_id`, the MODIS swath pixel index each grid cell was drawn from, for exact footprint-median matchups.
+- **What it measures**: skin sea-surface temperature (`sst`, K or °C), quality-filtered on the GHRSST `quality_level` band, plus a derived `valid` layer. Optionally emits `footprint_id`, the MODIS swath pixel index each grid cell was drawn from — a ~1 km observation covers many grid cells, so grouping by it recovers exactly the pixels one MODIS reading saw. The assembler carries it into the cube as `modis_footprint_id` (see [`assemble`](#assemble)), so footprint-level matchups need no per-granule file handling.
 
 **Project-level options** (`products.modis`):
 

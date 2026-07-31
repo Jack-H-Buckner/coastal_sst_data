@@ -50,6 +50,9 @@ per sensor, so they stay unqualified (`eco_insitu_sst`, not per-version) -- see 
 
   3D (time,y,x): mur_sst,
                  <s>_sst, <s>_valid, <s>_cloud (where the sensor publishes a cloud layer),
+                 <s>_footprint_id (where the sensor is gridded from a COARSER swath and its
+                   granules carried the layer -- today MODIS only; ids group the grid cells
+                   sharing one native observation, WITHIN a day, and restart every scene),
                    -- for a stacked-data sensor: <s>_sst_<ver>, <s>_valid_<ver>, <s>_cloud_<ver>,
                  <metvar>_<src>  (forcing: airtemp/wind_u/wind_v/wind_speed/swrad/cloud_cover),
                  <s>_<metvar>_<src>  (met_overpass, per combo),
@@ -174,7 +177,8 @@ def met_prefix(d: Path, aoi_id, days, want: str) -> tuple[str, str]:
 
 
 def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
-                           use_cloud=True, qc_levels=None, trust_valid=False):
+                           use_cloud=True, qc_levels=None, trust_valid=False,
+                           read_footprint=False):
     """Per-overpass sensors (ECOSTRESS/Landsat/MODIS): keep the clearest scene/day.
 
     Validity per sensor:
@@ -185,21 +189,32 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
           - use_cloud gates on the binary cloud layer (Landsat: reliable).
           - qc_levels (e.g. {0,1}) gates on QC mandatory-QA bits 0-1 instead of
             cloud (ECOSTRESS: cloud over-masks cold water, so gate on QC).
-    Returns (sst, cloud, valid, hour, water_union, times). `water_union` is the OR of the
-    water mask over scenes -- a high-res static water hint for narrow estuaries. `times`
-    is the CHOSEN scene's datetime per day (None where the sensor had no scene), so the
-    tide and the met snapshot can be matched to that exact scene rather than to the day.
+    Returns (sst, cloud, valid, hour, water_union, times, footprint). `water_union` is the
+    OR of the water mask over scenes -- a high-res static water hint for narrow estuaries.
+    `times` is the CHOSEN scene's datetime per day (None where the sensor had no scene), so
+    the tide and the met snapshot can be matched to that exact scene rather than to the day.
+
+    `footprint` is the native sensor-pixel index per grid cell, read only when
+    `read_footprint` and returned as None when NO granule on disk carried the layer -- it is
+    optional at acquisition time, so its absence is a fact about the files, not a failure.
+    Collapsing "we saw one" into the value is what lets the caller emit the channel or not
+    with a plain `is not None`, rather than shipping an all -1 array that reads as data.
+    It rides the SAME clearest-scene choice as the SST: read outside that selection it would
+    pair one granule's pixel indices with another granule's temperatures.
     """
     sst, cloud = _empty3d(days, H, W), _empty3d(days, H, W)
     valid = np.zeros((len(days), H, W), dtype="uint8")
     hour = np.full(len(days), np.nan, dtype="float32")
     times: list = [None] * len(days)
     water_union = np.zeros((H, W), dtype=bool)
+    # -1 (no native pixel), never NaN: this is an INDEX, and _empty3d is float.
+    footprint = np.full((len(days), H, W), -1, dtype="int32")
+    saw_footprint = False
     if not d.exists():
-        return sst, cloud, valid, hour, water_union, times
+        return sst, cloud, valid, hour, water_union, times, None
     qset = list(qc_levels) if qc_levels is not None else None
     didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
-    best = {}  # day -> (valid_count, sst, cloud, valid, datetime)
+    best = {}  # day -> (valid_count, sst, cloud, valid, footprint|None, datetime)
     for f in d.glob(f"{aoi_id}_*T*.nc"):
         dt = naming.parse_time(f.name)
         if dt is None:
@@ -215,6 +230,10 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
         s = ds["sst"].values.astype("float32")
         c = (ds["cloud"].values.astype("float32")
              if "cloud" in ds and ds["cloud"].shape == (H, W) else np.zeros((H, W), "float32"))
+        fp = None
+        if read_footprint and "footprint_id" in ds and ds["footprint_id"].shape == (H, W):
+            fp = ds["footprint_id"].values.astype("int32")
+            saw_footprint = True
         if trust_valid and "valid" in ds and ds["valid"].shape == (H, W):
             v = (ds["valid"].values > 0) & np.isfinite(s)
             wp = np.zeros((H, W), dtype=bool)              # no water layer to contribute
@@ -238,15 +257,27 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
         water_union |= wp
         vc = int(v.sum())
         if day not in best or vc > best[day][0]:
-            best[day] = (vc, s, c, v, dt)
-    for day, (_, s, c, v, dt) in best.items():
+            best[day] = (vc, s, c, v, fp, dt)
+    missing_fp = 0
+    for day, (_, s, c, v, fp, dt) in best.items():
         i = didx[day]
         sst[i] = s
         cloud[i] = np.nan_to_num(c, nan=0.0)
         valid[i] = v.astype("uint8")
         hour[i] = dt.hour + dt.minute / 60.0
         times[i] = dt
-    return sst, cloud, valid, hour, water_union, times
+        if fp is not None:
+            footprint[i] = fp
+        else:
+            missing_fp += 1
+    if saw_footprint and missing_fp:
+        # A partly backfilled directory: some granules predate the layer, or were acquired
+        # with `footprint_id: false`. Those days stay -1, which is indistinguishable from
+        # "off-swath" unless we say so here. Re-acquire with --overwrite to fill them.
+        log.warning("  %s: %d of %d scene-days have no footprint_id layer; those days are "
+                    "all -1 in the footprint channel", d.name, missing_fp, len(best))
+    return (sst, cloud, valid, hour, water_union, times,
+            footprint if saw_footprint else None)
 
 
 def load_tide_daily(d: Path, aoi_id, days):
@@ -598,14 +629,23 @@ def _load_sensor(ctx: AssemblyContext, sp, adir):
         adir, ctx.aid, ctx.days, ctx.H, ctx.W,
         water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
         qc_levels=list(sp.qc_levels) if sp.qc_levels is not None else None,
-        trust_valid=sp.trust_valid)
+        trust_valid=sp.trust_valid, read_footprint=sp.has_footprint)
+
+
+# The footprint index is a per-day identity, and saying so on the variable is the only place a
+# user reading the cube will see it: ids restart at 0 in every granule, so grouping across the
+# time axis merges unrelated native pixels into one bucket -- silently, and wrongly.
+_FOOTPRINT_ATTRS = dict(
+    long_name="native sensor pixel index this grid cell was resampled from; -1 = none",
+    comment="ids identify a pixel WITHIN one day's chosen scene only -- they restart at 0 "
+            "for every scene and are NOT comparable across days")
 
 
 def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None:
     """A single-collection sensor (Landsat, MODIS): one flat `<DIR>/aligned/<aoi>` tree, one
     channel-set under the bare prefix, one entry in `sensor_times`."""
     sp = s.sensor
-    sst, cloud, valid, hour, _water_union, times = _load_sensor(
+    sst, cloud, valid, hour, _water_union, times, footprint = _load_sensor(
         ctx, sp, ctx.adir(s.product.value))
     pre = sp.prefix
     ctx.emit(f"{pre}_sst", T3, sst)
@@ -613,6 +653,10 @@ def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None
         ctx.emit(f"{pre}_cloud", T3, cloud)   # channel would falsely read "never cloudy"
     ctx.emit(f"{pre}_valid", T3, valid)
     ctx.emit(f"{pre}_hour", ("time",), hour)
+    # Only when a granule actually carried the layer (it is optional at acquisition): an
+    # all -1 channel would read as "nothing was ever in swath" rather than "never recorded".
+    if footprint is not None:
+        ctx.emit(f"{pre}_footprint_id", T3, footprint, **_FOOTPRINT_ATTRS)
     sensor_times[pre] = times
 
 
@@ -641,13 +685,16 @@ def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> N
 
     per_tag_times: dict[str, list] = {}
     for tag in ordered:
-        sst, cloud, valid, hour, _wu, times = _load_sensor(ctx, sp, ctx.adir(s.product.value, tag))
+        sst, cloud, valid, hour, _wu, times, footprint = _load_sensor(
+            ctx, sp, ctx.adir(s.product.value, tag))
         pre = sp.prefix
         ctx.emit(f"{pre}_sst_{tag}", T3, sst)
         if sp.has_cloud:
             ctx.emit(f"{pre}_cloud_{tag}", T3, cloud)
         ctx.emit(f"{pre}_valid_{tag}", T3, valid)
         ctx.emit(f"{pre}_hour_{tag}", ("time",), hour)
+        if footprint is not None:
+            ctx.emit(f"{pre}_footprint_id_{tag}", T3, footprint, **_FOOTPRINT_ATTRS)
         per_tag_times[tag] = times
 
     # Single overpass identity: first-listed version wins each day, later versions fill gaps.
