@@ -11,7 +11,7 @@ import xarray as xr
 
 from coastal_sst_data.config import parse_config
 from coastal_sst_data import grid
-from coastal_sst_data.processes import datacube, insitu, insitu_ioos
+from coastal_sst_data.processes import datacube, insitu, insitu_acquire, insitu_ioos
 
 
 AOI = "aoi1"
@@ -113,9 +113,9 @@ def test_a_station_that_never_reports_is_dropped_and_logged(monkeypatch, project
     monkeypatch.setattr(insitu_ioos, "_get", fake)
 
     with caplog.at_level("WARNING"):
-        insitu_ioos.acquire(project, grids={AOI: g})
+        insitu_acquire.acquire(project, grids={AOI: g})
 
-    with xr.open_dataset(project.output_dir / "INSITU" / "aligned" / AOI /
+    with xr.open_dataset(project.output_dir / "INSITU" / "ioos" / "aligned" / AOI /
                          f"{AOI}_insitu.nc") as ds:
         assert list(ds["station_id"].values) == ["noaa_nos_co_ops_9437540"]
     assert "dropped gov-ndbc-46120" in caplog.text
@@ -139,8 +139,8 @@ def test_extending_the_date_range_rebuilds_the_single_file_series(monkeypatch, t
                 {"name": AOI, "center_lat": LAT, "center_lon": LON,
                  "buffer_ns_km": 5, "buffer_ew_km": 5}]}],
         })
-        insitu_ioos.acquire(proj, grids={AOI: grid.project_grids(proj)[AOI]})
-        return proj.output_dir / "INSITU" / "aligned" / AOI / f"{AOI}_insitu.nc"
+        insitu_acquire.acquire(proj, grids={AOI: grid.project_grids(proj)[AOI]})
+        return proj.output_dir / "INSITU" / "ioos" / "aligned" / AOI / f"{AOI}_insitu.nc"
 
     n_fetch = lambda: sum("/tabledap/" in u for u in fake.calls)
 
@@ -165,10 +165,79 @@ def test_a_station_lacking_the_variable_is_never_queried_for_it(monkeypatch, pro
         info={"noaa_nos_co_ops_9437540": INFO_WITH_SWT, "gov-ndbc-46120": INFO_NO_TEMP},
         data={"noaa_nos_co_ops_9437540": GOOD_CSV})
     monkeypatch.setattr(insitu_ioos, "_get", fake)
-    insitu_ioos.acquire(project, grids={AOI: g})
+    insitu_acquire.acquire(project, grids={AOI: g})
 
     assert not any("/tabledap/gov-ndbc-46120" in u for u in fake.calls)
     assert any("/tabledap/noaa_nos_co_ops_9437540" in u for u in fake.calls)
+
+
+# --------------------------------------------------------------------------- #
+# The moving-platform guard
+#
+# The cube's in-situ model is FIXED-STATION. Handed a track it would place the whole thing
+# in the median pixel -- which does not fail, it produces confidently WRONG matchups. So a
+# platform that moves is DROPPED and reported.
+# --------------------------------------------------------------------------- #
+def _track(lat_lons, base="2026-06-01T18:00"):
+    """A DataFrame of observations at the given positions, one minute apart."""
+    t = pd.date_range(base, periods=len(lat_lons), freq="1min")
+    return pd.DataFrame({"time": t,
+                         "latitude": [p[0] for p in lat_lons],
+                         "longitude": [p[1] for p in lat_lons],
+                         "value": np.linspace(11.0, 12.0, len(lat_lons))})
+
+
+def test_a_stationary_platform_passes_the_drift_guard():
+    """GPS jitter on a mooring is not motion: a platform that never leaves its own grid cell
+    must not be dropped."""
+    jitter = [(LAT, LON), (LAT + 1e-5, LON), (LAT, LON - 1e-5)]      # ~1 m
+    recs = [{"id": "m1", "df": _track(jitter)}]
+    keep, moving = insitu_acquire.split_moving_platforms(recs, 100.0)
+    assert [r["id"] for r in keep] == ["m1"]
+    assert moving == []
+
+
+def test_a_moving_platform_is_dropped_not_averaged_to_its_median_position():
+    """A drifter's median position is a pixel it may never have visited. Silently placing
+    the whole track there is the failure this guard exists to prevent."""
+    drifter = [(LAT, LON), (LAT + 0.02, LON), (LAT + 0.04, LON)]     # ~4.4 km
+    recs = [{"id": "drifter7", "df": _track(drifter)}]
+    keep, moving = insitu_acquire.split_moving_platforms(recs, 100.0)
+    assert keep == []
+    [(rec, drift)] = moving
+    assert rec["id"] == "drifter7"
+    assert drift == pytest.approx(2200, rel=0.1)      # half the span, from the median
+
+
+def test_the_drift_message_names_station_id_as_the_likely_cause():
+    """For a CSV the likelier explanation is not a drifter at all: it is a multi-station file
+    whose `station_id` column was never mapped, merging every station into one platform. The
+    message has to say so, or the user goes looking for a bug in their positions."""
+    msg = insitu_acquire._moving_platform_message({"id": "p"}, 4200.0)
+    assert "station_id" in msg
+    assert "4,200 m" in msg
+
+
+def test_a_moving_station_is_reported_as_a_failure_not_silently_missing(monkeypatch, tmp_path,
+                                                                       caplog):
+    """End to end: the platform is gone from the written file AND the run reports the loss.
+    A dropped station that only vanishes would look exactly like 'no buoys here'."""
+    moving_csv = csv_rows([
+        f"2026-06-01T18:00:00Z,{LAT},{LON},0.0,11.5,1",
+        f"2026-06-01T18:30:00Z,{LAT + 0.04},{LON},0.0,12.5,1",       # ~4.4 km north
+    ])
+    fake = FakeERDDAP(info={"noaa_nos_co_ops_9437540": INFO_WITH_SWT},
+                      data={"noaa_nos_co_ops_9437540": moving_csv})
+    monkeypatch.setattr(insitu_ioos, "_get", fake)
+    proj = _project(tmp_path)
+
+    with caplog.at_level("WARNING"):
+        rep = insitu_acquire.acquire(proj, grids={AOI: grid.project_grids(proj)[AOI]})
+
+    assert "moving platforms" in caplog.text
+    assert rep.outcome != "ok"                        # the loss is accounted for, not hidden
+    assert not (proj.output_dir / "INSITU" / "ioos" / "aligned" / AOI /
+                f"{AOI}_insitu.nc").exists()
 
 
 def test_the_variable_name_falls_back_per_station():
@@ -297,7 +366,7 @@ def _write_insitu(project, g, times, values, station="s1"):
                 "station_name": ("station", ["Test Station"]),
                 "lat": ("station", [LAT]), "lon": ("station", [LON]),
                 "variable": ("station", ["sea_water_temperature"])})
-    d = project.output_dir / "INSITU" / "aligned" / AOI
+    d = project.output_dir / "INSITU" / "ioos" / "aligned" / AOI
     d.mkdir(parents=True, exist_ok=True)
     ds.to_netcdf(d / f"{AOI}_insitu.nc")
 

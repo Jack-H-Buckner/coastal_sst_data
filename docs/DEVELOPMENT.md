@@ -354,13 +354,20 @@ Run `pytest` (offline; the suite stubs the network).
 
 ## 4. Adding a source to an existing product
 
-Products like `landsat`, `landcover`, and `insitu` are **source-selectable**: their spec sets
-`sources={name: module|None}` and the pipeline resolves *which module* per AoI from the
+Products like `landsat` and `landcover` are **source-selectable** (`SourceKind.ACCESS`): their spec
+sets `sources={name: module|None}` and the pipeline resolves *which module* per AoI from the
 region→project `source` option ([pipeline._modules_for](../src/coastal_sst_data/pipeline.py#L127)).
 The registry already reserves recognised-but-unimplemented sources as `None` (Landsat `aws`/`gee`,
 landcover `gee`), so a config naming one fails as *"not implemented"* rather than *"unknown source"*.
 
-To implement one (say `landsat_aws`):
+> **First decide which KIND of source you are adding.** `SourceKind.ACCESS` means *redundant access
+> to the same data* — pick one, one channel, one directory (Landsat via PC or AWS). `SourceKind.DATA`
+> means *distinct data the user stacks* — every configured source is acquired into its own
+> `<DIR>/<source>/aligned/` tree (`bathymetry`, `tides`, `met`, `cmems`, `insitu`). Getting this
+> backwards is the difference between "the user chooses" and "the user gets both". §4a below covers
+> the stacked case.
+
+To implement an ACCESS source (say `landsat_aws`):
 
 1. Point the source at your new module in the spec: `"aws": "coastal_sst_data.processes.landsat_aws"`.
    If it needs auth, set that source's entry in the `auth` dict.
@@ -377,6 +384,44 @@ Because the assembler and provenance key off the **product**, not the source, a 
 source needs **no changes to `datacube.py` or `provenance.py`** — that's the payoff of the contract.
 The interchangeability is the whole point: a cube built from `landsat_pc` and one built from
 `landsat_aws` must be indistinguishable channel-for-channel.
+
+### 4a. Adding a source to a STACKED (`SourceKind.DATA`) product
+
+A DATA product acquires **every** source in its `sources:` list, so there is no per-AoI module to
+resolve — `_check_registry` requires all its sources to map to **one** module, which fans out over
+them internally. Adding a source is therefore: a fetch function, a registry entry, and a `SOURCES`
+entry in the fan-out module. [`insitu_acquire`](../src/coastal_sst_data/processes/insitu_acquire.py)
+is the clearest model — it defines the seam explicitly:
+
+```python
+fetch_aoi(g, start, end, cfg, dry_run=False) -> [record, ...]
+SOURCES = {"ioos": insitu_ioos.fetch_aoi, "csv": insitu_csv.fetch_aoi}
+```
+
+Everything after the fetch — the union time axis, the range-aware skip guard, the atomic write, the
+report — is shared, so a new network is a fetch function rather than another copy of the loop.
+(`tides` and `met` do the same with a `_SOURCES` dict of fetchers inside a single module; split the
+sources into their own modules, as in-situ does, once they stop being a few lines each.)
+
+**Per-source auth** on a stacked product resolves as the union over the configured list
+([`config.required_backend`](../src/coastal_sst_data/config.py)), and raises if two stacked sources
+need *different* credentials — no product does this yet, and the preflight resolves one backend per
+product, so it says so rather than leaving one source's credentials unverified.
+
+**Channels: one per source, or one merged set?** The usual DATA shape is **one channel per source**
+(`depth_cudem`, `depth_gmrt`) — distinct data deserves distinct channels. **In-situ deliberately
+deviates**: every source merges into ONE channel set, because stations are *rows*, not channels.
+They occupy disjoint pixels anyway, and splitting them would multiply the whole `<sensor>_insitu_*`
+family by the source count while making `insitu_sst` stop meaning "ground truth". Which source a
+platform came from is recorded per station in the cube's `insitu_stations` table. If you add a
+stacked product whose sources are *rows* rather than *layers*, follow in-situ; otherwise follow
+bathymetry.
+
+> ⚠️ **Reading a stacked product's directories.** Do **not** treat every subdirectory of
+> `<DIR>/` as a source tag. `_contribute_stacked_sensor` did, and one stray leftover directory was
+> enough to produce silently all-sentinel channels across an entire project — see
+> [bug-empty-version-tag-channels.md](bug-empty-version-tag-channels.md). Require the expected file
+> to exist, and **log every directory you skip**. `datacube.load_insitu` is the pattern to copy.
 
 ---
 

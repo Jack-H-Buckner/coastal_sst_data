@@ -771,11 +771,48 @@ gives `thetao_0m` (level 0.494 m), `thetao_10m` (level **9.573** m), `thetao_30m
 machine auth.marine.copernicus.eu login <username> password <password>
 ```
 
-### In-situ (IOOS)
+### In-situ (IOOS + your own CSVs)
 In-situ observations are the cube's **only ground truth**. Every other channel is modelled (met, CMEMS, tides) or remotely sensed (ECOSTRESS, Landsat, MODIS, MUR); this is what a thermometer in the water actually read. The assembler writes each station's value into **the grid cell the station sits in**, and — the point of the exercise — **at the instant each satellite flew**, so a scene can be validated against a buoy pixel-for-pixel and minute-for-minute.
 
-- **Where it comes from**: the [IOOS Sensors ERDDAP](https://erddap.sensors.ioos.us/erddap) — one server aggregating **NDBC, NOAA CO-OPS, CDIP and the IOOS regional associations**, so most of North America is a single query. Stations are auto-discovered inside each AOI's bounding box. **No credentials.** It is a `source`-selector product (`source: ioos`), so another network is a new module behind the same contract.
-- **What it measures**: water temperature (`sea_water_temperature`, falling back per station to `sea_surface_temperature` — providers do not agree on the name), quality-flagged with QARTOD. The native sampling interval is kept (6 min for CO-OPS gauges), because matching an overpass needs the sub-hourly series.
+In-situ sources **STACK**: `sources: [ioos, csv]` acquires both, each into its own `INSITU/<source>/aligned/` tree, and the cube merges their platforms into **one** station table and one channel set. Public buoys and your own moorings are different *platforms*, not two routes to the same data, so a cube can carry both — with each station recording which source it came from.
+
+- **`ioos`** — the [IOOS Sensors ERDDAP](https://erddap.sensors.ioos.us/erddap): one server aggregating **NDBC, NOAA CO-OPS, CDIP and the IOOS regional associations**, so most of North America is a single query. Stations are auto-discovered inside each AOI's bounding box. **No credentials.** It measures water temperature (`sea_water_temperature`, falling back per station to `sea_surface_temperature` — providers do not agree on the name), quality-flagged with QARTOD. The native sampling interval is kept (6 min for CO-OPS gauges), because matching an overpass needs the sub-hourly series.
+- **`csv`** — your own thermometers, in **long format**: one row per observation. See below.
+
+#### Your own observations (`sources: [csv]`)
+
+```csv
+station_id,time,latitude,longitude,value
+mooring_a,2026-06-01T18:00:00Z,45.52,-123.92,11.8
+mooring_a,2026-06-01T18:10:00Z,45.52,-123.92,11.9
+mooring_b,2026-06-01T18:00:00Z,45.48,-123.90,12.4
+```
+
+Rows are **grouped by `station_id`**, so **one file may hold any number of stations** — each becomes its own platform, at its own position, in its own pixel. That is the normal case: a logger-fleet export is one file. The same id split across several files (per-year, per-deployment) merges into one platform, so you needn't pre-concatenate. `path` takes a file, a directory, or a glob, and one file can serve every AOI in the project — each AOI keeps the platforms that fall inside its grid.
+
+```yaml
+products:
+  insitu:
+    sources: [ioos, csv]
+    path: ~/data/moorings/*.csv
+    columns:                    # only the ones whose names differ from the defaults
+      station_id: platform
+      time: datetime_utc
+      value: temp_c
+    units: degC                 # degC | degF | K -> converted to degC
+    time_zone: UTC              # what a stamp with no offset means
+    qc_pass_values: [1, 2]      # values of your qc column to keep; omit to keep every row
+```
+
+Column names are configurable because rewriting files you already have is a good way to leave a feature unused; only the four required fields (`time`, `latitude`, `longitude`, `value`) must be present under *some* name. `z`, `qc` and `station_name` are picked up when present — with no `qc` column the rows assert QARTOD `2` (not evaluated), which the default `qc_flags` accept.
+
+Three failures this loader refuses to make quiet, because a *wrong* ground-truth value doesn't look like an error — it looks like the truth:
+
+- **A mistyped `path` is an error**, not an empty channel. "No files matched" and "no thermometers here" must never be the same outcome.
+- **A `units` mistake is range-checked.** 54 °F is a perfectly plausible °C sea temperature, so nothing downstream would ever catch it; values outside −5…45 °C after conversion warn loudly with a count.
+- **Merged stations are rejected.** If a multi-station file's `station_id` column isn't mapped, every station collapses into one platform. Where they share a time base (synchronised loggers usually do) de-duplication would keep one station's rows and silently discard the rest, so a "platform" reporting one instant from two positions is a hard error naming `station_id`. Where they don't, the moving-platform guard below catches it.
+
+**Moving platforms are not supported yet.** The cube's in-situ model is fixed-station: one position per platform for the whole window. A platform whose observations stray beyond `max_position_drift_m` (default: one grid cell, so GPS jitter passes) is **dropped and reported** — never collapsed onto its median position, which would place a whole track in a pixel it may never have visited. Drifters, gliders and ship transects need per-observation placement, a change to the shared data model and the cube schema; see [`docs/plan-user-provided-insitu-csv.md`](docs/plan-user-provided-insitu-csv.md).
 
 **Quality control.** QARTOD flags are `1` pass, `2` not-evaluated, `3` suspect, `4` fail, `9` missing. The default keeps **`[1, 2]`**: flag 2 is what stations that don't run QARTOD emit, and demanding flag 1 would discard much of the network.
 
@@ -783,11 +820,16 @@ In-situ observations are the cube's **only ground truth**. Every other channel i
 
 **Project-level options** (`products.insitu`):
 
-- `source`: the network (default `ioos`).
-- `variables`: preference order of ERDDAP variable names (default `[sea_water_temperature]`; `sea_surface_temperature` is tried as a fallback).
+- `sources`: which networks to **stack** (default `[ioos]`; `csv` must be opted into, since it needs a `path`).
 - `qc_flags`: QARTOD flags to keep (default `[1, 2]`).
 - `max_sensor_depth_m`: ignore sensors deeper than this on profiling moorings (default `5`).
-- `stations` / `exclude_stations`: an explicit allow-list (else auto-discovery) and a deny-list for a known-bad mooring.
+- `stations` / `exclude_stations`: an allow-list (else auto-discovery for `ioos`, every platform for `csv`) and a deny-list. Both match on station id, in **either** source — so a 50-platform CSV can be narrowed to the 5 that matter without editing the file.
+- `max_position_drift_m`: how far a platform's observations may stray before it is rejected as moving (default: one grid cell).
+- `variables` *(ioos)*: preference order of ERDDAP variable names (default `[sea_water_temperature]`; `sea_surface_temperature` is tried as a fallback).
+- `pad_deg` *(ioos)*: extra search padding around the AOI bbox.
+- `path`, `columns`, `units`, `time_zone`, `qc_pass_values`, `default_station_id` *(csv)*: see above.
+
+A region may override `sources`, `path`, `stations`, `exclude_stations` and `variables` — which data reaches *this* region is a fact about the world. It may **not** override `columns`, `units` or `qc_pass_values`: those decide what the channel *means*, and letting a region change them would make two AOIs' cubes silently non-comparable.
 
 **In the cube** (`datacube.insitu`, default `true`):
 
@@ -796,8 +838,8 @@ In-situ observations are the cube's **only ground truth**. Every other channel i
 | `insitu_sst` | (time,y,x) | the observation nearest the **reference time** (10:30 local solar), so it is contemporaneous with the met channels |
 | `{eco,lst,modis}_insitu_sst` | (time,y,x) | the observation nearest **that sensor's overpass** — the satellite-vs-buoy matchup |
 | `{eco,lst,modis}_insitu_dt_min` | (time,y,x) | signed minutes between the observation and the overpass, so matchup quality is auditable |
-| `insitu_n` | (time,y,x) | stations contributing to the cell (two buoys in one cell are averaged) |
-| `insitu_station` | (y,x) | `0` = none, `k` = station #k, indexing the `insitu_stations` cube attribute |
+| `insitu_n` | (time,y,x) | stations contributing to the cell — N stations sharing a cell are **averaged**, from any mix of sources |
+| `insitu_station` | (y,x) | `0` = none, `k` = station #k, indexing the `insitu_stations` cube attribute (which records each station's `source`) |
 
 All are sparse — NaN everywhere except station cells — which costs almost nothing under the cube's Blosc/zstd encoding. Beyond `datacube.insitu_max_dt_min` (default 60) a matchup is **NaN rather than a stale value**: a buoy reading two hours off an overpass is not truth for that scene, and pretending otherwise is how a validation set quietly acquires a bias.
 

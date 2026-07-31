@@ -28,7 +28,11 @@ QARTOD flags: 1 pass, 2 not-evaluated, 3 suspect, 4 fail, 9 missing. The default
 {1, 2}: flag 2 is what stations that do not run QARTOD emit, and demanding flag 1 would
 throw away much of the network.
 
-    <output_dir>/INSITU/aligned/<aoi>/<aoi>_insitu.nc   dims (station, time)
+This module is ONE SOURCE behind the shared in-situ loop: it discovers and fetches, and
+`insitu_acquire` owns the union time axis, the skip guard, the write and the report, so
+this and the user's own CSVs STACK into one cube. Its output lands at
+
+    <output_dir>/INSITU/ioos/aligned/<aoi>/<aoi>_insitu.nc   dims (station, time)
 
 The NATIVE sampling interval is kept (6 min for CO-OPS): the assembler needs the
 sub-hourly series to match a satellite overpass instant, exactly as `tides` writes a
@@ -44,16 +48,11 @@ from __future__ import annotations
 import io
 import logging
 import time
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import requests
-import xarray as xr
 
-from ..config import DataProduct, Project, opt as _opt, resolve_opts
-from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, provenance, report, store
+from .. import entry
 
 log = logging.getLogger(__name__)
 
@@ -204,173 +203,61 @@ def fetch_station(station_id: str, var: str, start, end, qc_flags, max_depth_m,
 
 
 # --------------------------------------------------------------------------- #
-# Assemble one AoI -> (station, time)
+# The source seam: one AoI's stations -> records
 # --------------------------------------------------------------------------- #
-def build_dataset(records: list[dict]) -> xr.Dataset:
-    """Per-station series -> one (station, time) Dataset on the union time axis."""
-    times = pd.DatetimeIndex(sorted({t for r in records for t in r["df"]["time"]}))
-    S, T = len(records), len(times)
+def fetch_aoi(g, start, end, cfg: dict, dry_run: bool = False) -> list[dict]:
+    """Every usable IOOS station overlapping this AoI, as acquisition records.
 
-    sst = np.full((S, T), np.nan, dtype="float32")
-    qc = np.zeros((S, T), dtype="uint8")
-    for i, r in enumerate(records):
-        df = r["df"].drop_duplicates(subset="time").set_index("time").reindex(times)
-        sst[i] = df["value"].to_numpy(dtype="float32")
-        if "qc" in df:
-            qc[i] = np.nan_to_num(df["qc"].to_numpy(dtype="float32"), nan=0).astype("uint8")
-
-    ds = xr.Dataset(
-        {"sst": (("station", "time"), sst), "qc": (("station", "time"), qc)},
-        coords={
-            "station": np.arange(S, dtype="int32"),
-            "time": times,
-            "station_id": ("station", [r["id"] for r in records]),
-            "station_name": ("station", [r["title"] for r in records]),
-            "lat": ("station", np.array([r["lat"] for r in records], "float64")),
-            "lon": ("station", np.array([r["lon"] for r in records], "float64")),
-            "variable": ("station", [r["var"] for r in records]),
-        },
-    )
-    ds["sst"].attrs.update(units="degC", long_name="in-situ water temperature")
-    ds["qc"].attrs.update(long_name="QARTOD aggregate flag",
-                          flag_values="1 pass, 2 not_evaluated, 3 suspect, 4 fail, 9 missing")
-    return ds
-
-
-def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str) -> Path:
-    """In-situ is a (station, time) table, not a raster: it does NOT go through
-    store.write_output -- there is no y/x for a GeoTIFF to hold."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return store.write_netcdf(ds, out_dir / f"{aoi_id}_insitu.nc",
-                              encoding={"sst": {"zlib": True, "complevel": 4},
-                                        "qc": {"zlib": True, "complevel": 4}})
-
-
-# --------------------------------------------------------------------------- #
-# Main loop
-# --------------------------------------------------------------------------- #
-def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    out_root, overwrite = eff["out_dir"], eff["overwrite"]
-    start, end = eff["time"]["start_date"], eff["time"]["end_date"]
-
-    names = select_aois(grids, only_aoi)
-
-    rep = report.ProductReport("insitu")
-
-    for name in names:
-        g = grids[name]
-        # Resolved PER AoI: station lists are inherently local, and `variables` is a
-        # per-NETWORK naming preference (sea_water_temperature vs sea_surface_temperature)
-        # -- every network still yields the one `insitu_sst` channel, so varying it by
-        # region does not change what the cube means.
-        ds_cfg = eff["ds"][name]
-        variables = ds_cfg["variables"]
-        out_path = out_root / name / f"{name}_insitu.nc"
-        if store.done(out_path, store.REQUIRED_VARS["INSITU"],
-                      covers=(start, end), overwrite=overwrite):
-            log.info("=== %s: %s exists, skipping ===", name, out_path.name)
-            rep.skip()
-            continue
-
-        log.info("=== AOI: %s ===", name)
-        stations = find_stations(g.search_bbox, start, end, ds_cfg["pad_deg"],
-                                 searchfor=variables[0])
-        allow, deny = set(ds_cfg["stations"]), set(ds_cfg["exclude_stations"])
-        if allow:
-            stations = [s for s in stations if s["id"] in allow]
-        stations = [s for s in stations if s["id"] not in deny]
-        log.info("  %d candidate station(s)", len(stations))
-        if dry_run:
-            for s in stations:
-                log.info("  [dry-run] %s | %s", s["id"], s["title"])
-            continue
-
-        records, empty = [], []
+    The seam `insitu_acquire` calls (see its docstring for the record contract). Everything
+    downstream of this -- the union time axis, the write, the report -- is shared with every
+    other network, so this function's whole job is: discover, filter, fetch, and SAY WHAT IT
+    DROPPED.
+    """
+    variables = cfg["variables"]
+    stations = find_stations(g.search_bbox, start, end, cfg["pad_deg"],
+                             searchfor=variables[0])
+    allow, deny = set(cfg["stations"]), set(cfg["exclude_stations"])
+    if allow:
+        stations = [s for s in stations if s["id"] in allow]
+    stations = [s for s in stations if s["id"] not in deny]
+    log.info("  %d candidate station(s)", len(stations))
+    if dry_run:
         for s in stations:
-            available = station_variables(s["id"])
-            var = pick_variable(available, variables)
-            if var is None:                       # would be an HTTP 400 -- never asked
-                empty.append(f"{s['id']} (no temperature variable)")
-                continue
-            df = fetch_station(s["id"], var, start, end, ds_cfg["qc_flags"],
-                               ds_cfg["max_sensor_depth_m"], available)
-            if df is None or df.empty:            # advertised it, never reported it
-                empty.append(f"{s['id']} (no QC-passing values)")
-                continue
-            records.append({"id": s["id"], "title": s["title"], "var": var, "df": df,
-                            "lat": float(df["latitude"].median()),
-                            "lon": float(df["longitude"].median())})
-            log.info("  %-28s %-24s %5d obs  %.1f-%.1f degC", s["id"], var, len(df),
-                     df["value"].min(), df["value"].max())
+            log.info("  [dry-run] %s | %s", s["id"], s["title"])
+        return []
 
-        # A station that reports nothing must be VISIBLE: an empty in-situ channel that
-        # looks like "no buoys here" is the failure mode this product cannot afford.
-        for e in empty:
-            log.warning("  dropped %s", e)
-        if not records:
-            log.warning("  %s: NO usable in-situ stations; nothing written", name)
-            rep.fail(name, f"no usable stations ({len(empty)} dropped)")
+    records, empty = [], []
+    for s in stations:
+        available = station_variables(s["id"])
+        var = pick_variable(available, variables)
+        if var is None:                       # would be an HTTP 400 -- never asked
+            empty.append(f"{s['id']} (no temperature variable)")
             continue
+        df = fetch_station(s["id"], var, start, end, cfg["qc_flags"],
+                           cfg["max_sensor_depth_m"], available)
+        if df is None or df.empty:            # advertised it, never reported it
+            empty.append(f"{s['id']} (no QC-passing values)")
+            continue
+        records.append({"id": s["id"], "title": s["title"], "var": var, "df": df,
+                        "lat": float(df["latitude"].median()),
+                        "lon": float(df["longitude"].median())})
+        log.info("  %-28s %-24s %5d obs  %.1f-%.1f degC", s["id"], var, len(df),
+                 df["value"].min(), df["value"].max())
 
-        ds = build_dataset(records)
-        ds.attrs.update(aoi_id=name, source="IOOS Sensors ERDDAP", erddap=ERDDAP,
-                        qc_flags=str(ds_cfg["qc_flags"]),
-                        **provenance.requested_range(start, end),
-                        **provenance.stamp(eff))
-        log.info("  wrote %s  (%d station(s), %d timestep(s))",
-                 write_output(ds, out_root / name, name).name,
-                 ds.sizes["station"], ds.sizes["time"])
-        rep.wrote(source="IOOS Sensors ERDDAP")
-    rep.log_summary()
-    return rep
-
-
-# --------------------------------------------------------------------------- #
-# Config adapter + pipeline entry point
-# --------------------------------------------------------------------------- #
-def _ds_cfg(opts) -> dict:
-    """One AoI's in-situ settings, from its region-resolved options bag."""
-    return {
-        "variables": list(_opt(opts, "variables", DEFAULT_VARIABLES)),
-        "qc_flags": [int(f) for f in _opt(opts, "qc_flags", DEFAULT_QC_FLAGS)],
-        "max_sensor_depth_m": _opt(opts, "max_sensor_depth_m", DEFAULT_MAX_SENSOR_DEPTH_M),
-        "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
-        "stations": list(_opt(opts, "stations", []) or []),
-        "exclude_stations": list(_opt(opts, "exclude_stations", []) or []),
-    }
-
-
-def _build_eff(project: Project) -> dict:
-    opts = project.products.get(DataProduct.insitu)
-    if opts is None:
-        raise ValueError("insitu is not a selected product in this config")
-
-    return {
-        "config_sha256": project.config_sha256,
-        "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.insitu))
-               for a in project.all_areas},
-        "out_dir": Path(project.output_dir) / "INSITU" / "aligned",
-        "overwrite": bool(_opt(opts, "overwrite", False)),
-        "time": {
-            "start_date": project.time.start_date.isoformat(),
-            "end_date": project.time.end_date.isoformat(),
-        },
-    }
-
-
-def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
-            overwrite=False) -> None:
-    """Acquire IOOS in-situ observations. Entry point for pipeline.py."""
-    eff = _build_eff(project)
-    if overwrite:
-        eff["overwrite"] = True
-    if grids is None:
-        grids = project_grids(project)
-    return run(eff, grids, aois, dry_run)
+    # A station that reports nothing must be VISIBLE: an empty in-situ channel that looks
+    # like "no buoys here" is the failure mode this product cannot afford.
+    for e in empty:
+        log.warning("  dropped %s", e)
+    return records
 
 
 def main():
-    entry.process_main(acquire, "coastal_sst_data IOOS in-situ acquisition.")
+    """IOOS is acquired through the shared loop; run that, narrowed to this source."""
+    from . import insitu_acquire
+
+    entry.process_main(
+        lambda project, **kw: insitu_acquire.acquire(project, source=SOURCE, **kw),
+        "coastal_sst_data IOOS in-situ acquisition.")
 
 
 if __name__ == "__main__":

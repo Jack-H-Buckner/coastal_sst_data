@@ -312,15 +312,49 @@ def load_bathy(d: Path, aoi_id, H, W):
     return elev, depth, dp25, dp75
 
 
-def load_insitu(d: Path, aoi_id):
-    """The AoI's in-situ station series, or None. Dims (station, time)."""
-    f = d / f"{aoi_id}_insitu.nc"
-    if not f.exists():
-        return None
-    return xr.open_dataset(f)
+def load_insitu(base: Path, aoi_id) -> list[tuple[str, xr.Dataset]]:
+    """Every in-situ source's station table for this AoI -> [(source, Dataset), ...].
+
+    In-situ STACKS (D10): a public network and the user's own thermometers are not two pipes
+    to the same observations, they are different PLATFORMS, so each source writes its own
+    `INSITU/<source>/aligned/<aoi>/` tree and they are read together here.
+
+    Only a directory that actually HOLDS this AoI's table counts as a source. That check is
+    not defensive tidiness: `_contribute_stacked_sensor` took EVERY subdirectory as a version
+    tag, and one stray leftover directory was enough to produce silent all-sentinel channels
+    across a whole project (docs/bug-empty-version-tag-channels.md). Every skip is logged, so
+    a mis-named tree is visible rather than absorbed.
+    """
+    out: list[tuple[str, xr.Dataset]] = []
+    if not base.exists():
+        return out
+    for d in sorted(p for p in base.iterdir() if p.is_dir()):
+        if d.name == "aligned":
+            continue                       # the pre-stacking flat layout, handled below
+        f = d / "aligned" / aoi_id / f"{aoi_id}_insitu.nc"
+        if not f.exists():
+            log.warning("  INSITU/%s holds no %s_insitu.nc; not read as an in-situ source",
+                        d.name, aoi_id)
+            continue
+        out.append((d.name, xr.open_dataset(f)))
+
+    # The pre-0.2 flat layout. Read it rather than silently dropping a project's only ground
+    # truth -- but say so, because nothing writes there any more. IOOS was the sole source
+    # that ever wrote it, so that is the tag it takes.
+    legacy = base / "aligned" / aoi_id / f"{aoi_id}_insitu.nc"
+    if legacy.exists():
+        if any(tag == "ioos" for tag, _ in out):
+            log.warning("  ignoring the legacy flat in-situ layout %s; INSITU/ioos/ supersedes it",
+                        legacy.parent)
+        else:
+            log.warning("  reading in-situ from the LEGACY flat layout %s; move it to "
+                        "INSITU/ioos/aligned/ -- it is no longer written there", legacy.parent)
+            out.append(("ioos", xr.open_dataset(legacy)))
+    return out
 
 
-def build_insitu(ids: xr.Dataset, g: AoiGrid, days, targets: dict, max_dt_min):
+def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, targets: dict,
+                 max_dt_min):
     """In-situ channels: the station's value at each target time, in the station's pixel.
 
     `targets` maps a channel prefix to one target datetime per day -- 'insitu' (the daily
@@ -333,46 +367,80 @@ def build_insitu(ids: xr.Dataset, g: AoiGrid, days, targets: dict, max_dt_min):
     last water-mask consumer; masking is a downstream determination now, per Goal 3). A
     station in a land cell stays there.
 
+    Every SOURCE's stations are merged into ONE channel set, because stations are ROWS, not
+    channels: they occupy disjoint pixels anyway, and splitting them per source would multiply
+    the whole `<sensor>_insitu_*` family while making `insitu_sst` stop meaning "ground truth".
+    Which source a platform came from is recorded per station in the table instead. The sources
+    are read as a LIST rather than concatenated: an outer join across two unrelated time axes
+    (6-minute CO-OPS against a 1-minute logger) would build a dense (station, time) block an
+    order of magnitude larger than either, for nothing.
+
     Returns (channels, station_table, station_map).
     """
     H, W = g.height, g.width
-    lons = np.asarray(ids["lon"].values, dtype="float64")
-    lats = np.asarray(ids["lat"].values, dtype="float64")
-    placed = insitu.station_pixels(lons, lats, g)             # water=None: no snapping
-
-    times = pd.DatetimeIndex(ids["time"].values)
-    sst = ids["sst"].values                         # (station, time)
 
     chans = {k: _empty3d(days, H, W) for k in targets}
     dts = {k: _empty3d(days, H, W) for k in targets if k != "insitu"}
     counts = np.zeros((len(days), H, W), dtype="float32")   # stations sharing a cell
     station_map = np.zeros((H, W), dtype="uint16")          # 0 = no station
     table = []
+    # Sums + contributor counts per cell, so N co-located stations give their true MEAN. A
+    # running `(prev + v) / 2` is not one for N > 2 -- it yields a/4 + b/4 + c/2.
+    sums = {k: np.zeros((len(days), H, W), dtype="float64") for k in targets}
+    dt_sums = {k: np.zeros((len(days), H, W), dtype="float64") for k in dts}
+    hits = {k: np.zeros((len(days), H, W), dtype="int32") for k in targets}
+    seen_ids: dict[str, str] = {}                           # station id -> its source
 
-    for s, place in enumerate(placed):
-        sid = str(ids["station_id"].values[s])
-        if not place["inside"]:
-            log.warning("  in-situ station %s falls outside the AoI grid; dropped", sid)
-            continue
-        r, c = place["row"], place["col"]
+    for src, ids in sources:
+        lons = np.asarray(ids["lon"].values, dtype="float64")
+        lats = np.asarray(ids["lat"].values, dtype="float64")
+        placed = insitu.station_pixels(lons, lats, g)         # water=None: no snapping
 
-        table.append({"index": len(table) + 1, "id": sid,
-                      "name": str(ids["station_name"].values[s]),
-                      "lat": float(lats[s]), "lon": float(lons[s]),
-                      "row": r, "col": c})
-        station_map[r, c] = len(table)
+        times = pd.DatetimeIndex(ids["time"].values)
+        sst = ids["sst"].values                     # (station, time)
 
-        for i in range(len(days)):
-            for key, tgt in targets.items():
-                v, dt = insitu.value_at(times, sst[s], tgt[i], max_dt_min)
-                if not np.isfinite(v):
-                    continue
-                # Two stations in one cell: average them, and count the contributors.
-                prev = chans[key][i, r, c]
-                chans[key][i, r, c] = v if not np.isfinite(prev) else (prev + v) / 2.0
-                if key in dts:
-                    dts[key][i, r, c] = dt
-            counts[i, r, c] += 1
+        for s, place in enumerate(placed):
+            sid = str(ids["station_id"].values[s])
+            if not place["inside"]:
+                log.warning("  in-situ station %s [%s] falls outside the AoI grid; dropped",
+                            sid, src)
+                continue
+            r, c = place["row"], place["col"]
+
+            # Two networks may name a platform the same thing; the table's ids must stay
+            # unique or a pixel's `insitu_station` index would point at either of them.
+            if seen_ids.get(sid, src) != src:
+                log.warning("  in-situ station id %r is used by both %s and %s; recording "
+                            "the latter as %s", sid, seen_ids[sid], src, f"{sid}@{src}")
+                sid = f"{sid}@{src}"
+            seen_ids.setdefault(sid, src)
+
+            table.append({"index": len(table) + 1, "id": sid,
+                          "name": str(ids["station_name"].values[s]),
+                          "source": src,
+                          "lat": float(lats[s]), "lon": float(lons[s]),
+                          "row": r, "col": c})
+            station_map[r, c] = len(table)
+
+            for i in range(len(days)):
+                for key, tgt in targets.items():
+                    v, dt = insitu.value_at(times, sst[s], tgt[i], max_dt_min)
+                    if not np.isfinite(v):
+                        continue
+                    sums[key][i, r, c] += v
+                    hits[key][i, r, c] += 1
+                    if key in dt_sums:
+                        dt_sums[key][i, r, c] += dt
+                counts[i, r, c] += 1
+
+    for key in targets:
+        got = hits[key] > 0
+        np.divide(sums[key], hits[key], out=chans[key], where=got,
+                  casting="unsafe")
+        chans[key][~got] = np.nan
+        if key in dts:
+            np.divide(dt_sums[key], hits[key], out=dts[key], where=got, casting="unsafe")
+            dts[key][~got] = np.nan
 
     out = {}
     for key in targets:
@@ -741,14 +809,16 @@ def _contribute_insitu(ctx: AssemblyContext) -> None:
     """
     if not ctx.eff["insitu"]:
         return
-    ids = load_insitu(ctx.adir("insitu"), ctx.aid)
-    if ids is None:
+    sources = load_insitu(ctx.eff["aligned_root"] / PRODUCT_DIRS["insitu"], ctx.aid)
+    if not sources:
         return
     targets = {"insitu": ctx.slots[SLOT_REF_UTC], **ctx.slots[SLOT_SENSOR_TIMES]}
     insitu_vars, station_table, station_map = build_insitu(
-        ids, ctx.g, ctx.days, targets, ctx.eff["insitu_max_dt_min"])
-    ids.close()
-    log.info("  in-situ: %d station(s) placed", len(station_table))
+        sources, ctx.g, ctx.days, targets, ctx.eff["insitu_max_dt_min"])
+    for _, ids in sources:
+        ids.close()
+    log.info("  in-situ: %d station(s) placed from %d source(s): %s",
+             len(station_table), len(sources), ", ".join(s for s, _ in sources))
     for name, (dims, arr) in insitu_vars.items():
         ctx.emit(name, dims, arr)
     if station_map is not None:

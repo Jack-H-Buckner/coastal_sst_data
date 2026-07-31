@@ -66,12 +66,30 @@ products:
     # Optional per-AOI gauge overrides (else nearest CO-OPS water-level station):
     # stations: {hood_canal: "9445133"}
   insitu:                    # in-situ buoys/gauges -- the cube's ground truth
-    source: ioos             # IOOS Sensors ERDDAP (NDBC + CO-OPS + CDIP + regionals)
+    # STACKED: every source listed is acquired into its own INSITU/<source>/ tree and the
+    # cube merges their platforms into ONE station table. `ioos` discovers public buoys;
+    # `csv` reads your own files. List both to get both.
+    sources: [ioos]          # ioos (IOOS Sensors ERDDAP: NDBC + CO-OPS + CDIP + regionals) | csv
     variables: [sea_water_temperature]   # falls back to sea_surface_temperature per station
     qc_flags: [1, 2]         # QARTOD: 1 pass, 2 not-evaluated (3/4/9 dropped)
     max_sensor_depth_m: 5    # ignore deep sensors on profiling moorings
     # stations: [noaa_nos_co_ops_9437540]   # optional allow-list (else auto-discovered)
     # exclude_stations: []
+    # --- the `csv` source: your own thermometers, in long format ----------------------
+    # One row per observation. Rows are GROUPED BY station_id, so one file may hold any
+    # number of platforms -- each becomes its own station, in its own pixel.
+    # path: ~/data/moorings/*.csv        # a file, a directory, or a glob
+    # columns:                           # only the ones whose names differ from these
+    #   station_id: station_id
+    #   time: time
+    #   latitude: latitude
+    #   longitude: longitude
+    #   value: value
+    #   # optional, used when present: z, qc, station_name
+    # time_zone: UTC          # what a timestamp with no offset is assumed to be
+    # units: degC             # degC | degF | K -- converted to degC
+    # qc_pass_values: [1, 2]  # values of the qc column to keep; omit to keep every row
+    # default_station_id: null  # id for a single-platform file with no station_id column
   landcover:
     source: esa               # esa (ESA WorldCover via Planetary Computer) | gee (future)
     year: 2021                # WorldCover v200 (2021); 2020 -> v100

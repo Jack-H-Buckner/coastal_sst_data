@@ -24,7 +24,7 @@ import pytest
 
 from coastal_sst_data import pipeline
 from coastal_sst_data.config import DataProduct, parse_config, opt, resolve_opts
-from coastal_sst_data.processes import cmems, insitu_ioos, met, tides
+from coastal_sst_data.processes import cmems, insitu_acquire, landcover_esa, met, tides
 
 
 def _two_continent_project(tmp_path):
@@ -43,9 +43,10 @@ def _two_continent_project(tmp_path):
             "met": {"sources": ["hrrr", "era5"], "variables": ["airtemp", "wind"]},
             "cmems": {"sources": ["my_global", "anfc_global"],
                       "variables": ["thetao"], "depths": [0.0, 10.0]},
-            "insitu": {"source": "ioos", "qc_flags": [1, 2]},
+            "insitu": {"sources": ["ioos"], "qc_flags": [1, 2]},
             "tides": {"sources": ["coops", "eo_tides"]},
             "bathymetry": {"sources": ["cudem"]},
+            "landcover": {"source": "esa"},
         },
         "auth": {"earthdata": {"auth_strategy": "netrc"},
                  "copernicus": {"auth_strategy": "netrc"}},
@@ -59,9 +60,10 @@ def _two_continent_project(tmp_path):
                  "met": {"sources": ["era5"]},
                  "cmems": {"sources": ["anfc_med"],
                            "datasets": {"anfc_med": "cmems_mod_med_phy-tem_anfc_4.2km_P1D-m"}},
-                 "insitu": {"source": "ioos", "exclude_stations": ["bogus1"]},
+                 "insitu": {"sources": ["ioos"], "exclude_stations": ["bogus1"]},
                  "tides": {"sources": ["eo_tides"], "model": "FES2022"},
                  "bathymetry": {"sources": ["gmrt"]},
+                 "landcover": {"source": "esa"},
              },
              "areas": [{"name": "ligurian", "center_lat": 44.0, "center_lon": 9.0,
                         "buffer_ns_km": 8, "buffer_ew_km": 8}]},
@@ -108,7 +110,7 @@ def test_bathymetry_dems_differ_per_region(tmp_path):
 
 def test_insitu_station_excludes_are_per_region(tmp_path):
     """Station lists are inherently local, so they resolve per region."""
-    ds = insitu_ioos._build_eff(_two_continent_project(tmp_path))["ds"]
+    ds = insitu_acquire._build_eff(_two_continent_project(tmp_path))["ds"]
     assert ds["tillamook"]["exclude_stations"] == []
     assert ds["ligurian"]["exclude_stations"] == ["bogus1"]
 
@@ -154,17 +156,21 @@ def test_global_products_have_no_region_keys():
 # --------------------------------------------------------------------------- #
 # Dispatch: one product, two source MODULES, in one run
 # --------------------------------------------------------------------------- #
+# These exercise the PICK-ONE (SourceKind.ACCESS) dispatch path, where the resolved source
+# decides which MODULE serves an AoI. Land-cover is the vehicle: in-situ used to be the
+# example, but its sources now STACK (every source is served by one fan-out module), so it no
+# longer exercises per-AoI module selection at all. `insitu` covers the stacked path below.
 def test_pipeline_groups_aois_by_their_resolved_source_module(tmp_path):
     """The dispatch half. `_modules_for` groups AoIs by the module that will serve them, so
-    a project whose regions use different in-situ networks runs BOTH in one pass -- which
+    a project whose regions use different land-cover backends runs BOTH in one pass -- which
     the old project-wide `project.products[...].source` lookup could not express at all."""
     project = _two_continent_project(tmp_path)
-    groups = pipeline._modules_for(project, DataProduct.insitu, ["tillamook", "ligurian"])
-    # Both regions name `ioos` here, so they coalesce onto one module -- the grouping is by
+    groups = pipeline._modules_for(project, DataProduct.landcover, ["tillamook", "ligurian"])
+    # Both regions name `esa` here, so they coalesce onto one module -- the grouping is by
     # RESOLVED MODULE, not by region, so identical sources are not needlessly split.
     assert len(groups) == 1
     module, aois = groups[0]
-    assert module is insitu_ioos
+    assert module is landcover_esa
     assert sorted(aois) == ["ligurian", "tillamook"]
 
 
@@ -174,34 +180,46 @@ def _set_region_source(project, region_idx, product, source):
 
 
 def test_pipeline_splits_when_regions_resolve_to_different_modules(tmp_path, monkeypatch):
-    """Register a second in-situ network for one region only: the pipeline must dispatch
+    """Register a second land-cover backend for one region only: the pipeline must dispatch
     BOTH modules, each with just its own AoIs. This is the case the old project-wide
-    `project.products[insitu].source` lookup could not express at all."""
-    # Register a stub network. `SOURCE_MODULES` holds dotted module paths, resolved lazily,
+    `project.products[<product>].source` lookup could not express at all."""
+    # Register a stub backend. `SOURCE_MODULES` holds dotted module paths, resolved lazily,
     # but an already-imported module object passes straight through -- which is exactly what
     # lets a test register a source without shipping a module for it.
     sentinel = object()
-    monkeypatch.setitem(pipeline.SOURCE_MODULES[DataProduct.insitu], "emodnet", sentinel)
+    monkeypatch.setitem(pipeline.SOURCE_MODULES[DataProduct.landcover], "corine", sentinel)
 
     project = _two_continent_project(tmp_path)
-    # The Mediterranean region switches to the (newly registered) European network.
-    _set_region_source(project, 1, DataProduct.insitu, "emodnet")
+    # The Mediterranean region switches to the (newly registered) European product.
+    _set_region_source(project, 1, DataProduct.landcover, "corine")
 
-    groups = dict(pipeline._modules_for(project, DataProduct.insitu,
+    groups = dict(pipeline._modules_for(project, DataProduct.landcover,
                                         ["tillamook", "ligurian"]))
-    assert groups[insitu_ioos] == ["tillamook"]      # N. America -> IOOS
-    assert groups[sentinel] == ["ligurian"]          # Mediterranean -> the new network
+    assert groups[landcover_esa] == ["tillamook"]    # N. America -> ESA WorldCover
+    assert groups[sentinel] == ["ligurian"]          # Mediterranean -> the new backend
 
 
 def test_an_aoi_whose_source_has_no_module_is_reported_not_dropped(tmp_path):
     """A source with no implementation must be LOUD. That AoI produces nothing, and a cube
     missing a product looks exactly like one whose product found no data."""
     project = _two_continent_project(tmp_path)
-    _set_region_source(project, 1, DataProduct.insitu, "nonesuch")
-    groups = dict(pipeline._modules_for(project, DataProduct.insitu,
+    _set_region_source(project, 1, DataProduct.landcover, "nonesuch")
+    groups = dict(pipeline._modules_for(project, DataProduct.landcover,
                                         ["tillamook", "ligurian"]))
-    assert groups[insitu_ioos] == ["tillamook"]
+    assert groups[landcover_esa] == ["tillamook"]
     assert groups[None] == ["ligurian"]              # unimplemented -> surfaced, not silent
+
+
+def test_stacked_insitu_dispatches_one_module_for_every_source(tmp_path):
+    """The STACKED counterpart: in-situ sources are not alternatives to choose between, so
+    every AoI resolves to the one fan-out module, which acquires each configured source into
+    its own tree. There is no per-AoI source selector left to split on."""
+    project = _two_continent_project(tmp_path)
+    groups = pipeline._modules_for(project, DataProduct.insitu, ["tillamook", "ligurian"])
+    assert len(groups) == 1
+    module, aois = groups[0]
+    assert module is insitu_acquire
+    assert sorted(aois) == ["ligurian", "tillamook"]
 
 
 # --------------------------------------------------------------------------- #

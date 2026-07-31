@@ -637,6 +637,52 @@ def test_known_region_source_key_is_accepted(base_project):
     parse_config(cfg)          # must not raise
 
 
+# --------------------------------------------------------------------------- #
+# In-situ: pick-one `source` became stacked `sources`
+# --------------------------------------------------------------------------- #
+def test_insitu_source_is_rejected_and_points_at_sources(base_project):
+    """In-situ sources STACK now, so the singular key is gone. Accepting it and ignoring it
+    would be a config that LIES -- the run would quietly acquire the default set. The generic
+    unknown-key check already carries the migration, because it suggests the near miss."""
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["insitu"] = {"source": "ioos"}
+    with pytest.raises(ValidationError, match="did you mean 'sources'"):
+        parse_config(cfg)
+
+
+def test_insitu_sources_must_name_known_sources(base_project):
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["insitu"] = {"sources": ["ioos", "nonesuch"]}
+    with pytest.raises(ValidationError, match="nonesuch"):
+        parse_config(cfg)
+
+
+def test_a_region_may_point_insitu_at_its_own_file(base_project):
+    """Which file holds THIS region's observations is a fact about the world, like which DEM
+    has coverage -- so `path` (and the station lists) are region-overridable."""
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["insitu"] = {"sources": ["csv"], "path": "/data/all.csv"}
+    cfg["regions"][0]["sources"] = {"insitu": {"path": "/data/pnw/*.csv",
+                                               "exclude_stations": ["bogus"]}}
+    parse_config(cfg)          # must not raise
+
+
+@pytest.mark.parametrize("key,value", [
+    ("columns", {"value": "temp_c"}),     # would change what the channel is READ from
+    ("units", "degF"),                    # would change what the channel MEANS
+    ("qc_pass_values", [1]),              # would apply a different QC bar
+])
+def test_a_region_may_not_reshape_the_insitu_channel(base_project, key, value):
+    """The line the registry draws: 'which source has coverage here' yes, 'what the cube
+    means' no. A region reading its values in degF would make two AoIs' cubes silently
+    non-comparable."""
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["insitu"] = {"sources": ["csv"], "path": "/data/all.csv"}
+    cfg["regions"][0]["sources"] = {"insitu": {key: value}}
+    with pytest.raises(ValidationError, match="not a recognised option"):
+        parse_config(cfg)
+
+
 def test_the_working_example_config_still_loads():
     """The registry must describe what real configs actually use."""
     load_config(Path(__file__).parents[1] / "examples" / "config.test.yaml")
