@@ -109,11 +109,25 @@ def write_landsat(project, g, day, hour, temp=288.0):
     _write(project, "LANDSAT", f"{AOI}_{stamp}.nc", ds)
 
 
-def write_modis(project, g, day, temp=287.0):
+def write_modis(project, g, day, temp=287.0, *, footprint=True, block=3, temp_step=0.0):
+    """One MODIS scene, with the `footprint_id` layer MODIS writes by default.
+
+    The ids are laid out as `block` x `block` tiles, which is the shape a real nearest-neighbour
+    resample from a ~1 km swath onto a fine grid produces: many grid cells per native pixel.
+    `temp_step` makes SST vary per footprint (block-constant, as that resample always is), so a
+    footprint-grouped average has something to average; the 0.0 default keeps SST constant for
+    the tests that predate the layer. `footprint=False` writes the pre-feature file (sst+valid),
+    which is what a granule acquired with `footprint_id: false` looks like.
+    """
     H, W, xs, ys = _grid_hw(g)
-    ds = xr.Dataset({"sst": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
-                     "valid": (("time", "y", "x"), np.ones((1, H, W), "uint8"))},
-                    coords={"time": [day], "y": ys, "x": xs})
+    rows, cols = np.arange(H)[:, None], np.arange(W)[None, :]
+    fp = (rows // block) * ((W + block - 1) // block) + (cols // block)
+    fp = np.broadcast_to(fp, (H, W)).astype("int32")
+    data = {"sst": (("time", "y", "x"), (temp + temp_step * fp)[None].astype("float32")),
+            "valid": (("time", "y", "x"), np.ones((1, H, W), "uint8"))}
+    if footprint:
+        data["footprint_id"] = (("time", "y", "x"), fp[None])
+    ds = xr.Dataset(data, coords={"time": [day], "y": ys, "x": xs})
     _write(project, "MODIS", f"{AOI}_{day.strftime('%Y%m%d')}T210000.nc", ds)
 
 
@@ -317,6 +331,97 @@ def test_modis_trusts_valid_layer(project, grids, days):
     assert np.nanmean(ds["modis_sst"].isel(time=1).values) == pytest.approx(290.0)
     assert int(ds["modis_valid"].isel(time=1).values.sum()) == g.height * g.width
     assert np.isnan(ds["modis_sst"].isel(time=0).values).all()   # no granule that day
+
+
+# --------------------------------------------------------------------------- #
+# `modis_footprint_id` -- which native ~1 km observation each fine cell came from.
+#
+# MODIS is gridded from a COARSER swath, so a block of grid cells shares one observation.
+# Carrying that grouping into the cube is what lets a downstream calibration average a
+# high-res sensor over exactly the pixels one MODIS observation covers, without reopening
+# the per-granule NetCDFs. Three things have to hold for that to be worth anything: the
+# ids must be integers with a real "no pixel" sentinel, they must come from the SAME scene
+# the SST came from, and they must be absent (not all -1) when the granules never had them.
+# --------------------------------------------------------------------------- #
+def _modis_base(project, g, days):
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+
+
+def test_modis_footprint_id_reaches_the_cube(project, grids, days):
+    g = grids[AOI]
+    _modis_base(project, g, days)
+    write_modis(project, g, days[1], temp=290.0, block=3)
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "modis_footprint_id" in ds.data_vars
+    # An INDEX, not a measurement: int32 with a -1 sentinel, never a float with NaN.
+    assert ds["modis_footprint_id"].dtype == np.int32
+    fp = ds["modis_footprint_id"].isel(time=1).values
+    assert (fp >= 0).all()                               # the whole AoI was in swath
+    # Days with no granule are -1 throughout -- distinguishable from any real id.
+    assert (ds["modis_footprint_id"].isel(time=0).values == -1).all()
+    # A footprint spans many grid cells; that is the entire point of the channel.
+    _, counts = np.unique(fp, return_counts=True)
+    assert counts.max() == 9                              # 3x3 blocks
+    assert "NOT comparable across days" in ds["modis_footprint_id"].attrs["comment"]
+
+
+def test_footprint_ids_group_cells_that_share_one_modis_observation(project, grids, days):
+    """The property the channel exists to support: cells sharing an id share a MODIS value,
+    so averaging another sensor within an id is averaging over one MODIS observation."""
+    g = grids[AOI]
+    _modis_base(project, g, days)
+    write_modis(project, g, days[1], temp=290.0, block=3, temp_step=0.5)
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    fp = ds["modis_footprint_id"].isel(time=1).values
+    sst = ds["modis_sst"].isel(time=1).values
+    for fid in np.unique(fp):
+        block = sst[fp == fid]
+        assert np.ptp(block) == 0.0, f"footprint {fid} spans >1 MODIS value"
+    # ...and distinct footprints really are distinct observations (temp_step made them vary),
+    # so a group-by is not silently collapsing the whole scene into one bucket.
+    assert len(np.unique(sst)) == len(np.unique(fp))
+
+
+def test_no_footprint_channel_when_the_granules_never_carried_one(project, grids, days):
+    """`footprint_id` is optional at acquisition. When no granule has it, the channel is
+    ABSENT rather than all -1 -- which would read as 'nothing was ever in swath'."""
+    g = grids[AOI]
+    _modis_base(project, g, days)
+    write_modis(project, g, days[1], temp=290.0, footprint=False)
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "modis_footprint_id" not in ds.data_vars
+    assert "modis_sst" in ds.data_vars                    # the rest of MODIS is unaffected
+
+
+def test_footprint_comes_from_the_same_scene_as_the_sst(project, grids, days):
+    """Two granules on one day: the clearest wins, and its footprint must win with it.
+    Reading the footprint outside that choice would pair one granule's pixel indices with
+    another granule's temperatures -- wrong, and invisible."""
+    g = grids[AOI]
+    _modis_base(project, g, days)
+    H, W, xs, ys = _grid_hw(g)
+    for hh, valid_rows, block in [(19, H // 2, 2), (21, H, 3)]:   # the 21:00 scene is clearer
+        rows, cols = np.arange(H)[:, None], np.arange(W)[None, :]
+        fp = ((rows // block) * ((W + block - 1) // block) + (cols // block)).astype("int32")
+        fp = np.broadcast_to(fp, (H, W)).astype("int32")
+        valid = np.zeros((H, W), "uint8")
+        valid[:valid_rows] = 1
+        ds_in = xr.Dataset(
+            {"sst": (("time", "y", "x"), np.full((1, H, W), 290.0, "float32")),
+             "valid": (("time", "y", "x"), valid[None]),
+             "footprint_id": (("time", "y", "x"), fp[None])},
+            coords={"time": [days[1]], "y": ys, "x": xs})
+        _write(project, "MODIS", f"{AOI}_{days[1].strftime('%Y%m%d')}T{hh:02d}0000.nc", ds_in)
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert ds["modis_hour"].values[1] == pytest.approx(21.0)      # the clearer scene won
+    _, counts = np.unique(ds["modis_footprint_id"].isel(time=1).values, return_counts=True)
+    assert counts.max() == 9        # the 21:00 scene's 3x3 blocks, not the 19:00 scene's 2x2
 
 
 # --------------------------------------------------------------------------- #

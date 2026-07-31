@@ -117,9 +117,8 @@ class SensorSpec:
     These fields ARE the arguments `datacube.load_clearest_overpass` already takes -- they
     were passed as three hand-written call sites, one per sensor. Declaring them makes the
     sensor family a LOOP, so a fourth sensor gets its `<prefix>_sst`, `_cloud`, `_valid`,
-    `_hour`, `_water_elev`, `_water_class`, `_tide`, its overpass-met snapshots and its
-    in-situ matchups for free -- every one of those channel names is already generated from
-    the prefix.
+    `_hour`, `_footprint_id`, its overpass-met snapshots and its in-situ matchups for free --
+    every one of those channel names is already generated from the prefix.
     """
     prefix: str                                  # eco | lst | modis -- names every channel
     water_is_land: bool = False                  # ECOSTRESS's water layer has inverted polarity
@@ -131,6 +130,12 @@ class SensorSpec:
     # `modis_cloud` -- an all-zero cloud channel would read as "this scene was never cloudy",
     # which is a claim its files do not make.
     has_cloud: bool = True
+    # Whether this sensor's aligned files MAY carry a `footprint_id` layer -- the index of the
+    # native sensor pixel each grid cell was resampled from, which only a sensor gridded from a
+    # COARSER swath has to say (MODIS: ~1 km observations on a 100 m grid). This flag is
+    # permission, not a promise: the layer is optional at acquisition time, so the assembler
+    # emits `<prefix>_footprint_id` only when a granule on disk actually carried one.
+    has_footprint: bool = False
 
 
 @dataclass(frozen=True)
@@ -379,7 +384,10 @@ REGISTRY: tuple[ProductSpec, ...] = (
         depends_on=(DataProduct.landsat,),
         # Already quality-filtered upstream -> trust the file's own `valid` layer; it has no
         # water or cloud layer to recompute from, and so publishes no `modis_cloud` channel.
-        sensor=SensorSpec(prefix="modis", trust_valid=True, has_cloud=False),
+        # It is the one sensor gridded from a COARSER swath, so it alone can say which native
+        # ~1 km observation each grid cell came from -- `modis_footprint_id`.
+        sensor=SensorSpec(prefix="modis", trust_valid=True, has_cloud=False,
+                          has_footprint=True),
         provenance_inputs=("modis",),
     ),
 
