@@ -146,11 +146,18 @@ def test_region_cannot_override_a_channel_shaping_option(tmp_path, product, key,
 
 
 def test_global_products_have_no_region_keys():
-    """MUR/MODIS/ECOSTRESS are global -- a region source for them would be a no-op, so the
-    registry has none and the validator will reject one."""
+    """MODIS/ECOSTRESS are global -- a region source for them would be a no-op, so the
+    registry has none and the validator will reject one.
+
+    MUR is global in its DATA too, and its data keys are still project-wide; the one region
+    key it has (`overpass_sensors`) does not reshape the cube -- it says which sensors are
+    worth restricting MUR's DOWNLOADS to here, which genuinely varies (an AoI may be
+    ECOSTRESS-only). `mur_sst` means the same thing in every region either way.
+    """
     from coastal_sst_data.config import REGION_OPTIONS
-    for p in (DataProduct.mur, DataProduct.modis, DataProduct.ecostress):
+    for p in (DataProduct.modis, DataProduct.ecostress):
         assert p not in REGION_OPTIONS
+    assert REGION_OPTIONS[DataProduct.mur] == {"overpass_sensors"}
 
 
 # --------------------------------------------------------------------------- #

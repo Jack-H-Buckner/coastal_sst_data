@@ -35,6 +35,11 @@ products:
     versions: [v003, v002]
   mur:
     variable: analysed_sst
+    # Fetch only the days a sensor flew, by CHANNEL PREFIX (eco/lst/modis). MUR's job here is
+    # the cloud-filter baseline, which can only read a day a sensor also imaged -- so over a
+    # long window most daily downloads produce a file nothing reads. Unset -> every day.
+    # Region-overridable. Leave commented unless you want the restriction (see README).
+    # overpass_sensors: [eco]
   cmems:                     # Copernicus Marine global physics (offshore water column)
     # DISTINCT-DATA sources are STACKED (one cmems_<var>_<tag> channel each), not picked-one:
     # my_global (GLORYS12 reanalysis), anfc_global (analysis/forecast). Regional models
@@ -166,6 +171,11 @@ regions:
         # the offset (no coverage / wide spread / while a transient outage retries); a resolved
         # value always wins over it. Uncomment to give this region a best estimate:
         # datum_offset_m: 1.31   # elevation of MSL in the DEM's datum (m)
+      # MUR's overpass-day filter is region-overridable, because WHICH sensors are worth
+      # restricting to varies: a region you only image with ECOSTRESS should not pull a MUR
+      # day for every near-daily MODIS pass. Overrides `products.mur.overpass_sensors`.
+      # mur:
+      #   overpass_sensors: [eco]
     # list aois in the region.
     areas:
       - name: tillamook_bay

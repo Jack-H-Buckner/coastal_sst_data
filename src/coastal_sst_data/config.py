@@ -789,6 +789,59 @@ class Project(BaseModel):
             raise ValueError("invalid overpass combinations:\n  " + "\n  ".join(problems))
         return self
 
+    @model_validator(mode="after")
+    def _overpass_sensor_lists_are_valid(self):
+        """`mur.overpass_sensors` must name LOADED sensors by their channel PREFIX.
+
+        The prefix is `eco`, not `ecostress`: the filter finds a sensor's days by globbing the
+        aligned tree that prefix names, so a product name matches nothing and MUR would restrict
+        itself to ZERO days -- a run that downloads nothing and reports no error. An unselected
+        sensor is the same failure by a different route. Both fail at load, which is what makes
+        the runtime message ("the sensors have not run in this output dir") unambiguous: after
+        this validator, an empty sensor tree cannot mean a typo.
+
+        Absent = no restriction (every day, the default). An EMPTY list is rejected rather than
+        read as either extreme.
+        """
+        from .products import sensors as _sensors
+        sensor_of = {s.sensor.prefix: s.product for s in _sensors()}    # prefix -> DataProduct
+        problems: list[str] = []
+
+        def check(where: str, opts, key: str):
+            raw = (getattr(opts, "model_extra", None) or {}).get(key)
+            if raw is None:
+                return
+            names = [raw] if isinstance(raw, str) else list(raw)
+            if not names:
+                problems.append(f"{where} is empty; omit the key to fetch every day, or list "
+                                f"at least one of {sorted(sensor_of)}.")
+            for name in names:
+                name = str(name)
+                if name not in sensor_of:
+                    hint = get_close_matches(name, sorted(sensor_of), n=1, cutoff=0.4)
+                    suggest = f" (did you mean {hint[0]!r}?)" if hint else ""
+                    problems.append(f"{where}: {name!r} is not a sensor{suggest}; choose from "
+                                    f"{sorted(sensor_of)}.")
+                elif sensor_of[name] not in self.products:
+                    problems.append(f"{where}: {name!r} names product "
+                                    f"{sensor_of[name].value!r}, which is not selected -- it "
+                                    "would never write the overpasses to filter on.")
+
+        # (product, option key). One entry today; a table so a second product adopting the
+        # same key does not reopen this validator.
+        for host, key in ((DataProduct.mur, "overpass_sensors"),):
+            if host not in self.products:
+                continue
+            check(f"products.{host.value}.{key}", self.products[host], key)
+            for r in self.regions:
+                if host in r.sources:
+                    check(f"regions[{r.name}].sources.{host.value}.{key}",
+                          r.sources[host], key)
+
+        if problems:
+            raise ValueError("invalid overpass sensor list(s):\n  " + "\n  ".join(problems))
+        return self
+
     # What this project was LOADED FROM. Kept so an assembled datacube can embed the
     # exact config that produced it -- a cube whose config has since been edited, moved,
     # or deleted is still reproducible from its own attrs. Private (not config fields), so

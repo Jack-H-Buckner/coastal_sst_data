@@ -623,6 +623,44 @@ def test_bad_tide_overpass_combinations_are_rejected(base_project):
         parse_config(base_project)
 
 
+def test_bad_mur_overpass_sensors_are_rejected(base_project):
+    """`mur.overpass_sensors` restricts MUR's DOWNLOADS to the days a sensor flew, by globbing
+    the aligned tree that sensor PREFIX names. A product name or an unselected sensor matches
+    no tree, so MUR would fetch zero days and report no error -- fail at load instead."""
+    base_project["products"]["mur"] = {"overpass_sensors": ["ecostress"]}
+    with pytest.raises(ValidationError, match="did you mean 'eco'"):
+        parse_config(base_project)
+
+    # a real prefix, but the sensor that would write those overpasses isn't selected
+    base_project["products"]["mur"] = {"overpass_sensors": ["lst"]}
+    with pytest.raises(ValidationError, match="not selected"):
+        parse_config(base_project)
+
+    # [] is ambiguous between "every day" and "no days" -- neither is safe to guess
+    base_project["products"]["mur"] = {"overpass_sensors": []}
+    with pytest.raises(ValidationError, match="is empty"):
+        parse_config(base_project)
+
+
+def test_good_mur_overpass_sensors_are_accepted(base_project):
+    base_project["products"]["ecostress"] = None
+    base_project["products"]["mur"] = {"overpass_sensors": ["eco"]}
+    parse_config(base_project)                                   # must not raise
+
+    base_project["products"]["mur"] = {"overpass_sensors": "eco"}   # a bare string is one
+    parse_config(base_project)
+
+    # ...and a region may name a different set (an AoI may be ECOSTRESS-only)
+    cfg = copy.deepcopy(base_project)
+    cfg["products"]["modis"] = None
+    cfg["regions"][0]["sources"]["mur"] = {"overpass_sensors": ["modis"]}
+    parse_config(cfg)
+
+    cfg["regions"][0]["sources"]["mur"] = {"overpass_sensors": ["lst"]}   # landsat unselected
+    with pytest.raises(ValidationError, match="not selected"):
+        parse_config(cfg)
+
+
 def test_unknown_region_source_key_is_rejected(base_project):
     cfg = copy.deepcopy(base_project)
     cfg["regions"][0]["sources"] = {"bathymetry": {"sourcez": ["cudem"]}}

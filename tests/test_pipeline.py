@@ -54,10 +54,11 @@ def acquire_calls(monkeypatch):
 # A. Dispatch & ordering
 # ---------------------------------------------------------------------------
 def test_products_run_in_process_order(acquire_calls):
-    # config lists them out of order; pipeline must impose PROCESS_ORDER.
+    # config lists them out of order; pipeline must impose PROCESS_ORDER. MUR follows the
+    # sensors because its `overpass_sensors` filter reads their aligned dirs.
     proj = _make_project({"mur": None, "bathymetry": None, "ecostress": None}, auth=EARTHDATA)
     pipeline.run_pipeline(proj, dry_run=True)
-    assert [c["name"] for c in acquire_calls] == ["bathymetry", "mur", "ecostress"]
+    assert [c["name"] for c in acquire_calls] == ["bathymetry", "ecostress", "mur"]
 
 
 def test_landsat_runs_before_modis(acquire_calls):

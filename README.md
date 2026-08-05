@@ -474,7 +474,9 @@ preprocess:
     fill_water: { sources: [mur, cmems] }
     # ECOSTRESS cloud screening vs the gap-free L4 baseline (cold-deviation).
     filter_clouds: { method: offset, baseline: mur_sst, threshold_k: 5.0, sensors: [eco] }
-    #   ...or the distribution-based, seasonally-aware variant:
+    #   ...or the distribution-based, seasonally-aware variant. Note this one builds its cutoff
+    #   from the baseline's OWN climatology, so it wants a dense baseline: pairing it with
+    #   `products.mur.overpass_sensors` leaves fewer samples per pixel (see the MUR section).
     # filter_clouds: { method: sigma, baseline: mur_sst, n_sigma: 3.0, stat_scope: pixel, seasonality: harmonic }
     # Meteorological cloud-cover gate (HRRR/ERA5, %): scene-level + per-pixel.
     filter_cloud_cover: { scene_max_pct: 30, pixel_max_pct: 80, sensors: [eco] }
@@ -734,8 +736,44 @@ MUR is the always-present, gap-free SST backbone the high-resolution products ad
 - `short_name`: Earthdata short name (default `MUR-JPL-L4-GLOB-v4.1`).
 - `variable`: variable to read (default `analysed_sst`).
 - `pad_deg`: degrees of padding added around the AOI lat/lon window before subsetting (default `0.05`).
+- `overpass_sensors`: fetch only the days these sensors flew (default: unset — every day). See below.
 
-**Region-level options**: none.
+**Region-level options**: `overpass_sensors`.
+
+#### MUR on overpass days only
+
+MUR's main job downstream is the cloud-filter baseline, which can only ever read a day a thermal
+sensor also imaged. Over a multi-year window most of the daily downloads therefore produce a file
+nothing reads. `overpass_sensors` restricts the days fetched to the ones a named sensor actually
+recorded an overpass over *this* AOI, discovered by reading the sensors' aligned dirs:
+
+```yaml
+products:
+  mur:
+    overpass_sensors: [eco]        # ...or [eco, lst, modis]
+```
+
+Name sensors by their **channel prefix** (`eco`, `lst`, `modis`), not the product name — a wrong
+name is rejected at config load. It is region-overridable, because which sensors are worth
+restricting to genuinely varies (an AOI may be ECOSTRESS-only). Because the filter reads what the
+sensors wrote, MUR now runs **after** them in the process order; running `--products mur` alone
+against an output dir where those sensors have never run fails loudly rather than silently
+downloading nothing.
+
+Three consequences worth knowing:
+
+- **`fill_water` leaves non-overpass days unfilled.** It fills water pixels from `mur_sst`/`cmems_*`;
+  where MUR was not fetched there is nothing to fill from.
+- **`filter_clouds: {method: offset}` is unaffected** — it compares each day's sensor SST against
+  that day's baseline, and only overpass days have sensor SST to filter. **`method: sigma` is
+  affected**: it builds its cutoff from the baseline's *own* observed climatology, so a sparser MUR
+  means fewer samples per pixel, and pixels with too few samples get a NaN cutoff (kept).
+- **The cube's thin-coverage warning for `mur` is suppressed** when this option is set, and the
+  `coverage` attr marks the entry `"sparse": true` — the fraction is still measured and reported.
+
+The filter restricts what is **fetched**, not what exists: days written before you set the option
+stay on disk and stay in the cube. Conversely, setting it does not backfill — widen or drop the
+option and re-run to fetch the rest.
 
 ### CMEMS (Copernicus Marine global physics)
 CMEMS supplies the **offshore ocean state at depth** — the water column the nearshore exchanges with. Where MUR gives one skin temperature at the surface, this gives temperature (and optionally salinity and currents) *through the water column*, so a model can see the stratification and the offshore water mass that upwelling and tidal exchange draw into an estuary.

@@ -97,11 +97,16 @@ def test_process_order_honours_the_real_constraints():
     for sensor in (DataProduct.ecostress, DataProduct.landsat, DataProduct.modis):
         assert pos[sensor] < pos[DataProduct.met]
 
+    # MUR's `overpass_sensors` filter restricts its days to the ones a sensor flew, which it
+    # discovers from those same aligned dirs -- so MUR can no longer lead the run.
+    for sensor in (DataProduct.ecostress, DataProduct.landsat, DataProduct.modis):
+        assert pos[sensor] < pos[DataProduct.mur]
+
 
 def test_process_order_is_stable_and_matches_the_previous_hand_kept_list():
     """The topological sort must not have quietly reshuffled a working pipeline."""
     assert [p.value for p in pipeline.process_order()] == [
-        "bathymetry", "mur", "cmems", "ecostress", "landsat", "modis",
+        "bathymetry", "cmems", "ecostress", "landsat", "modis", "mur",
         "met", "met_overpass", "tides", "landcover", "insitu",
     ]
 

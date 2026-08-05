@@ -81,7 +81,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from ..config import CompressionSpec, DataProduct, Project
+from ..config import CompressionSpec, DataProduct, Project, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, naming, products, provenance, report, store
 from . import insitu, met as met_mod, water_level
@@ -998,10 +998,12 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     # days. Count what actually landed, stamp it on the cube, and say so when a product is
     # thin. `prod` (which products wrote files) also feeds provenance, so it is collected once.
     prod = provenance.collect(eff["aligned_root"], ctx.aid, PRODUCT_DIRS)
-    cov = coverage(ds, days, present=set(prod))
+    cov = coverage(ds, days, present=set(prod),
+                   sparse=eff.get("sparse_daily", {}).get(ctx.aid))
     ds.attrs["coverage"] = json.dumps(cov, sort_keys=True)
     for product, c in sorted(cov.items()):
-        if c["fraction"] < COVERAGE_WARN:
+        # A product the config deliberately fetched on only some days is thin ON PURPOSE.
+        if c["fraction"] < COVERAGE_WARN and not c.get("sparse"):
             log.warning("  %s: %s covers only %d of %d day(s) (%.0f%%) -- the rest are NaN "
                         "slices, which look exactly like cloudy days. Check the run report "
                         "for what failed.",
@@ -1049,7 +1051,7 @@ DAILY_CHANNELS = {s.product.value: s.coverage_channel
                   for s in products.REGISTRY if s.coverage_channel}
 
 
-def coverage(ds: xr.Dataset, days, present=None) -> dict:
+def coverage(ds: xr.Dataset, days, present=None, sparse=None) -> dict:
     """{product: {days_with_data, days_expected, fraction}} for the daily products.
 
     A day "has data" if its slice holds at least one finite value. This is the check that
@@ -1059,6 +1061,12 @@ def coverage(ds: xr.Dataset, days, present=None) -> dict:
     `present` is the set of products that actually wrote files for this AoI. A product that
     was never run is ABSENT, not thin -- reporting it at 0% would bury the products that
     really are thin under noise about products nobody asked for.
+
+    `sparse` is the set the CONFIG asked to be partial -- MUR restricted to overpass days.
+    Their coverage is still measured and still reported (the number is the honest answer, and
+    a reader of the cube should see it), but flagged `sparse: true` so the caller does not
+    warn about a gap the user chose. A warning that fires on every run of a correct config is
+    how a real one gets ignored.
     """
     out = {}
     # Coverage-channel PREFIXES. A per-source product (D5) has no single channel any more, so
@@ -1087,6 +1095,8 @@ def coverage(ds: xr.Dataset, days, present=None) -> dict:
         n = int(has.sum())
         out[product] = {"days_with_data": n, "days_expected": len(days),
                         "fraction": (n / len(days)) if len(days) else 0.0}
+        if sparse and product in sparse:
+            out[product]["sparse"] = True
     return out
 
 
@@ -1189,12 +1199,28 @@ def _sensor_version_pref(project: Project) -> dict[str, list[str]]:
     return out
 
 
+def _sparse_daily(project: Project, aoi: str) -> set[str]:
+    """Daily products this AoI's config deliberately fetched on only SOME days.
+
+    Today that is MUR with `overpass_sensors` set: its days are restricted to the ones a
+    thermal sensor flew, so the resulting cube gaps are the config working, not a lost run.
+    Resolved per AoI because the option is region-overridable.
+    """
+    out: set[str] = set()
+    if DataProduct.mur in project.products and _opt(
+            resolve_opts(project, aoi, DataProduct.mur), "overpass_sensors", None):
+        out.add("mur")
+    return out
+
+
 def _build_eff(project: Project) -> dict:
     """Map a validated Project into the flat `eff` dict `run()` consumes."""
     dc = project.datacube
     root = Path(project.output_dir)
     return {
         "aligned_root": root,                         # per-product <DIR>/aligned/<aoi>
+        # {aoi: products whose thin coverage is intended} -- see _sparse_daily.
+        "sparse_daily": {a.name: _sparse_daily(project, a.name) for a in project.all_areas},
         # Version preference order for stacked-DATA sensors (ECOSTRESS), for the D5 merge.
         "sensor_version_pref": _sensor_version_pref(project),
         "out_dir": root / dc.output_subdir,
