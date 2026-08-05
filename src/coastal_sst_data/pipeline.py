@@ -7,10 +7,13 @@ each selected product to its acquisition module -- every module honours the same
 ``acquire(project, *, grids=None, aois=None, dry_run=False, overwrite=False)``
 contract, so orchestration is a thin loop.
 
-Two ordering facts matter and are handled here:
-  * Products run in a fixed ORDER (statics/backbone first).
+Three ordering facts matter and are handled here:
+  * Products run in a fixed ORDER (statics first).
   * Landsat runs BEFORE MODIS, because MODIS coincidence reads the Landsat
     aligned files (match_landsat).
+  * The thermal sensors run BEFORE met_overpass and MUR, both of which read the
+    sensors' aligned dirs -- met_overpass to find the instants to snapshot, MUR
+    to restrict its days to the ones a sensor flew (`overpass_sensors`).
 
 Landsat and landcover are dispatched by their ``source`` selector; only the
 free/anonymous sources are implemented today (Landsat `pc`, landcover `esa`).
@@ -72,15 +75,16 @@ def _resolve(target):
 def process_order() -> list[DataProduct]:
     """Every product, in an order that honours its declared dependencies.
 
-    This replaces a hand-ordered list whose two real constraints lived only in a comment:
-    Landsat must precede MODIS (MODIS's coincidence filter reads Landsat's aligned files),
-    and the sensors must precede met (met's overpass snapshots are taken at times read from
-    their directories). Both are now `depends_on` edges on the specs, so a new product
+    This replaces a hand-ordered list whose real constraints lived only in a comment: Landsat
+    must precede MODIS (MODIS's coincidence filter reads Landsat's aligned files), and the
+    sensors must precede met (whose overpass snapshots are taken at times read from their
+    directories) and MUR (whose `overpass_sensors` filter reads the same directories to decide
+    which days to fetch). All are now `depends_on` edges on the specs, so a new product
     declares what it needs and is placed correctly -- rather than the author having to
     reason about a global ordering and get it right by hand.
 
     A stable topological sort: registry declaration order is preserved wherever the
-    dependencies allow, so the result still reads as "statics and backbone first".
+    dependencies allow, so the result still reads as "statics first".
     """
     order: list[DataProduct] = []
     placed: set[DataProduct] = set()

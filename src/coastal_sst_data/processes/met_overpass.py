@@ -32,25 +32,12 @@ import pandas as pd
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, naming, products, provenance, report, store
+from .. import entry, naming, overpass, provenance, report, store
 from . import met
 
 log = logging.getLogger(__name__)
 
 SOURCE = "met_overpass"
-
-
-def _sensor_dirs(root: Path) -> dict[str, list[Path]]:
-    """{sensor prefix -> its aligned dir(s)}: a flat sensor has one (lst -> [LANDSAT/aligned]);
-    a STACKED-DATA sensor (ECOSTRESS) has one per collection-version tree on disk
-    (eco -> [ECOSTRESS/v002/aligned, ECOSTRESS/v003/aligned]). The sensor 'flew' if ANY version
-    recorded a scene, so overpass discovery searches every version's tree."""
-    out: dict[str, list[Path]] = {}
-    for s in products.sensors():
-        base = root / s.dir
-        out[s.sensor.prefix] = (sorted(base.glob("*/aligned")) if s.is_stacked_data
-                                else [base / "aligned"])
-    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -67,7 +54,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
     mo_root, fmt, overwrite = eff["mo_root"], eff["fmt"], eff["overwrite"]
     to_celsius = grid_cfg.get("to_celsius", False)
     days = pd.date_range(eff["time"]["start_date"], eff["time"]["end_date"], freq="D")
-    sensor_dirs = _sensor_dirs(eff["root"])
+    sensor_dirs = overpass.sensor_dirs(eff["root"])
 
     names = select_aois(grids, only_aoi)
     rep = report.ProductReport("met_overpass")
@@ -91,7 +78,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
             aoi_out = mo_root / src / "aligned" / name
 
             for day in days:
-                for op in met.overpass_times_for_day(dirs, name, day):
+                for op in overpass.times_for_day(dirs, name, day):
                     op_stem = naming.time_stem(name, op)
                     if store.done(aoi_out / f"{op_stem}.nc", store.REQUIRED_VARS["MET_OVERPASS"],
                                   shape=(g.height, g.width), overwrite=overwrite):

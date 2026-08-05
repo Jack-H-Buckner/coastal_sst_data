@@ -13,6 +13,12 @@ MUR is a gap-free L4 analysis, so it has no cloud mask; `valid` = finite SST
 (i.e. water). It is the always-present backbone the model fills high-res detail
 onto. A later stage bins these to the daily datacube.
 
+`overpass_sensors` narrows the days fetched to the ones a named thermal sensor
+actually flew over this AoI, read from the sensors' aligned dirs. MUR's main job
+downstream is the cloud-filter baseline, which can only ever read a day a sensor
+also imaged -- so over a multi-year window most of the daily downloads produce a
+file nothing reads. Opt-in: omit the option and every day is fetched, as before.
+
 Usage (run from the OCEANSR project root, Earthdata auth via ~/.netrc):
     python src/acquire_mur.py --config configs/config.yaml
     python src/acquire_mur.py --config configs/config.yaml --aoi hood_canal
@@ -22,6 +28,7 @@ Usage (run from the OCEANSR project root, Earthdata auth via ~/.netrc):
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +41,7 @@ from rasterio.enums import Resampling
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, naming, net, provenance, report, store
+from .. import entry, naming, net, overpass, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -47,8 +54,75 @@ DEFAULT_VARIABLE = "analysed_sst"
 DEFAULT_PAD_DEG = 0.05
 
 
+# The nominal stamp that opens a MUR granule id: 20230715090000-JPL-L4_GHRSST-...
+_UR_STAMP_RE = re.compile(r"(\d{8})\d{6}")
+
+
 # Config is loaded/validated by coastal_sst_data.config; the per-AoI CRS + grid
 # come from coastal_sst_data.grid (AoiGrid), shared with every other product.
+
+
+# --------------------------------------------------------------------------- #
+# Granule selection (the `overpass_sensors` filter)
+# --------------------------------------------------------------------------- #
+def _iso(s: str):
+    """A CMR timestamp -> datetime, with or without fractional seconds. None if unparseable."""
+    try:
+        return pd.Timestamp(str(s).replace("Z", "+00:00")).tz_convert(None).to_pydatetime()
+    except Exception:
+        return None
+
+
+def _granule_day_stamp(granule) -> str | None:
+    """The YYYYMMDD a daily MUR granule IS, from its CATALOGUE metadata.
+
+    Read without opening the file, because not opening it is the whole point of the filter.
+
+    NOT `RangeDateTime.BeginningDateTime`, which is what the MODIS coincidence filter reads
+    (modis._granule_time): a MUR L4 granule's temporal extent is the 24 h ANALYSIS WINDOW
+    centred on its 09:00Z nominal time, so its BeginningDateTime falls on the PREVIOUS
+    calendar day -- selecting on it would shift every chosen day by one, silently. The
+    granule id carries the nominal stamp; the fallback is the MIDPOINT of the range, which
+    lands back on 09:00Z of the right day. None when neither is readable.
+    """
+    umm = granule.get("umm", {}) if hasattr(granule, "get") else {}
+    meta = granule.get("meta", {}) if hasattr(granule, "get") else {}
+    for ur in (umm.get("GranuleUR"), meta.get("native-id")):
+        m = _UR_STAMP_RE.match(str(ur or ""))
+        if m:
+            return m.group(1)
+
+    rng = (umm.get("TemporalExtent") or {}).get("RangeDateTime") or {}
+    beg, end = _iso(rng.get("BeginningDateTime")), _iso(rng.get("EndingDateTime"))
+    if beg and end:
+        return naming.day_stamp(beg + (end - beg) / 2)
+    return None
+
+
+def _select_granules(granules, day_stamps: set[str] | None) -> list:
+    """Restrict the daily granule list to the days a named sensor actually flew.
+
+    `day_stamps=None` -> unrestricted (the default: MUR is a daily backbone).
+
+    A granule whose day cannot be READ is kept, with a warning. Fail-open on identification
+    only: the worst case is downloading what the unfiltered code downloaded anyway, whereas
+    fail-closed on a CMR metadata change would silently delete days from the record.
+    """
+    if day_stamps is None:
+        return list(granules)
+    kept, unknown = [], 0
+    for granule in granules:
+        stamp = _granule_day_stamp(granule)
+        if stamp is None:
+            unknown += 1
+            kept.append(granule)
+        elif stamp in day_stamps:
+            kept.append(granule)
+    if unknown:
+        log.warning("    %d granule(s) carry no readable day in their catalogue metadata; "
+                    "kept rather than dropped (the overpass filter cannot identify them)",
+                    unknown)
+    return kept
 
 
 # --------------------------------------------------------------------------- #
@@ -93,31 +167,78 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
     rep = report.ProductReport("mur")
 
+    # Whether a sensor tree EXISTS is a fact about the project; whether THIS AoI has scenes in
+    # it is per-AoI (the tree is <DIR>/aligned/<aoi>). So the preflight splits there.
+    wanted = sorted({s for c in eff["ds"].values() for s in (c["overpass_sensors"] or ())})
+    sdirs = overpass.sensor_dirs(eff["root"]) if wanted else {}
+    absent = [p for p in wanted if not any(d.exists() for d in sdirs.get(p, []))]
+    if wanted and absent == wanted:
+        msg = (f"mur.overpass_sensors names {wanted}, but none has an aligned tree under "
+               f"{eff['root']}: the sensors have not run in this output dir, so restricting "
+               "MUR to overpass days would fetch NOTHING. Run the sensors first (a full "
+               "pipeline run does -- mur depends on them), or drop `overpass_sensors`.")
+        # Raise rather than warn: pipeline.run_pipeline records this as `mur: failed: ...` and
+        # carries on with the other products, so it is maximally loud AND non-fatal. The
+        # dry-run downgrade is load-bearing -- the sensors' own dry run writes nothing, so on a
+        # fresh tree every --dry-run would otherwise report MUR failed.
+        if dry_run:
+            log.warning("  %s", msg)
+        else:
+            raise ValueError(msg)
+    elif absent:
+        log.warning("  overpass_sensors: %s has no aligned tree; filtering on the rest (%s)",
+                    absent, [p for p in wanted if p not in absent])
+
     for name in names:
         g = grids[name]
-        # MUR is a GLOBAL product, so it has no region-varying options -- but its settings
-        # are still resolved per AoI, so every product answers to the same contract.
+        # MUR is a GLOBAL product, so nothing about the DATA varies by region -- but its
+        # settings are still resolved per AoI (and `overpass_sensors` genuinely does vary),
+        # so every product answers to the same contract.
         ds_cfg = eff["ds"][name]
         variable = ds_cfg["variable"]
         pad = float(ds_cfg["pad_deg"])
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
                  name, g.target_crs, g.width, g.height, g.resolution_m)
 
+        want = ds_cfg["overpass_sensors"]
+        day_stamps = None
+        if want:
+            dirs = [d for p in want for d in sdirs.get(p, [])]
+            day_stamps = overpass.days_with_scenes(dirs, name)
+            if not day_stamps:
+                # Two very different situations reach here, and saying which is the whole
+                # value of the message: a tree that exists but holds no scene for this AoI is
+                # a fact about the DATA; no tree at all is a stage that has not run (already
+                # reported by the preflight, which only warns under --dry-run).
+                why = ("the sensor trees exist, so this is a fact about the data, not a stage "
+                       "that was skipped" if any(d.exists() for d in dirs)
+                       else "no aligned tree for it under this output dir -- see above")
+                log.warning("  %s: %s recorded no scene on ANY day -> MUR fetches nothing "
+                            "here (%s).", name, "/".join(want), why)
+                rep.note = "; ".join(filter(None, [rep.note, f"{name}: no overpass days"]))
+                continue
+            log.info("  overpass filter: %s flew on %d day(s)", "/".join(want), len(day_stamps))
+
         granules = net.retry(
             lambda: earthaccess.search_data(
                 short_name=ds_cfg["short_name"], temporal=(start, end),
                 bounding_box=tuple(g.search_bbox)),
             what=f"MUR search {name}")
-        log.info("  %d daily MUR granule(s)", len(granules))
-        rep.expect(len(granules))
-        if not granules:
+        kept = _select_granules(granules, day_stamps)
+        log.info("  %d daily MUR granule(s)%s", len(granules),
+                 "" if day_stamps is None else f" -> {len(kept)} on overpass days")
+        # AFTER the filter: `expected` is what the stage MEANT to produce (report.py), so
+        # expecting the unfiltered count would make every filtered run read as having lost days.
+        rep.expect(len(kept))
+        if not kept:
             continue
         if dry_run:
-            log.info("  [dry-run] would process %d day(s)", len(granules))
+            log.info("  [dry-run] would process %d day(s)%s", len(kept),
+                     "" if day_stamps is None else f" of {len(granules)}")
             continue
 
         aoi_out = out_root / name
-        for gi, granule in enumerate(granules, 1):
+        for gi, granule in enumerate(kept, 1):
             try:
                 fobj = net.retry(lambda: earthaccess.open([granule])[0],
                                  what=f"MUR open granule {gi}")
@@ -127,14 +248,23 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             except Exception as exc:
                 # A failed download and a day that genuinely has no data used to look
                 # identical: one warning, no tally, and `Done.` all the same.
-                log.warning("    [%d/%d] FAILED (%s)", gi, len(granules), exc)
+                log.warning("    [%d/%d] FAILED (%s)", gi, len(kept), exc)
                 rep.fail(f"{name} granule {gi}", exc)
                 continue
+
+            # The file's own time is the authority for the stem; this only reports that the
+            # catalogue metadata the filter SELECTED on disagreed with it, which would mean
+            # `_granule_day_stamp` is reading the wrong field for this collection. A visible
+            # warning rather than a silent off-by-one -- the output stays correct either way.
+            if day_stamps is not None and naming.day_stamp(t) not in day_stamps:
+                log.warning("    [%d/%d] catalogue day and file day disagree (%s); the "
+                            "overpass filter selected on catalogue metadata",
+                            gi, len(kept), naming.day_stamp(t))
 
             stem = naming.day_stem(name, t)
             if store.done(aoi_out / f"{stem}.nc", store.REQUIRED_VARS["MUR"],
                           shape=(g.height, g.width), overwrite=overwrite):
-                log.info("  [%d/%d] %s already processed, skipping", gi, len(granules),
+                log.info("  [%d/%d] %s already processed, skipping", gi, len(kept),
                          naming.day_stamp(t))
                 rep.skip()
                 continue
@@ -148,7 +278,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             ds.attrs.update(aoi_id=name, source=src,
                             processing="subset + bilinear upsample to AOI grid",
                             **provenance.stamp(eff))
-            log.info("  [%d/%d] wrote %s", gi, len(granules),
+            log.info("  [%d/%d] wrote %s", gi, len(kept),
                      store.write_output(ds, aoi_out, stem, fmt))
             rep.wrote(source=src)
 
@@ -159,12 +289,27 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
+def _overpass_sensors(raw) -> tuple[str, ...] | None:
+    """The sensor prefixes MUR restricts its days to; None = every day (the default).
+
+    A bare string is one sensor. The names were checked against the loaded sensors at config
+    load (config._overpass_sensor_lists_are_valid), so anything here is real.
+    """
+    if raw is None:
+        return None
+    names = [raw] if isinstance(raw, str) else list(raw)
+    return tuple(str(n) for n in names) or None
+
+
 def _ds_cfg(opts) -> dict:
-    """One AoI's MUR settings. MUR is global, so nothing here is region-overridable."""
+    """One AoI's MUR settings. MUR is a global product, so nothing about the DATA varies by
+    region -- but `overpass_sensors` does (which sensors are worth restricting days to here),
+    so it is resolved region-then-global like every other option."""
     return {
         "short_name": _opt(opts, "short_name", SHORT_NAME),
         "variable": _opt(opts, "variable", DEFAULT_VARIABLE),
         "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
+        "overpass_sensors": _overpass_sensors(_opt(opts, "overpass_sensors", None)),
     }
 
 
@@ -184,6 +329,9 @@ def _build_eff(project: Project) -> dict:
         "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.mur))
                for a in project.all_areas},
         "grid": grid_cfg,
+        # The output root, not just MUR's own tree: the overpass filter reads the SENSORS'
+        # aligned dirs, which hang off the same root.
+        "root": Path(project.output_dir),
         "out_dir": Path(project.output_dir) / "MUR" / "aligned",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),

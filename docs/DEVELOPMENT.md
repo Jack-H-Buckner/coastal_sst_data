@@ -121,7 +121,7 @@ file, nothing else for this step.** Fields, with the ones people forget called o
 | `region_options` / `region_only_options` | which options a region may override | the line is enforced: *"which source has coverage here" → yes; "what the cube channel means" → no.* Every region option must also be in `options` (or `region_only_options`). |
 | `auth` | backend name, `None`, or `{source: backend}` | must match `sources` keys exactly when it's a dict. |
 | `required_vars` | variables a **finished** file must carry | the skip guard uses this to tell a truncated write from a done one. Empty means "channel set is config-dependent" (met, CMEMS) → the check falls back to "opens and holds ≥1 data var". |
-| `depends_on` | products that must run first | declared as a dependency, **not** a position in a hand-kept order. The topo-sort in [`pipeline.process_order`](../src/coastal_sst_data/pipeline.py#L72) places you. |
+| `depends_on` | products that must run first | declared as a dependency, **not** a position in a hand-kept order. The topo-sort in [`pipeline.process_order`](../src/coastal_sst_data/pipeline.py#L72) places you. Applies to *reading another product's output at acquisition time*, whatever the reason: `met_overpass` snapshots at the sensors' instants; `mur` restricts its days to them. Declare the edge unconditionally, even for an opt-in feature — an edge that appears only for some configs would make the process order config-dependent. |
 | `sensor` | a `SensorSpec`, or `None` | set **only** for `OVERPASS_SENSOR` thermal products. |
 | `coverage_channel` | the cube channel that proves this product produced data on a day | **daily products only** — an overpass sensor with no scene on a day is normal, so coverage-checking it would train the user to ignore the warning. |
 | `provenance_inputs` | the product(s) a field from this one is attributed to | usually just itself. |
@@ -181,6 +181,12 @@ def acquire(project, *, grids=None, aois=None, dry_run=False, overwrite=False) -
 **[`mur.py`](../src/coastal_sst_data/processes/mur.py) is the reference implementation.** It is the
 smallest module that exercises the whole contract; copy its structure. The conventions it follows,
 which your module must too:
+
+> One thing in `mur.py` is **not** part of the contract to copy: the `overpass_sensors` filter
+> (`_granule_day_stamp` / `_select_granules` and the preflight in `run`) is a MUR-specific feature —
+> restricting a daily backbone's downloads to the days a thermal sensor flew. If your product needs
+> the same idea, reuse [`overpass.py`](../src/coastal_sst_data/overpass.py) rather than copying the
+> code; everything else below is the contract.
 
 1. **The `_build_eff` → `run` split.** `acquire` calls `_build_eff(project)` to flatten the
    validated Pydantic `Project` into a plain `eff` dict, then hands that to `run(eff, grids, …)`.

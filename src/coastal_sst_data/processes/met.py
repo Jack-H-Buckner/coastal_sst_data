@@ -315,26 +315,6 @@ def reference_time_utc(day, lon: float, ref_hours: float, basis: str) -> pd.Time
     return (base + pd.Timedelta(hours=hours)).round("1h")
 
 
-def overpass_times_for_day(overpass_dirs, aoi_id: str, day) -> list[datetime]:
-    """Datetimes (UTC, naive) of thermal scenes for this AoI on `day`.
-
-    Reads the stamp the SENSOR stages wrote, via the shared convention
-    (coastal_sst_data.naming) -- this is the seam where met discovers what to snapshot
-    forcing against, so its parse must be the sensors' format by construction.
-    """
-    daystr = naming.day_stamp(day)
-    times = []
-    for d in overpass_dirs:
-        adir = Path(d) / aoi_id
-        if not adir.exists():
-            continue
-        for f in adir.glob(f"{aoi_id}_{daystr}T*.nc"):
-            t = naming.parse_time(f.name)
-            if t is not None:
-                times.append(t)
-    return sorted(set(times))
-
-
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #

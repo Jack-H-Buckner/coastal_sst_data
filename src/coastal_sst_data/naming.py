@@ -6,8 +6,9 @@ An aligned output's FILENAME is a load-bearing contract, not a cosmetic choice. 
 acquisition stages encode a timestamp into it and the assembler decodes it back out:
 `datacube.load_clearest_overpass` finds a sensor's scenes by globbing `<aoi>_*T*.nc` and
 parsing the stamp; `datacube.load_at_times` reconstructs a filename from a datetime to
-fetch the met snapshot taken at that exact overpass; `met.overpass_times_for_day`
-discovers the scenes to snapshot against by parsing the same stamp.
+fetch the met snapshot taken at that exact overpass; `overpass.times_for_day` and
+`overpass.days_with_scenes` discover, from the same stamp, what the met snapshots and MUR's
+overpass-day filter should be taken against.
 
 Until now that convention was re-declared wherever it was needed -- the same
 `re.compile(r"(\\d{8}T\\d{6})")` appeared in FOUR modules, and the corresponding

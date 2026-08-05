@@ -836,6 +836,34 @@ def test_thin_coverage_is_warned_about(project, grids, days, caplog):
     assert "look exactly like cloudy days" in caplog.text
 
 
+def test_deliberately_sparse_mur_is_reported_but_not_warned_about(tmp_path, days, caplog):
+    """MUR restricted to overpass days (`mur.overpass_sensors`) is thin ON PURPOSE. The
+    fraction is still measured and still stamped on the cube -- a reader must see it -- but
+    the warning would fire on every assemble of a correct config, which is how the real
+    thin-coverage warning gets ignored."""
+    project = parse_config({
+        "name": "dc", "output_dir": str(tmp_path),
+        "time": {"start_date": "2026-06-01", "end_date": "2026-06-03"},
+        "auth": {"earthdata": {"auth_strategy": "netrc"}},
+        "products": {"bathymetry": None, "ecostress": None,
+                     "mur": {"overpass_sensors": ["eco"]}},
+        "regions": [{"name": "r", "areas": [
+            {"name": AOI, "center_lat": 45.5, "center_lon": -123.9,
+             "buffer_ns_km": 2, "buffer_ew_km": 2}]}],
+    })
+    g = grid.project_grids(project)[AOI]
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    write_mur(project, g, [days[0]], water_hole_cols=slice(0, 0))   # 1 of 3 days, as asked
+
+    with caplog.at_level("WARNING"):
+        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    cov = json.loads(ds.attrs["coverage"])["mur"]
+    assert (cov["fraction"], cov["sparse"]) == (1 / 3, True)   # measured AND labelled
+    assert "covers only" not in caplog.text
+
+
 def test_full_coverage_does_not_warn(project, grids, days, caplog):
     g = grids[AOI]
     write_mur(project, g, days, water_hole_cols=slice(0, 0))

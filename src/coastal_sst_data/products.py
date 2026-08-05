@@ -284,9 +284,18 @@ REGISTRY: tuple[ProductSpec, ...] = (
         kind=Kind.DAILY_RASTER,
         module="coastal_sst_data.processes.mur",
         auth="earthdata",
-        options=_COMMON | {"short_name", "variable", "pad_deg"},
+        options=_COMMON | {"short_name", "variable", "pad_deg", "overpass_sensors"},
+        # MUR is a GLOBAL product, so nothing about the DATA varies by region -- but which
+        # sensors are worth restricting its days to does (an AoI may be ECOSTRESS-only).
+        region_options=frozenset({"overpass_sensors"}),
         required_vars=("sst", "valid"),
         coverage_channel="mur_sst",
+        # `overpass_sensors` restricts MUR's days to the ones a sensor actually flew, read
+        # from the sensors' aligned dirs -- so they must have run first. Declared even when
+        # the option is unset: a dependency that appears only for some configs would make the
+        # process order config-dependent, and the edge costs nothing when the filter is off
+        # (nothing reads MUR's output during acquisition).
+        depends_on=(DataProduct.ecostress, DataProduct.landsat, DataProduct.modis),
         provenance_inputs=("mur",),
     ),
 
