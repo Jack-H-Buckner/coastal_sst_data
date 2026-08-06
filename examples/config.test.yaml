@@ -116,23 +116,29 @@ datacube:
   insitu_max_dt_min: 60      # matchup tolerance; beyond it an overpass gets NaN
   # (Met-at-overpass moved to the `met_overpass` product above; overpass_met was removed.)
 
-# Optional POST-ASSEMBLY preprocessing. Runs AFTER assembly, reads each datacube/<aoi>.zarr,
-# and writes a SEPARATE derived cube preprocessed/<aoi>.zarr -- the raw cube stays untouched.
-# Opt-in: nothing runs unless `enabled: true` AND you pass --preprocess (or the `preprocess`
-# subcommand). This is where the masking/filling/water-level the raw cube omits get a home.
+# Optional POST-ASSEMBLY preprocessing. Runs AFTER assembly: opens each datacube/<aoi>.zarr,
+# adds its derived channels, and rewrites THAT SAME store -- one cube holding raw and derived
+# side by side. The assembled channels are never overwritten (every derived channel gets a name
+# of its own, e.g. mur_sst_gapfilled / eco_sst_v002_clean), so re-running is safe and needs no
+# re-assembly. Opt-in: nothing runs unless `enabled: true` AND you pass --preprocess (or the
+# `preprocess` subcommand). This is where the masking/filling/water-level the cube omits get a
+# home. NOTE: `output_subdir`, `chunks` and `compression` are NOT valid here -- there is no
+# separate cube to place or encode, so a config that sets them fails validation.
 preprocess:
   enabled: false
   steps:
     # Tide-adjusted waterline per thermal sensor, at its overpass -> <sensor>_water_elev /
     # <sensor>_water_class. Source tags default to the sole DEM/tide present if unset.
     water_line: { dem_source: cudem, tide_source: coops, sensors: [eco, lst] }
-    # Nearest-neighbour fill of the level-4 SST gaps over water (landcover_water==1), with a
-    # <channel>_filled companion mask (1=invented, 0=observed).
+    # Nearest-neighbour fill of the level-4 SST gaps over water (landcover_water==1) into
+    # <channel>_gapfilled, beside the untouched source, with a <channel>_filled companion mask
+    # (1=invented, 0=observed).
     fill_water: { sources: [mur, cmems]}
     # ECOSTRESS cloud screening vs a gap-free L4 baseline (MUR/CMEMS). Cloud biases thermal-IR
-    # SST cold, so a pixel far COLDER than the baseline is likely cloud. Drops fold into
-    # eco_valid_<ver>/eco_sst_<ver> + a <channel>_cloudfiltered flag. Runs after fill_water so
-    # `offset` mode sees the gap-filled baseline.
+    # SST cold, so a pixel far COLDER than the baseline is likely cloud. Drops fold into a
+    # SCREENED product eco_sst_<ver>_clean / eco_valid_<ver>_clean (the raw channels keep their
+    # own values) + a <channel>_clean_cloudfiltered flag. Runs after fill_water so `offset` mode
+    # sees the gap-filled baseline.
     #   method: offset -> drop where baseline - eco > threshold_k (K); <=0 disables.
     #   method: sigma  -> drop where eco < climatology mean - n_sigma*sigma, fit from the
     #                     baseline's OWN observed climatology (stat_scope: pixel|pooled,
@@ -144,8 +150,9 @@ preprocess:
     # Meteorological cloud-cover gate on ECOSTRESS using the HRRR/ERA5 total-cloud-cover field
     # (percent). A pixel drops if EITHER gate fires: scene-level (AOI-mean cloud at overpass >
     # scene_max_pct -> drop the whole overpass) or per-pixel (> pixel_max_pct). A null/>=100
-    # threshold disables that gate. Emits a <channel>_metcloudfiltered flag and a
-    # <sensor>_scene_cloud_pct_<src> diagnostic. Composes with filter_clouds (drops union).
+    # threshold disables that gate. Emits a <channel>_clean_metcloudfiltered flag and a
+    # <sensor>_scene_cloud_pct_<src> diagnostic. Composes with filter_clouds (both write the same
+    # _clean product, so drops union).
     filter_cloud_cover: { scene_max_pct: 30, pixel_max_pct: 80, sensors: [eco] }
     # Over-land cloud screen: thermal-IR reads WARMER than air over land by day, so a land pixel
     # far colder than the HRRR/ERA5 air temperature is likely cloud. Drops where

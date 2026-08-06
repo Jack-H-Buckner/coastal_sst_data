@@ -903,7 +903,7 @@ def test_overpass_sensors_are_not_judged_on_daily_coverage(project, grids, days)
 GOLDEN = Path(__file__).parent / "golden" / "datacube_golden.json"
 
 # provenance / run-stamp attrs: excluded from the snapshot (they change on every tree edit).
-RUNSTAMP_ATTRS = ("created_at", "code_version", "package_version",
+RUNSTAMP_ATTRS = ("created_at", "preprocessed_at", "code_version", "package_version",
                   "config_yaml", "config_sha256", "config_path",
                   "provenance", "provenance_products")
 

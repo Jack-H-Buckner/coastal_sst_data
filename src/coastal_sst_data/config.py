@@ -410,23 +410,26 @@ class DataCubeSpec(BaseModel):
 
 
 class PreprocessSpec(BaseModel):
-    """Optional POST-ASSEMBLY preprocessing: derived channels computed from the raw cube.
+    """Optional POST-ASSEMBLY preprocessing: derived channels added to the assembled cube.
 
-    The assembled datacube ships RAW ingredients (see DataCubeSpec); this stage reads each
-    `<output_dir>/<datacube.output_subdir>/<aoi>.zarr` and writes a SEPARATE derived cube
-    `<output_dir>/<output_subdir>/<aoi>.zarr`, leaving the raw cube untouched. It is opt-in
-    (`enabled`), so existing runs are unaffected. Each entry in `steps` selects a step from
-    the `preprocess.STEPS` registry (e.g. `water_line`, `fill_water`, `filter_clouds`,
-    `filter_cloud_cover`, `filter_land_clouds`) and carries its per-step options; unknown step
-    keys / options fail loudly at stage time.
+    The assembler ships RAW ingredients (see DataCubeSpec); this stage adds the derived
+    channels to that same `<output_dir>/<datacube.output_subdir>/<aoi>.zarr`, under names of
+    its own so the assembled channels keep their values. It is opt-in (`enabled`), so existing
+    runs are unaffected. Each entry in `steps` selects a step from the `preprocess.STEPS`
+    registry (e.g. `water_line`, `fill_water`, `filter_clouds`, `filter_cloud_cover`,
+    `filter_land_clouds`) and carries its per-step options; unknown step keys / options fail
+    loudly at stage time.
+
+    REMOVED KEYS (`extra="forbid"`, so a config that still sets one fails validation rather
+    than being quietly ignored): `output_subdir` -- there is no separate derived cube to place
+    any more; and `compression` / `chunks` -- one cube has one encoding, taken from `datacube`.
     """
     model_config = {"extra": "forbid"}
     enabled: bool = False                      # opt-in; nothing runs unless set true
     steps: dict[str, PreprocessStepOptions] = Field(default_factory=dict)
-    output_subdir: str = "preprocessed"        # derived-cube dir under output_dir
-    overwrite: bool = False                    # rebuild existing <aoi>.zarr derived cubes
-    compression: CompressionSpec = Field(default_factory=CompressionSpec)
-    chunks: dict[str, int] = Field(default_factory=lambda: {"time": 64, "y": 128, "x": 128})
+    # Re-derive channels a cube already carries. Off by default because the stage detects a
+    # changed step selection on its own; this is for forcing a rebuild after a code change.
+    overwrite: bool = False
 
     @field_validator("steps", mode="before")
     @classmethod

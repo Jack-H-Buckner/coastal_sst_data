@@ -44,6 +44,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy import ndimage
 
+from .channels import CLEAN, CORRECTED
+
 if TYPE_CHECKING:                          # avoid an import cycle: only a type hint needs it
     from .preprocess import PreprocessContext
 
@@ -316,7 +318,7 @@ def _opts(ctx: "PreprocessContext", key: str) -> dict:
 
 def _working(ctx: "PreprocessContext", name: str, *, dims=T3, dtype="float32"):
     """The CURRENT value of a channel: a channel already emitted this run (an earlier step's output,
-    e.g. the cloud-filtered SST) wins over the raw cube. None if absent / wrong-shaped."""
+    e.g. the cloud-filtered SST) wins over the cube. None if absent / wrong-shaped."""
     if name in ctx.channels:
         d, arr = ctx.channels[name]
         if tuple(d) != tuple(dims):
@@ -325,9 +327,27 @@ def _working(ctx: "PreprocessContext", name: str, *, dims=T3, dtype="float32"):
     return ctx.read(name, dims=dims, dtype=dtype)
 
 
+def _fit_sst(ctx: "PreprocessContext", name: str):
+    """The SST the registration fits on for raw channel `name`: this run's cloud-filtered
+    `<name>_clean` if a filter produced one, else the raw channel.
+
+    The filters write a SEPARATE `_clean` product rather than screening `name` in place, so the
+    fit has to ask for it by name -- cloud edges are the dominant noise source in the
+    registration, and fitting the unscreened scene is a silent quality regression. Restricted to
+    THIS run's output: a `_clean` left on the cube by an earlier run reflects that run's
+    thresholds, not the ones selected now.
+    """
+    clean = f"{name}{CLEAN}"
+    if clean in ctx.channels:
+        d, arr = ctx.channels[clean]
+        if tuple(d) == T3:
+            return np.asarray(arr).astype("float32", copy=False)
+    return ctx.read(name, dims=T3, dtype="float32")
+
+
 def _res_m(ctx: "PreprocessContext") -> float:
     """Grid posting in metres from the raw cube's x coordinate."""
-    x = np.asarray(ctx.ds_raw["x"].values, "float64")
+    x = np.asarray(ctx.ds_cube["x"].values, "float64")
     return float(abs(x[1] - x[0])) if x.size > 1 else float(ctx.g.resolution_m)
 
 
@@ -383,10 +403,10 @@ def _step_flag_georef(ctx: "PreprocessContext") -> None:
     T = len(ctx.days)
 
     for pre in (_as_list(opts["sensors"]) or ["eco"]):
-        sst_names = ctx.channels_with_prefix(f"{pre}_sst")
+        sst_names = ctx.base_channels(f"{pre}_sst")
         if not sst_names:
             continue                                   # sensor not acquired -> emit nothing
-        working = _working(ctx, sst_names[0])          # cloud-filtered SST of the primary version
+        working = _fit_sst(ctx, sst_names[0])          # cloud-filtered SST of the primary version
         if working is None or working.ndim != 3:
             continue
 
@@ -460,10 +480,10 @@ def _step_correct_georef(ctx: "PreprocessContext") -> None:
         applied = (flag == FLAG["displaced"])
 
         # Version suffixes come from the RAW SST channels (shared granule geometry across versions).
-        for sst_name in ctx.channels_with_prefix(f"{pre}_sst"):
+        # `base_channels` skips this step's own `_georef_corrected` output and the filters'
+        # `_clean` product, both of which sit in the cube after an earlier run.
+        for sst_name in ctx.base_channels(f"{pre}_sst"):
             suffix = sst_name[len(f"{pre}_sst"):]
-            if "_georef_corrected" in suffix:
-                continue
             for fld in fields:
                 name = f"{pre}_{fld}{suffix}"
                 fill, dtype = _FIELD_FILL.get(fld, (float(opts["fill"]), "float32"))
@@ -473,7 +493,7 @@ def _step_correct_georef(ctx: "PreprocessContext") -> None:
                 out = raw.copy()
                 for t in np.nonzero(applied)[0]:
                     out[t] = shift_array(raw[t], int(dy[t]), int(dx[t]), fill=fill, dtype=dtype)
-                ctx.emit(f"{name}_georef_corrected", T3, out,
+                ctx.emit(f"{name}{CORRECTED}", T3, out,
                          long_name=f"{name} shifted onto corrected georeferencing "
                                    f"(displaced scenes only)")
 

@@ -250,7 +250,7 @@ There are five subcommands:
 | `verify` | Connect to every credentialed service the selected products need and confirm the credentials work | yes |
 | `run` | Run the pipeline: compute the shared grid once, then acquire each selected product in order | yes |
 | `assemble` | Knit the aligned per-product outputs into one analysis-ready datacube (`.zarr`) per AOI | no |
-| `preprocess` | Post-assembly: read each assembled cube and write a **separate** derived cube (waterline, water-filled level-4) | no |
+| `preprocess` | Post-assembly: add the derived channels (waterline, gap-filled level-4, screened SST) to the assembled cube | no |
 | `provenance` | Print a built cube's provenance: the config that made it, each field's sources, access dates | no |
 
 **A typical workflow** builds up from cheap, offline checks to the full run:
@@ -300,7 +300,7 @@ MODIS additionally ships `modis_footprint_id` (`int32`, `-1` = no observation): 
 
 Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision. (Met-at-overpass is configured on the `met_overpass` product, not here — see below.)
 
-> **Note (raw-output simplification).** The cube ships **raw ingredients** on a common grid and daily axis; masking, water-filling, station snapping, and multi-input derivations are downstream modelling determinations. The `fill_mur_water`, `fill_cmems_water`, and `water_level` keys were **removed** — MUR/CMEMS ship observed values with honest NaN gaps, there is no derived `landmask`, and water level is reconstructed downstream from the raw per-source `elevation_<dem>` + `depth_<dem>` + `tide_<src>` channels plus each DEM's `datum_offset_m` / `datum_status` attributes. An old config that still sets any of these three keys now **fails validation** rather than being silently ignored. Those computations are not gone — they are the opt-in [`preprocess`](#preprocess) stage now, which runs *after* assembly and writes them to a **separate** derived cube, keeping the raw cube raw.
+> **Note (raw-output simplification).** The cube ships **raw ingredients** on a common grid and daily axis; masking, water-filling, station snapping, and multi-input derivations are downstream modelling determinations. The `fill_mur_water`, `fill_cmems_water`, and `water_level` keys were **removed** — MUR/CMEMS ship observed values with honest NaN gaps, there is no derived `landmask`, and water level is reconstructed downstream from the raw per-source `elevation_<dem>` + `depth_<dem>` + `tide_<src>` channels plus each DEM's `datum_offset_m` / `datum_status` attributes. An old config that still sets any of these three keys now **fails validation** rather than being silently ignored. Those computations are not gone — they are the opt-in [`preprocess`](#preprocess) stage now, which runs *after* assembly and adds them to the cube under **names of their own**, so the assembled channels keep the values their sources delivered.
 
 #### Provenance: what produced each field, and when
 
@@ -357,7 +357,7 @@ Water level (and the submerged/exposed classification of a tidal flat) is a **mo
 | `<sensor>_tide_<src>` | (time,) | *ready-made:* the tide already interpolated to that sensor's overpass instant (the `tide_overpass` product) |
 | `<sensor>_hour` | (time,) | the exact overpass hour of the scene the cube kept (NaN where none) |
 
-A downstream process references `elevation_<dem>` to MSL with **that DEM's** `datum_offset_m` attribute, takes the tide at the scene from `<sensor>_tide_<src>` (or interpolates `tide_<src>` to `<sensor>_hour` itself), and classifies each cell — exactly the computation the assembler used to hard-code, now made per-process. The built-in [`preprocess`](#preprocess) stage's `water_line` step is exactly this computation, materialised into a derived cube for you.
+A downstream process references `elevation_<dem>` to MSL with **that DEM's** `datum_offset_m` attribute, takes the tide at the scene from `<sensor>_tide_<src>` (or interpolates `tide_<src>` to `<sensor>_hour` itself), and classifies each cell — exactly the computation the assembler used to hard-code, now made per-process. The built-in [`preprocess`](#preprocess) stage's `water_line` step is exactly this computation, materialised into the cube for you.
 
 **Datum.** Tides are relative to **MSL** (a *tidal* datum — the 19-year mean of observed water level at a gauge), but a DEM need not be: CUDEM is **NAVD88** (a *geodetic* datum). The gap between the two surfaces is **local** and far from negligible — MSL sits roughly **1.0–1.4 m above NAVD88 in the Pacific Northwest** (vs. ~0.1–0.3 m on the Gulf coast), which is comparable to the entire intertidal range, so ignoring it misclassifies much of a tidal flat. Each DEM source's offset is **resolved automatically as it is acquired** (NOAA VDatum for CUDEM/NAVD88, cross-checked against the nearest CO-OPS gauge; 0 for GMRT, which is already ~MSL) and ships as attributes on that source's `elevation_<dem>` channel. It can't be a config constant: the right value depends on **which DEM** it belongs to (CUDEM and GMRT on the same AOI need different offsets), which is exactly why it rides per-source rather than as one cube-wide number. Re-run `bathymetry --overwrite` to re-resolve it.
 
@@ -376,10 +376,19 @@ VDatum is sampled at **several points spread across the AOI's waterline band**, 
 
 An **opt-in** stage that runs *after* `assemble` and turns the raw cube's ingredients into the
 **downstream determinations the cube deliberately does not bake in** (masking, water-filling, water
-level — see the note above). It reads each `datacube/<aoi>.zarr` and writes a **separate** derived cube
-`<output_dir>/preprocessed/<aoi>.zarr`, leaving the raw cube untouched, so the raw analysis-ready
-product and the "cleaned" modelling product live side by side. Like acquisition it is driven by a
-registry: each step declares what it reads/writes, and adding one is a single registration (see the
+level — see the note above). It opens each `datacube/<aoi>.zarr`, adds its derived channels, and
+rewrites **that same store** atomically — one cube per AOI holding the raw analysis-ready product and
+the "cleaned" modelling product side by side, so nothing downstream has to join two stores.
+
+**Assembled channels are never overwritten.** Every derived channel gets a name of its own, so
+`eco_sst_v002` still holds what the sensor delivered while `eco_sst_v002_clean` holds the screened
+product. That is also what makes the stage **idempotent**: each step seeds from the raw channel and
+rewrites only its own outputs, so re-running with new thresholds needs no re-assembly and never
+compounds the previous run's drops. Re-running with an unchanged step selection is a no-op; change a
+threshold and it re-runs on its own.
+
+Like acquisition it is driven by a registry: each step declares what it reads/writes, and adding one
+is a single registration (see the
 [developer guide](docs/DEVELOPMENT.md#5b-adding-a-post-assembly-preprocess-step)).
 
 Ten steps ship today:
@@ -390,8 +399,8 @@ Ten steps ship today:
   `datum_offset_m`) and the overpass tide — exactly the computation [Water level](#water-level-reconstructed-downstream-from-raw-ingredients)
   describes, now materialised.
 - **`fill_water`** — nearest-neighbour fill of the level-4 SST products' (`mur_sst`, `cmems_*`) NaN gaps
-  over water (`landcover_water == 1`), with a `<channel>_filled` companion mask so a filled value never
-  passes for an observed one.
+  over water (`landcover_water == 1`) into `<channel>_gapfilled`, beside the untouched source channel,
+  with a `<channel>_filled` companion mask so a filled value never passes for an observed one.
 - **`filter_clouds`** — screens cloud-contaminated ECOSTRESS pixels against a **gap-free L4 baseline**
   (`mur_sst` / a `cmems_*` analysis). Cloud biases thermal-IR SST **cold**, so a pixel far colder than
   the baseline is treated as cloud. Two `method`s: **`offset`** (default) drops where
@@ -399,18 +408,19 @@ Ten steps ship today:
   the `fill_water` gap-filled one if present, which is why this step runs after `fill_water`; **`sigma`**
   builds the baseline's **own climatology** (least-squares mean + residual σ) and drops any pixel colder
   than `mean − n_sigma·σ` (default `3.0`), with `stat_scope: pixel` (per-cell, default) or `pooled` and
-  `seasonality: off` (default) or `harmonic` (a day-of-year annual cycle). Drops fold into
-  `<sensor>_valid_<ver>` and NaN the matching `<sensor>_sst_<ver>` (unless `mask_sst: false`), plus a
-  `<sensor>_sst_<ver>_cloudfiltered` flag (`1 = dropped`) so every drop stays auditable.
+  `seasonality: off` (default) or `harmonic` (a day-of-year annual cycle). Drops fold into a
+  **screened product** — `<sensor>_valid_<ver>_clean`, and a NaN'd `<sensor>_sst_<ver>_clean` (unless
+  `mask_sst: false`) — seeded from the raw channels, which keep their own values, plus a
+  `<sensor>_sst_<ver>_clean_cloudfiltered` flag (`1 = dropped`) so every drop stays auditable.
 - **`filter_cloud_cover`** — gates ECOSTRESS on the **met total-cloud-cover** field (HRRR/ERA5, in
   percent). Two independent gates — a pixel drops if **either** fires: **scene-level** (`scene_max_pct`,
   default `30`) drops the *whole* overpass when the AOI-mean cloud cover at the overpass exceeds it, and
   **per-pixel** (`pixel_max_pct`, default `80`) drops individual pixels above it (a `null` / `≥100`
   threshold disables that gate). Prefers the overpass-matched `<sensor>_cloud_cover_<src>`, falling back
   to the daily forcing `cloud_cover_<src>`; `source` (default auto: overpass over forcing, `hrrr` over
-  `era5`) picks. Emits a `<sensor>_scene_cloud_pct_<src>` diagnostic and a `<sensor>_sst_<ver>_metcloudfiltered`
-  flag. It **composes** with `filter_clouds` — both read the working SST/valid, so their drops union
-  regardless of order.
+  `era5`) picks. Emits a `<sensor>_scene_cloud_pct_<src>` diagnostic and a
+  `<sensor>_sst_<ver>_clean_metcloudfiltered` flag. It **composes** with `filter_clouds` — both write
+  the same `_clean` product, so their drops union regardless of order.
 - **`filter_land_clouds`** — screens cloud-contaminated pixels **over land** against the **near-surface
   air temperature** (HRRR/ERA5). Over land the thermal-IR surface reads *warmer* than the air by day, so
   a land pixel far colder than the air is likely cloud: it drops where `airtemp − sst > threshold_k`
@@ -420,8 +430,8 @@ Ten steps ship today:
   `<sensor>_water_class == exposed` at its overpass (which requires the `water_line` step to be enabled).
   Air temperature prefers the overpass-matched `<sensor>_airtemp_<src>` over the daily forcing
   `airtemp_<src>`; `source` (default auto: overpass over forcing, `hrrr` over `era5`) picks. Drops fold
-  into `<sensor>_valid_<ver>` / `<sensor>_sst_<ver>` plus a `<sensor>_sst_<ver>_landcloudfiltered` flag,
-  and compose with the other two filters (all read the working SST/valid). This is the **land**
+  into the same `<sensor>_sst_<ver>_clean` / `_valid_<ver>_clean` product plus a
+  `<sensor>_sst_<ver>_clean_landcloudfiltered` flag, and compose with the other two filters. This is the **land**
   counterpart to `filter_clouds`, which screens **water** against an L4 SST baseline.
 - **`flag_georef`** — diagnoses per-scene ECOSTRESS **georeferencing error**. Some granules are
   geolocated wrong, contributing wrong SST at every coastal pixel with nothing to flag it. This step
@@ -543,10 +553,11 @@ coastal-sst-data run --config config.yaml --assemble --preprocess   # acquire, a
 coastal-sst-data preprocess --config config.yaml --aoi tillamook_bay # just this stage
 ```
 
-- `--aoi <name> …` — only specific AOIs. `--overwrite` — rebuild existing derived cubes. `--dry-run` —
-  report only. An AOI whose raw cube hasn't been assembled yet is skipped with a warning (run `assemble`
-  first). The derived cube carries the raw inputs each derived channel was built from, so it is legible
-  standalone; open it with `xr.open_zarr("data/preprocessed/<aoi>.zarr")`.
+- `--aoi <name> …` — only specific AOIs. `--overwrite` — re-derive channels the cube already carries
+  (not normally needed: a changed step selection re-runs on its own). `--dry-run` — report only. An AOI
+  whose cube hasn't been assembled yet is skipped with a warning (run `assemble` first). There is one
+  store either way — open it with `xr.open_zarr("data/datacube/<aoi>.zarr")`. The cube's
+  `preprocess_channels` attribute lists exactly which channels this stage owns.
 
 ### `validate` and `grids`
 

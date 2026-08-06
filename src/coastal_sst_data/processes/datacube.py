@@ -1139,6 +1139,21 @@ def build_encoding(ds: xr.Dataset, compression: CompressionSpec, chunks: dict) -
 # --------------------------------------------------------------------------- #
 # Write (atomic, NFS-safe)
 # --------------------------------------------------------------------------- #
+def write_zarr(ds: xr.Dataset, zpath: Path, encoding: dict):
+    """Write a Zarr cube to `zpath`, which must not exist. NOT atomic -- see `write_zarr_safe`.
+
+    Exposed on its own for the one caller that has to keep its SOURCE store open across the
+    write and so cannot let the swap happen inside `write_zarr_safe`: `preprocess.run`, which
+    rewrites the cube it is reading (it drives `store.atomic` itself, writing here and closing
+    the source before the block ends).
+    """
+    with warnings.catch_warnings():
+        # Zarr v3 warns that consolidated metadata isn't in the v3 spec; xarray
+        # still writes+reads it and it speeds opening a many-variable cube.
+        warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
+        ds.to_zarr(zpath, mode="w-", consolidated=True, encoding=encoding)
+
+
 def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
     """Write a Zarr cube ATOMICALLY: the final path only ever holds a COMPLETE cube.
 
@@ -1150,11 +1165,7 @@ def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
     NFS when a reader still holds a chunk open.
     """
     with store.atomic(Path(zpath)) as tmp:
-        with warnings.catch_warnings():
-            # Zarr v3 warns that consolidated metadata isn't in the v3 spec; xarray
-            # still writes+reads it and it speeds opening a many-variable cube.
-            warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
-            ds.to_zarr(tmp, mode="w-", consolidated=True, encoding=encoding)
+        write_zarr(ds, tmp, encoding)
 
 
 # --------------------------------------------------------------------------- #

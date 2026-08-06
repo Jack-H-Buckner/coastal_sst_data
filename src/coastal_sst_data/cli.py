@@ -9,7 +9,7 @@ A single entry point over the pieces of the package:
     coastal-sst-data validate --config config.yaml        # load + summarize the config
     coastal-sst-data grids    --config config.yaml        # show each AoI's target grid
     coastal-sst-data assemble --config config.yaml        # knit aligned outputs -> datacubes
-    coastal-sst-data preprocess --config config.yaml      # post-assembly derived cubes
+    coastal-sst-data preprocess --config config.yaml      # post-assembly derived channels
     coastal-sst-data check    --config config.yaml        # find truncated/incomplete outputs
 
 (Equivalent to `python -m coastal_sst_data.cli <command> ...`.) Each subcommand
@@ -226,7 +226,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="After acquisition, assemble the aligned outputs into datacubes.")
     p_run.add_argument("--preprocess", action="store_true",
                        help="After assembly, run post-assembly preprocessing into a separate "
-                            "derived cube (needs `preprocess.enabled` in the config).")
+                            "derived channels into the assembled cube (needs "
+                            "`preprocess.enabled` in the config).")
     p_run.set_defaults(func=_cmd_run)
 
     p_verify = sub.add_parser("verify", help="Verify configured credentials connect.")
@@ -260,7 +261,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre = sub.add_parser(
         "preprocess",
         help="Post-assembly preprocessing: read each assembled cube and write a separate "
-             "derived cube (waterline, water-filled level-4). Needs `preprocess.enabled`.")
+             "derived channels (waterline, gap-filled level-4, screened SST) into the "
+             "assembled cube. Needs `preprocess.enabled`.")
     add_common(p_pre)
     p_pre.add_argument("--aoi", nargs="+", dest="aois", help="Only these AoI name(s).")
     p_pre.add_argument("--overwrite", action="store_true",

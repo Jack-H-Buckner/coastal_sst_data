@@ -349,7 +349,8 @@ def test_corrected_filters_compose_on_clean_channel(tmp_path):
 
 
 def test_corrected_pipeline_end_to_end_write_path(tmp_path):
-    # Through preprocess() (assemble + zarr write), assert both channels land with right dtypes.
+    # Through preprocess() (assemble + zarr rewrite), assert both channels land in the ASSEMBLED
+    # cube with the right dtypes, beside the raw geometry they were derived from.
     from coastal_sst_data import grid as _grid
     from coastal_sst_data.processes import datacube
     from tests.test_preprocess import _project, _write_full_fixture, AOI
@@ -366,8 +367,10 @@ def test_corrected_pipeline_end_to_end_write_path(tmp_path):
     assert rep.written == 1
 
     import xarray as xr
-    ds = xr.open_zarr(proj.output_dir / "preprocessed" / f"{AOI}.zarr")
+    ds = xr.open_zarr(proj.output_dir / "datacube" / f"{AOI}.zarr")
     corrected = [v for v in ds.data_vars if v.endswith("_georef_corrected")]
     clean = [v for v in ds.data_vars if v.endswith("_georef_corrected_clean")]
     assert corrected and clean                               # both stages materialised
     assert ds["eco_sst_v002_georef_corrected_clean"].dtype == np.float32
+    # The uncorrected geometry is still in the same cube, so the two can be compared directly.
+    assert "eco_sst_v002" in ds.data_vars and "eco_sst_v002_clean" in ds.data_vars
