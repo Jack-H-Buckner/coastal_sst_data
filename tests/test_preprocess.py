@@ -1,11 +1,12 @@
-"""Post-assembly preprocessing stage. Assembles a tiny SYNTHETIC raw cube (reusing the
-datacube test writers), then runs the preprocess steps and asserts the derived cube: the
-waterline is pure glue over water_level.water_level_fields, the level-4 NN fill respects the
-land-cover water mask and flags invented cells, the raw cube is left untouched, and the
-import-time step invariants fire. No network, no real data.
+"""Post-assembly preprocessing stage. Assembles a tiny SYNTHETIC cube (reusing the datacube
+test writers), then runs the preprocess steps and asserts what they added to it: the waterline
+is pure glue over water_level.water_level_fields, the level-4 NN fill respects the land-cover
+water mask and flags invented cells, the ASSEMBLED channels come through the rewrite untouched,
+re-running is idempotent, and the import-time step invariants fire. No network, no real data.
 
-The golden test (`test_preprocessed_golden_is_unchanged`) is the derived cube's own safety
-net, kept SEPARATE from datacube_golden.json so the two stages don't couple."""
+The golden test (`test_preprocessed_golden_is_unchanged`) snapshots the cube AFTER preprocess,
+kept separate from datacube_golden.json (the cube as `assemble` leaves it) so a change to one
+stage does not force a regeneration of the other's golden."""
 
 import json
 import os
@@ -132,7 +133,7 @@ def test_fill_water_fills_over_water_flags_it_and_leaves_land_alone(project, gri
     ds_raw = _raw_cube(project, g, days)
     ds_out = preprocess.preprocess_aoi(ds_raw, g, preprocess._build_eff(project))
 
-    mur0 = ds_out["mur_sst"].isel(time=0).values
+    mur0 = ds_out["mur_sst_gapfilled"].isel(time=0).values
     flag0 = ds_out["mur_sst_filled"].isel(time=0).values
     # Water holes were filled from the nearest finite pixel; the land hole stayed NaN.
     assert np.isfinite(mur0[:, 5:8]).all()
@@ -142,8 +143,10 @@ def test_fill_water_fills_over_water_flags_it_and_leaves_land_alone(project, gri
     assert (flag0[:, 0] == 0).all()          # a land NaN is not "filled"
     assert (flag0[:, 4] == 0).all()          # an observed water cell is not "filled"
     assert ds_out["mur_sst_filled"].dtype == np.uint8
-    # The mask it filled against travels along.
+    # The mask it filled against is in the same cube, and the SOURCE keeps its holes: the
+    # gap-filled field is a companion to `mur_sst`, not a replacement for it.
     assert "landcover_water" in ds_out.data_vars
+    assert np.isnan(ds_out["mur_sst"].isel(time=0).values[:, 5:8]).all()
 
 
 def test_fill_water_also_fills_cmems_per_source(project, grids, days):
@@ -153,8 +156,9 @@ def test_fill_water_also_fills_cmems_per_source(project, grids, days):
     ds_raw = _raw_cube(project, g, days)
     ds_out = preprocess.preprocess_aoi(ds_raw, g, preprocess._build_eff(project))
     c = "cmems_thetao_0m_my_global"
-    assert np.isfinite(ds_out[c].isel(time=0).values[:, 6:8]).all()
+    assert np.isfinite(ds_out[f"{c}_gapfilled"].isel(time=0).values[:, 6:8]).all()
     assert (ds_out[f"{c}_filled"].isel(time=0).values[:, 6:8] == 1).all()
+    assert np.isnan(ds_out[c].isel(time=0).values[:, 6:8]).all()          # source untouched
 
 
 def test_fill_water_without_a_mask_channel_fills_nothing(project, grids, days, caplog):
@@ -169,7 +173,7 @@ def test_fill_water_without_a_mask_channel_fills_nothing(project, grids, days, c
                         coords={"time": days, "y": ys, "x": xs}, attrs={"crs": g.target_crs})
     with caplog.at_level("WARNING"):
         ds_out = preprocess.preprocess_aoi(ds_raw, g, preprocess._build_eff(project))
-    assert "mur_sst_filled" not in ds_out.data_vars              # step declined
+    assert "mur_sst_gapfilled" not in ds_out.data_vars           # step declined
     assert "fill_water" in caplog.text
 
 
@@ -212,14 +216,14 @@ def test_filter_clouds_offset_drops_cold_anomalies(tmp_path):
                       mur_sst=np.full((1, H, W), 285.0, "float32"))
     ds = _pp(proj, g, cube)
 
-    flag = ds["eco_sst_v002_cloudfiltered"].isel(time=0).values
+    flag = ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values
     assert (flag[:, 5] == 1).all() and flag.sum() == H        # only column 5 dropped
-    assert np.isnan(ds["eco_sst_v002"].isel(time=0).values[:, 5]).all()
-    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 6]).all()
-    assert (ds["eco_valid_v002"].isel(time=0).values[:, 5] == 0).all()
-    assert ds["eco_sst_v002_cloudfiltered"].dtype == np.uint8
-    assert ds["eco_valid_v002"].dtype == np.uint8
-    assert ds["eco_sst_v002"].dtype == np.float32
+    assert np.isnan(ds["eco_sst_v002_clean"].isel(time=0).values[:, 5]).all()
+    assert np.isfinite(ds["eco_sst_v002_clean"].isel(time=0).values[:, 6]).all()
+    assert (ds["eco_valid_v002_clean"].isel(time=0).values[:, 5] == 0).all()
+    assert ds["eco_sst_v002_clean_cloudfiltered"].dtype == np.uint8
+    assert ds["eco_valid_v002_clean"].dtype == np.uint8
+    assert ds["eco_sst_v002_clean"].dtype == np.float32
 
 
 def test_filter_clouds_threshold_zero_is_a_noop(tmp_path):
@@ -230,9 +234,11 @@ def test_filter_clouds_threshold_zero_is_a_noop(tmp_path):
                       eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
                       mur_sst=np.full((1, H, W), 285.0, "float32"))
     ds = _pp(proj, g, cube)
-    # Disabled -> the step emits nothing (the derived cube carries only what steps emit).
-    assert "eco_sst_v002_cloudfiltered" not in ds.data_vars
-    assert "eco_sst_v002" not in ds.data_vars
+    # Disabled -> the step emits nothing, so there is no screened product at all and the
+    # assembled channel is left exactly as it came in.
+    assert "eco_sst_v002_clean_cloudfiltered" not in ds.data_vars
+    assert "eco_sst_v002_clean" not in ds.data_vars
+    np.testing.assert_array_equal(ds["eco_sst_v002"].values, eco)
 
 
 def test_filter_clouds_keeps_pixels_where_baseline_is_nan(tmp_path):
@@ -244,8 +250,8 @@ def test_filter_clouds_keeps_pixels_where_baseline_is_nan(tmp_path):
                       eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W), mur_sst=mur)
     ds = _pp(proj, g, cube)
     # NaN baseline -> NaN diff -> kept, never flagged.
-    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 5] == 0).all()
-    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 5]).all()
+    assert (ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values[:, 5] == 0).all()
+    assert np.isfinite(ds["eco_sst_v002_clean"].isel(time=0).values[:, 5]).all()
 
 
 def test_filter_clouds_uses_fill_waters_filled_baseline(tmp_path):
@@ -260,7 +266,7 @@ def test_filter_clouds_uses_fill_waters_filled_baseline(tmp_path):
                       eco_sst_v002=eco, eco_valid_v002=_ones_valid(1, H, W),
                       mur_sst=mur, landcover_water=np.ones((H, W), "float32"))
     ds = _pp(proj, g, cube)
-    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 5] == 1).all()
+    assert (ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values[:, 5] == 1).all()
 
 
 # ---- filter_clouds: sigma method (baseline-floor climatology) ------------------------------ #
@@ -281,7 +287,7 @@ def _sigma_cube(g, times, cold_col=5, warm_col=6):
 def test_filter_clouds_sigma_pixel_drops_below_floor(tmp_path):
     proj, g = _setup(tmp_path, {"filter_clouds": {"method": "sigma", "n_sigma": 3.0}})
     ds = _pp(proj, g, _sigma_cube(g, pd.date_range("2026-06-01", periods=5)))
-    flag = ds["eco_sst_v002_cloudfiltered"].isel(time=0).values
+    flag = ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values
     # cutoff = 287 - 3*1.58 = 282.3: 280 < cutoff (drop), 285 > cutoff (keep).
     assert (flag[:, 5] == 1).all()
     assert (flag[:, 6] == 0).all()
@@ -292,7 +298,7 @@ def test_filter_clouds_sigma_pooled_scope(tmp_path):
     proj, g = _setup(tmp_path,
                      {"filter_clouds": {"method": "sigma", "n_sigma": 3.0, "stat_scope": "pooled"}})
     ds = _pp(proj, g, _sigma_cube(g, pd.date_range("2026-06-01", periods=5)))
-    flag = ds["eco_sst_v002_cloudfiltered"].isel(time=0).values
+    flag = ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values
     assert (flag[:, 5] == 1).all() and (flag[:, 6] == 0).all()
 
 
@@ -305,8 +311,8 @@ def test_filter_clouds_sigma_keeps_nan_baseline_pixels(tmp_path):
     eco = np.full((5, H, W), np.nan, "float32"); eco[0] = 287.0; eco[0, :, 7] = 280.0
     cube = _hand_cube(g, times, eco_sst_v002=eco, eco_valid_v002=_ones_valid(5, H, W), mur_sst=mur)
     ds = _pp(proj, g, cube)
-    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 7] == 0).all()
-    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 7]).all()
+    assert (ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values[:, 7] == 0).all()
+    assert np.isfinite(ds["eco_sst_v002_clean"].isel(time=0).values[:, 7]).all()
 
 
 def test_filter_clouds_sigma_harmonic_catches_seasonal_outlier(tmp_path):
@@ -326,8 +332,8 @@ def test_filter_clouds_sigma_harmonic_catches_seasonal_outlier(tmp_path):
     cube = _hand_cube(g, times, eco_sst_v002=eco, eco_valid_v002=_ones_valid(365, H, W),
                       mur_sst=mur)
 
-    fh = _pp(proj_h, g, cube)["eco_sst_v002_cloudfiltered"].isel(time=day).values
-    fo = _pp(proj_o, g, cube)["eco_sst_v002_cloudfiltered"].isel(time=day).values
+    fh = _pp(proj_h, g, cube)["eco_sst_v002_clean_cloudfiltered"].isel(time=day).values
+    fo = _pp(proj_o, g, cube)["eco_sst_v002_clean_cloudfiltered"].isel(time=day).values
     assert (fh[:, 5] == 1).all() and (fh[:, 6] == 0).all()   # harmonic drops the seasonal outlier
     assert (fo[:, 5] == 0).all()                             # constant climatology misses it
 
@@ -337,7 +343,7 @@ def test_filter_clouds_harmonic_short_span_falls_back_to_constant(tmp_path, capl
     with caplog.at_level("INFO"):
         ds = _pp(proj, g, _sigma_cube(g, pd.date_range("2026-06-01", periods=5)))
     assert "too short" in caplog.text                        # harmonic degraded to constant
-    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 5] == 1).all()
+    assert (ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values[:, 5] == 1).all()
 
 
 # ---- filter_cloud_cover: meteorological total cloud cover ---------------------------------- #
@@ -350,13 +356,13 @@ def test_filter_cloud_cover_scene_rejects_cloudy_overpass(tmp_path):
                       eco_valid_v002=_ones_valid(2, H, W),
                       eco_cloud_cover_hrrr=tcc, landcover_water=np.ones((H, W), "float32"))
     ds = _pp(proj, g, cube)
-    assert (ds["eco_valid_v002"].isel(time=0).values == 0).all()
-    assert np.isnan(ds["eco_sst_v002"].isel(time=0).values).all()
-    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values == 1).all()
+    assert (ds["eco_valid_v002_clean"].isel(time=0).values == 0).all()
+    assert np.isnan(ds["eco_sst_v002_clean"].isel(time=0).values).all()
+    assert (ds["eco_sst_v002_clean_metcloudfiltered"].isel(time=0).values == 1).all()
     assert ds["eco_scene_cloud_pct_hrrr"].isel(time=0).item() == pytest.approx(40.0)
     # the clear overpass is untouched
-    assert (ds["eco_valid_v002"].isel(time=1).values == 1).all()
-    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=1).values == 0).all()
+    assert (ds["eco_valid_v002_clean"].isel(time=1).values == 1).all()
+    assert (ds["eco_sst_v002_clean_metcloudfiltered"].isel(time=1).values == 0).all()
 
 
 def test_filter_cloud_cover_pixel_gate_drops_only_cloudy_pixels(tmp_path):
@@ -367,7 +373,7 @@ def test_filter_cloud_cover_pixel_gate_drops_only_cloudy_pixels(tmp_path):
                       eco_sst_v002=np.full((1, H, W), 286.0, "float32"),
                       eco_valid_v002=_ones_valid(1, H, W),
                       eco_cloud_cover_hrrr=tcc, landcover_water=np.ones((H, W), "float32"))
-    flag = _pp(proj, g, cube)["eco_sst_v002_metcloudfiltered"].isel(time=0).values
+    flag = _pp(proj, g, cube)["eco_sst_v002_clean_metcloudfiltered"].isel(time=0).values
     assert (flag[:, 5] == 1).all() and flag.sum() == H          # only column 5 (scene mean ~12<30)
 
 
@@ -379,7 +385,7 @@ def test_filter_cloud_cover_disable_pixel_gate(tmp_path):
                       eco_sst_v002=np.full((1, H, W), 286.0, "float32"),
                       eco_valid_v002=_ones_valid(1, H, W),
                       eco_cloud_cover_hrrr=tcc, landcover_water=np.ones((H, W), "float32"))
-    flag = _pp(proj, g, cube)["eco_sst_v002_metcloudfiltered"].isel(time=0).values
+    flag = _pp(proj, g, cube)["eco_sst_v002_clean_metcloudfiltered"].isel(time=0).values
     assert flag.sum() == 0                                       # pixel gate off, scene mean <30
 
 
@@ -393,7 +399,7 @@ def test_filter_cloud_cover_works_with_era5(tmp_path):
                       landcover_water=np.ones((H, W), "float32"))
     ds = _pp(proj, g, cube)
     assert "eco_scene_cloud_pct_era5" in ds.data_vars
-    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values == 1).all()
+    assert (ds["eco_sst_v002_clean_metcloudfiltered"].isel(time=0).values == 1).all()
 
 
 def test_filter_cloud_cover_no_met_channel_is_a_noop(tmp_path, caplog):
@@ -404,7 +410,7 @@ def test_filter_cloud_cover_no_met_channel_is_a_noop(tmp_path, caplog):
                       eco_valid_v002=_ones_valid(1, H, W))
     with caplog.at_level("WARNING"):
         ds = _pp(proj, g, cube)
-    assert "eco_sst_v002_metcloudfiltered" not in ds.data_vars
+    assert "eco_sst_v002_clean_metcloudfiltered" not in ds.data_vars
     assert "filter_cloud_cover" in caplog.text
 
 
@@ -420,15 +426,15 @@ def test_cloud_filters_compose(tmp_path):
                       mur_sst=np.full((1, H, W), 285.0, "float32"),
                       eco_cloud_cover_hrrr=tcc, landcover_water=np.ones((H, W), "float32"))
     ds = _pp(proj, g, cube)
-    valid = ds["eco_valid_v002"].isel(time=0).values
-    sst = ds["eco_sst_v002"].isel(time=0).values
+    valid = ds["eco_valid_v002_clean"].isel(time=0).values
+    sst = ds["eco_sst_v002_clean"].isel(time=0).values
     assert (valid[:, 3] == 0).all() and (valid[:, 8] == 0).all()
     assert np.isnan(sst[:, 3]).all() and np.isnan(sst[:, 8]).all()
     # each flag marks only its own gate's pixels
-    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 3] == 1).all()
-    assert (ds["eco_sst_v002_cloudfiltered"].isel(time=0).values[:, 8] == 0).all()
-    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values[:, 8] == 1).all()
-    assert (ds["eco_sst_v002_metcloudfiltered"].isel(time=0).values[:, 3] == 0).all()
+    assert (ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values[:, 3] == 1).all()
+    assert (ds["eco_sst_v002_clean_cloudfiltered"].isel(time=0).values[:, 8] == 0).all()
+    assert (ds["eco_sst_v002_clean_metcloudfiltered"].isel(time=0).values[:, 8] == 1).all()
+    assert (ds["eco_sst_v002_clean_metcloudfiltered"].isel(time=0).values[:, 3] == 0).all()
 
 
 # ---- filter_land_clouds: over-land air-temperature deviation ------------------------------- #
@@ -444,12 +450,12 @@ def test_filter_land_clouds_drops_cold_land_pixels(tmp_path):
                       eco_airtemp_hrrr=np.full((1, H, W), 295.0, "float32"),
                       landcover_water=np.zeros((H, W), "float32"))   # all LAND
     ds = _pp(proj, g, cube)
-    flag = ds["eco_sst_v002_landcloudfiltered"].isel(time=0).values
+    flag = ds["eco_sst_v002_clean_landcloudfiltered"].isel(time=0).values
     assert (flag[:, 5] == 1).all() and flag.sum() == H       # only column 5 dropped
-    assert np.isnan(ds["eco_sst_v002"].isel(time=0).values[:, 5]).all()
-    assert (ds["eco_valid_v002"].isel(time=0).values[:, 5] == 0).all()
-    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 6]).all()
-    assert ds["eco_sst_v002_landcloudfiltered"].dtype == np.uint8
+    assert np.isnan(ds["eco_sst_v002_clean"].isel(time=0).values[:, 5]).all()
+    assert (ds["eco_valid_v002_clean"].isel(time=0).values[:, 5] == 0).all()
+    assert np.isfinite(ds["eco_sst_v002_clean"].isel(time=0).values[:, 6]).all()
+    assert ds["eco_sst_v002_clean_landcloudfiltered"].dtype == np.uint8
 
 
 def test_filter_land_clouds_leaves_water_pixels_alone(tmp_path):
@@ -463,8 +469,8 @@ def test_filter_land_clouds_leaves_water_pixels_alone(tmp_path):
                       eco_airtemp_hrrr=np.full((1, H, W), 295.0, "float32"),
                       landcover_water=np.ones((H, W), "float32"))    # all WATER
     ds = _pp(proj, g, cube)
-    assert (ds["eco_sst_v002_landcloudfiltered"].isel(time=0).values == 0).all()
-    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 5]).all()
+    assert (ds["eco_sst_v002_clean_landcloudfiltered"].isel(time=0).values == 0).all()
+    assert np.isfinite(ds["eco_sst_v002_clean"].isel(time=0).values[:, 5]).all()
 
 
 def test_filter_land_clouds_water_line_source(tmp_path):
@@ -481,10 +487,10 @@ def test_filter_land_clouds_water_line_source(tmp_path):
                       eco_airtemp_hrrr=np.full((1, H, W), 295.0, "float32"),
                       eco_water_class=wc)
     ds = _pp(proj, g, cube)
-    flag = ds["eco_sst_v002_landcloudfiltered"].isel(time=0).values
+    flag = ds["eco_sst_v002_clean_landcloudfiltered"].isel(time=0).values
     assert (flag[:, 5] == 1).all()                           # EXPOSED + cold -> dropped
     assert (flag[:, 6] == 0).all()                           # SUBMERGED + cold -> kept
-    assert np.isfinite(ds["eco_sst_v002"].isel(time=0).values[:, 6]).all()
+    assert np.isfinite(ds["eco_sst_v002_clean"].isel(time=0).values[:, 6]).all()
 
 
 def test_filter_land_clouds_threshold_zero_is_a_noop(tmp_path):
@@ -496,7 +502,7 @@ def test_filter_land_clouds_threshold_zero_is_a_noop(tmp_path):
                       eco_airtemp_hrrr=np.full((1, H, W), 295.0, "float32"),
                       landcover_water=np.zeros((H, W), "float32"))
     ds = _pp(proj, g, cube)
-    assert "eco_sst_v002_landcloudfiltered" not in ds.data_vars
+    assert "eco_sst_v002_clean_landcloudfiltered" not in ds.data_vars
 
 
 def test_filter_land_clouds_no_air_temp_is_a_noop(tmp_path, caplog):
@@ -508,7 +514,7 @@ def test_filter_land_clouds_no_air_temp_is_a_noop(tmp_path, caplog):
                       landcover_water=np.zeros((H, W), "float32"))
     with caplog.at_level("WARNING"):
         ds = _pp(proj, g, cube)
-    assert "eco_sst_v002_landcloudfiltered" not in ds.data_vars
+    assert "eco_sst_v002_clean_landcloudfiltered" not in ds.data_vars
     assert "filter_land_clouds" in caplog.text
 
 
@@ -557,50 +563,115 @@ def test_unknown_step_or_option_is_rejected_at_stage_time(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Through run(): the write path, and the raw cube left untouched
+# Through run(): the write path -- ONE cube, derived channels added, raw ones intact
 # --------------------------------------------------------------------------- #
-def test_run_writes_a_separate_cube_and_leaves_the_raw_one_untouched(project, grids, days):
-    g = grids[AOI]
-    _write_full_fixture(project, g, days)
+def _assembled(project, grids, days):
+    """Assemble the full fixture and return (cube path, snapshot of it)."""
+    _write_full_fixture(project, grids[AOI], days)
     datacube.assemble(project, grids=grids)                # writes datacube/aoi1.zarr
-    raw_zpath = project.output_dir / "datacube" / f"{AOI}.zarr"
-    before = _snapshot(xr.open_zarr(raw_zpath))
+    zpath = project.output_dir / "datacube" / f"{AOI}.zarr"
+    with xr.open_zarr(zpath) as ds:
+        return zpath, _snapshot(ds)
 
-    preprocess.preprocess(project, grids=grids)            # writes preprocessed/aoi1.zarr
-    derived = project.output_dir / "preprocessed" / f"{AOI}.zarr"
-    assert derived.exists()
 
-    ds = xr.open_zarr(derived)
-    assert "eco_water_elev" in ds.data_vars
-    assert "mur_sst_filled" in ds.data_vars
-    # Coords are the raw cube's own -> the two align cell-for-cell.
-    raw = xr.open_zarr(raw_zpath)
+def test_run_adds_derived_channels_to_the_assembled_cube(project, grids, days):
+    zpath, before = _assembled(project, grids, days)
+
+    preprocess.preprocess(project, grids=grids)            # rewrites datacube/aoi1.zarr
+    assert not (project.output_dir / "preprocessed").exists()   # no second store any more
+
+    with xr.open_zarr(zpath) as ds:
+        assert "eco_water_elev" in ds.data_vars            # derived channels landed
+        assert "mur_sst_gapfilled" in ds.data_vars
+        after = _snapshot(ds)
+    # Every assembled channel survived the rewrite with its values, dtype and attrs intact --
+    # the whole point of giving the derived channels names of their own.
+    assert set(before["data_vars"]) < set(after["data_vars"])
+    for name, snap in before["data_vars"].items():
+        assert after["data_vars"][name] == snap, f"{name} was modified by preprocess"
     for c in ("time", "y", "x"):
-        np.testing.assert_array_equal(ds[c].values, raw[c].values)
-    # The raw cube is byte-for-value unchanged.
-    assert _diff_snapshots(before, _snapshot(raw)) == []
+        assert after["coords"][c] == before["coords"][c]
 
 
-def test_run_skips_when_the_raw_cube_is_missing(project, grids, caplog):
+def test_run_is_idempotent(project, grids, days):
+    """Re-running with the same steps rebuilds an IDENTICAL cube. The filters seed from the raw
+    channels, so a second pass cannot union its drops onto the first pass's."""
+    zpath, _ = _assembled(project, grids, days)
+    preprocess.preprocess(project, grids=grids)
+    with xr.open_zarr(zpath) as ds:
+        once = _snapshot(ds)
+
+    rep = preprocess.preprocess(project, grids=grids, overwrite=True)   # force the rebuild
+    assert rep.written == 1
+    with xr.open_zarr(zpath) as ds:
+        twice = _snapshot(ds)
+    assert _diff_snapshots(once, twice) == []
+
+
+def test_rerun_does_not_nest_derived_suffixes(project, grids, days):
+    """The cube a re-run reads already holds `_clean` / `_gapfilled` channels. The input scans
+    skip them, so no `_clean_clean` or `_gapfilled_gapfilled` can appear."""
+    zpath, _ = _assembled(project, grids, days)
+    preprocess.preprocess(project, grids=grids)
+    preprocess.preprocess(project, grids=grids, overwrite=True)
+    with xr.open_zarr(zpath) as ds:
+        names = list(ds.data_vars)
+    assert not [n for n in names if "_clean_clean" in n or "_gapfilled_gapfilled" in n]
+
+
+def test_dropping_a_step_drops_the_channels_it_owned(project, grids, days, tmp_path):
+    """The cube must not keep shipping output its own `preprocess` attr no longer claims."""
+    zpath, _ = _assembled(project, grids, days)
+    preprocess.preprocess(project, grids=grids)
+    with xr.open_zarr(zpath) as ds:
+        assert "eco_water_elev" in ds.data_vars
+
+    narrowed = _project(tmp_path, steps={"fill_water": None})       # water_line deselected
+    preprocess.preprocess(narrowed, grids=grids)
+    with xr.open_zarr(zpath) as ds:
+        assert "eco_water_elev" not in ds.data_vars
+        assert "mur_sst_gapfilled" in ds.data_vars
+
+
+def test_run_skips_when_the_cube_is_missing(project, grids, caplog):
     with caplog.at_level("WARNING"):
         rep = preprocess.preprocess(project, grids=grids)   # no assemble first
     assert rep.written == 0 and rep.skipped == 1
     assert "run `assemble` first" in caplog.text
-    assert not list((project.output_dir / "preprocessed").glob("*.zarr"))
+    assert not list((project.output_dir / "datacube").glob("*.zarr"))
 
 
-def test_run_overwrite_semantics(project, grids, days):
+def test_run_skips_a_cube_that_already_holds_this_step_selection(project, grids, days):
+    """No `overwrite` needed for the common case: the stage recognises its own output and does
+    not redo it, but a CHANGED step selection re-runs on its own."""
+    _assembled(project, grids, days)
+    assert preprocess.preprocess(project, grids=grids).written == 1
+    rep = preprocess.preprocess(project, grids=grids)
+    assert rep.skipped == 1 and rep.written == 0
+    assert preprocess.preprocess(project, grids=grids, overwrite=True).written == 1
+
+
+def test_a_changed_step_selection_re_runs_without_overwrite(project, grids, days, tmp_path):
+    _assembled(project, grids, days)
+    preprocess.preprocess(project, grids=grids)
+    changed = _project(tmp_path, steps={"water_line": None, "fill_water": None,
+                                        "filter_clouds": {"threshold_k": 2.0}})
+    assert preprocess.preprocess(changed, grids=grids).written == 1
+
+
+def test_a_step_may_not_overwrite_an_assembled_channel(project, grids, days, monkeypatch):
+    """The guard that protects the raw values, exercised with a deliberately misbehaving step."""
     g = grids[AOI]
     _write_full_fixture(project, g, days)
-    datacube.assemble(project, grids=grids)
-    preprocess.preprocess(project, grids=grids)
-    derived = project.output_dir / "preprocessed" / f"{AOI}.zarr"
-    mtime = derived.stat().st_mtime
+    ds_raw = datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
-    rep = preprocess.preprocess(project, grids=grids)       # exists, no overwrite -> skip
-    assert rep.skipped == 1 and rep.written == 0
-    rep = preprocess.preprocess(project, grids=grids, overwrite=True)
-    assert rep.written == 1
+    def _clobber(ctx):
+        ctx.emit("mur_sst", ("time", "y", "x"), np.zeros((len(days), g.height, g.width), "f4"))
+
+    bad = preprocess.PreprocessStep(key="fill_water", reads=(), writes=(), fn=_clobber)
+    monkeypatch.setattr(preprocess, "STEPS", (bad,))
+    with pytest.raises(RuntimeError, match="would overwrite assembled channel"):
+        preprocess.preprocess_aoi(ds_raw, g, preprocess._build_eff(project))
 
 
 # --------------------------------------------------------------------------- #

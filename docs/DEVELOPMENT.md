@@ -456,9 +456,9 @@ than re-downloading a DEM tile, which is why it has its own subcommand.
 
 ## 5b. Adding a post-assembly preprocess step
 
-A **preprocess step** runs *after* the datacube is assembled, reading the raw `<aoi>.zarr` and writing
-a **separate** derived cube `<output_dir>/<preprocess.output_subdir>/<aoi>.zarr` — the raw cube stays
-untouched. This is where the *downstream modelling determinations* the assembler deliberately omits
+A **preprocess step** runs *after* the datacube is assembled, reading
+`<output_dir>/<datacube.output_subdir>/<aoi>.zarr`, adding its derived channels, and rewriting **that
+same store** atomically. This is where the *downstream modelling determinations* the assembler deliberately omits
 (masking, water-filling, water level — see [datacube.py](../src/coastal_sst_data/processes/datacube.py)'s
 design note and the raw-output refactor's D6/D7/D12) get a structured, opt-in home. All the machinery
 lives in one module, [`processes/preprocess.py`](../src/coastal_sst_data/processes/preprocess.py), and it
@@ -470,10 +470,14 @@ Adding a step is **three things in one file** plus (if it emits genuinely new ch
 provenance mapping:
 
 1. **Write a `_step_<name>(ctx)` function.** It receives a `PreprocessContext` and calls
-   `ctx.emit(name, dims, arr, **attrs)` to add derived channels and `ctx.carry(name)` to copy a raw
-   input forward (so the derived cube is self-describing). Read raw channels **defensively** with
+   `ctx.emit(name, dims, arr, **attrs)` to add derived channels. **The name must be one no assembler
+   channel uses** — the step writes into the assembled cube, so emitting `eco_sst_v002` would destroy
+   what the sensor delivered; give the output a suffix of its own and register it in
+   [`processes/channels.py`](../src/coastal_sst_data/processes/channels.py). `preprocess_aoi` raises if
+   a step tries. Read channels **defensively** with
    `ctx.read(name, dims=...)` (returns `None` when a channel is absent or wrong-shaped) /
-   `ctx.has(name)` / `ctx.channels_with_prefix(...)` / `ctx.sensor_hours(prefix)` — a step must
+   `ctx.has(name)` / **`ctx.base_channels(prefix)`** (a prefix scan that hides a previous run's derived
+   channels — use this, not `channels_with_prefix`, to discover inputs) / `ctx.sensor_hours(prefix)` — a step must
    **degrade** (emit nothing, or all-`UNKNOWN`) when an input product wasn't selected, never crash the
    stage. `_step_water_line` and `_step_fill_water` are the two worked examples; both are thin glue
    over existing math (`processes.water_level`, and a restored `fill_water_nn`). A step that needs
@@ -524,10 +528,15 @@ coastal-sst-data preprocess --config config.yaml --aoi <one> --overwrite
 python -m coastal_sst_data.processes.preprocess --config config.yaml
 ```
 
-Test it in [`tests/test_preprocess.py`](../tests/test_preprocess.py): assemble a synthetic raw cube
+Test it in [`tests/test_preprocess.py`](../tests/test_preprocess.py): assemble a synthetic cube
 (reusing the `test_datacube` writers), run `preprocess_aoi`, and assert the derived channels — plus the
-step invariants and a **separate** golden (`tests/golden/preprocessed_golden.json`) so the two stages
-don't couple. The raw cube must be left byte-unchanged (there's a test for exactly that).
+step invariants and a golden (`tests/golden/preprocessed_golden.json`, the cube *after* preprocess) kept
+separate from `datacube_golden.json` (the cube as `assemble` leaves it) so a change to one stage does not
+force the other's golden to be regenerated.
+
+Two properties every step must keep, each with a test: the **assembled channels come through unchanged**,
+and the stage is **idempotent** — a step seeds its target from the raw channel, never from whatever it
+finds on disk under its own output name, or a second run composes onto the first run's results.
 
 ---
 

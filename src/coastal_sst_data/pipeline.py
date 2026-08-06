@@ -187,8 +187,8 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     runs LAST and records its outcome under the "datacube" summary key.
 
     preprocess: after assembly, run the post-assembly preprocessing steps
-    (preprocess.preprocess) on each assembled cube, writing a separate derived
-    cube. Runs AFTER assemble (so it sees a freshly-written raw cube) and is a
+    (preprocess.preprocess), which add their derived channels to each assembled
+    cube. Runs AFTER assemble (so it sees a freshly-written cube) and is a
     no-op unless the config's `preprocess.enabled` is set. Records its outcome
     under the "preprocess" summary key.
     """
@@ -298,9 +298,9 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
             outcomes["datacube"] = f"failed: {exc}"
             run_report.add("datacube", None, outcome=f"stage raised: {exc}")
 
-    # Terminal stage (after assembly): post-assembly preprocessing into a separate derived
-    # cube. Opt-in via the config, and it runs AFTER assemble so it always sees a freshly
-    # written raw cube in the same invocation.
+    # Terminal stage (after assembly): post-assembly preprocessing, which adds its derived
+    # channels to the cube assemble just wrote. Opt-in via the config, and it runs AFTER
+    # assemble so it always sees a freshly written cube in the same invocation.
     if preprocess and project.preprocess.enabled:
         log.info("=== preprocess ===")
         try:
@@ -345,7 +345,8 @@ def main():
                     help="after acquisition, assemble the aligned outputs into per-AoI datacubes")
     ap.add_argument("--preprocess", action="store_true",
                     help="after assembly, run the post-assembly preprocessing steps into a "
-                         "separate derived cube (needs `preprocess.enabled` in the config)")
+                         "derived channels into the assembled cube (needs "
+                         "`preprocess.enabled` in the config)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 

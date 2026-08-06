@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
-coastal_sst_data -- post-assembly preprocessing (derived cube, runs AFTER the assembler).
+coastal_sst_data -- post-assembly preprocessing (runs AFTER the assembler, into the SAME cube).
 
-The assembled datacube ships RAW ingredients on a common grid + daily axis (see
-`processes.datacube`): masking, water-filling, and multi-input derivations are DOWNSTREAM
-modelling determinations, so the raw cube does not bake them in. This stage is that
-downstream layer, given a structured, config-driven home. It reads each assembled
-`<output_dir>/<datacube.output_subdir>/<aoi>.zarr` and writes a SEPARATE derived cube
+The assembler ships RAW ingredients on a common grid + daily axis (see `processes.datacube`):
+masking, water-filling, and multi-input derivations are DOWNSTREAM modelling determinations,
+so assembly does not bake them in. This stage is that downstream layer, given a structured,
+config-driven home. It opens the assembled
 
-    <output_dir>/<preprocess.output_subdir>/<aoi>.zarr
+    <output_dir>/<datacube.output_subdir>/<aoi>.zarr
 
-leaving the raw cube byte-untouched. Like the acquisition stages it is a thin loop over a
-REGISTRY: each preprocessing STEP declares what cube channels it reads/writes and a compute
-function, and adding a new step is one `PreprocessStep` registration -- exactly mirroring the
-datacube's contributor protocol (`datacube.CONTRIBUTORS`), but reading an OPENED xarray cube
-rather than aligned files.
+adds its derived channels, and rewrites THAT SAME store atomically -- one cube per AoI holding
+raw and derived side by side, so a consumer never has to join two stores.
+
+RAW CHANNELS ARE NEVER OVERWRITTEN. Every derived channel gets its own name (`_gapfilled`,
+`_clean`, `_water_elev`, `_georef_*`, ...), so `eco_sst_v002` still holds the values the
+sensor delivered while `eco_sst_v002_clean` holds the filtered product. That is what keeps the
+stage IDEMPOTENT: each step seeds from the raw channel and rewrites its own outputs, so
+re-running with new thresholds needs no re-assembly and never composes onto last run's drops.
+
+Like the acquisition stages it is a thin loop over a REGISTRY: each preprocessing STEP declares
+what cube channels it reads/writes and a compute function, and adding a new step is one
+`PreprocessStep` registration -- exactly mirroring the datacube's contributor protocol
+(`datacube.CONTRIBUTORS`), but reading an OPENED xarray cube rather than aligned files. A step
+must not emit a channel the assembler wrote; see `processes.channels`.
 
 Steps shipped today (both re-introduce computations the raw-output refactor deliberately
 pushed downstream -- D6/D7/D12):
@@ -24,25 +32,21 @@ pushed downstream -- D6/D7/D12):
                     waterline) and `<sensor>_water_class` (submerged/exposed/unknown). Pure
                     glue over `processes.water_level`.
   * fill_water   -- nearest-neighbour fill of the level-4 SST products' (MUR, CMEMS) NaN gaps
-                    over water (`landcover_water==1`), with a `<channel>_filled` companion
-                    mask so an invented value stays distinguishable from an observed one.
+                    over water (`landcover_water==1`) into `<channel>_gapfilled`, with a
+                    `<channel>_filled` companion mask so an invented value stays
+                    distinguishable from an observed one.
   * filter_clouds -- screen ECOSTRESS pixels against a gap-free baseline L4 SST (MUR/CMEMS):
                     a fixed cold offset (`baseline - eco > threshold_k`) or a distribution-based,
                     seasonally-aware outlier floor (`eco < mean - n_sigma*sigma`). Folds drops
-                    into `<sensor>_valid_<ver>`/`<sensor>_sst_<ver>` + a `*_cloudfiltered` flag.
+                    into `<sensor>_sst_<ver>_clean`/`_valid_<ver>_clean` + a `*_cloudfiltered` flag.
   * filter_cloud_cover -- gate ECOSTRESS on the met total-cloud-cover field (HRRR/ERA5, percent):
                     a scene-level rejection and a per-pixel cutoff, with a `*_metcloudfiltered`
                     flag and a `<sensor>_scene_cloud_pct_<src>` diagnostic. Composes with
-                    filter_clouds (both read the WORKING sst/valid, so drops union).
+                    filter_clouds (both read the WORKING `_clean` product, so drops union).
   * filter_land_clouds -- screen OVER-LAND pixels against the near-surface air temperature
                     (HRRR/ERA5): drop where `airtemp - sst > threshold_k` on cells the landcover
                     mask or the `water_line` step's tide-adjusted water line marks as land. Folds
-                    into `<sensor>_valid_<ver>`/`<sensor>_sst_<ver>` + a `*_landcloudfiltered` flag.
-
-The derived cube is self-describing: alongside each derived channel it carries the specific
-raw inputs it was built from (the DEM elevation + its datum attrs, the water mask, the tide /
-overpass-hour channels), so it is legible standalone rather than only as a join against the
-raw cube.
+                    into the same `_clean` product + a `*_landcloudfiltered` flag.
 
 Usage:
     coastal-sst-data run --config config.yaml --assemble --preprocess
@@ -68,10 +72,11 @@ from ..config import Project, resolve_step_opts
 from ..grid import AoiGrid, project_grids, select_aois
 from .. import entry, products, provenance, report, store
 from . import datacube, water_level
+from .channels import GAPFILLED, is_derived
 from .cloud_filter import (_step_filter_clouds, _step_filter_cloud_cover,
                            _step_filter_land_clouds)
 from .georef import _step_flag_georef, _step_correct_georef
-from .datacube import build_encoding, write_zarr_safe
+from .datacube import build_encoding, write_zarr
 from .water_level import EXPOSED, SUBMERGED, UNKNOWN
 
 log = logging.getLogger(__name__)
@@ -126,12 +131,15 @@ class PreprocessStep:
 
 @dataclass
 class PreprocessContext:
-    """The shared state a step reads and writes while one AoI's derived cube is built.
+    """The shared state a step reads and writes while one AoI's derived channels are built.
 
-    A step reads channels off the OPENED raw cube (`read`, `has`, `channels_with_prefix`,
-    `sensor_hours`), emits derived channels (`emit`), and copies raw inputs forward so the
-    derived cube is self-describing (`carry`). It never mutates `ds_raw`. The orchestrator
-    assembles `channels` into the derived Dataset once every step has run.
+    A step reads channels off the OPENED cube (`read`, `has`, `base_channels`, `sensor_hours`)
+    and emits derived channels (`emit`). It never mutates `ds_cube`. The orchestrator merges
+    `channels` back onto the cube once every step has run.
+
+    `ds_cube` may already hold the derived channels of an EARLIER preprocess run -- the stage
+    rewrites the cube in place. So a step scans for its inputs with `base_channels`, which hides
+    them, and seeds its outputs from the raw channel rather than from whatever is on disk.
     """
     g: AoiGrid
     eff: dict
@@ -139,14 +147,14 @@ class PreprocessContext:
     aid: str
     H: int
     W: int
-    ds_raw: xr.Dataset
+    ds_cube: xr.Dataset
     channels: dict[str, tuple] = field(default_factory=dict)
     var_attrs: dict[str, dict] = field(default_factory=dict)
     global_attrs: dict[str, Any] = field(default_factory=dict)
 
-    # ---- reading the raw cube (defensive: a missing/misshaped channel -> None) -------- #
+    # ---- reading the cube (defensive: a missing/misshaped channel -> None) ----------- #
     def has(self, name: str) -> bool:
-        return name in self.ds_raw.variables
+        return name in self.ds_cube.variables
 
     def read(self, name: str, *, dims=None, dtype="float32") -> np.ndarray | None:
         """A raw-cube channel as a plain array, or None if absent / wrong-shaped.
@@ -154,15 +162,31 @@ class PreprocessContext:
         Mirrors the datacube loaders' discipline: a step must degrade (skip, or emit
         all-UNKNOWN) when an input product was never selected, not crash the whole stage.
         """
-        if name not in self.ds_raw.variables:
+        if name not in self.ds_cube.variables:
             return None
-        da = self.ds_raw[name]
+        da = self.ds_cube[name]
         if dims is not None and tuple(da.dims) != tuple(dims):
             return None
         return np.asarray(da.values).astype(dtype, copy=False)
 
     def channels_with_prefix(self, prefix: str) -> list[str]:
-        return sorted(str(v) for v in self.ds_raw.data_vars if str(v).startswith(prefix))
+        """EVERY cube channel starting with `prefix`, derived ones included.
+
+        Almost every caller wants `base_channels` instead -- see there. This stays for the
+        scans whose prefix cannot reach a derived name (the met fields).
+        """
+        return sorted(str(v) for v in self.ds_cube.data_vars if str(v).startswith(prefix))
+
+    def base_channels(self, prefix: str) -> list[str]:
+        """The channels starting with `prefix` that the ASSEMBLER wrote, newest run's derived
+        channels excluded (`processes.channels.DERIVED_SUFFIXES`).
+
+        This is what a step scans to discover its inputs. The cube it reads may already hold a
+        previous preprocess run's output, and `<pre>_sst<ver>_clean` starts with `<pre>_sst`
+        just as `<pre>_sst<ver>` does -- so a plain prefix scan would filter last run's product
+        a second time and emit `<pre>_sst<ver>_clean_clean`.
+        """
+        return [n for n in self.channels_with_prefix(prefix) if not is_derived(n)]
 
     def sensor_hours(self, prefix: str) -> np.ndarray | None:
         """Per-day fractional overpass hour for a sensor, or None if the sensor is absent.
@@ -173,21 +197,21 @@ class PreprocessContext:
         sensor emitted no hour channel at all -- i.e. it was not acquired -- so the caller
         emits nothing for it rather than an all-UNKNOWN channel.
         """
-        names = sorted(str(v) for v in self.ds_raw.data_vars
+        names = sorted(str(v) for v in self.ds_cube.data_vars
                        if (str(v) == f"{prefix}_hour" or str(v).startswith(f"{prefix}_hour_"))
-                       and self.ds_raw[v].dims == ("time",))
+                       and self.ds_cube[v].dims == ("time",))
         if not names:
             return None
         out = np.full(len(self.days), np.nan, "float32")
         for n in names:
-            arr = np.asarray(self.ds_raw[n].values, "float32")
+            arr = np.asarray(self.ds_cube[n].values, "float32")
             take = np.isnan(out) & np.isfinite(arr)
             out[take] = arr[take]
         return out
 
     def elevation_source(self) -> str | None:
         """The DEM tag to use when `dem_source` is unset: the sole `elevation_<dem>` present."""
-        tags = sorted(str(v)[len("elevation_"):] for v in self.ds_raw.data_vars
+        tags = sorted(str(v)[len("elevation_"):] for v in self.ds_cube.data_vars
                       if str(v).startswith("elevation_"))
         if not tags:
             return None
@@ -198,7 +222,7 @@ class PreprocessContext:
 
     def tide_source(self) -> str | None:
         """The tide tag to use when `tide_source` is unset: the sole daily `tide_<src>`."""
-        tags = sorted(str(v)[len("tide_"):] for v in self.ds_raw.data_vars
+        tags = sorted(str(v)[len("tide_"):] for v in self.ds_cube.data_vars
                       if str(v).startswith("tide_") and not str(v).startswith("tide_range_"))
         if not tags:
             return None
@@ -221,22 +245,15 @@ class PreprocessContext:
         """
         return resolve_step_opts(self.eff["project"], self.aid, key)
 
-    # ---- writing the derived cube ---------------------------------------------------- #
+    # ---- writing the derived channels -------------------------------------------------- #
     def emit(self, name: str, dims, arr, **attrs) -> None:
         self.channels[name] = (dims, arr)
         if attrs:
             self.var_attrs.setdefault(name, {}).update(attrs)
 
-    def carry(self, name: str) -> None:
-        """Copy a raw-cube channel VERBATIM into the derived cube (with its attrs), so a
-        derived channel travels beside the input it was built from. No-op if the channel is
-        absent or already present (a later `emit` of the same name wins)."""
-        if name in self.channels or name not in self.ds_raw.variables:
-            return
-        da = self.ds_raw[name]
-        self.channels[name] = (da.dims, np.asarray(da.values))
-        if da.attrs:
-            self.var_attrs.setdefault(name, {}).update(dict(da.attrs))
+    # (There is no `carry`. When the derived channels lived in a cube of their own, each step
+    # copied its raw inputs across so that cube was legible standalone. They now land in the
+    # cube those inputs came from, so a copy would just be a second name for the same array.)
 
 
 # --------------------------------------------------------------------------- #
@@ -248,8 +265,8 @@ def _step_water_line(ctx: PreprocessContext) -> None:
     Pure glue over `processes.water_level` (the reference math the raw-output refactor left in
     place for exactly this): subtract the DEM's DEM->MSL datum offset to put the ground on MSL,
     take that sensor's overpass tide, and re-reference each cell to the tide-adjusted waterline.
-    Emits `<sensor>_water_elev` and `<sensor>_water_class`; carries the DEM elevation, the
-    overpass-hour channel(s), and the overpass-tide channel it used.
+    Emits `<sensor>_water_elev` and `<sensor>_water_class`, beside the DEM elevation, the
+    overpass-hour channel(s) and the overpass-tide channel it read them from.
     """
     opts = ctx.step_opts("water_line")
     dem_source = opts.get("dem_source") or ctx.elevation_source()
@@ -266,9 +283,8 @@ def _step_water_line(ctx: PreprocessContext) -> None:
     if elev is None:
         log.warning("  water_line: no usable elevation_%s channel; skipping", dem_source)
         return
-    datum = float(ctx.ds_raw[f"elevation_{dem_source}"].attrs.get(
+    datum = float(ctx.ds_cube[f"elevation_{dem_source}"].attrs.get(
         "datum_offset_m", water_level.DEFAULT_DATUM_OFFSET_M))
-    ctx.carry(f"elevation_{dem_source}")
 
     for s in sensors:
         hours = ctx.sensor_hours(s)
@@ -285,11 +301,6 @@ def _step_water_line(ctx: PreprocessContext) -> None:
                  long_name=f"{s} submerged/exposed at its overpass",
                  flag_values=[SUBMERGED, EXPOSED, UNKNOWN],
                  flag_meanings="submerged exposed unknown")
-        # Carry the raw ingredients this sensor's fields were built from.
-        for n in ctx.channels_with_prefix(f"{s}_hour"):
-            ctx.carry(n)
-        if tide_source is not None and ctx.has(f"{s}_tide_{tide_source}"):
-            ctx.carry(f"{s}_tide_{tide_source}")
 
 
 def _overpass_tide(ctx: PreprocessContext, sensor: str, src, hours) -> np.ndarray:
@@ -315,10 +326,11 @@ def _step_fill_water(ctx: PreprocessContext) -> None:
 
     A cell is fillable where the mask channel (default `landcover_water`) is water and the
     source channel is NaN -- the model's ~9 km land mask can swallow an estuary, and MUR ships
-    honest NaN gaps. Emits the FILLED source channel (same name) plus a `<channel>_filled`
-    uint8 mask (1 = invented over unobserved water, 0 = observed), so a filled value never
-    passes for an observed one. Filling everywhere would fabricate data over land the source
-    legitimately never covered, so an absent mask means: fill nothing.
+    honest NaN gaps. Emits `<channel>_gapfilled` -- the filled field, BESIDE the untouched
+    source channel -- plus a `<channel>_filled` uint8 mask (1 = invented over unobserved water,
+    0 = observed), so a filled value never passes for an observed one. Filling everywhere would
+    fabricate data over land the source legitimately never covered, so an absent mask means:
+    fill nothing.
     """
     opts = ctx.step_opts("fill_water")
     mask_channel = opts.get("mask_channel", "landcover_water")
@@ -334,7 +346,6 @@ def _step_fill_water(ctx: PreprocessContext) -> None:
     if not channels:
         log.warning("  fill_water: no level-4 source channels (mur_sst / cmems_*) to fill")
         return
-    ctx.carry(mask_channel)
 
     for c in channels:
         raw = ctx.read(c, dims=T3)
@@ -343,7 +354,7 @@ def _step_fill_water(ctx: PreprocessContext) -> None:
         observed = np.isfinite(raw)
         filled = fill_water_nn(raw, water)
         filled_mask = (np.isfinite(filled) & ~observed).astype("uint8")
-        ctx.emit(c, T3, filled, preprocess=f"nn_filled over {mask_channel}",
+        ctx.emit(f"{c}{GAPFILLED}", T3, filled, preprocess=f"nn_filled over {mask_channel}",
                  long_name=f"{c} (nearest-neighbour filled over water)")
         ctx.emit(f"{c}_filled", T3, filled_mask,
                  long_name=(f"{c} was nearest-neighbour filled over water the source did not "
@@ -352,13 +363,13 @@ def _step_fill_water(ctx: PreprocessContext) -> None:
 
 
 def _fill_channels(ctx: PreprocessContext, sources) -> list[str]:
-    """The level-4 channels to fill: `mur_sst` and every `cmems_*` (bar `_valid`/`_filled`),
-    restricted to the `sources` product tags (`mur` / `cmems`) when given."""
+    """The level-4 channels to fill: `mur_sst` and every `cmems_*` (bar `_valid` and this
+    step's own output), restricted to the `sources` product tags (`mur` / `cmems`) when given."""
     pairs: list[tuple[str, str]] = []
     if ctx.has("mur_sst"):
         pairs.append(("mur", "mur_sst"))
-    for c in ctx.channels_with_prefix("cmems_"):
-        if not c.endswith(("_valid", "_filled")):
+    for c in ctx.base_channels("cmems_"):
+        if not c.endswith("_valid"):
             pairs.append(("cmems", c))
     if sources is None:
         return [c for _, c in pairs]
@@ -392,14 +403,14 @@ STEPS: tuple[PreprocessStep, ...] = (
     PreprocessStep(
         key="fill_water",
         reads=("landcover_water", "mur_sst", "cmems_"),
-        writes=("_filled",),
+        writes=("_gapfilled", "_filled"),
         fn=_step_fill_water,
         option_keys=frozenset({"sources", "mask_channel"}),
     ),
     PreprocessStep(
         key="filter_clouds",
         reads=("eco_sst", "eco_valid", "eco_cloud", "mur_sst", "cmems_", "doy_sin", "doy_cos"),
-        writes=("_sst", "_valid", "_cloudfiltered"),
+        writes=("_clean", "_cloudfiltered"),
         fn=_step_filter_clouds,
         depends_on=("fill_water",),        # so offset mode sees the gap-filled baseline
         option_keys=_CLOUDS_OPTS,
@@ -408,7 +419,7 @@ STEPS: tuple[PreprocessStep, ...] = (
     PreprocessStep(
         key="filter_cloud_cover",
         reads=("eco_cloud_cover_", "cloud_cover_", "eco_sst", "eco_valid", "landcover_water"),
-        writes=("_sst", "_valid", "_metcloudfiltered", "_scene_cloud_pct"),
+        writes=("_clean", "_metcloudfiltered", "_scene_cloud_pct"),
         fn=_step_filter_cloud_cover,
         depends_on=("filter_clouds",),     # deterministic order; drops compose via `_working`
         option_keys=_CLOUD_COVER_OPTS,
@@ -418,7 +429,7 @@ STEPS: tuple[PreprocessStep, ...] = (
         key="filter_land_clouds",
         reads=("eco_sst", "eco_valid", "eco_airtemp_", "airtemp_",
                "landcover_water", "_water_class"),
-        writes=("_sst", "_valid", "_landcloudfiltered"),
+        writes=("_clean", "_landcloudfiltered"),
         fn=_step_filter_land_clouds,
         # after water_line (its `<pre>_water_class` feeds land_source=water_line) and the other
         # cloud filters (deterministic order; every filter's drops union via `_working`). A
@@ -588,51 +599,90 @@ def _check_step_options(eff: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Build one AoI's derived cube
+# Build one AoI's cube: the assembled channels + this stage's derived ones
 # --------------------------------------------------------------------------- #
-def preprocess_aoi(ds_raw: xr.Dataset, g: AoiGrid, eff: dict) -> xr.Dataset:
-    """Build the derived Dataset for one AoI from its assembled raw cube.
+def preprocess_aoi(ds_cube: xr.Dataset, g: AoiGrid, eff: dict) -> xr.Dataset:
+    """The assembled cube for one AoI WITH the selected steps' derived channels merged in.
 
     Every selected step runs through the uniform `(ctx) -> None` protocol in `depends_on`
-    order. The derived cube is built on the RAW cube's own coords (never re-derived), so the
-    two align cell-for-cell, and it carries the raw inputs each derived channel came from.
+    order, then its emissions are assigned onto the cube it read them from -- on the cube's own
+    coords, never re-derived, so nothing can drift out of alignment.
+
+    A derived channel never takes an assembled channel's name (`processes.channels`), so this
+    only ever ADDS variables; re-running replaces the previous run's derived channels in place.
+    `preprocess_steps_stale` is what decides whether that re-run is worth doing.
     """
-    days = pd.DatetimeIndex(ds_raw["time"].values)
+    days = pd.DatetimeIndex(ds_cube["time"].values)
     ctx = PreprocessContext(g=g, eff=eff, days=days, aid=g.name,
-                            H=int(ds_raw.sizes["y"]), W=int(ds_raw.sizes["x"]), ds_raw=ds_raw)
+                            H=int(ds_cube.sizes["y"]), W=int(ds_cube.sizes["x"]), ds_cube=ds_cube)
 
     selected = [s for s in STEPS if s.key in eff["steps"]]
     for step in _topo_order(selected):
         step.fn(ctx)
 
-    ds_out = xr.Dataset(
-        ctx.channels,
-        coords={"time": ds_raw["time"].values,
-                "y": ds_raw["y"].values, "x": ds_raw["x"].values})
+    # What the LAST run added, so this one can tell its own output from the assembler's. Without
+    # it a re-run cannot distinguish "replacing my `eco_georef_flag`" from "clobbering a channel
+    # the assembler wrote", since neither name carries a derived suffix.
+    was_derived = set(json.loads(ds_cube.attrs.get("preprocess_channels", "[]")))
+
+    clobbered = sorted(n for n in ctx.channels
+                       if n in ds_cube.variables and n not in was_derived)
+    if clobbered:
+        # An import-time check can't catch this: what a step emits depends on the channels the
+        # cube happens to hold. Failing here beats silently overwriting the sensor's own data.
+        raise RuntimeError(
+            f"preprocess would overwrite assembled channel(s) {clobbered} -- a step must emit "
+            f"under a name of its own (see processes.channels) so the raw values survive.")
+
+    # Channels the last run added that this step selection no longer produces: drop them, or the
+    # cube keeps shipping output its own `preprocess` attr no longer claims.
+    stale = sorted(n for n in was_derived - set(ctx.channels) if n in ds_cube.variables)
+    if stale:
+        log.info("  dropping %d channel(s) from a previous step selection: %s",
+                 len(stale), ", ".join(stale))
+
+    ds_out = ds_cube.drop_vars(stale).assign(
+        {n: (dims, arr) for n, (dims, arr) in ctx.channels.items()})
     ds_out.attrs.update(
         aoi_id=ctx.aid,
-        crs=ds_raw.attrs.get("crs", g.target_crs),
-        derived_from=f"{eff['project'].datacube.output_subdir}/{ctx.aid}.zarr",
+        crs=ds_cube.attrs.get("crs", g.target_crs),
         preprocess=json.dumps({k: eff["steps"][k] for k in
-                               (s.key for s in selected)}, sort_keys=True))
+                               (s.key for s in selected)}, sort_keys=True),
+        # Which channels this stage owns -- the next run reads it back (above), and a consumer
+        # can tell a derived channel from an observed one without parsing names.
+        preprocess_channels=json.dumps(sorted(ctx.channels), sort_keys=True))
     ds_out.attrs.update(ctx.global_attrs)
     for name, attrs in ctx.var_attrs.items():
         if name in ds_out:
             ds_out[name].attrs.update(attrs)
 
-    # PROVENANCE: the config that built this cube, and for every field the source(s) it came
-    # from. Same machinery as the assembler; the derived channels are mapped in
-    # provenance.field_inputs (water_line -> bathymetry/tides/sensor; *_filled -> its base).
+    # PROVENANCE: re-stamped over the WHOLE cube, so the derived fields are recorded beside the
+    # assembled ones. `created_at` stays the assembly's -- it dates the observations, which this
+    # stage does not touch -- and `preprocessed_at` dates the derivation.
     prod = provenance.collect(eff["aligned_root"], ctx.aid, datacube.PRODUCT_DIRS)
     rec = provenance.build(eff["project"], list(ds_out.data_vars), prod)
     ds_out.attrs.update(
-        created_at=rec["created_at"], package_version=rec["package_version"],
-        code_version=rec["code_version"],
+        created_at=ds_cube.attrs.get("created_at", rec["created_at"]),
+        preprocessed_at=rec["created_at"],
+        package_version=rec["package_version"], code_version=rec["code_version"],
         config_sha256=rec["config_sha256"] or "", config_path=rec["config_path"] or "",
         config_yaml=rec["config_yaml"] or "",
         provenance=json.dumps(rec["fields"], sort_keys=True),
         provenance_products=json.dumps(rec["products"], sort_keys=True))
     return ds_out
+
+
+def preprocess_steps_stale(ds_cube: xr.Dataset, eff: dict) -> bool:
+    """Would re-running the selected steps on `ds_cube` change anything?
+
+    False when the cube already carries the output of THIS step selection, built by THIS code
+    version -- the stage is idempotent, so that re-run would rewrite an identical cube. A config
+    or code change makes it True and the stage re-runs on its own; `overwrite` forces it.
+    """
+    selected = json.dumps({k: eff["steps"][k] for k in
+                           (s.key for s in STEPS if s.key in eff["steps"])}, sort_keys=True)
+    return (ds_cube.attrs.get("preprocess") != selected
+            or ds_cube.attrs.get("code_version") != provenance.code_version())
 
 
 # --------------------------------------------------------------------------- #
@@ -645,57 +695,68 @@ def _build_eff(project: Project) -> dict:
     return {
         "project": project,
         "aligned_root": root,                         # per-product <DIR>/aligned/<aoi>
-        "raw_root": root / project.datacube.output_subdir,
-        "out_dir": root / pp.output_subdir,
+        "cube_dir": root / project.datacube.output_subdir,
         "steps": {k: dict(v.model_extra or {}) for k, v in pp.steps.items()},
-        "chunks": dict(pp.chunks),
-        "compression": pp.compression,
+        # One cube, ONE encoding: this stage rewrites the store the assembler wrote, so its own
+        # chunking/compression would silently re-chunk the assembled channels too. Both come
+        # from `datacube`, which is also what keeps the re-write chunk-aligned with what it read.
+        "chunks": dict(project.datacube.chunks),
+        "compression": project.datacube.compression,
         "overwrite": bool(pp.overwrite),
     }
 
 
 def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    """Build one derived Zarr cube per AoI from its assembled raw cube."""
+    """Add each AoI's derived channels to its assembled cube, rewriting that cube in place."""
     _check_step_options(eff)
     if not eff["steps"]:
         log.info("preprocess: no steps selected; nothing to do.")
         return None
 
-    out_dir = eff["out_dir"]
+    cube_dir = eff["cube_dir"]
     overwrite = eff["overwrite"]
     names = select_aois(grids, only_aoi)
     rep = report.ProductReport("preprocess")
 
-    if not dry_run:
-        out_dir.mkdir(parents=True, exist_ok=True)
-
     for name in names:
         g = grids[name]
-        raw_zpath = eff["raw_root"] / f"{name}.zarr"
-        zpath = out_dir / f"{name}.zarr"
+        zpath = cube_dir / f"{name}.zarr"
 
-        if not raw_zpath.exists():
+        if not zpath.exists():
             log.warning("=== %s: no assembled cube at %s; run `assemble` first -- skipping ===",
-                        name, raw_zpath.name)
-            rep.skip()
-            continue
-        if zpath.exists() and not overwrite:
-            log.info("=== %s: %s exists, skipping (use overwrite) ===", name, zpath.name)
+                        name, zpath.name)
             rep.skip()
             continue
         store.sweep_scratch(zpath)      # clear scratch from a run that died mid-write
+        if not overwrite:
+            with xr.open_zarr(zpath) as ds_cube:
+                stale = preprocess_steps_stale(ds_cube, eff)
+            if not stale:
+                log.info("=== %s: %s already holds this step selection's output, skipping "
+                         "(use overwrite to force) ===", name, zpath.name)
+                rep.skip()
+                continue
         if dry_run:
-            log.info("=== %s: [dry-run] would preprocess -> %s ===", name, zpath.name)
+            log.info("=== %s: [dry-run] would preprocess into %s ===", name, zpath.name)
             continue
 
         log.info("=== preprocessing %s (steps: %s) ===",
                  name, ", ".join(sorted(eff["steps"])))
-        with xr.open_zarr(raw_zpath) as ds_raw:
-            ds_out = preprocess_aoi(ds_raw, g, eff)
-        write_zarr_safe(ds_out, zpath, build_encoding(ds_out, eff["compression"], eff["chunks"]))
-        log.info("  wrote %s  vars=%d shape=(t=%d,y=%d,x=%d)", zpath.name,
-                 len(ds_out.data_vars), ds_out.sizes["time"], ds_out.sizes["y"],
-                 ds_out.sizes["x"])
+        # The cube is BOTH the input and the output. `store.atomic` gives us a scratch path to
+        # build the new one in and swaps it over only on a clean return -- and the swap has to
+        # happen after the source is CLOSED, which is why this drives `atomic` itself instead
+        # of handing the finished dataset to `write_zarr_safe`. A run killed part-way leaves
+        # the assembled cube exactly as it was.
+        with store.atomic(zpath) as tmp:
+            with xr.open_zarr(zpath) as ds_cube:
+                n_before = len(ds_cube.data_vars)
+                ds_out = preprocess_aoi(ds_cube, g, eff)
+                shape = (ds_out.sizes["time"], ds_out.sizes["y"], ds_out.sizes["x"])
+                n_after = len(ds_out.data_vars)
+                write_zarr(ds_out, tmp,
+                           build_encoding(ds_out, eff["compression"], eff["chunks"]))
+        log.info("  rewrote %s  vars=%d (+%d derived) shape=(t=%d,y=%d,x=%d)",
+                 zpath.name, n_after, n_after - n_before, *shape)
         rep.wrote()
 
     rep.log_summary()
@@ -707,8 +768,10 @@ def preprocess(project: Project, *, grids=None, aois=None, dry_run=False,
     """Preprocess assembled cubes for a validated Project. Terminal stage, runs after assembly.
 
     Same signature as every product's acquire() and datacube.assemble(); reads only the
-    assembled `<aoi>.zarr` cubes (and the aligned tide series on disk), so it must run AFTER
-    the assembler. A no-op unless `project.preprocess.enabled` (checked by the callers).
+    assembled `<aoi>.zarr` cubes (and the aligned tide series on disk) and rewrites each in
+    place, so it must run AFTER the assembler. A no-op unless `project.preprocess.enabled`
+    (checked by the callers). Safe to re-run: it is a no-op when the cube already carries this
+    step selection's output, and rebuilds the derived channels from the raw ones otherwise.
     """
     eff = _build_eff(project)
     if overwrite:
