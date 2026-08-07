@@ -20,8 +20,10 @@ downloaded). The alignment, mask logic and output schema are identical across
 sources, so the datacube assembler reads LANDSAT/aligned/ without caring which
 source produced it.
 
-Auth: NONE. Planetary Computer signs asset URLs anonymously (free). AWS/GEE
-sources will need their own credentials; see the config `landsat.source` selector.
+Auth: NONE. Planetary Computer signs asset URLs anonymously (free) -- but the SAS
+token it issues expires in ~30-60 min, so assets are signed PER SCENE, not once at
+search time; see `sign_item`. AWS/GEE sources will need their own credentials; see
+the config `landsat.source` selector.
 
 Usage:
     python -m coastal_sst_data.processes.landsat_pc --config config.yaml
@@ -60,6 +62,14 @@ CDIST_SCALE = 0.01  # `cdist` (ST_CDIST) DN -> km
 # Planetary Computer uses lowercase-hyphen platform names.
 DEFAULT_PLATFORMS = ["landsat-8", "landsat-9"]
 
+# Per-asset read retries. Deliberately fewer than net.MAX_RETRY: a Landsat scene is FIVE
+# windowed COG reads and a multi-year AoI is hundreds of scenes, so the budget is spent per
+# ASSET, five times over, on every scene. GDAL already retries 5xx/429 inside each attempt
+# (GDAL_HTTP_MAX_RETRY), so net.retry here is the backstop for what GDAL does not retry -- a
+# connection reset mid-stream, a curl/SSL error. Three attempts sleep 2s + 4s, bounding a
+# scene at ~30s of backoff instead of the ~70s four would allow.
+READ_ATTEMPTS = 3
+
 
 def _pc_platform(name: str) -> str:
     """Normalize a platform name to Planetary Computer style ('LANDSAT_8' -> 'landsat-8')."""
@@ -71,12 +81,19 @@ def _pc_platform(name: str) -> str:
 # the PC client installed -- only `acquire` needs it).
 # --------------------------------------------------------------------------- #
 def search_scenes(collection, stac_url, bbox, start, end, platforms, cloud_max):
-    """Return signed STAC items for Landsat scenes over the AoI bbox + dates."""
-    import planetary_computer
+    """Return UNSIGNED STAC items for Landsat scenes over the AoI bbox + dates.
+
+    Unsigned on purpose. The catalogue used to be opened with
+    `modifier=planetary_computer.sign_inplace`, which signs every item as it is materialised
+    -- once, here, for a search that may span years. Signing now happens per scene
+    (`sign_item`), and it HAS to happen there: `planetary_computer.sign_url` returns an href
+    that already carries `st`/`se`/`sp` UNTOUCHED, so signing here would make every later
+    re-sign a silent no-op handing back the same dead token.
+    """
     from pystac_client import Client
 
     def _search():
-        cat = Client.open(stac_url, modifier=planetary_computer.sign_inplace)
+        cat = Client.open(stac_url)
         search = cat.search(
             collections=[collection],
             bbox=list(bbox),
@@ -89,16 +106,53 @@ def search_scenes(collection, stac_url, bbox, start, end, platforms, cloud_max):
     return net.retry(_search, what="Landsat STAC search")
 
 
+def sign_item(item):
+    """A COPY of `item` whose asset hrefs carry a FRESH Planetary Computer SAS token.
+
+    PC signs anonymously, but the token it issues lives ~30-60 minutes. Signing at search
+    time meant ONE token for a whole AoI: an hour into a multi-year date range every
+    remaining href 403'd, each scene was caught, logged FAILED and skipped -- and because
+    scenes are processed in DATE order, an expiring token looked exactly like a date cutoff.
+    The AoI appeared to simply stop partway through, and the next AoI, with a fresh search and
+    a fresh token, worked for another hour. So: sign per scene, as late as possible, after the
+    skip guard has already decided we want this one.
+
+    `copy=True` (the default) is load-bearing twice over. The item in the caller's list keeps
+    its UNSIGNED href, so a second call really does mint a new token; and
+    `planetary_computer.sign_url` returns an already-signed href UNCHANGED, so signing an
+    already-signed item would quietly hand back the dead one.
+
+    Freshness needs no force flag -- 1.0.0 has none. PC's token cache re-fetches whenever the
+    cached token has under a minute left, and a token that just produced a 403 is by
+    definition past its expiry.
+
+    Lazy import, so the module still loads without the PC client installed -- and so this
+    stays the single seam the tests replace.
+    """
+    import planetary_computer
+
+    return net.retry(lambda: planetary_computer.sign(item), what=f"Landsat sign {item.id}")
+
+
 # --------------------------------------------------------------------------- #
 # Per-scene: windowed COG reads -> shared grid -> sst/cloud/water/valid
 # --------------------------------------------------------------------------- #
-def _read_asset(href, g: AoiGrid, *, resampling, masked=True):
+def _read_asset(item, key: str, g: AoiGrid, *, resampling, masked=True):
     """One Landsat COG asset, windowed onto the shared grid (see grid.read_cog_window).
 
     `masked=False` keeps raw integer values, which is what the bit-packed QA_PIXEL band
     needs. 300 m of pad is a few Landsat pixels of slack for the reprojection edges.
+
+    Wrapped in `net.retry` -- this was the only windowed COG read in the tree without one. A
+    scene is five independent range-read sequences, and one transient 503 on any of the five
+    lost the WHOLE scene: the caller catches, logs FAILED, moves on, and the skip guard never
+    revisits it. The href is pinned as a default argument (the CUDEM idiom) so every attempt
+    reads the URL we signed for this pass.
     """
-    return read_cog_window(href, g, resampling=resampling, masked=masked, pad_m=300.0)
+    def _read(href=item.assets[key].href):
+        return read_cog_window(href, g, resampling=resampling, masked=masked, pad_m=300.0)
+
+    return net.retry(_read, what=f"Landsat {item.id} {key}", attempts=READ_ATTEMPTS)
 
 
 def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
@@ -111,22 +165,22 @@ def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
     a = item.assets
     thermal_key = "lwir11" if "lwir11" in a else "lwir"   # L8/9 vs L4-7
 
-    dn = _read_asset(a[thermal_key].href, g, resampling=Resampling.bilinear)
+    dn = _read_asset(item, thermal_key, g, resampling=Resampling.bilinear)
     kelvin = dn * ST_SCALE + ST_OFFSET
     sst = (kelvin - 273.15) if to_celsius else kelvin
 
     # Water via NDWI = (green - nir) / (green + nir).
-    green = _read_asset(a["green"].href, g, resampling=Resampling.bilinear) * SR_SCALE + SR_OFFSET
-    nir = _read_asset(a["nir08"].href, g, resampling=Resampling.bilinear) * SR_SCALE + SR_OFFSET
+    green = _read_asset(item, "green", g, resampling=Resampling.bilinear) * SR_SCALE + SR_OFFSET
+    nir = _read_asset(item, "nir08", g, resampling=Resampling.bilinear) * SR_SCALE + SR_OFFSET
     ndwi = (green - nir) / (green + nir)
     water = ndwi >= float(mask_cfg.get("ndwi_threshold", 0.0))
 
     # Cloud via QA_PIXEL bits: dilated(1) | cloud(3) | shadow(4), + ST_CDIST buffer.
-    qa = _read_asset(a["qa_pixel"].href, g, resampling=Resampling.nearest, masked=False).astype("int64")
+    qa = _read_asset(item, "qa_pixel", g, resampling=Resampling.nearest, masked=False).astype("int64")
     cloudy = ((qa & (1 << 1)) != 0) | ((qa & (1 << 3)) != 0) | ((qa & (1 << 4)) != 0)
     buf_km = float(mask_cfg.get("cloud_buffer_km", 1.0))
     if buf_km > 0 and "cdist" in a:
-        cdist_km = _read_asset(a["cdist"].href, g, resampling=Resampling.bilinear) * CDIST_SCALE
+        cdist_km = _read_asset(item, "cdist", g, resampling=Resampling.bilinear) * CDIST_SCALE
         cloudy = cloudy | (cdist_km < buf_km)
 
     ds = xr.Dataset({
@@ -149,6 +203,42 @@ def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
         processing="PC STAC + COG windowed read -> reprojected/clipped to AoI grid",
     )
     return ds
+
+
+# The wordings a dead SAS token arrives in. GDAL does not always surface the status: a 403 on
+# the header request can look to /vsicurl like a file that simply is not there, so the
+# absent/unrecognised wordings count too. The asymmetry is deliberate -- a false positive
+# costs ONE extra read of a scene that was already failing; a false negative costs the scene,
+# and then every scene after it. `net.err_text` has stripped the href, so "403" here is prose,
+# not an April 3rd acquisition date.
+_EXPIRED_SIGNATURE = ("403", "forbidden", "access denied", "authenticationfailed",
+                      "signature", "expired", "not recognized as", "no such file",
+                      "does not exist in the file system")
+
+
+def _is_expired_signature(exc: BaseException) -> bool:
+    """Did this read fail because the scene's signature had gone stale?"""
+    return any(w in net.err_text(exc) for w in _EXPIRED_SIGNATURE)
+
+
+def read_scene(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool, acq_time,
+               aoi_id: str) -> Optional[xr.Dataset]:
+    """`scene_to_dataset` on freshly signed assets, re-signed ONCE if the token expired.
+
+    Signing per scene is necessary but not quite sufficient: a scene is five windowed reads,
+    and a token with a minute left on it can die between the first asset and the last. That
+    arrives as a 403 -- which `net.retry` correctly refuses to retry, because re-reading a
+    dead URL is pointless. Re-reading a LIVE one is not, so the retry lives HERE, at the only
+    level that can mint a new signature. Exactly once: if a second, freshly signed attempt
+    fails too, the token was never the problem, and run()'s handler records a real failure.
+    """
+    try:
+        return scene_to_dataset(sign_item(item), g, mask_cfg, to_celsius, acq_time, aoi_id)
+    except Exception as exc:
+        if not _is_expired_signature(exc):
+            raise
+        log.info("    %s signature expired mid-scene; re-signing and retrying once", item.id)
+        return scene_to_dataset(sign_item(item), g, mask_cfg, to_celsius, acq_time, aoi_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -197,7 +287,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 log.info("  %s already processed, skipping", naming.time_stamp(acq))
                 continue
             try:
-                ds = scene_to_dataset(it, g, mask_cfg, to_celsius, acq, name)
+                ds = read_scene(it, g, mask_cfg, to_celsius, acq, name)
             except Exception as exc:
                 log.warning("    FAILED %s (%s)", it.id, exc)
                 rep.fail(f"{name} {it.id}", exc)

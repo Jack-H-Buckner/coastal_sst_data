@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 log = logging.getLogger(__name__)
@@ -71,6 +72,29 @@ def _status_of(exc: BaseException) -> int | None:
     return code if isinstance(code, int) else None
 
 
+_PATHY = re.compile(r"\S*[/\\]\S*")
+
+
+def err_text(exc: BaseException) -> str:
+    """An exception's text -- its whole cause chain, paths and URLs removed -- for matching on.
+
+    Paths go because they are full of digits that are not statuses. GDAL puts the entire href
+    in every message it raises, and a Landsat href carries the acquisition date
+    (`LC08_L2SP_046027_20240403_02_T1`) plus a random SAS token: without this, the "403"
+    inside an April 3rd scene reads as Forbidden, and a reset connection on that day becomes a
+    permanent answer. A date is not a status.
+
+    The cause chain goes IN because rioxarray/fsspec wrap the failure that actually happened:
+    the outer message says "could not open", and the word that decides is one level down.
+    """
+    parts, seen = [], set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        parts.append(f"{type(exc).__name__}: {exc}")
+        exc = exc.__cause__ or exc.__context__
+    return _PATHY.sub("<path>", " | ".join(parts)).lower()
+
+
 def is_transient(exc: BaseException) -> bool:
     """Is this worth trying again, or is it the server's final answer?
 
@@ -82,15 +106,20 @@ def is_transient(exc: BaseException) -> bool:
     if status is not None:
         return status in TRANSIENT_STATUS
 
-    # No status to go on (socket errors, fsspec/h5 wrappers, GDAL's RuntimeError). Fall back
-    # to the exception type and its text -- a timeout or a reset connection is transient by
-    # definition.
-    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
-        return True
-    text = f"{type(exc).__name__}: {exc}".lower()
+    # No status to go on (socket errors, fsspec/h5 wrappers, GDAL's RuntimeError). Read the
+    # TEXT first, then fall back to the exception TYPE.
+    #
+    # That order used to be reversed, and it quietly inverted this module's whole promise.
+    # `rasterio.errors.RasterioIOError` subclasses OSError, so the isinstance fallback fired
+    # before this list was ever consulted, and EVERY 403 GDAL reported was retried four times
+    # with backoff as a "hiccup" -- the exact opposite of "a 403 is an ANSWER". An expired
+    # Planetary Computer signature is what that looks like in practice.
+    text = err_text(exc)
     if any(w in text for w in ("unauthorized", "forbidden", "not found", "no such file",
                                "401", "403", "404", "credential", "authentication")):
         return False
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
     return any(w in text for w in ("timeout", "timed out", "connection", "reset", "broken "
                                    "pipe", "temporarily", "try again", "503", "502", "500",
                                    "429", "curl", "ssl", "eof"))
