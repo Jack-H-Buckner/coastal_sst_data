@@ -16,6 +16,14 @@ auth:
     auth_strategy: netrc
   copernicus:                # CMEMS; secret lives in ~/.netrc under
     auth_strategy: netrc     #   machine auth.marine.copernicus.eu
+  # Mid-run re-authentication. A multi-year acquisition outlives its credential, and an
+  # expired token looks exactly like the date range ending -- so a credential older than
+  # max_age_s is replaced at the next safe boundary, and one rejected mid-read is replaced
+  # and retried once. Both defaults are usually right; lower max_age_s to exercise the path.
+  # NOTE: auth_strategy `interactive` is deliberately NEVER auto-refreshed -- it would block
+  # an unattended run on a password prompt. Use netrc or environment for long runs.
+  max_age_s: 1800            # 30 min
+  max_refreshes: 20          # per backend per run; exceeded -> a real failure, not a retry
 
 # Grid  
 grid:

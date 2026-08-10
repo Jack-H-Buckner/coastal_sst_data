@@ -44,6 +44,16 @@ Like Earthdata, the secret never goes in the config: it lives in ~/.netrc under
 `machine auth.marine.copernicus.eu`, in COPERNICUSMARINE_SERVICE_USERNAME/PASSWORD, or
 in the toolbox's own credentials file. Declare only the strategy, in `auth.copernicus`.
 
+WHAT EXPIRES HERE IS THE HANDLE, NOT A TOKEN. Unlike Earthdata, copernicusmarine caches no
+token in-process -- credentials are re-read from env/file on every call, and the ARCO data
+path is unsigned (the username rides along only for usage accounting). So a mid-run 401/403
+is usually NOT something re-logging-in can fix. What DOES go stale is the LAZY DATASET
+HANDLE: `open_window` is called once per (AoI, source) and then read day by day, which for a
+5-year range is ~1800 chunk fetches through one client built at open time. The only refresh
+that works is re-opening, so that is exactly what the day loop in `run()` does -- and a
+per-day failure is no longer swallowed as a coverage gap, which is how an expiry used to
+reach the cube as an indistinguishable NaN slice.
+
 Usage:
     python -m coastal_sst_data.processes.cmems --config config.yaml
     python -m coastal_sst_data.processes.cmems --config config.yaml --aoi hood_canal
@@ -63,7 +73,7 @@ from rasterio.enums import Resampling
 
 from ..config import DataProduct, Project, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, naming, net, provenance, report, store
+from .. import auth, entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -124,13 +134,21 @@ def open_window(dataset_id, variables, bbox_ll, pad, start, end, depths, creds):
 
     try:
         return net.retry(lambda: copernicusmarine.open_dataset(**kw),
-                         what=f"CMEMS open {dataset_id}")
+                         what=f"CMEMS open {dataset_id}",
+                         refresh=auth.refresher("copernicus"))
     except Exception as exc:
         # Returns None -> this source contributes no data here (a NaN slice in its channel).
         # That is right for a genuine coverage gap and WRONG for an expired credential -- which
         # used to look identical, at INFO. Say which one this is, loudly, so a missing channel
         # is not mistaken for "this source doesn't cover the AoI".
-        if net.is_transient(exc):
+        if net.is_auth_error(exc):
+            # Named separately from the generic failure below because the remedy differs and
+            # the consequence is severe: an empty channel here is NOT a coverage gap, and if a
+            # fallback source is stacked it will quietly serve a different product instead.
+            log.error("  %s: CREDENTIAL failure (%s). This is not a coverage gap -- Copernicus "
+                      "Marine rejected the credential, so this channel will be empty.",
+                      dataset_id, exc)
+        elif net.is_transient(exc):
             log.warning("  %s: unreachable after retries (%s); treating as no data",
                         dataset_id, exc)
         else:
@@ -226,6 +244,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
     days = pd.date_range(start, end, freq="D")
 
+    # CMEMS never logged in during acquisition -- it relied on the preflight and passed a
+    # credentials file per open. Logging in here gives the backend a recorded age, so the
+    # proactive check below has something to measure.
+    auth.login("copernicus", {"auth_strategy": eff["strategy"]})
+
     names = select_aois(grids, only_aoi)
     rep = report.ProductReport("cmems")
 
@@ -237,6 +260,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
         sources = [s for s in ds_cfg["sources"] if only_source is None or s == only_source]
 
         for src in sources:
+            # `open_dataset` is where credentials are actually checked, so this is the
+            # meaningful boundary at which to top the credential up.
+            auth.ensure_fresh("copernicus", {"auth_strategy": eff["strategy"]})
             dsid = datasets.get(src)
             if dsid is None:
                 log.warning("  %s: no dataset id for source %r (register it in `datasets`)",
@@ -268,9 +294,29 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
             if level_of:
                 log.info("  %s: depths %s -> model levels %s", src, [f"{d:g}" for d in level_of],
                          [f"{v:.2f}" for v in level_of.values()])
+            # ONE lazy handle, then potentially thousands of days read through it -- a 5-year
+            # range is ~1800 chunk fetches against the client `open_window` built once. That
+            # handle is what goes stale here, NOT a process-wide token (copernicusmarine caches
+            # none, and the ARCO path is unsigned), so the only refresh that can work is
+            # RE-OPENING. `holder` is what lets the closure below read through the new handle.
+            holder = [sds]
+
+            def _reopen():
+                log.info("  %s: re-opening the dataset handle after a credential failure", dsid)
+                fresh = open_window(dsid, variables, g.search_bbox, pad,
+                                    min(remaining).date(), max(remaining).date(),
+                                    depths, eff["creds"])
+                if fresh is None:
+                    raise RuntimeError(f"{dsid}: could not re-open after a credential failure")
+                holder[0] = fresh
+
             for day in remaining:
                 try:
-                    ds = day_dataset(sds, day, g, variables, level_of, grid_cfg, to_celsius)
+                    ds = net.retry(
+                        lambda day=day: day_dataset(holder[0], day, g, variables, level_of,
+                                                    grid_cfg, to_celsius),
+                        what=f"CMEMS {src} {naming.day_stamp(day)}",
+                        attempts=1, refresh=_reopen)
                 except Exception as exc:
                     log.warning("    %s: %s", day.strftime("%Y%m%d"), exc); continue
                 if ds is None:                       # this source has no such day -> NaN in cube
@@ -281,7 +327,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                 log.info("  [%s] %s -> %s", src, naming.day_stamp(day),
                          store.write_output(ds, aoi_out, naming.day_stem(name, day), fmt).name)
                 rep.wrote(source=dsid)
-            sds.close()
+            holder[0].close()
     rep.log_summary()
     return rep
 
@@ -331,6 +377,7 @@ def _build_eff(project: Project) -> dict:
                for a in project.all_areas},
         "grid": grid_cfg,
         "creds": creds,
+        "strategy": strategy,
         "cmems_root": Path(project.output_dir) / "CMEMS",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
@@ -350,6 +397,9 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     simply contributes no channel -- there is no fallback.
     """
     eff = _build_eff(project)
+    # Credentials expire and runs are long: apply this project's refresh policy before any
+    # network call. acquire() is the one entry point every invocation path goes through.
+    auth.configure(project.auth)
     if overwrite:
         eff["overwrite"] = True
     if grids is None:

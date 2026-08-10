@@ -228,6 +228,25 @@ which your module must too:
 4. **Wrap everything that touches the network in [`net.retry`](../src/coastal_sst_data/net.py)** —
    `net.retry(lambda: ..., what="CHL search {name}")`. Bare requests have no timeout or retry.
 
+   **If the call needs a credential, pass a refresher too** —
+   `net.retry(lambda: ..., what=..., refresh=auth.refresher("earthdata", eff["earthdata"]))`.
+   Runs last hours; credentials do not. Without it an expiry is a `403`, which `net.retry`
+   correctly refuses to retry, and every remaining item fails the same way — in date order,
+   so it reads as the data simply stopping. Two rules go with it:
+
+   * **Log in through [`auth.login`](../src/coastal_sst_data/auth.py), never the client library.**
+     A login nobody timestamped cannot be proactively refreshed. Then call `auth.ensure_fresh`
+     at loop boundaries (per AoI, and every `auth.CHECK_EVERY` items) so the common case is a
+     credential replaced *before* it dies rather than after.
+   * **The closure must include the call that MINTS the credential** — the `open()`, the
+     `sign()` — not just the read. `earthaccess.open` returns a handle bound to the session it
+     was created with, so re-authenticating cannot heal a handle you already hold; only
+     re-opening can. A retry that re-reads through a dead handle loops on the same failure.
+
+   Where the credential is per-URL rather than per-process (a presigned href, a lazy dataset
+   handle), an expiry can surface as a *missing file* — pass `markers=net.SIGNED_URL_MARKERS`
+   to opt into the wider, deliberately ambiguous vocabulary.
+
 5. **Stamp provenance into every file:** `ds.attrs.update(aoi_id=name, source=..., **provenance.stamp(eff))`.
    `provenance.stamp` records `acquired_at`, the package version, and the config hash — this is what
    lets the assembler report *when* each field was fetched, and distinguish a recorded date from a
@@ -549,7 +568,8 @@ specific silent-failure hole:
 |---|---|---|
 | [`store.py`](../src/coastal_sst_data/store.py) | `store.write_output` (atomic), `store.done` (skip guard) | a mid-write crash leaving a file that exists, opens, and is truncated — taken for "done" forever |
 | [`naming.py`](../src/coastal_sst_data/naming.py) | encode/decode the aligned-file timestamp | a write-side and read-side stamp drifting apart → every affected day a silent NaN slice |
-| [`net.py`](../src/coastal_sst_data/net.py) | `net.retry` around every network call | an unbounded hang or a transient failure aborting a long run |
+| [`net.py`](../src/coastal_sst_data/net.py) | `net.retry` around every network call; `net.is_auth_error` to tell a dead credential from a dead server | an unbounded hang, a transient failure aborting a long run, or a credential expiring four hours in and reading as a permission error that kills the rest of the range |
+| [`auth.py`](../src/coastal_sst_data/auth.py) | `auth.login` (never the client library directly), `auth.refresher` on credentialed `net.retry` calls, `auth.ensure_fresh` at loop boundaries | a login nobody timestamped — and therefore cannot refresh — leaving a multi-hour run to die on an expired token that looks exactly like the data running out |
 | [`report.py`](../src/coastal_sst_data/report.py) | `ProductReport` accounting | a lossy stage reporting "ok" and hiding the gap |
 | [`provenance.py`](../src/coastal_sst_data/provenance.py) | `provenance.stamp` on write; `field_inputs` for the cube | a channel shipping with a blank/guessed source record |
 | [`config.py`](../src/coastal_sst_data/config.py) | `resolve_opts` + `opt` for per-AoI options | a region override silently ignored, or an unread option silently accepted |

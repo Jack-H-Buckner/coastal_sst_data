@@ -497,11 +497,22 @@ class CopernicusAuth(BaseModel):
 
 
 class AuthConfig(BaseModel):
-    """Non-secret authentication settings, one block per backend."""
+    """Non-secret authentication settings, one block per backend, plus run-wide refresh policy.
+
+    NAMING CONSTRAINT: `auth.required_backends` reaches a backend's settings with
+    `getattr(project.auth, backend)`, so every BACKEND NAME must be an attribute here -- and
+    conversely, a non-backend field added here must not collide with one. `max_age_s` and
+    `max_refreshes` are safe; a field called `earthdata_options` would not be.
+    """
     model_config = {"extra": "forbid"}
     earthdata: EarthdataAuth | None = None
     gee: GeeAuth | None = None
     copernicus: CopernicusAuth | None = None
+
+    # Credentials expire and runs are long. These bound the mid-run re-authentication the
+    # acquisition stages do; see `coastal_sst_data.auth` for what each one prevents.
+    max_age_s: float = 1800.0     # proactively re-login a credential older than this
+    max_refreshes: int = 20       # per backend per run; exceeded -> a real failure, not a retry
 
 
 # ---------------------------------------------------------------------------

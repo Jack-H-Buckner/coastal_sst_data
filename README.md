@@ -604,9 +604,23 @@ auth:
     auth_strategy: netrc      # only if you select the cmems product
   gee:
     project: my-gcp-project   # only if you use a gee source
+
+  # Mid-run re-authentication (both optional; these are the defaults)
+  max_age_s: 1800             # replace a credential older than this at the next safe boundary
+  max_refreshes: 20           # per backend per run; exceeded -> a real failure, not a retry
 ```
 
 The config is validated on load: if you select a product that needs a backend and its block is missing, loading fails immediately with a clear message (e.g. *"product 'ecostress' requires `auth.earthdata`"*). Products using anonymous sources need no `auth:` block at all.
+
+**Credentials expire; long runs outlive them.** A multi-year AoI is hours of downloading, and an Earthdata token or a Planetary Computer signature minted at the start is dead well before the last granule. The failure is nastier than it sounds: granules are processed in **date order**, so an expiring token looks exactly like the record simply ending partway through — and the next AoI, starting with a fresh token, works for another hour.
+
+So the pipeline treats "your credential" as a distinct answer from "the server is busy" and from "it isn't there":
+
+- **Reactive** — a call rejected with a credential-shaped error triggers one re-authentication and one retry. If the *fresh* credential is rejected the same way, the log says so explicitly (`still rejected after a credential refresh — this is not an expiry`), because at that point the credentials themselves are wrong.
+- **Proactive** — a credential older than `max_age_s` is replaced at a safe boundary (between AoIs, and every 50 items), so the usual case is replacing it *before* anything fails.
+- **Bounded** — refreshes are rate-limited per backend, so hundreds of failing granules cannot cause hundreds of logins, and capped by `max_refreshes`, so a genuinely bad credential surfaces as a failure instead of an endless retry loop.
+
+> **`auth_strategy: interactive` is never auto-refreshed.** Re-authenticating would block on a password prompt, which on an unattended overnight run is worse than failing. It fails immediately with a message naming the backend. Use `netrc` or `environment` for long runs.
 
 **Verify credentials before a full run.** Before downloading anything, the pipeline runs a **preflight that actually connects** to every service the run needs — so a wrong password or a missing key fails in seconds, not hours in. You can run that check yourself at any time:
 
