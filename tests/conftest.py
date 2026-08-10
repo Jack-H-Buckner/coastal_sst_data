@@ -6,7 +6,22 @@ import rasterio
 from rasterio.transform import from_origin
 
 from coastal_sst_data.config import AreaOfInterest, GridSpec
-from coastal_sst_data import grid
+from coastal_sst_data import auth, grid
+
+
+@pytest.fixture(autouse=True)
+def _clean_auth_sessions():
+    """Isolate `auth`'s process-global credential state between tests.
+
+    `auth.login` records a timestamp and `auth.refresh` counts against a budget, both in
+    module dicts that outlive a test. Without this, a test that logs in leaves a credential
+    that a later test sees as already-fresh -- so `ensure_fresh` silently does nothing and the
+    test passes for the wrong reason. `configure()` likewise resets the policy to its defaults.
+    """
+    auth.reset()
+    auth.configure(None)
+    yield
+    auth.reset()
 
 
 @pytest.fixture

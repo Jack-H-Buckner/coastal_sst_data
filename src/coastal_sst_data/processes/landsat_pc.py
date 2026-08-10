@@ -20,10 +20,13 @@ downloaded). The alignment, mask logic and output schema are identical across
 sources, so the datacube assembler reads LANDSAT/aligned/ without caring which
 source produced it.
 
-Auth: NONE. Planetary Computer signs asset URLs anonymously (free) -- but the SAS
-token it issues expires in ~30-60 min, so assets are signed PER SCENE, not once at
-search time; see `sign_item`. AWS/GEE sources will need their own credentials; see
-the config `landsat.source` selector.
+Auth: NO LOGIN, but not no credential. Planetary Computer signs asset URLs anonymously
+(free) -- yet the SAS token it issues expires in ~30-60 min, which is a credential with a
+TTL by any other name. So assets are signed PER SCENE, not once at search time (see
+`sign_item`), and a signature that dies mid-scene is replaced through the same
+`net.retry(refresh=...)` seam the credentialed backends use, with `auth.refresher("pc")`
+evicting PC's token cache (see `read_scene`). AWS/GEE sources will need their own
+credentials; see the config `landsat.source` selector.
 
 Usage:
     python -m coastal_sst_data.processes.landsat_pc --config config.yaml
@@ -47,7 +50,7 @@ from rasterio.enums import Resampling
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
-from .. import entry, naming, net, provenance, report, store
+from .. import auth, entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -122,9 +125,15 @@ def sign_item(item):
     `planetary_computer.sign_url` returns an already-signed href UNCHANGED, so signing an
     already-signed item would quietly hand back the dead one.
 
-    Freshness needs no force flag -- 1.0.0 has none. PC's token cache re-fetches whenever the
-    cached token has under a minute left, and a token that just produced a 403 is by
-    definition past its expiry.
+    FRESHNESS IS NOT AUTOMATIC, though this once claimed it was. PC's cache re-fetches only
+    when the cached token has under a minute left:
+
+        if not token or token.ttl() < 60:
+
+    so a token that just produced a 403 but still looks valid by that clock -- skew, an
+    Azure-side revocation, a short grace window -- is handed straight back, and the "re-sign"
+    silently returns the dead token. `read_scene` therefore passes `auth.refresher("pc")`,
+    which evicts the cache first; `sign_item` on its own only guarantees a token, not a NEW one.
 
     Lazy import, so the module still loads without the PC client installed -- and so this
     stays the single seam the tests replace.
@@ -148,11 +157,17 @@ def _read_asset(item, key: str, g: AoiGrid, *, resampling, masked=True):
     lost the WHOLE scene: the caller catches, logs FAILED, moves on, and the skip guard never
     revisits it. The href is pinned as a default argument (the CUDEM idiom) so every attempt
     reads the URL we signed for this pass.
+
+    No `refresh` here, deliberately: re-reading the SAME signed href cannot be helped by a new
+    token. `markers` still widens the vocabulary, which is what stops a dead-signature wording
+    from being retried three times as a transient hiccup before it reaches `read_scene` -- the
+    one level that can actually re-sign.
     """
     def _read(href=item.assets[key].href):
         return read_cog_window(href, g, resampling=resampling, masked=masked, pad_m=300.0)
 
-    return net.retry(_read, what=f"Landsat {item.id} {key}", attempts=READ_ATTEMPTS)
+    return net.retry(_read, what=f"Landsat {item.id} {key}", attempts=READ_ATTEMPTS,
+                     markers=net.SIGNED_URL_MARKERS)
 
 
 def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
@@ -205,22 +220,6 @@ def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
     return ds
 
 
-# The wordings a dead SAS token arrives in. GDAL does not always surface the status: a 403 on
-# the header request can look to /vsicurl like a file that simply is not there, so the
-# absent/unrecognised wordings count too. The asymmetry is deliberate -- a false positive
-# costs ONE extra read of a scene that was already failing; a false negative costs the scene,
-# and then every scene after it. `net.err_text` has stripped the href, so "403" here is prose,
-# not an April 3rd acquisition date.
-_EXPIRED_SIGNATURE = ("403", "forbidden", "access denied", "authenticationfailed",
-                      "signature", "expired", "not recognized as", "no such file",
-                      "does not exist in the file system")
-
-
-def _is_expired_signature(exc: BaseException) -> bool:
-    """Did this read fail because the scene's signature had gone stale?"""
-    return any(w in net.err_text(exc) for w in _EXPIRED_SIGNATURE)
-
-
 def read_scene(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool, acq_time,
                aoi_id: str) -> Optional[xr.Dataset]:
     """`scene_to_dataset` on freshly signed assets, re-signed ONCE if the token expired.
@@ -231,14 +230,20 @@ def read_scene(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool, acq_time,
     dead URL is pointless. Re-reading a LIVE one is not, so the retry lives HERE, at the only
     level that can mint a new signature. Exactly once: if a second, freshly signed attempt
     fails too, the token was never the problem, and run()'s handler records a real failure.
+
+    The wordings a dead SAS token arrives in used to live here as a private list; they are now
+    `net.SIGNED_URL_MARKERS`, shared with every other per-URL credential. `attempts=1` because
+    the transient budget belongs to `_read_asset` -- the auth retry is a separate budget and
+    does not spend it.
+
+    `refresh` has to be a REAL action even though PC is anonymous and `fn` re-signs itself:
+    see `auth._refresh_pc`. `sign_item` alone can hand back the very token that just 403'd,
+    because planetary_computer's cache only re-fetches below a minute of nominal TTL.
     """
-    try:
-        return scene_to_dataset(sign_item(item), g, mask_cfg, to_celsius, acq_time, aoi_id)
-    except Exception as exc:
-        if not _is_expired_signature(exc):
-            raise
-        log.info("    %s signature expired mid-scene; re-signing and retrying once", item.id)
-        return scene_to_dataset(sign_item(item), g, mask_cfg, to_celsius, acq_time, aoi_id)
+    return net.retry(
+        lambda: scene_to_dataset(sign_item(item), g, mask_cfg, to_celsius, acq_time, aoi_id),
+        what=f"Landsat scene {item.id}", attempts=1,
+        refresh=auth.refresher("pc"), markers=net.SIGNED_URL_MARKERS)
 
 
 # --------------------------------------------------------------------------- #
@@ -351,6 +356,9 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     acquire(). No credentials required (PC signs assets anonymously).
     """
     eff = _build_eff(project)
+    # Credentials expire and runs are long: apply this project's refresh policy before any
+    # network call. acquire() is the one entry point every invocation path goes through.
+    auth.configure(project.auth)
     if overwrite:
         eff["overwrite"] = True
     if grids is None:

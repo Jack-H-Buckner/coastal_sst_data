@@ -41,7 +41,7 @@ from rasterio.enums import Resampling
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, naming, net, overpass, provenance, report, store
+from .. import auth, entry, naming, net, overpass, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -160,8 +160,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     out_root, fmt, overwrite = eff["out_dir"], eff["fmt"], eff["overwrite"]
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
-    log.info("Authenticating with Earthdata (strategy=%s)", eff["earthdata"]["auth_strategy"])
-    earthaccess.login(strategy=eff["earthdata"]["auth_strategy"])
+    auth.login("earthdata", eff["earthdata"])
 
     names = select_aois(grids, only_aoi)
 
@@ -199,6 +198,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         pad = float(ds_cfg["pad_deg"])
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
                  name, g.target_crs, g.width, g.height, g.resolution_m)
+        auth.ensure_fresh("earthdata", eff["earthdata"])
 
         want = ds_cfg["overpass_sensors"]
         day_stamps = None
@@ -238,13 +238,25 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             continue
 
         aoi_out = out_root / name
+        ed = auth.refresher("earthdata", eff["earthdata"])
         for gi, granule in enumerate(kept, 1):
+            # Proactive: a multi-year AoI is hundreds of granules on one login, so top the
+            # credential up between them rather than discovering it died on granule 400.
+            if gi % auth.CHECK_EVERY == 0:
+                auth.ensure_fresh("earthdata", eff["earthdata"])
             try:
-                fobj = net.retry(lambda: earthaccess.open([granule])[0],
-                                 what=f"MUR open granule {gi}")
-                da, t = subset_and_reproject(fobj, variable, g.search_bbox, pad,
-                                             g.target_crs, g.transform, g.width,
-                                             g.height, g.geom_proj, grid_cfg)
+                # The OPEN is inside the retry with the read, not outside it. `earthaccess.open`
+                # returns a handle bound to the fsspec session it was created with, so
+                # re-authenticating cannot heal a handle we already hold -- only re-opening can.
+                # Retrying just `subset_and_reproject` would read through the same dead session
+                # forever. `granule=granule` pins the loop variable (the CUDEM idiom).
+                def _fetch(granule=granule):
+                    fobj = earthaccess.open([granule])[0]
+                    return subset_and_reproject(fobj, variable, g.search_bbox, pad,
+                                                g.target_crs, g.transform, g.width,
+                                                g.height, g.geom_proj, grid_cfg)
+
+                da, t = net.retry(_fetch, what=f"MUR granule {gi}", refresh=ed)
             except Exception as exc:
                 # A failed download and a day that genuinely has no data used to look
                 # identical: one warning, no tally, and `Done.` all the same.
@@ -357,6 +369,9 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     overwrite    reprocess days even if the aligned file exists
     """
     eff = _build_eff(project)
+    # Credentials expire and runs are long: apply this project's refresh policy before any
+    # network call. acquire() is the one entry point every invocation path goes through.
+    auth.configure(project.auth)
     if overwrite:
         eff["overwrite"] = True
     if grids is None:

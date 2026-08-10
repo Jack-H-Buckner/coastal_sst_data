@@ -6,7 +6,7 @@ import pandas as pd
 from pathlib import Path
 from coastal_sst_data.config import load_config, parse_config, AreaOfInterest, GridSpec
 from coastal_sst_data.processes import mur
-from coastal_sst_data import grid
+from coastal_sst_data import auth, grid
 
 
 def _ds(eff):
@@ -190,7 +190,9 @@ def three_days(monkeypatch, tmp_path, aoi_grid):
     `open` resolves the granule through the same metadata the filter selects on, so a test
     asserting on the FILES written is also asserting the two agree.
     """
-    monkeypatch.setattr(mur.earthaccess, "login", lambda **kw: None)
+    # The auth SEAM, not `earthaccess.login`: the stage now goes through
+    # `auth.login`, which records when the credential was minted.
+    monkeypatch.setitem(auth.AUTH_HANDLERS, "earthdata", lambda s: None)
     made = {d.replace("-", ""): make_mur_granule(tmp_path / f"src_{d}.nc", aoi_grid,
                                                  when=d, sst_kelvin=290.0)
             for d in DAYS}
@@ -213,6 +215,61 @@ def test_run_without_the_option_still_fetches_every_day(three_days, tmp_path, ao
     assert _written(tmp_path, aoi_grid.name) == [f"{aoi_grid.name}_2026060{i}.nc"
                                                  for i in (1, 2, 3)]
     assert (rep.expected, rep.written) == (3, 3)
+
+
+def test_an_expired_credential_mid_run_is_refreshed_and_the_range_completes(
+        three_days, tmp_path, aoi_grid, monkeypatch, caplog):
+    """The whole feature, end to end, offline.
+
+    This is the failure that motivated it: an EDL token minted at t=0 dies partway through a
+    long range, every remaining granule 403s, and -- because granules are processed in DATE
+    order -- the AoI looks like it simply ran out of days. Here the second granule's open
+    fails once with a 403; the stage must replace the credential, retry, and still write all
+    three days with nothing recorded as failed.
+    """
+    refreshes = []
+    monkeypatch.setitem(auth.REFRESH_HANDLERS, "earthdata",
+                        lambda s: refreshes.append(1))
+
+    real_open = mur.earthaccess.open
+    seen = {"n": 0, "boom": False}
+
+    def flaky_open(gs):
+        seen["n"] += 1
+        if seen["n"] == 2 and not seen["boom"]:
+            seen["boom"] = True                      # dies once, on the second granule
+            raise RuntimeError("HTTP 403 Forbidden: EDL token expired")
+        return real_open(gs)
+
+    monkeypatch.setattr(mur.earthaccess, "open", flaky_open)
+
+    rep = mur.run(_mur_eff(tmp_path, aoi_grid), {aoi_grid.name: aoi_grid}, None, False)
+
+    # The range COMPLETED -- it did not stop at the granule where the token died.
+    assert _written(tmp_path, aoi_grid.name) == [f"{aoi_grid.name}_2026060{i}.nc"
+                                                 for i in (1, 2, 3)]
+    assert (rep.expected, rep.written) == (3, 3)
+    assert not rep.failures            # a recovered expiry is not a data loss
+    assert len(refreshes) == 1         # replaced once, not once per granule
+    assert "credential rejected" in caplog.text
+
+
+def test_a_credential_that_is_simply_wrong_is_not_retried_forever(
+        three_days, tmp_path, aoi_grid, monkeypatch, caplog):
+    """The other half of the diagnosis: if a FRESH credential is rejected the same way, the
+    problem was never expiry, and the log must say so rather than implying a flaky network."""
+    refreshes = []
+    monkeypatch.setitem(auth.REFRESH_HANDLERS, "earthdata", lambda s: refreshes.append(1))
+    monkeypatch.setattr(mur.earthaccess, "open",
+                        lambda gs: (_ for _ in ()).throw(
+                            RuntimeError("HTTP 403 Forbidden: not authorized")))
+
+    rep = mur.run(_mur_eff(tmp_path, aoi_grid), {aoi_grid.name: aoi_grid}, None, False)
+
+    assert rep.written == 0 and len(rep.failures) == 3     # a real, tallied loss
+    assert "still rejected after a credential refresh" in caplog.text
+    # Rate-limited: three failing granules, ONE login attempt.
+    assert len(refreshes) == 1
 
 
 def test_run_fetches_only_the_days_a_sensor_flew(three_days, tmp_path, aoi_grid):

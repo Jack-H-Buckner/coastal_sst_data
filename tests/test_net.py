@@ -174,6 +174,174 @@ def test_keyboard_interrupt_is_never_retried():
 
 
 # --------------------------------------------------------------------------- #
+# is_auth_error -- the THIRD category: not "wait and try again", but "try again
+# with a different credential"
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_statuses_are_auth_errors(status):
+    assert net.is_auth_error(_http(status))
+
+
+@pytest.mark.parametrize("status", [404, 429, 500, 503])
+def test_other_statuses_are_not_auth_errors(status):
+    """A status the server actually sent is definitive. Only 401/403 say "your credential"."""
+    assert not net.is_auth_error(_http(status))
+
+
+def test_a_500_mentioning_authentication_is_not_an_auth_error():
+    """A known status must WIN over the prose. An auth service having an outage returns 5xx
+    with "authentication" all over the body; refreshing a perfectly good credential because
+    of it would burn the budget on someone else's problem."""
+    exc = _http(500)
+    exc.args = ("authentication service temporarily unavailable",)
+    assert not net.is_auth_error(exc)
+    assert net.is_transient(exc)            # it is a hiccup, and still retried as one
+
+
+def test_a_rasterio_403_is_an_auth_error_and_still_not_transient():
+    """Both classifiers must agree on a dead signature: not worth waiting for, worth
+    re-signing for. If it were transient too, it would be retried against the dead URL."""
+    exc = RasterioIOError(f"'{_HREF}': HTTP response code: 403")
+    assert net.is_auth_error(exc)
+    assert not net.is_transient(exc)
+
+
+def test_a_date_in_a_scene_id_is_not_a_403():
+    """The word-boundary test, and the reason `"403" in text` is not good enough.
+
+    `err_text` only scrubs tokens containing a slash, so a BARE scene id survives it -- and
+    `LC08_L2SP_046027_20240403_02_T1` contains "403". Matching it would refresh the credential
+    on every failure of every April 3rd scene: a date-shaped bug in the fix for a
+    date-shaped bug, one layer down from the one already pinned above.
+    """
+    exc = RuntimeError("LC08_L2SP_046027_20240403_02_T1 read failed")
+    assert "403" in str(exc)
+    assert not net.is_auth_error(exc)
+
+
+def test_signed_url_markers_are_opt_in():
+    """GDAL reports a 403 on a HEAD request as a file that is not there -- and so does a
+    granule that is genuinely not there. Ambiguous, so only the per-URL callers opt in."""
+    exc = RasterioIOError("'/vsicurl/https://x/y.tif': does not exist in the file system")
+    assert not net.is_auth_error(exc)
+    assert net.is_auth_error(exc, net.SIGNED_URL_MARKERS)
+
+
+def test_the_cause_chain_decides_for_auth_too():
+    try:
+        try:
+            raise RasterioIOError("HTTP response code: 403")
+        except RasterioIOError as inner:
+            raise RuntimeError("could not open the asset") from inner
+    except RuntimeError as exc:
+        assert net.is_auth_error(exc)
+
+
+# --------------------------------------------------------------------------- #
+# retry(refresh=...) -- replacing the credential, exactly once
+# --------------------------------------------------------------------------- #
+def test_refresh_fires_once_and_the_retry_succeeds():
+    calls, refreshed, waits = [], [], []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise _http(401)
+        return "ok"
+
+    got = net.retry(flaky, what="x", sleep=waits.append,
+                    refresh=lambda: refreshed.append(1))
+    assert got == "ok"
+    assert len(calls) == 2 and len(refreshed) == 1
+    # A fresh credential works on the spot or it does not. Backing off first would just be
+    # dead time in a run that is already hours long.
+    assert waits == []
+
+
+def test_the_auth_retry_does_not_spend_the_transient_budget():
+    """The headline property. `attempts` is the budget for a server having a moment; an
+    expired credential is a different failure with a different fix, and must not eat it."""
+    calls, waits = [], []
+    seq = [_http(401), _http(503), _http(503), "ok"]
+
+    def flaky():
+        calls.append(1)
+        got = seq[len(calls) - 1]
+        if got == "ok":
+            return got
+        raise got
+
+    assert net.retry(flaky, what="x", attempts=3, sleep=waits.append,
+                     refresh=lambda: None) == "ok"
+    assert len(calls) == 4          # 1 auth + all 3 transient attempts still available
+    assert waits == [2.0, 4.0]
+
+
+def test_a_refreshed_credential_still_rejected_is_final():
+    """The diagnosis the whole feature exists to deliver: if a NEW credential is rejected
+    the same way, the problem was never expiry."""
+    calls, refreshed = [], []
+
+    def forbidden():
+        calls.append(1)
+        raise _http(403)
+
+    with pytest.raises(RuntimeError):
+        net.retry(forbidden, what="x", attempts=5, sleep=lambda s: None,
+                  refresh=lambda: refreshed.append(1))
+    assert len(calls) == 2 and len(refreshed) == 1     # not `attempts` times
+
+
+def test_without_a_refresh_the_behaviour_is_unchanged():
+    """Every call site that has not opted in must behave exactly as it did before."""
+    calls = []
+
+    def forbidden():
+        calls.append(1)
+        raise _http(401)
+
+    with pytest.raises(RuntimeError):
+        net.retry(forbidden, what="x", attempts=4, sleep=lambda s: None)
+    assert len(calls) == 1
+
+
+def test_a_refresh_that_raises_surfaces_the_ORIGINAL_error():
+    """`rep.fail(item, exc)` records this string in the run report. "refresh budget
+    exhausted" there would hide which granule was actually lost."""
+    def forbidden():
+        raise _http(401)
+
+    def refuse():
+        raise ValueError("auth_strategy='interactive' cannot re-authenticate")
+
+    with pytest.raises(RuntimeError, match="server said 401"):
+        net.retry(forbidden, what="x", sleep=lambda s: None, refresh=refuse)
+
+
+def test_markers_are_threaded_through_retry():
+    """A per-URL caller opts into the wider vocabulary; the default caller does not."""
+    def missing():
+        raise RasterioIOError("'/vsicurl/https://x/y.tif': no such file")
+
+    default_refreshes, signed_refreshes = [], []
+    with pytest.raises(RasterioIOError):
+        net.retry(missing, what="x", attempts=1, sleep=lambda s: None,
+                  refresh=lambda: default_refreshes.append(1))
+    with pytest.raises(RasterioIOError):
+        net.retry(missing, what="x", attempts=1, sleep=lambda s: None,
+                  refresh=lambda: signed_refreshes.append(1), markers=net.SIGNED_URL_MARKERS)
+    assert default_refreshes == [] and len(signed_refreshes) == 1
+
+
+def test_keyboard_interrupt_is_never_treated_as_an_auth_error():
+    def interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        net.retry(interrupted, what="x", sleep=lambda s: None, refresh=lambda: None)
+
+
+# --------------------------------------------------------------------------- #
 # GDAL env
 # --------------------------------------------------------------------------- #
 def test_setup_gdal_env_sets_a_deadline_and_a_retry_policy(monkeypatch):

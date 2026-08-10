@@ -102,5 +102,172 @@ def test_verify_only_checks_requested_products(monkeypatch):
     # verifying only the public product must NOT touch earthdata
     assert auth.verify(proj, products=[DataProduct.bathymetry]) == {}
 
+# ---------------------------------------------------------------------------
+# Credential lifetime: the state auth.py did not have.
+#
+# A preflight is not enough on a multi-hour run. These pin the three things that
+# make a mid-run credential replaceable: knowing its AGE, forcing a genuinely
+# fresh login, and refusing to do either when it would do harm.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def clock(monkeypatch):
+    """A hand-advanced monotonic clock, so ages can be tested without sleeping."""
+    now = [1000.0]
+    monkeypatch.setattr(auth, "_clock", lambda: now[0])
+    return now
+
+
+@pytest.fixture
+def handlers(monkeypatch):
+    """Stub login + refresh handlers that record the order they ran in."""
+    order = []
+    monkeypatch.setitem(auth.AUTH_HANDLERS, "earthdata", lambda s: order.append("login"))
+    monkeypatch.setitem(auth.REFRESH_HANDLERS, "earthdata", lambda s: order.append("refresh"))
+    return order
+
+
+NETRC = {"auth_strategy": "netrc"}
+
+
+def test_login_records_when_so_the_age_is_knowable(clock, handlers):
+    auth.login("earthdata", NETRC)
+    assert auth.age("earthdata") == 0.0
+    clock[0] += 600
+    assert auth.age("earthdata") == 600.0
+
+
+def test_age_is_none_for_a_backend_that_never_logged_in():
+    assert auth.age("earthdata") is None
+
+
+def test_verify_seeds_the_session_registry(monkeypatch):
+    """So a credential's age is counted from the preflight that actually minted it, and the
+    first stage does not immediately log in a second time."""
+    monkeypatch.setattr(auth, "AUTH_HANDLERS", {"earthdata": lambda s: None})
+    auth.verify(_project({"mur": None}, earthdata=True))
+    assert auth.age("earthdata") is not None
+
+
+def test_refresh_forces_a_login_the_plain_handler_would_not(clock, handlers):
+    """The registries are separate because `earthaccess.login()` a second time is a NO-OP --
+    it returns the same stale Auth without contacting EDL. A refresh that reused
+    AUTH_HANDLERS would log success and change nothing."""
+    auth.login("earthdata", NETRC)
+    clock[0] += 3600
+    assert auth.refresh("earthdata", NETRC) is True
+    assert handlers == ["login", "refresh"]
+    assert auth.age("earthdata") == 0.0          # the clock restarted
+
+
+def test_ensure_fresh_is_a_noop_inside_the_ttl(clock, handlers):
+    auth.login("earthdata", NETRC)
+    clock[0] += 60
+    assert auth.ensure_fresh("earthdata", NETRC, max_age_s=1800) is False
+    assert handlers == ["login"]
+
+
+def test_ensure_fresh_replaces_a_stale_credential(clock, handlers):
+    auth.login("earthdata", NETRC)
+    clock[0] += 2000
+    assert auth.ensure_fresh("earthdata", NETRC, max_age_s=1800) is True
+    assert handlers == ["login", "refresh"]
+
+
+def test_the_rate_limit_stops_a_login_storm(clock, handlers):
+    """A dead credential does not fail once -- it fails on every one of the hundreds of
+    granules still to come, and each one asks for a refresh."""
+    auth.login("earthdata", NETRC)
+    assert auth.refresh("earthdata", NETRC) is True
+    clock[0] += 5                                 # well inside MIN_REFRESH_INTERVAL_S
+    assert auth.refresh("earthdata", NETRC) is False
+    assert handlers == ["login", "refresh"]       # not twice
+
+
+def test_the_budget_stops_refreshing_forever(clock, handlers, monkeypatch):
+    """A run needing more than the budget is not experiencing expiry, and quietly
+    re-logging-in forever would hide whatever it IS experiencing."""
+    monkeypatch.setattr(auth, "MAX_REFRESHES", 2)
+    monkeypatch.setattr(auth, "MIN_REFRESH_INTERVAL_S", 0.0)
+    auth.login("earthdata", NETRC)
+    auth.refresh("earthdata", NETRC)
+    auth.refresh("earthdata", NETRC)
+    with pytest.raises(auth.CredentialRefreshError, match="budget exhausted"):
+        auth.refresh("earthdata", NETRC)
+    assert handlers.count("refresh") == 2
+
+
+def test_interactive_is_never_re_authenticated(clock, handlers):
+    """A run blocked overnight on a password prompt is worse than one that failed."""
+    auth.login("earthdata", {"auth_strategy": "interactive"})
+    with pytest.raises(auth.CredentialRefreshError, match="interactive"):
+        auth.refresh("earthdata", {"auth_strategy": "interactive"})
+    assert "refresh" not in handlers
+    # and the message must say what to do about it
+    with pytest.raises(auth.CredentialRefreshError, match="netrc"):
+        auth.refresh("earthdata", {"auth_strategy": "interactive"})
+
+
+def test_ensure_fresh_swallows_a_refusal_but_refresh_raises(clock, handlers):
+    """A reactive refresh runs after a read already failed, so raising costs nothing. A
+    proactive one runs while everything is working, and must never be what stops a run."""
+    auth.login("earthdata", {"auth_strategy": "interactive"})
+    clock[0] += 5000
+    assert auth.ensure_fresh("earthdata", {"auth_strategy": "interactive"}) is False
+
+
+def test_the_strategy_is_remembered_so_deep_call_sites_need_no_settings(clock, handlers):
+    """`modis._fetch_download` builds a refresher without its `eff` bag in scope."""
+    auth.login("earthdata", {"auth_strategy": "interactive"})
+    with pytest.raises(auth.CredentialRefreshError, match="interactive"):
+        auth.refresh("earthdata")            # settings omitted
+
+
+def test_refresher_is_a_zero_arg_callable_for_net_retry(clock, handlers):
+    auth.login("earthdata", NETRC)
+    r = auth.refresher("earthdata", NETRC)
+    r()
+    assert handlers == ["login", "refresh"]
+
+
+def test_refresher_is_none_for_a_backend_that_cannot_be_refreshed():
+    """None, not a no-op: `net.retry(refresh=None)` is byte-identical to the old path, so a
+    public product's call site keeps failing fast exactly as it did."""
+    assert auth.refresher("nope") is None
+    assert auth.refresher(None) is None
+
+
+def test_refresh_of_an_unknown_backend_refuses():
+    with pytest.raises(auth.CredentialRefreshError, match="no refresh handler"):
+        auth.refresh("nope", NETRC)
+
+
+def test_pc_is_refreshable_without_being_a_login_backend():
+    """Planetary Computer is anonymous -- nothing to log in to -- but its SAS token is still
+    a credential that expires. It must therefore NOT be in AUTH_HANDLERS (required_backends
+    would try `getattr(project.auth, "pc")`), yet must be refreshable."""
+    assert "pc" not in auth.AUTH_HANDLERS
+    assert "pc" in auth.REFRESH_HANDLERS
+    assert auth.refresher("pc") is not None
+
+
+def test_pc_refresh_evicts_the_token_cache(monkeypatch):
+    """`planetary_computer.sign` re-fetches only below 60s of nominal TTL, so a token Azure
+    has just REJECTED can be handed straight back. Clearing the cache is the force flag."""
+    pc_sas = pytest.importorskip("planetary_computer.sas")
+    monkeypatch.setitem(pc_sas.TOKEN_CACHE, "https://example/token", "dead")
+    auth.refresh("pc")
+    assert "https://example/token" not in pc_sas.TOKEN_CACHE
+
+
+def test_configure_applies_the_project_policy():
+    proj = _project({"mur": None}, earthdata=True)
+    proj.auth.max_age_s = 60.0
+    proj.auth.max_refreshes = 3
+    auth.configure(proj.auth)
+    assert auth.MAX_AGE_S == 60.0 and auth.MAX_REFRESHES == 3
+    auth.configure(None)                     # restores the defaults
+    assert auth.MAX_AGE_S == auth._DEFAULT_MAX_AGE_S
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

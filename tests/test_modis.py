@@ -13,6 +13,7 @@ import xarray as xr
 
 from coastal_sst_data.config import parse_config
 from coastal_sst_data.processes import modis
+from coastal_sst_data import auth
 from .conftest import UniformDs
 
 
@@ -235,7 +236,7 @@ def _modis_eff(tmp_path):
 def test_a_failed_granule_leaves_no_tmp_file_behind(monkeypatch, tmp_path, aoi_grid):
     """A partial download must not survive the attempt: the next run would see the name
     already present, skip the download, and read the truncated file."""
-    monkeypatch.setattr(modis.earthaccess, "login", lambda **kw: None)
+    monkeypatch.setitem(auth.AUTH_HANDLERS, "earthdata", lambda s: None)
     monkeypatch.setattr(modis.earthaccess, "search_data", lambda **kw: [_Gran()])
 
     def fetch_then_die(granule, bbox, tmp_dir):
@@ -255,7 +256,7 @@ def test_a_failed_granule_leaves_no_tmp_file_behind(monkeypatch, tmp_path, aoi_g
 
 
 def test_a_successful_granule_also_cleans_up_its_scratch(monkeypatch, tmp_path, aoi_grid):
-    monkeypatch.setattr(modis.earthaccess, "login", lambda **kw: None)
+    monkeypatch.setitem(auth.AUTH_HANDLERS, "earthdata", lambda s: None)
     monkeypatch.setattr(modis.earthaccess, "search_data", lambda **kw: [_Gran()])
 
     src = write_modis_granule(tmp_path / "src.nc", aoi_grid.search_bbox,

@@ -48,7 +48,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, naming, net, provenance, report, store
+from .. import auth, entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -102,8 +102,13 @@ def _fetch_download(granule, bbox, tmp_dir: Path) -> Path:
     in a `finally` -- a granule directory that outlives its attempt cannot be reused.
     """
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    # `download` re-derives its session from `earthaccess.__store__` on each call, and a
+    # refresh rebuilds that store -- so unlike an already-open handle, a retried download
+    # genuinely benefits. No settings needed: the strategy was recorded when the stage
+    # logged in (see auth._strategy).
     paths = net.retry(lambda: earthaccess.download([granule], local_path=str(tmp_dir)),
-                      what="MODIS granule download")
+                      what="MODIS granule download",
+                      refresh=auth.refresher("earthdata"))
     if not paths:
         raise RuntimeError("earthaccess.download returned no path")
     return Path(paths[0])
@@ -207,8 +212,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     to_celsius = grid_cfg.get("to_celsius", False)
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
-    log.info("Authenticating with Earthdata (strategy=%s)", eff["earthdata"]["auth_strategy"])
-    earthaccess.login(strategy=eff["earthdata"]["auth_strategy"])
+    auth.login("earthdata", eff["earthdata"])
 
     names = select_aois(grids, only_aoi)
 
@@ -239,7 +243,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             lambda: earthaccess.search_data(
                 short_name=ds_cfg["short_name"], temporal=(start, end),
                 bounding_box=tuple(g.search_bbox)),
-            what=f"MODIS search {name}")
+            what=f"MODIS search {name}",
+            refresh=auth.refresher("earthdata", eff["earthdata"]))
         kept = _select_granules(granules, ls_times, match_landsat, max_dt, daytime_only)
         log.info("  %d granule(s) over AOI -> %d after daytime/coincidence filter",
                  len(granules), len(kept))
@@ -250,7 +255,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             continue
 
         aoi_out = out_root / name
-        for gr, t in kept:
+        for gi, (gr, t) in enumerate(kept, 1):
+            # Proactive: top the credential up between granules rather than discovering it
+            # died four hours in.
+            if gi % auth.CHECK_EVERY == 0:
+                auth.ensure_fresh("earthdata", eff["earthdata"])
             tstr = naming.time_stamp(t)
             stem = naming.time_stem(name, t)
             if store.done(aoi_out / f"{stem}.nc", store.REQUIRED_VARS["MODIS"],
@@ -343,6 +352,9 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     with match_landsat should run AFTER Landsat so its aligned files exist.
     """
     eff = _build_eff(project)
+    # Credentials expire and runs are long: apply this project's refresh policy before any
+    # network call. acquire() is the one entry point every invocation path goes through.
+    auth.configure(project.auth)
     if overwrite:
         eff["overwrite"] = True
     if full_series:

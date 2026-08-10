@@ -49,7 +49,7 @@ from rasterio.enums import Resampling
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
-from .. import entry, naming, net, products, provenance, report, store
+from .. import auth, entry, naming, net, products, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -100,8 +100,13 @@ def expected_vars(ds_cfg: dict) -> tuple[str, ...]:
 # Earthdata search / download
 # --------------------------------------------------------------------------- #
 def login(strategy: str):
-    log.info("Authenticating with Earthdata (strategy=%s)", strategy)
-    earthaccess.login(strategy=strategy)
+    """Authenticate to Earthdata AND record when, via `auth.login`.
+
+    Kept as a named seam because the tests replace it, but it no longer calls
+    `earthaccess.login` directly: a login nobody timestamped cannot be proactively
+    refreshed, which is exactly what a multi-hour run needs.
+    """
+    auth.login("earthdata", {"auth_strategy": strategy})
 
 
 def search_granules(ds_cfg: dict, bbox, start: str, end: str):
@@ -112,7 +117,8 @@ def search_granules(ds_cfg: dict, bbox, start: str, end: str):
             temporal=(start, end),
             bounding_box=tuple(bbox),
         ),
-        what=f"ECOSTRESS search {ds_cfg['short_name']}")
+        what=f"ECOSTRESS search {ds_cfg['short_name']}",
+        refresh=auth.refresher("earthdata"))
     log.info("  found %d granule(s)", len(results))
     return results
 
@@ -175,6 +181,13 @@ def process_granule(role_to_file, ds_cfg, grid_cfg, g: AoiGrid, aoi_id,
             da = read_cog_window(fobj, g, resampling=resampling, pad_m=ECO_PAD_M)
             da = da.rio.clip([g.geom_proj], g.target_crs, drop=False)
         except Exception as exc:  # window outside this tile, transient COG read failure...
+            # ...but NOT a dead credential. An expired S3/EDL token fails every layer
+            # identically, so swallowing it here turned an expiry into "core layer(s)
+            # missing" and dropped the granule as degraded -- the same silent, data-shaped
+            # failure that once made a Landsat AoI look like it ran out of dates. Let it out
+            # to the caller, which is the level that can re-authenticate and re-open.
+            if net.is_auth_error(exc):
+                raise
             log.warning("    layer %s failed to read (%s)", role, exc)
             failed.append(role)
             continue
@@ -266,6 +279,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers,
         versions = [v for v in ds_cfg["versions"] if only_source is None or v == only_source]
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) | versions=%s ===",
                  name, g.target_crs, g.width, g.height, g.resolution_m, versions)
+        auth.ensure_fresh("earthdata", eff["earthdata"])
 
         for tag in versions:
             # The search + the source-attr stamp both read `version` (the bare collection
@@ -288,6 +302,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers,
             aoi_out = eco_root / tag / "aligned" / name
 
             for gi, granule in enumerate(granules, 1):
+                if gi % auth.CHECK_EVERY == 0:
+                    auth.ensure_fresh("earthdata", eff["earthdata"])
                 role_to_url = filter_links_for_granule(granule, layers)
                 if not role_to_url:
                     continue
@@ -304,15 +320,23 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers,
                 log.info("  [%s %d/%d] streaming %d layer(s) for %s",
                          tag, gi, len(granules), len(role_to_url), tstr)
                 try:
-                    fobjs = net.retry(lambda: earthaccess.open(list(role_to_url.values())),
-                                      what=f"ECOSTRESS open {tag} {tstr}")
+                    # The OPEN and the READS go in ONE closure. `earthaccess.open` returns
+                    # handles bound to the fsspec session they were created with, so
+                    # re-authenticating cannot heal a handle already held -- only re-opening
+                    # can. Retrying the reads alone would keep reading through a dead session.
+                    def _open_and_read(urls=list(role_to_url.values()),
+                                       roles=list(role_to_url)):
+                        fobjs = earthaccess.open(urls)
+                        return process_granule(dict(zip(roles, fobjs)), vcfg, grid_cfg,
+                                               g, name, t)
+
+                    ds = net.retry(_open_and_read, what=f"ECOSTRESS {tag} {tstr}",
+                                   refresh=auth.refresher("earthdata", eff["earthdata"]))
                 except Exception as exc:
                     log.warning("    FAILED to open %s %s (%s)", tag, tstr, exc)
                     rep.fail(f"{name} {tag} {tstr}", exc)
                     continue
-                role_to_file = dict(zip(role_to_url.keys(), fobjs))
 
-                ds = process_granule(role_to_file, vcfg, grid_cfg, g, name, t)
                 if ds is None:
                     # dropped as degraded (a mask layer was missing) -- a LOSS, not a no-op
                     rep.fail(f"{name} {tag} {tstr}", "granule dropped (missing core layer)")
@@ -407,6 +431,9 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     list_layers  print available COG suffixes for the first granule and exit
     """
     eff = _build_eff(project)
+    # Credentials expire and runs are long: apply this project's refresh policy before any
+    # network call. acquire() is the one entry point every invocation path goes through.
+    auth.configure(project.auth)
     if overwrite:
         eff["overwrite"] = True
     if grids is None:
