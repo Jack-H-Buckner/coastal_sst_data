@@ -398,6 +398,38 @@ def test_no_footprint_channel_when_the_granules_never_carried_one(project, grids
     assert "modis_sst" in ds.data_vars                    # the rest of MODIS is unaffected
 
 
+def test_no_int32_footprint_is_allocated_when_no_granule_carried_the_layer(
+        project, grids, days, monkeypatch):
+    """The absent-footprint case must not COST anything either.
+
+    The `(T,H,W)` int32 index is the same size as an SST channel, and it used to be filled
+    with -1 up front and thrown away on the way out -- 16 GiB on a large AoI, for a channel
+    the caller never emits. `np.full` touches every page, so this was committed memory, not a
+    lazy reservation.
+    """
+    g = grids[AOI]
+    _modis_base(project, g, days)
+    write_modis(project, g, days[1], temp=290.0, footprint=False)
+
+    big = []
+    real_full = np.full
+
+    def spy(shape, *a, **kw):
+        out = real_full(shape, *a, **kw)
+        if out.ndim == 3:
+            big.append((out.shape, out.dtype))
+        return out
+
+    monkeypatch.setattr(datacube.np, "full", spy)
+    d = project.output_dir / "MODIS" / "aligned" / AOI
+    *_, footprint = datacube.load_clearest_overpass(
+        d, AOI, days, g.height, g.width, trust_valid=True, read_footprint=True)
+
+    assert footprint is None
+    assert not [s for s, dt in big if dt == np.dtype("int32")], (
+        f"allocated a 3-D int32 array for a footprint that does not exist: {big}")
+
+
 def test_footprint_comes_from_the_same_scene_as_the_sst(project, grids, days):
     """Two granules on one day: the clearest wins, and its footprint must win with it.
     Reading the footprint outside that choice would pair one granule's pixel indices with

@@ -103,6 +103,52 @@ def _empty3d(days, H, W):
     return np.full((len(days), H, W), np.nan, dtype="float32")
 
 
+def _cached(cache, key, build):
+    """`build()`, memoised in `cache` under `key`. Uncached (a plain call) when `cache` is None.
+
+    Every loader here discovers its inputs by globbing its own directory. That is paid once per
+    AoI today, but the assembler walks the time axis in BLOCKS for a cube too large to hold at
+    once (see `run`), and a per-block rescan of a directory holding thousands of scenes -- times
+    the number of products, times the number of blocks -- would trade the memory problem for a
+    wall-clock one. One dict per AoI, threaded through the loaders, keeps it at once.
+
+    `cache=None` is the default everywhere, so a contributor written against the documented
+    loader signatures (which take no cache) keeps working, just uncached.
+    """
+    if cache is None:
+        return build()
+    if key not in cache:
+        cache[key] = build()
+    return cache[key]
+
+
+def scene_index(d: Path, aoi_id, *, cache=None) -> dict[str, list]:
+    """{day_stamp: [(datetime, path), ...]} for a per-overpass sensor's aligned directory.
+
+    Built from FILENAMES alone -- nothing is opened -- so `load_clearest_overpass` can work
+    through one day's granules at a time instead of globbing the whole directory and holding
+    every day's chosen scene until the end.
+
+    Each day's granules are sorted by (time, name). That also settles a tie in the
+    clearest-scene contest deterministically (the earliest scene wins) where it used to fall
+    to whatever order the filesystem happened to hand back.
+    """
+    def build() -> dict[str, list]:
+        out: dict[str, list] = {}
+        if not d.exists():
+            return out
+        for f in d.glob(f"{aoi_id}_*T*.nc"):
+            dt = naming.parse_time(f.name)
+            if dt is None:
+                continue
+            out.setdefault(naming.day_stamp(dt), []).append((dt, f))
+        for granules in out.values():
+            granules.sort(key=lambda g: (g[0], g[1].name))
+        return out
+
+    return _cached(cache, ("scenes", str(d)), build)
+
+
 def load_daily_sensor(d: Path, aoi_id, days, H, W, var, *, prefix=""):
     """MUR/met style: one file per day (<aoi>_<prefix><YYYYMMDD>.nc) -> (T,H,W).
 
@@ -178,7 +224,7 @@ def met_prefix(d: Path, aoi_id, days, want: str) -> tuple[str, str]:
 
 def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                            use_cloud=True, qc_levels=None, trust_valid=False,
-                           read_footprint=False):
+                           read_footprint=False, cache=None):
     """Per-overpass sensors (ECOSTRESS/Landsat/MODIS): keep the clearest scene/day.
 
     Validity per sensor:
@@ -189,10 +235,15 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
           - use_cloud gates on the binary cloud layer (Landsat: reliable).
           - qc_levels (e.g. {0,1}) gates on QC mandatory-QA bits 0-1 instead of
             cloud (ECOSTRESS: cloud over-masks cold water, so gate on QC).
-    Returns (sst, cloud, valid, hour, water_union, times, footprint). `water_union` is the
-    OR of the water mask over scenes -- a high-res static water hint for narrow estuaries.
+    Returns (sst, cloud, valid, hour, times, footprint).
     `times` is the CHOSEN scene's datetime per day (None where the sensor had no scene), so
     the tide and the met snapshot can be matched to that exact scene rather than to the day.
+
+    ONE DAY AT A TIME. The scenes are walked per day (via `scene_index`) and the day's winner
+    is written into the output before the next day is read, so the only scene arrays alive at
+    once are the contender and the incumbent. Accumulating every day's winner first and
+    copying afterwards -- which is what this did -- held a WHOLE WINDOW of scenes alongside
+    the outputs that were already allocated, roughly doubling the peak for no benefit.
 
     `footprint` is the native sensor-pixel index per grid cell, read only when
     `read_footprint` and returned as None when NO granule on disk carried the layer -- it is
@@ -200,84 +251,90 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
     Collapsing "we saw one" into the value is what lets the caller emit the channel or not
     with a plain `is not None`, rather than shipping an all -1 array that reads as data.
     It rides the SAME clearest-scene choice as the SST: read outside that selection it would
-    pair one granule's pixel indices with another granule's temperatures.
+    pair one granule's pixel indices with another granule's temperatures. The array is
+    allocated only once a scene actually yields one: it is int32 (T,H,W), the same size as an
+    SST channel, and eagerly filling one with -1 for a sensor that never carried the layer
+    cost a large AoI many GB to build something the caller then threw away.
     """
     sst, cloud = _empty3d(days, H, W), _empty3d(days, H, W)
     valid = np.zeros((len(days), H, W), dtype="uint8")
     hour = np.full(len(days), np.nan, dtype="float32")
     times: list = [None] * len(days)
-    water_union = np.zeros((H, W), dtype=bool)
-    # -1 (no native pixel), never NaN: this is an INDEX, and _empty3d is float.
-    footprint = np.full((len(days), H, W), -1, dtype="int32")
+    footprint = None
     saw_footprint = False
-    if not d.exists():
-        return sst, cloud, valid, hour, water_union, times, None
     qset = list(qc_levels) if qc_levels is not None else None
     didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
-    best = {}  # day -> (valid_count, sst, cloud, valid, footprint|None, datetime)
-    for f in d.glob(f"{aoi_id}_*T*.nc"):
-        dt = naming.parse_time(f.name)
-        if dt is None:
-            continue
-        day = naming.day_stamp(dt)
-        if day not in didx:
-            continue
-        ds = xr.open_dataset(f)
-        if "time" in ds.dims:
-            ds = ds.isel(time=0)
-        if "sst" not in ds or ds["sst"].shape != (H, W):
-            ds.close(); continue
-        s = ds["sst"].values.astype("float32")
-        c = (ds["cloud"].values.astype("float32")
-             if "cloud" in ds and ds["cloud"].shape == (H, W) else np.zeros((H, W), "float32"))
-        fp = None
-        if read_footprint and "footprint_id" in ds and ds["footprint_id"].shape == (H, W):
-            fp = ds["footprint_id"].values.astype("int32")
-            saw_footprint = True
-        if trust_valid and "valid" in ds and ds["valid"].shape == (H, W):
-            v = (ds["valid"].values > 0) & np.isfinite(s)
-            wp = np.zeros((H, W), dtype=bool)              # no water layer to contribute
-        else:
-            if "water" in ds and ds["water"].shape == (H, W):
-                w = ds["water"].values.astype("float32")
-                wp = np.isfinite(w) & ((w < 0.5) if water_is_land else (w > 0.5))
-            else:
-                wp = np.zeros((H, W), dtype=bool)          # no water layer -> claim NOTHING
-            q = (ds["quality"].values if "quality" in ds and ds["quality"].shape == (H, W) else None)
-            v = np.isfinite(s) & wp
-            if use_cloud:
-                v &= ~(np.nan_to_num(c, nan=1.0) > 0)
-            if qset is not None and q is not None:
-                mqa = np.full((H, W), -1, dtype="int64")
-                fin = np.isfinite(q)
-                mqa[fin] = q[fin].astype("int64") & 0b11   # mandatory-QA bits 0-1
-                v &= np.isin(mqa, qset)
-        ds.close()
-
-        water_union |= wp
-        vc = int(v.sum())
-        if day not in best or vc > best[day][0]:
-            best[day] = (vc, s, c, v, fp, dt)
     missing_fp = 0
-    for day, (_, s, c, v, fp, dt) in best.items():
-        i = didx[day]
+    scene_days = 0
+    for day, granules in scene_index(d, aoi_id, cache=cache).items():
+        i = didx.get(day)
+        if i is None:
+            continue
+        best = None  # (valid_count, sst, cloud, valid, footprint|None, datetime)
+        for dt, f in granules:
+            ds = xr.open_dataset(f)
+            if "time" in ds.dims:
+                ds = ds.isel(time=0)
+            if "sst" not in ds or ds["sst"].shape != (H, W):
+                ds.close(); continue
+            s = ds["sst"].values.astype("float32")
+            c = (ds["cloud"].values.astype("float32")
+                 if "cloud" in ds and ds["cloud"].shape == (H, W) else np.zeros((H, W), "float32"))
+            fp = None
+            if read_footprint and "footprint_id" in ds and ds["footprint_id"].shape == (H, W):
+                fp = ds["footprint_id"].values.astype("int32")
+                saw_footprint = True
+            if trust_valid and "valid" in ds and ds["valid"].shape == (H, W):
+                v = (ds["valid"].values > 0) & np.isfinite(s)
+            else:
+                if "water" in ds and ds["water"].shape == (H, W):
+                    w = ds["water"].values.astype("float32")
+                    wp = np.isfinite(w) & ((w < 0.5) if water_is_land else (w > 0.5))
+                else:
+                    wp = np.zeros((H, W), dtype=bool)      # no water layer -> claim NOTHING
+                q = (ds["quality"].values if "quality" in ds and ds["quality"].shape == (H, W)
+                     else None)
+                v = np.isfinite(s) & wp
+                if use_cloud:
+                    v &= ~(np.nan_to_num(c, nan=1.0) > 0)
+                if qset is not None and q is not None:
+                    mqa = np.full((H, W), -1, dtype="int64")
+                    fin = np.isfinite(q)
+                    mqa[fin] = q[fin].astype("int64") & 0b11   # mandatory-QA bits 0-1
+                    v &= np.isin(mqa, qset)
+            ds.close()
+
+            vc = int(v.sum())
+            if best is None or vc > best[0]:
+                best = (vc, s, c, v, fp, dt)
+        if best is None:
+            continue                                       # every granule failed the shape check
+        _, s, c, v, fp, dt = best
         sst[i] = s
         cloud[i] = np.nan_to_num(c, nan=0.0)
         valid[i] = v.astype("uint8")
         hour[i] = dt.hour + dt.minute / 60.0
         times[i] = dt
-        if fp is not None:
-            footprint[i] = fp
-        else:
+        scene_days += 1
+        if fp is None:
             missing_fp += 1
+        else:
+            if footprint is None:
+                # -1 (no native pixel), never NaN: this is an INDEX, and _empty3d is float.
+                footprint = np.full((len(days), H, W), -1, dtype="int32")
+            footprint[i] = fp
+    if saw_footprint and footprint is None:
+        # Granules carried the layer but no CHOSEN scene did -- an all -1 channel, which the
+        # warning below explains. Kept distinct from "no granule ever had one" (-> None, no
+        # channel at all), because those say different things about the tree.
+        footprint = np.full((len(days), H, W), -1, dtype="int32")
     if saw_footprint and missing_fp:
         # A partly backfilled directory: some granules predate the layer, or were acquired
         # with `footprint_id: false`. Those days stay -1, which is indistinguishable from
         # "off-swath" unless we say so here. Re-acquire with --overwrite to fill them.
         log.warning("  %s: %d of %d scene-days have no footprint_id layer; those days are "
-                    "all -1 in the footprint channel", d.name, missing_fp, len(best))
-    return (sst, cloud, valid, hour, water_union, times,
-            footprint if saw_footprint else None)
+                    "all -1 in the footprint channel", d.name, missing_fp, scene_days)
+    return sst, cloud, valid, hour, times, footprint
 
 
 def load_tide_daily(d: Path, aoi_id, days):
@@ -415,11 +472,15 @@ def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, target
     counts = np.zeros((len(days), H, W), dtype="float32")   # stations sharing a cell
     station_map = np.zeros((H, W), dtype="uint16")          # 0 = no station
     table = []
-    # Sums + contributor counts per cell, so N co-located stations give their true MEAN. A
-    # running `(prev + v) / 2` is not one for N > 2 -- it yields a/4 + b/4 + c/2.
-    sums = {k: np.zeros((len(days), H, W), dtype="float64") for k in targets}
-    dt_sums = {k: np.zeros((len(days), H, W), dtype="float64") for k in dts}
-    hits = {k: np.zeros((len(days), H, W), dtype="int32") for k in targets}
+    # Sums + contributor counts, so N co-located stations give their true MEAN. A running
+    # `(prev + v) / 2` is not one for N > 2 -- it yields a/4 + b/4 + c/2.
+    #
+    # Accumulated PER STATION CELL -- {(row, col): {sums/dt_sums/hits: {key: (T,) array}}} --
+    # not as dense (T,H,W) grids. The values exist in a handful of pixels, so the dense form
+    # spent three arrays per target (two of them float64) on a grid that is NaN almost
+    # everywhere: 104 bytes per cell per day, of which 72 were these accumulators. On a large
+    # AoI that is hundreds of GB to hold a few buoys. Only the EMITTED channels are dense.
+    cells: dict[tuple[int, int], dict] = {}
     seen_ids: dict[str, str] = {}                           # station id -> its source
 
     for src, ids in sources:
@@ -453,25 +514,38 @@ def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, target
                           "row": r, "col": c})
             station_map[r, c] = len(table)
 
+            acc = cells.setdefault((r, c), {
+                "sums": {k: np.zeros(len(days), dtype="float64") for k in targets},
+                "dt_sums": {k: np.zeros(len(days), dtype="float64") for k in dts},
+                "hits": {k: np.zeros(len(days), dtype="int32") for k in targets},
+            })
             for i in range(len(days)):
                 for key, tgt in targets.items():
                     v, dt = insitu.value_at(times, sst[s], tgt[i], max_dt_min)
                     if not np.isfinite(v):
                         continue
-                    sums[key][i, r, c] += v
-                    hits[key][i, r, c] += 1
-                    if key in dt_sums:
-                        dt_sums[key][i, r, c] += dt
+                    acc["sums"][key][i] += v
+                    acc["hits"][key][i] += 1
+                    if key in acc["dt_sums"]:
+                        acc["dt_sums"][key][i] += dt
                 counts[i, r, c] += 1
 
-    for key in targets:
-        got = hits[key] > 0
-        np.divide(sums[key], hits[key], out=chans[key], where=got,
-                  casting="unsafe")
-        chans[key][~got] = np.nan
-        if key in dts:
-            np.divide(dt_sums[key], hits[key], out=dts[key], where=got, casting="unsafe")
-            dts[key][~got] = np.nan
+    # Densify, one station cell at a time. The dtypes going into `np.divide` are the ones the
+    # dense form used (float64 sums / int32 hits -> float32 out, casting="unsafe"): the ufunc
+    # picks its loop from them, so widening `hits` here could move a value in the last bit.
+    # Everything not written stays NaN from `_empty3d`, which is what a cell with no station
+    # -- or a day with no observation in tolerance -- means.
+    for (r, c), acc in cells.items():
+        for key in targets:
+            hit = acc["hits"][key]
+            got = hit > 0
+            col = np.full(len(days), np.nan, dtype="float32")
+            np.divide(acc["sums"][key], hit, out=col, where=got, casting="unsafe")
+            chans[key][:, r, c] = col
+            if key in dts:
+                dcol = np.full(len(days), np.nan, dtype="float32")
+                np.divide(acc["dt_sums"][key], hit, out=dcol, where=got, casting="unsafe")
+                dts[key][:, r, c] = dcol
 
     out = {}
     for key in targets:
@@ -645,7 +719,7 @@ def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None
     """A single-collection sensor (Landsat, MODIS): one flat `<DIR>/aligned/<aoi>` tree, one
     channel-set under the bare prefix, one entry in `sensor_times`."""
     sp = s.sensor
-    sst, cloud, valid, hour, _water_union, times, footprint = _load_sensor(
+    sst, cloud, valid, hour, times, footprint = _load_sensor(
         ctx, sp, ctx.adir(s.product.value))
     pre = sp.prefix
     ctx.emit(f"{pre}_sst", T3, sst)
@@ -685,7 +759,7 @@ def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> N
 
     per_tag_times: dict[str, list] = {}
     for tag in ordered:
-        sst, cloud, valid, hour, _wu, times, footprint = _load_sensor(
+        sst, cloud, valid, hour, times, footprint = _load_sensor(
             ctx, sp, ctx.adir(s.product.value, tag))
         pre = sp.prefix
         ctx.emit(f"{pre}_sst_{tag}", T3, sst)
