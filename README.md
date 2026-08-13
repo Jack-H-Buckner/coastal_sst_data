@@ -169,13 +169,54 @@ python -m pip install --no-build-isolation --no-deps pytides2 # ensure you are u
 **Pin the version for reproducibility.** `@main` is a moving target — two projects set up a week apart can get different code. Pin to a git tag or commit so each project's env is reproducible:
 
 ```yaml
-- git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@v0.0.1     # a git tag
+- git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@v0.2.7     # a git tag
 - git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@21c14a1    # a commit SHA
 ```
 
-To bump a consumer to a newer version later: `pip install --upgrade --force-reinstall --no-deps "git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@v0.1.0"`.
+Releases are tagged `vX.Y.Z`; `git tag --list` in a clone, or the repo's tags page, shows what is available.
+
+To bump a consumer to a newer version later, see [Updating an existing install](#updating-an-existing-install).
 
 **Alternative — no per-project install.** If a project just needs to *run* the package occasionally, you can skip embedding it and instead `conda activate coastal_sst_data` (the standalone env from `environment.github.yml`) and work there. That's simplest for one-off use, but it doesn't let the package coexist with another project's own dependencies — for that, use the embedded pattern above.
+
+### Updating an existing install
+
+How you pull in a newer version depends on how the environment installed the package in the first place. Activate the environment first in every case.
+
+**A clone you develop in** (`environment.yml`, which installs `-e ".[dev]"`). The install is **editable**, so a `git pull` is enough for code changes — there is nothing to reinstall to pick up a new function or a bug fix:
+
+```bash
+git pull
+```
+
+Re-run the install when the **version** changed, or when you want the version reported correctly:
+
+```bash
+pip install -e ".[dev]" --no-deps
+```
+
+This matters more than it looks. An editable install records its version in the *dist metadata at install time*, and `coastal_sst_data.__version__` reads that metadata — not `pyproject.toml`. So an env installed months ago keeps reporting the version it was created at however many times you pull, and since the assembler stamps that value into every cube as the `package_version` attribute, a stale env quietly mislabels its own output. Check what an environment actually has:
+
+```bash
+python -c "import importlib.metadata as m; print(m.version('coastal_sst_data'))"
+```
+
+If that disagrees with `version` in [`pyproject.toml`](pyproject.toml), reinstall as above.
+
+When **dependencies** change (a new package in `environment.yml`, not just new code), update the env itself — see [Install (recommended: conda / mamba)](#install-recommended-conda--mamba):
+
+```bash
+mamba env update -f environment.yml --prune
+```
+
+**An environment that installed from GitHub** (`environment.github.yml`, or another project built on `environment.consumer.yml`). There is no working copy to pull, so reinstall the package — and only the package:
+
+```bash
+pip install --upgrade --force-reinstall --no-deps \
+  "git+https://github.com/Jack-H-Buckner/coastal_sst_data.git@v0.2.7"
+```
+
+Use `@main` for the tip, or `@<tag>` / `@<commit-sha>` to pin (see [Pin the version for reproducibility](#use-it-in-another-project-as-a-library) above). **`--no-deps` is not optional here**: conda-forge supplies the compiled geospatial stack, and letting pip resolve dependencies pulls wheels that mix native runtimes and can segfault at import or during the met/regrid stages. `--force-reinstall` is what makes pip replace a same-version-numbered install that has moved underneath the tag.
 
 ### Credentials
 
@@ -298,7 +339,7 @@ MODIS additionally ships `modis_footprint_id` (`int32`, `-1` = no observation): 
 - `--overwrite` — rebuild cubes that already exist.
 - `--dry-run` — report what would be assembled; write nothing.
 
-Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision. (Met-at-overpass is configured on the `met_overpass` product, not here — see below.)
+Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, `block_days` / `memory_budget_gb` (see below), and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision. (Met-at-overpass is configured on the `met_overpass` product, not here — see below.)
 
 Memory is bounded by `block_days` and `memory_budget_gb`. A cube costs `channels × days × height × width × 4` bytes to build, which grows with the AOI **and** with the date range — a multi-year window on a large grid can want hundreds of GB and simply be killed. So the assembler builds and writes a **block of days at a time**, making peak memory a function of the block instead of the window. The defaults handle this on their own: `block_days: auto` sizes each AOI's block from its own grid and a memory budget, and an AOI that fits is still assembled in one pass exactly as before. Set `block_days` to an integer to pin it, or `memory_budget_gb` when the assembler shares a machine — or when the detected figure is not the allowance the job really has, which is the usual case on a scheduler, where the kernel kills the process at its cgroup limit rather than at the hardware's. The chosen block, the budget, and where the budget came from are logged for every AOI:
 
@@ -484,11 +525,22 @@ channel and a land source (`landcover`, or the `water_line` step). `flag_georef`
 `landcover_water`** channel (`landcover` product) and the ECOSTRESS SST; `correct_georef` needs
 `flag_georef` selected. Where an input is absent the step logs a warning and does nothing.
 
+**Memory is bounded the same way `assemble` bounds it**, by `block_days` and `memory_budget_gb` — this stage reads a whole cube and writes a larger one, so it has the same problem. It processes and writes a **block of days at a time**, and both keys default to *inheriting the `datacube` value*, so configuring the assembler usually configures this too. Set `preprocess.block_days` / `preprocess.memory_budget_gb` when this stage needs a **smaller** block than assembly did, which it can: it holds the channels it *reads* as well as the ones it derives.
+
+Two behaviours worth knowing:
+
+- **The cube's existing chunking is preserved.** Preprocess inherits the store's on-disk time chunk rather than re-imposing `datacube.chunks` — it has to, because the assembler may have deliberately *reduced* that chunk to fit its own memory budget, and silently undoing that would make the cube unwritable again. (`preprocess:` therefore has no `chunks` or `compression` of its own; one cube, one encoding, taken from `datacube`.)
+- **Blocking does not change any value.** Nine of the ten steps are day-local, so a block sees exactly what the whole cube would have shown it. The exception is `filter_clouds` with `method: sigma`, whose climatology is a least-squares fit over the whole time axis: that fit is *streamed* across the blocks and solved once, so a blocked run and an unblocked one produce the same cutoff. Nothing about the result depends on the block size.
+
 Enable it in the config (nothing runs otherwise), then run it folded into a `run` or on its own:
 
 ```yaml
 preprocess:
   enabled: true
+  # Memory blocking, as datacube.block_days / memory_budget_gb. Unset -> inherit the datacube
+  # value. Set them when preprocessing needs a smaller block than assembly did.
+  # block_days: auto
+  # memory_budget_gb: 16
   steps:
     water_line: { dem_source: cudem, tide_source: coops, sensors: [eco, lst] }
     fill_water: { sources: [mur, cmems] }

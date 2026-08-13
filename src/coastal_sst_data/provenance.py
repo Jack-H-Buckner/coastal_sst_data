@@ -64,10 +64,12 @@ def package_version() -> str:
 def code_version() -> str:
     """Which CODE built this -- the git commit, not the package version.
 
-    `package_version` is pinned in pyproject and does not move: every cube ever built is
-    stamped "0.0.1" whatever commit produced it. That is fine for a release artifact and
-    useless for provenance, because the code is exactly what changes between two cubes
-    built from the same config. And it changes MEANINGFULLY: `mur_valid` used to include
+    `package_version` moves only at a RELEASE: every cube built between two version bumps is
+    stamped the same number whatever commit produced it -- and, because that number comes from
+    the metadata an install recorded rather than from pyproject, an environment installed
+    before the last few releases keeps stamping the OLD one. That is fine for a release
+    artifact and useless for provenance, because the code is exactly what changes between two
+    cubes built from the same config. And it changes MEANINGFULLY: `mur_valid` used to include
     NN-filled pixels and now does not; `depth` used to be fabricated zeros where the DEM
     was missing and is now NaN. Two cubes with identical `config_sha256` and identical
     `package_version` can therefore hold different numbers, and nothing in either says so.
