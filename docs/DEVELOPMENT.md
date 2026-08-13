@@ -548,6 +548,39 @@ provenance mapping:
    `["bathymetry", "tides", sensor]`). Channels that keep a raw name (a filled `mur_sst`, a
    `mur_sst_filled` mask) already resolve via the existing `mur_`/`cmems_` prefixes.
 
+#### The two rules a step must follow about time
+
+A cube too large to hold in memory is preprocessed a **block of days at a time**
+(`preprocess.block_days`), so `ctx.ds_cube` may be one time slice of the store and your step is
+called once per block with a fresh `ctx`. Because `ctx.read` reads off `ctx.ds_cube`, a **day-local**
+step — one whose output for a day depends only on that day's input — needs no changes at all for
+this: it asks for a channel and gets that block's days. Nine of the ten shipped steps are day-local.
+
+1. **Emit on `ctx.days`, decide on `ctx.all_days`.** Any question whose answer describes the *cube*
+   rather than the block must be asked of `ctx.all_days` / `ctx.read_all`. `cloud_filter`'s "is the
+   day-of-year span long enough to fit a seasonal harmonic?" is the worked example — asked of a
+   block it answers *no* every time, and a ten-year cube silently fits a constant climatology
+   everywhere while the config says `harmonic`.
+
+2. **Your channel SET may depend on the cube's channels, never on the days.** Emit a channel for
+   every block or for none. A channel present in some blocks and not others builds a store whose
+   variables disagree about the length of the time axis — which *writes* without error and then
+   fails on `open_zarr` with `conflicting sizes for dimension 'time'`. `_check_channel_set` compares
+   each block against `preprocess_census` and stops the run instead.
+
+**If your step reduces over the time axis** — a climatology, a trend, anything needing all days at
+once — it cannot be answered from one block. Declare a `WindowStat` on its registration:
+`passes(ctx)` says how many prepasses your *config* needs (return `0` when it is configured
+day-locally, and you pay nothing), `accumulate(ctx, i)` folds in one block, and `reduce(ctx, i)`
+turns the accumulators into the statistic, which lands in `ctx.window` for your `fn` to read per
+block. `cloud_filter`'s sigma climatology is the worked example: its fit is masked normal
+equations, every term a plain sum over `t`, so accumulating block by block is the same arithmetic
+in a different order — exact, not approximate.
+
+Use `ctx.cache` (shared across an AoI's blocks) for anything derived from the grid or the tree
+rather than from the days — `flag_georef`'s coastline distance transform is cached this way, or it
+would run once per block.
+
 Config, invocation, and testing:
 
 ```yaml

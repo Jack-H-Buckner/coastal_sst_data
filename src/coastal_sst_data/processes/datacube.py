@@ -1554,8 +1554,14 @@ def budget_bytes(eff: dict) -> tuple[int, str]:
     return max(int(raw * 0.5), _MIN_BUDGET), f"half of {src}"
 
 
-def resolve_block_days(eff: dict, per_day: int, n_days: int) -> tuple[int, int]:
+def resolve_block_days(eff: dict, per_day: int, n_days: int,
+                       *, transient: float = _TRANSIENT_FACTOR) -> tuple[int, int]:
     """(block_days, time_chunk) for one AoI.
+
+    `transient` scales the channel arithmetic to stand in for what a stage holds BESIDE its
+    channels. The default is calibrated on the assembler, whose transients are a scene or two;
+    a stage with heavier ones (preprocess promotes its baseline to float64 and copies arrays to
+    fold drops into) passes a larger factor.
 
     Every block boundary lands on a chunk boundary. An append that starts mid-chunk makes Zarr
     read, decompress, merge, recompress and rewrite every chunk it touches -- on a large grid
@@ -1571,7 +1577,7 @@ def resolve_block_days(eff: dict, per_day: int, n_days: int) -> tuple[int, int]:
         return block, min(tc, block)
 
     budget, _src = budget_bytes(eff)
-    max_days = max(1, int((budget - _BUDGET_HEADROOM) // (per_day * _TRANSIENT_FACTOR))
+    max_days = max(1, int((budget - _BUDGET_HEADROOM) // (per_day * transient))
                    if per_day > 0 else n_days)
     if max_days >= n_days:                       # the whole cube fits: one pass, as before
         return n_days, tc

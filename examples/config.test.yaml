@@ -143,6 +143,12 @@ datacube:
 # separate cube to place or encode, so a config that sets them fails validation.
 preprocess:
   enabled: false
+  # Memory blocking, exactly as datacube.block_days / memory_budget_gb -- this stage reads a whole
+  # cube and writes a larger one, so it has the same problem. Unset -> inherit the datacube value.
+  # Set them when preprocessing needs a smaller block than assembly did, which it can: it holds
+  # the channels it READS as well as the ones it derives.
+  # block_days: auto
+  # memory_budget_gb: 16
   steps:
     # Tide-adjusted waterline per thermal sensor, at its overpass -> <sensor>_water_elev /
     # <sensor>_water_class. Source tags default to the sole DEM/tide present if unset.

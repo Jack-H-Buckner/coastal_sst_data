@@ -444,6 +444,13 @@ class PreprocessSpec(BaseModel):
     model_config = {"extra": "forbid"}
     enabled: bool = False                      # opt-in; nothing runs unless set true
     steps: dict[str, PreprocessStepOptions] = Field(default_factory=dict)
+    # Memory blocking, exactly as `datacube.block_days` / `memory_budget_gb` -- this stage reads
+    # a whole cube and writes a larger one, so it has the same problem. Both default to None
+    # meaning "use the datacube value": the stages usually want the same answer, and one knob is
+    # enough until they do not. Set these when preprocessing needs a smaller block than assembly
+    # did, which it can: it holds the channels it READS as well as the ones it derives.
+    block_days: int | Literal["auto"] | None = None
+    memory_budget_gb: float | None = Field(None, gt=0)
     # Re-derive channels a cube already carries. Off by default because the stage detects a
     # changed step selection on its own; this is for forcing a rebuild after a code change.
     overwrite: bool = False

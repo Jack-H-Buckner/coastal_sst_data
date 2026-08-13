@@ -385,10 +385,12 @@ the cube opens with `xr.open_zarr` at the full 2404-day length.
 
 ## Out of scope — flagged, not fixed
 
-**`preprocess.run` will OOM on the same AoI.** It does `xr.open_zarr(zpath)` -> `preprocess_aoi` ->
-`write_zarr` of the whole cube, and re-chunks the store back to `datacube.chunks` — which would undo
-a reduced time chunk. If a project runs preprocess after assemble, that stage needs the same
-treatment (blocked, or a `region=` write loop) before the OOM is fixed end to end.
+**~~`preprocess.run` will OOM on the same AoI.~~** *Done — see
+`docs/plan-bounded-memory-preprocessing.md`.* It did `xr.open_zarr(zpath)` -> `preprocess_aoi` ->
+`write_zarr` of the whole cube, and re-chunked the store back to `datacube.chunks`, undoing a
+reduced time chunk. It is now blocked on the same axis, inherits the store's chunking rather than
+overwriting it, and streams the one step that reduces over time (`filter_clouds` with
+`method: sigma`) through an accumulator.
 
 **Disk, not just RAM.** The `store.atomic` scratch cube and the previous cube coexist until the
 swap, so the output filesystem needs roughly 2x the compressed cube.
