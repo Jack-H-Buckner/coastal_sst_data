@@ -25,7 +25,79 @@ auth:
   max_age_s: 1800            # 30 min
   max_refreshes: 20          # per backend per run; exceeded -> a real failure, not a retry
 
-# Grid  
+# =========================================================================== #
+# PARALLELISM (optional; the whole block can be deleted)
+#
+# A run spends most of its wall clock WAITING ON OTHER PEOPLE'S SERVERS, and most of that
+# waiting is independent. This block decides how much of it overlaps. It changes only how
+# many pieces are in flight -- never what the run produces: the same files land in the same
+# places, and `jobs: 1` takes the original serial code path rather than a one-worker
+# emulation of the new one.
+#
+# The values below are the DEFAULTS (serial), spelled out so they are easy to raise. Delete
+# the block entirely and you get exactly the same thing.
+#
+#   coastal-sst-data run --config config.yaml --jobs 8      # or override on the CLI
+# =========================================================================== #
+runtime:
+  # ---- How many acquisitions at once -------------------------------------- #
+  # One task is a (product, AoI) PAIR, so 8 might be `mur` for Tillamook while `landsat`
+  # runs for Padilla. Only three ordering constraints exist, and all three are one product
+  # reading another's aligned files: modis <- landsat, and mur/met_overpass <- the thermal
+  # sensors. Every other product starts immediately.
+  #
+  # Those edges are PER-AoI, because each of those reads is scoped to an AoI. So mur(padilla)
+  # waits for landsat(padilla) but NOT for landsat(tillamook) -- there is no barrier between
+  # AoIs at all.
+  #
+  # A good starting point on a server is 8. Raise it if the run is clearly network-bound and
+  # the gates below (not this number) are what is holding it back.
+  jobs: 1
+
+  # ---- How many AoIs assemble/preprocess at once -------------------------- #
+  # Deliberately separate from `jobs`, and much smaller. These stages are bounded by MEMORY,
+  # not by the network, and THE MEMORY BUDGET IS DIVIDED BETWEEN THEM: `budget_bytes` detects
+  # the machine's memory and halves it on the assumption it owns the box, which stops being
+  # true the moment two AoIs assemble at once. With assemble_jobs: 4 on a 200 GB machine each
+  # AoI gets ~25 GB rather than 100 GB, and `datacube.block_days: auto` just produces smaller
+  # (still chunk-aligned) blocks. The division is logged per run.
+  #
+  # Keep this low. An acquisition failure costs a retry; an OOM here throws away all the
+  # downloading, which is the expensive part. 2 is a sensible ceiling on most machines.
+  #
+  # assemble(aoi) and preprocess(aoi) are CHAINED, never overlapped -- they read and rewrite
+  # the same <aoi>.zarr. That chaining is also the win: one AoI preprocesses while the next
+  # is still assembling.
+  assemble_jobs: 1
+
+  # ---- Per-SERVICE caps --------------------------------------------------- #
+  # This is the answer to "how many calls may I make to one API on one account", and it
+  # differs enough per service that one `jobs` number cannot express it. Products sharing a
+  # SERVER share a gate -- mur, modis and ecostress are three products behind ONE Earthdata
+  # account, so a cap on `earthdata` is what actually protects the account. (Which gate a
+  # product belongs to is declared on its ProductSpec, not here.)
+  #
+  # All workers run in ONE PROCESS, so they share one login per backend, one refresh budget
+  # and one rate-limit window: 8 workers across 3 Earthdata products and 2 AoIs produce
+  # exactly ONE login, same as jobs: 1.
+  #
+  # Omit `gates` (or any single key) for the values below. Raise them when the run moves
+  # closer to the data -- in-region on AWS, Earthdata tolerates far more than it does over a
+  # home link.
+  gates:
+    earthdata: 6      # mur, modis, ecostress. `earthaccess` also threads INTERNALLY, so the
+                      #   real connection count is a multiple of this; CMR search is the
+                      #   throttled part.
+    pc: 4             # landsat, landcover. Planetary Computer is ANONYMOUS -- no account, so
+                      #   no per-account limit; throttling is per-IP.
+    herbie: 4         # met, met_overpass (HRRR via Herbie).
+    copernicus: 1     # cmems. The lazy dataset handle carries its own client and is not safe
+                      #   to share; the toolbox parallelises internally already.
+    noaa_small: 1     # tides. Small public metadata API behind a shared HTTP session.
+    erddap: 1         # insitu. Same.
+    dem: 1            # bathymetry. One CUDEM tile-index cache file, shared by every AoI.
+
+# Grid
 grid:
   resolution_m: 100          # target posting in metres
   target_crs: auto           # "auto" -> local UTM per AOI, or e.g. "EPSG:32610"

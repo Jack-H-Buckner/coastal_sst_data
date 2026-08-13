@@ -47,6 +47,13 @@ VIIRS = ProductSpec(
     kind=Kind.OVERPASS_SENSOR,
     module="coastal_sst_data.processes.modis",   # stand-in: we only assemble, never acquire
     auth="earthdata",
+    # SHARES the earthdata gate with mur/modis/ecostress, because it shares their SERVER --
+    # a concurrency cap has to apply to the service, not to each product. A private gate here
+    # (`gate="viirs"`) would let a fourth Earthdata product run at full concurrency alongside
+    # the three already sharing one, and the account would see the sum. Nothing would raise;
+    # the only symptom would be a service deciding it is being abused. Hence `gate` is
+    # required rather than defaulted -- only the author knows which server this reads from.
+    gate="earthdata",
     options=frozenset({"output_format", "overwrite", "short_name"}),
     required_vars=("sst", "water", "cloud", "valid"),
     # Deliberately a DIFFERENT validity rule from all three existing sensors: normal water

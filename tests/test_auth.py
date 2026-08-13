@@ -148,6 +148,46 @@ def test_verify_seeds_the_session_registry(monkeypatch):
     assert auth.age("earthdata") is not None
 
 
+def test_login_reuses_a_credential_that_is_still_fresh(clock, handlers):
+    """A stage's run() logs in at its top, and how many times run() is ENTERED is an
+    orchestration detail -- one call per AoI rather than one per product is what makes AoIs
+    parallelisable. Without this, that split becomes N x M logins against one account in a
+    few seconds, which a service is entitled to read as abuse."""
+    assert auth.login("earthdata", NETRC) is True
+    assert auth.login("earthdata", NETRC) is False
+    assert auth.login("earthdata", NETRC) is False
+    assert handlers == ["login"]                      # ONE round-trip, not three
+
+
+def test_login_re_authenticates_once_the_credential_is_old(clock, handlers):
+    """Reuse is bounded by the same MAX_AGE_S that `ensure_fresh` enforces, so reusing a
+    recorded session is never a weaker guarantee than minting a new one."""
+    auth.login("earthdata", NETRC)
+    clock[0] += auth.MAX_AGE_S + 1
+    assert auth.login("earthdata", NETRC) is True
+    assert handlers == ["login", "login"]
+
+
+def test_login_force_always_authenticates(clock, handlers):
+    auth.login("earthdata", NETRC)
+    assert auth.login("earthdata", NETRC, force=True) is True
+    assert handlers == ["login", "login"]
+
+
+def test_verify_connects_even_when_a_session_is_recorded(monkeypatch, clock):
+    """The whole promise of a preflight is that it CONNECTS. If `verify` reused a recorded
+    session it would answer "your credentials worked earlier in this process", which is not
+    the question the user asked when they ran `coastal-sst-data verify`."""
+    calls = []
+    monkeypatch.setattr(auth, "AUTH_HANDLERS", {"earthdata": lambda s: calls.append(1)})
+    project = _project({"mur": None}, earthdata=True)
+
+    auth.verify(project)
+    auth.verify(project)          # same process, credential still young
+
+    assert len(calls) == 2
+
+
 def test_refresh_forces_a_login_the_plain_handler_would_not(clock, handlers):
     """The registries are separate because `earthaccess.login()` a second time is a NO-OP --
     it returns the same stale Auth without contacting EDL. A refresh that reused
@@ -271,3 +311,28 @@ def test_configure_applies_the_project_policy():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
+
+def test_concurrent_first_logins_collapse_to_one(monkeypatch, clock):
+    """The check and the login must be ONE atomic step. Checked separately, a cold start
+    lets every worker read "no session", all decide to authenticate, and the account sees
+    the storm this whole mechanism exists to prevent."""
+    import threading
+    import time as _time
+
+    calls, lock = [], threading.Lock()
+
+    def slow_login(settings):
+        _time.sleep(0.05)              # wide enough for the others to reach the check
+        with lock:
+            calls.append(1)
+
+    monkeypatch.setattr(auth, "AUTH_HANDLERS", {"earthdata": slow_login})
+
+    threads = [threading.Thread(target=auth.login, args=("earthdata", NETRC))
+               for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert calls == [1]                # ONE round-trip, six callers

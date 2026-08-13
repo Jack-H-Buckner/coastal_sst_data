@@ -27,6 +27,25 @@ def test_registry_invariants_hold():
     products._check_registry()          # must not raise
 
 
+def test_every_product_names_the_service_it_loads_from():
+    """A concurrency cap has to apply to the SERVER, not to each product -- mur, modis and
+    ecostress are three products behind one Earthdata account."""
+    assert all(s.gate for s in products.REGISTRY)
+    shared = {s.product.value for s in products.REGISTRY if s.gate == "earthdata"}
+    assert {"mur", "modis", "ecostress"} <= shared
+
+
+def test_a_product_without_a_gate_is_rejected(monkeypatch):
+    """Defaulting an unset gate would be the worst failure mode available: it silently hands
+    that product a PRIVATE cap, so it runs at full concurrency alongside the products it
+    shares a server with and the account sees the sum. Nothing raises, nothing logs."""
+    import dataclasses
+    ungated = dataclasses.replace(products.REGISTRY[0], gate="")
+    monkeypatch.setattr(products, "REGISTRY", (ungated,) + products.REGISTRY[1:])
+    with pytest.raises(RuntimeError, match="gate"):
+        products._check_registry()
+
+
 # --------------------------------------------------------------------------- #
 # The derivations
 # --------------------------------------------------------------------------- #

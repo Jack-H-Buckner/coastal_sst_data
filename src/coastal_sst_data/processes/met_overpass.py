@@ -32,7 +32,7 @@ import pandas as pd
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, naming, overpass, provenance, report, store
+from .. import entry, naming, net, overpass, provenance, report, store
 from . import met
 
 log = logging.getLogger(__name__)
@@ -86,7 +86,17 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                     if dry_run:
                         log.info("  [dry-run] would snapshot %s @ %s", src, naming.time_stamp(op))
                         continue
-                    got = met._fetch_one(src, g, op, ds_cfg)
+                    # `_fetch_one` RAISES on a failed read and returns None when there is
+                    # genuinely nothing here (see its docstring). Tallying both as "no data"
+                    # is what made a lost snapshot indistinguishable from an AoI the model
+                    # does not cover.
+                    try:
+                        got = met._fetch_one(src, g, op, ds_cfg)
+                    except Exception as exc:
+                        log.warning("  overpass %s [%s] FAILED (%s)",
+                                    naming.time_stamp(op), src, exc)
+                        rep.fail(f"{name} {src} {naming.time_stamp(op)}", f"{src}: {exc}")
+                        continue
                     if not got:
                         rep.fail(f"{name} {src} {naming.time_stamp(op)}", f"{src}: no data")
                         continue
@@ -151,6 +161,8 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     Runs AFTER the sensor stages (it reads their overpass times) and reuses met's fetchers.
     Every combo's source is validated against met's SOURCES, so a typo fails loudly.
     """
+    # Reuses met's fetchers, so it needs met's network policy too (see met.acquire).
+    net.setup_requests_timeout()
     eff = _build_eff(project)
     if overwrite:
         eff["overwrite"] = True
