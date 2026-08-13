@@ -337,6 +337,34 @@ If your product is daily and you set a `coverage_channel`, the coverage check pi
 `DAILY_CHANNELS` automatically — no wiring. If your product deliberately ships **no** cube channel,
 set `cube_opt_out=True` on its `ProductSpec` so the invariant knows the omission is intentional.
 
+#### The two rules a contributor must follow about time
+
+A cube too large to hold in memory is assembled a **block of days at a time** (see
+`datacube.block_days`), so `ctx.days` may be one slice of the cube's axis rather than the whole
+thing. Your contributor is called once per block, with a fresh `ctx` each time. Two rules follow,
+and both are enforced — you will get a `RuntimeError` naming your contributor, not a broken cube.
+
+1. **Emit on `ctx.days`, decide on `ctx.all_days`.** Arrays you emit are indexed by the block
+   (`ctx.days`). But any question whose answer describes the *cube* — which variant of a product
+   feeds it, whether a layer exists anywhere in the tree — must be asked of `ctx.all_days`.
+   `met_prefix` is the worked example: asked about one block's days it answers "these are daily
+   means", and the cube ends up splicing two different times of day into one channel.
+
+2. **Your channel SET may depend on the files, never on the days.** Emit `chl` on every block or on
+   none. A channel that appears in some blocks and not others produces a store whose variables
+   disagree about the length of the time axis — which *writes* without error and then fails on
+   `open_zarr` with `conflicting sizes for dimension 'time'`, long after the run that caused it.
+   `_check_channel_set` compares each block against `channel_census` and stops the run instead.
+
+   If a channel's existence genuinely depends on file contents, resolve it once over the whole
+   window and pass the answer down, as `footprint_available` does for `<sensor>_footprint_id` — the
+   only channel in the assembler that has this property.
+
+`ctx.cache` is shared across an AoI's blocks. Pass it to any loader that accepts `cache=` so a
+directory is scanned once per AoI rather than once per block; `_cached(cache, key, build)` is the
+helper if you add a loader of your own. Anything the cache holds **open** must be released in
+`close_cache`.
+
 ### 3d. Teaching provenance about new channels
 
 Every cube channel must resolve to a source in

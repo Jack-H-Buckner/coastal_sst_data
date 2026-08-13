@@ -122,6 +122,15 @@ datacube:
   met_time: reference        # reference (products.met.reference_time) | daily_mean
   insitu: true               # buoy value at the reference time + a matchup per overpass
   insitu_max_dt_min: 60      # matchup tolerance; beyond it an overpass gets NaN
+  # Days assembled+written per pass. Peak memory is channels x block_days x height x width x 4,
+  # so this is what keeps a long window on a large AOI from being killed by the kernel.
+  # "auto" sizes it per AOI from the grid and the budget below; an AOI that fits is still
+  # assembled in ONE pass. An integer pins it.
+  block_days: auto
+  # Budget "auto" spends. Unset -> detected ($COASTAL_SST_DATA_MEM_GB, $SLURM_MEM_PER_NODE,
+  # the cgroup limit, then physical RAM) and HALVED. Set it when the assembler shares a
+  # machine, or when the detected number is not what the job is actually allowed.
+  # memory_budget_gb: 24
   # (Met-at-overpass moved to the `met_overpass` product above; overpass_met was removed.)
 
 # Optional POST-ASSEMBLY preprocessing. Runs AFTER assembly: opens each datacube/<aoi>.zarr,

@@ -987,6 +987,19 @@ def _write_full_fixture(project, g, days):
     write_tides(project, g, days)
 
 
+def _long_project(tmp_path, n_days=10):
+    """The `project` fixture over a longer window -- 3 days cannot be split into blocks."""
+    end = (pd.Timestamp("2026-06-01") + pd.Timedelta(days=n_days - 1)).date().isoformat()
+    return parse_config({
+        "name": "dc", "output_dir": str(tmp_path),
+        "time": {"start_date": "2026-06-01", "end_date": end},
+        "products": {"bathymetry": None},
+        "regions": [{"name": "r", "areas": [
+            {"name": AOI, "center_lat": 45.5, "center_lon": -123.9,
+             "buffer_ns_km": 2, "buffer_ew_km": 2}]}],
+    })
+
+
 def _fingerprint(arr) -> str:
     """A NaN-aware content hash of an array: value-level, not bit-payload-level.
 
@@ -1109,6 +1122,316 @@ def test_golden_cube_is_unchanged(project, grids, days):
     assert not problems, (
         "datacube drifted from the golden snapshot:\n  " + "\n  ".join(problems) +
         "\n\nIf this change is intended, regenerate with UPDATE_GOLDEN=1 and review the diff.")
+
+
+# --------------------------------------------------------------------------- #
+# Blocked assembly
+#
+# A cube whose channels x days x cells exceeds memory is assembled and written a BLOCK of
+# days at a time. The contract is that this changes nothing about the result -- so the
+# central test compares a blocked cube against a single-pass one, channel for channel.
+# --------------------------------------------------------------------------- #
+def _assemble_to_zarr(project, block_days=None):
+    """Assemble the project's one AoI to Zarr and return the written cube's snapshot."""
+    eff = datacube._build_eff(project)
+    eff["met_overpass_combos"] = [("eco", "hrrr"), ("lst", "hrrr")]
+    eff["tide_overpass_combos"] = [("eco", "coops"), ("lst", "coops")]
+    if block_days is not None:
+        eff["block_days"] = block_days
+    datacube.run(eff, grid.project_grids(project), None, False)
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        return _snapshot(ds)
+
+
+def test_blocked_and_single_block_cubes_are_identical(tmp_path):
+    """The whole point: HOW the cube is written must not change WHAT is written.
+
+    Values, dtypes, dims, per-variable attrs, coverage, met_time and the in-situ station
+    table, all compared through the same comparator the golden test uses.
+    """
+    p_one = _long_project(tmp_path / "one", n_days=10)
+    p_many = _long_project(tmp_path / "many", n_days=10)
+    for p in (p_one, p_many):
+        g = grid.project_grids(p)[AOI]
+        days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+        _write_full_fixture(p, g, days)
+
+    one = _assemble_to_zarr(p_one, block_days=10)      # a single pass
+    many = _assemble_to_zarr(p_many, block_days=3)     # 3 + 3 + 3 + 1, a short tail
+
+    assert _diff_snapshots(one, many) == [], (
+        "a blocked cube differs from a single-pass one:\n  "
+        + "\n  ".join(_diff_snapshots(one, many)))
+
+
+def test_channel_census_matches_the_assembled_cube(project, grids, days):
+    """The census predicts memory and freezes the channel set, so it must equal reality.
+
+    It runs the contributors over a zero-length axis; anything it misses is a channel the
+    blocked path would either drop or mis-size.
+    """
+    g = grids[AOI]
+    _write_full_fixture(project, g, days)
+    eff = _eff_with_overpass(project)
+
+    census = datacube.channel_census(g, eff, days)
+    ds = datacube.assemble_aoi(g, eff, days)
+
+    assert set(census) == set(ds.data_vars)
+    for name, (dims, dtype) in census.items():
+        assert dims == ds[name].dims, name
+        assert dtype == ds[name].dtype, name
+
+
+def test_footprint_channel_survives_blocking_when_one_block_lacks_the_layer(tmp_path):
+    """`footprint_id` is the one channel whose existence depends on file CONTENTS.
+
+    Decided per block, blocks disagree -- and the resulting store writes without complaint,
+    then raises `conflicting sizes for dimension 'time'` when anyone opens it. So the test
+    asserts by OPENING, and checks the axis is whole.
+    """
+    for only_day in (4, 0):                       # layer late in the window, and early
+        p = _long_project(tmp_path / f"fp{only_day}", n_days=6)
+        g = grid.project_grids(p)[AOI]
+        days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+        write_mur(p, g, days, water_hole_cols=slice(0, 0))
+        for i in range(6):
+            write_modis(p, g, days[i], temp=287.0, footprint=(i == only_day))
+
+        snap = _assemble_to_zarr(p, block_days=2)        # 3 blocks; only one has the layer
+
+        assert snap["dims"]["time"] == 6
+        fp = snap["data_vars"]["modis_footprint_id"]
+        assert fp["shape"][0] == 6, "the footprint channel is shorter than the time axis"
+        assert fp["stats"]["min"] == -1               # the days without the layer
+        assert fp["stats"]["max"] > 0                 # the day with it
+
+
+def test_met_prefix_is_decided_from_the_whole_window_not_a_block(tmp_path):
+    """Which met variant feeds the cube is a fact about the TREE, not about any one block.
+
+    The config asks for `reference` here, but the tree only ever got daily means, so the cube
+    must fall back to those. Asked about a slice of the window instead -- one block's days, or
+    the census's zero days -- the answer comes back `reference`, nothing on disk matches it,
+    and the cube ships an all-NaN forcing channel that looks exactly like a met product that
+    was never acquired.
+    """
+    p = _long_project(tmp_path, n_days=4)
+    g = grid.project_grids(p)[AOI]
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    write_mur(p, g, days, water_hole_cols=slice(0, 0))
+    write_met_daily(p, g, days, temp=280.0)               # daily mean only -- no ref_ files
+
+    snap = _assemble_to_zarr(p, block_days=1)             # 4 blocks
+
+    assert snap["global_attrs"]["met_time"] == "daily_mean"
+    air = snap["data_vars"]["airtemp_hrrr"]["stats"]
+    assert air["n_finite"] == 4 * g.height * g.width, "the forcing channel is NaN"
+    assert air["min"] == air["max"] == 280.0
+
+
+def test_the_met_variant_does_not_change_between_blocks(tmp_path):
+    """The mixed tree: reference snapshots for part of the window only.
+
+    Whatever the cube picks, it must pick it ONCE. A per-block choice splices two different
+    times of day into a single channel, and stamps `met_time` from whichever block wrote last.
+    """
+    p = _long_project(tmp_path, n_days=4)
+    g = grid.project_grids(p)[AOI]
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    write_mur(p, g, days, water_hole_cols=slice(0, 0))
+    write_met_daily(p, g, days, temp=280.0)                        # daily mean, every day
+    write_met_daily(p, g, days[-1:], temp=291.0, prefix="ref_")    # reference, LAST day only
+
+    snap = _assemble_to_zarr(p, block_days=1)                      # 4 blocks
+
+    assert snap["global_attrs"]["met_time"] == "reference"
+    air = snap["data_vars"]["airtemp_hrrr"]["stats"]
+    # Only the last day has a reference file, so the rest are NaN -- NOT the 280.0 daily mean,
+    # which is what a block-by-block choice would have mixed in.
+    assert air["n_finite"] == g.height * g.width
+    assert air["min"] == air["max"] == 291.0
+
+
+def test_attrs_survive_the_append(tmp_path):
+    """Appending REPLACES a Zarr group's attrs, so the whole-cube ones are re-stamped at the
+    end. Without that the cube still opens, still holds every value, and has silently lost
+    its coverage, provenance and station table."""
+    p = _long_project(tmp_path, n_days=6)
+    g = grid.project_grids(p)[AOI]
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    _write_full_fixture(p, g, days)
+    (p.output_dir / "MUR" / "aligned" / AOI / f"{AOI}_20260604.nc").unlink()   # one lost day
+
+    eff = datacube._build_eff(p)
+    eff["block_days"] = 2
+    datacube.run(eff, grid.project_grids(p), None, False)
+
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        for key in ("coverage", "provenance", "provenance_products", "config_yaml",
+                    "insitu_stations", "aoi_id", "crs", "met_time", "created_at"):
+            assert key in ds.attrs, f"{key} did not survive the append"
+        cov = json.loads(ds.attrs["coverage"])["mur"]
+        # days_expected is the FULL axis, not the last block's length.
+        assert cov["days_expected"] == 6
+        assert cov["days_with_data"] == 5           # the day whose file was removed
+
+
+def test_a_failure_part_way_through_a_blocked_write_leaves_the_previous_cube_intact(
+        tmp_path, monkeypatch):
+    """A blocked write can run for hours, so the atomicity guarantee matters MORE here than
+    for a single write: the cube on disk is the old one or the new one, never a store with
+    half its days."""
+    p = _long_project(tmp_path, n_days=8)
+    g = grid.project_grids(p)[AOI]
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    write_mur(p, g, days, water_hole_cols=slice(0, 0))
+
+    eff = datacube._build_eff(p)
+    eff["block_days"] = 2
+    datacube.run(eff, grid.project_grids(p), None, False)          # a good cube first
+    zpath = eff["out_dir"] / f"{AOI}.zarr"
+    with xr.open_zarr(zpath) as ds:
+        before = _snapshot(ds)
+
+    calls = {"n": 0}
+    real_append = datacube.append_zarr
+
+    def flaky(ds, path, **kw):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise ConnectionError("the filesystem went away mid-cube")
+        return real_append(ds, path, **kw)
+
+    monkeypatch.setattr(datacube, "append_zarr", flaky)
+    eff["overwrite"] = True
+    with pytest.raises(ConnectionError):
+        datacube.run(eff, grid.project_grids(p), None, False)
+
+    with xr.open_zarr(zpath) as ds:
+        assert _diff_snapshots(before, _snapshot(ds)) == []
+    assert not list(zpath.parent.glob(f"{AOI}.zarr.part-*")), "scratch left behind"
+    assert not list(zpath.parent.glob(f"{AOI}.zarr.old-*")), "stash left behind"
+
+
+def test_a_contributor_that_varies_its_channels_by_block_is_a_hard_error(tmp_path):
+    """The invariant behind the census: emit a different channel set in a later block and the
+    run must stop, rather than build a store nobody can open."""
+    p = _long_project(tmp_path, n_days=4)
+    g = grid.project_grids(p)[AOI]
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    write_mur(p, g, days, water_hole_cols=slice(0, 0))
+
+    census = {"mur_sst": (("time", "y", "x"), np.dtype("float32")),
+              "ghost": (("time", "y", "x"), np.dtype("float32"))}
+    with pytest.raises(RuntimeError, match="channel set"):
+        datacube._check_channel_set(
+            {"mur_sst": (("time", "y", "x"), np.dtype("float32"))}, census, 2, days)
+
+
+def test_a_warning_about_the_tree_is_logged_once_not_once_per_block(tmp_path, caplog):
+    """Every block re-reads the same tree, so a warning ABOUT the tree repeats per block.
+
+    Worth pinning because the first attempt at this silently did nothing: a Logger's filters
+    are applied only to records logged on that logger directly, never to records propagating
+    up from a child, so a filter on the package logger sees none of the module's messages.
+    """
+    p = _long_project(tmp_path, n_days=8)
+    g = grid.project_grids(p)[AOI]
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    write_mur(p, g, days, water_hole_cols=slice(0, 0))
+    # A partly backfilled MODIS tree: every block then holds one scene-day with the footprint
+    # layer and one without, so the "partly backfilled" warning is reached in every block.
+    for i in range(8):
+        write_modis(p, g, days[i], temp=287.0, footprint=(i % 2 == 0))
+
+    eff = datacube._build_eff(p)
+    eff["block_days"] = 2                                   # 4 blocks
+    with caplog.at_level("WARNING", logger="coastal_sst_data.processes.datacube"):
+        datacube.run(eff, grid.project_grids(p), None, False)
+
+    backfill = [r for r in caplog.records if "no footprint_id layer" in r.getMessage()]
+    assert len(backfill) == 1, f"logged {len(backfill)}x across 4 blocks, expected once"
+
+
+def test_a_whole_window_attr_that_changes_between_blocks_is_a_hard_error():
+    """`met_time` describing one block instead of the cube is the case this guards."""
+    acc = {}
+    datacube._merge_block_attrs(acc, {"met_time": "reference"}, 0)
+    with pytest.raises(RuntimeError, match="met_time"):
+        datacube._merge_block_attrs(acc, {"met_time": "daily_mean"}, 1)
+
+
+# --------------------------------------------------------------------------- #
+# Sizing the block
+# --------------------------------------------------------------------------- #
+def _sizing_eff(*, time_chunk=64, budget_gb=None, block_days="auto"):
+    return {"chunks": {"time": time_chunk, "y": 128, "x": 128},
+            "block_days": block_days, "memory_budget_gb": budget_gb}
+
+
+def test_bytes_per_day_counts_the_channels_that_grow_with_time():
+    census = {"a": (("time", "y", "x"), np.dtype("float32")),   # 4 bytes/cell
+              "b": (("time", "y", "x"), np.dtype("uint8")),     # 1 byte/cell
+              "static": (("y", "x"), np.dtype("float32")),      # paid once: not counted
+              "series": (("time",), np.dtype("float32"))}       # 4 bytes/day
+    assert datacube.bytes_per_day(census, 10, 20) == 200 * 4 + 200 * 1 + 4
+
+
+def test_a_cube_that_fits_the_budget_is_assembled_in_one_pass():
+    """The single-pass path is not merely an optimisation -- it is how the unblocked
+    behaviour is preserved exactly."""
+    block, chunk = datacube.resolve_block_days(
+        _sizing_eff(budget_gb=64), per_day=1_000_000, n_days=100)
+    assert block == 100 and chunk == 64
+
+
+def test_the_block_is_a_whole_number_of_time_chunks():
+    # 64 GiB budget, ~1 GB/day, /2 transient factor -> ~34 days -> floor to 2 chunks of 16.
+    block, chunk = datacube.resolve_block_days(
+        _sizing_eff(time_chunk=16, budget_gb=64), per_day=1_000_000_000, n_days=400)
+    assert chunk == 16
+    assert block % chunk == 0 and block < 400
+
+
+def test_a_budget_below_one_chunk_shrinks_the_chunk_rather_than_misaligning():
+    """An append landing mid-chunk read-modify-writes every chunk it touches, which on a
+    large grid costs more than the memory it saves. The chunk gives way instead."""
+    block, chunk = datacube.resolve_block_days(
+        _sizing_eff(time_chunk=64, budget_gb=8), per_day=1_000_000_000, n_days=400)
+    assert chunk < 64 and block == chunk
+    assert chunk in datacube._TIME_CHUNK_LADDER
+
+
+def test_an_absurd_budget_still_yields_a_usable_block():
+    block, chunk = datacube.resolve_block_days(
+        _sizing_eff(budget_gb=0.001), per_day=10**12, n_days=1000)
+    assert block >= 1 and chunk >= 1 and block % chunk == 0
+
+
+def test_an_explicit_block_days_overrides_the_budget():
+    block, chunk = datacube.resolve_block_days(
+        _sizing_eff(budget_gb=1024, block_days=7), per_day=1, n_days=100)
+    assert block == 7 and chunk <= 7
+
+
+def test_the_configured_budget_is_used_as_given_and_a_detected_one_is_halved(monkeypatch):
+    got, src = datacube.budget_bytes({"memory_budget_gb": 8})
+    assert got == 8 * 1024**3 and "memory_budget_gb" in src
+
+    monkeypatch.setenv("COASTAL_SST_DATA_MEM_GB", "32")
+    got, src = datacube.budget_bytes({})
+    assert got == 16 * 1024**3, "a detected budget must leave room for everything else"
+    assert "half of" in src
+
+
+def test_the_scheduler_allowance_is_preferred_over_the_hardware(monkeypatch):
+    """The failure that started this: a job is killed at its cgroup/scheduler limit, which on
+    a big node can be a small fraction of physical RAM."""
+    monkeypatch.delenv("COASTAL_SST_DATA_MEM_GB", raising=False)
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "16384")             # MB
+    raw, src = datacube._detected_budget_bytes()
+    assert raw == 16384 * 1024**2 and src == "$SLURM_MEM_PER_NODE"
 
 
 if __name__ == "__main__":

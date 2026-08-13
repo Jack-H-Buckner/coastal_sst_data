@@ -300,6 +300,16 @@ MODIS additionally ships `modis_footprint_id` (`int32`, `-1` = no observation): 
 
 Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision. (Met-at-overpass is configured on the `met_overpass` product, not here — see below.)
 
+Memory is bounded by `block_days` and `memory_budget_gb`. A cube costs `channels × days × height × width × 4` bytes to build, which grows with the AOI **and** with the date range — a multi-year window on a large grid can want hundreds of GB and simply be killed. So the assembler builds and writes a **block of days at a time**, making peak memory a function of the block instead of the window. The defaults handle this on their own: `block_days: auto` sizes each AOI's block from its own grid and a memory budget, and an AOI that fits is still assembled in one pass exactly as before. Set `block_days` to an integer to pin it, or `memory_budget_gb` when the assembler shares a machine — or when the detected figure is not the allowance the job really has, which is the usual case on a scheduler, where the kernel kills the process at its cgroup limit rather than at the hardware's. The chosen block, the budget, and where the budget came from are logged for every AOI:
+
+```
+=== assembling Hobart (2404 days, grid=1218x1507) ===
+  34 channel(s), 30 of them (t,y,x): 233 MB/day; budget 16.0 GiB (half of cgroup v2)
+    -> 76 block(s) of 32 day(s), time chunk 32, peak ~14.6 GiB
+```
+
+If the budget cannot fit even one time chunk's worth of days, the cube's time chunk is reduced to match the block (loudly), so that every block boundary stays chunk-aligned — an append landing mid-chunk forces Zarr to rewrite every chunk it touches.
+
 > **Note (raw-output simplification).** The cube ships **raw ingredients** on a common grid and daily axis; masking, water-filling, station snapping, and multi-input derivations are downstream modelling determinations. The `fill_mur_water`, `fill_cmems_water`, and `water_level` keys were **removed** — MUR/CMEMS ship observed values with honest NaN gaps, there is no derived `landmask`, and water level is reconstructed downstream from the raw per-source `elevation_<dem>` + `depth_<dem>` + `tide_<src>` channels plus each DEM's `datum_offset_m` / `datum_status` attributes. An old config that still sets any of these three keys now **fails validation** rather than being silently ignored. Those computations are not gone — they are the opt-in [`preprocess`](#preprocess) stage now, which runs *after* assembly and adds them to the cube under **names of their own**, so the assembled channels keep the values their sources delivered.
 
 #### Provenance: what produced each field, and when
