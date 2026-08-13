@@ -428,6 +428,42 @@ def test_the_reference_time_channel_is_sampled_like_met(project, g, days):
     assert np.nanmax(arr) == pytest.approx(14.0)      # the 18:30 obs, not the 03:00 one
 
 
+def _write_insitu_stations(project, times, values_by_station):
+    """Several stations at the SAME lat/lon -- i.e. sharing one grid cell."""
+    ids = list(values_by_station)
+    ds = xr.Dataset(
+        {"sst": (("station", "time"),
+                 np.array([values_by_station[s] for s in ids], dtype="float32")),
+         "qc": (("station", "time"), np.ones((len(ids), len(times)), "uint8"))},
+        coords={"station": list(range(len(ids))), "time": pd.DatetimeIndex(times),
+                "station_id": ("station", ids),
+                "station_name": ("station", [f"Station {s}" for s in ids]),
+                "lat": ("station", [LAT] * len(ids)),
+                "lon": ("station", [LON] * len(ids)),
+                "variable": ("station", ["sea_water_temperature"] * len(ids))})
+    d = project.output_dir / "INSITU" / "ioos" / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}_insitu.nc")
+
+
+def test_two_stations_in_one_cell_average(project, g, days):
+    """N co-located stations give their true MEAN, not a running pairwise average.
+
+    The channels are accumulated per station CELL rather than on a dense grid, so this is the
+    one behaviour that restructuring could plausibly break -- and every other in-situ test
+    places a single station, which cannot tell a mean from a last-write-wins.
+    """
+    _write_insitu_stations(project, ["2026-06-01T18:30"],
+                           {"s1": [10.0], "s2": [14.0], "s3": [18.0]})
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    arr = ds["insitu_sst"].isel(time=0).values
+    assert np.isfinite(arr).sum() == 1                  # all three share one pixel
+    r, c = np.argwhere(np.isfinite(arr))[0]
+    assert arr[r, c] == pytest.approx(14.0)             # (10 + 14 + 18) / 3, not 15.0
+    assert ds["insitu_n"].isel(time=0).values[r, c] == pytest.approx(3.0)
+
+
 def test_insitu_can_be_turned_off(project, g, days):
     _write_insitu(project, g, ["2026-06-01T18:00"], [12.5])
     eff = datacube._build_eff(project)

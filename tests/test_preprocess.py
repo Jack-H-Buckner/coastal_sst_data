@@ -201,6 +201,24 @@ def _pp(proj, g, cube):
     return preprocess.preprocess_aoi(cube, g, preprocess._build_eff(proj))
 
 
+def _pp_blocked(proj, g, cube, block_days):
+    """`_pp`, but driven a block of days at a time -- the orchestration `_preprocess_blocked`
+    performs, without the Zarr round trip, so a test can compare the two results directly."""
+    eff = preprocess._build_eff(proj)
+    all_days = pd.DatetimeIndex(cube["time"].values)
+    window, cache = {}, {}
+    census, _reads = preprocess.preprocess_census(cube, g, eff, all_days,
+                                                  window=window, cache=cache)
+    stale, _expected = preprocess.resolve_channel_plan(cube, census)
+    blocks = [slice(i, min(i + block_days, len(all_days)))
+              for i in range(0, len(all_days), block_days)]
+    preprocess._run_window_stats(eff, cube, g, all_days, blocks, window=window, cache=cache)
+    parts = [preprocess.preprocess_block(cube.isel(time=sl), g, eff, all_days=all_days,
+                                         ds_all=cube, stale=stale, window=window, cache=cache)
+             for sl in blocks]
+    return xr.concat(parts, dim="time", data_vars="minimal", coords="minimal")
+
+
 def _ones_valid(T, H, W):
     return np.ones((T, H, W), "uint8")
 
@@ -336,6 +354,49 @@ def test_filter_clouds_sigma_harmonic_catches_seasonal_outlier(tmp_path):
     fo = _pp(proj_o, g, cube)["eco_sst_v002_clean_cloudfiltered"].isel(time=day).values
     assert (fh[:, 5] == 1).all() and (fh[:, 6] == 0).all()   # harmonic drops the seasonal outlier
     assert (fo[:, 5] == 0).all()                             # constant climatology misses it
+
+
+def test_the_sigma_climatology_is_the_same_fit_however_it_is_blocked(tmp_path):
+    """The climatology is a masked least-squares fit, and every term of its normal equations is
+    a plain sum over time -- so accumulating block by block is the SAME arithmetic in a
+    different order, not an approximation. This is the claim the whole change rests on."""
+    for scope in ("pixel", "pooled"):
+        proj, g = _setup(tmp_path / scope, {"filter_clouds": {
+            "method": "sigma", "n_sigma": 3.0, "stat_scope": scope}})
+        cube = _sigma_cube(g, pd.date_range("2026-06-01", periods=20))
+
+        one = _pp(proj, g, cube)["eco_sst_v002_clean"].values
+        many = _pp_blocked(proj, g, cube, 3)["eco_sst_v002_clean"].values
+
+        np.testing.assert_array_equal(np.isnan(one), np.isnan(many))     # the DROPS must match
+        np.testing.assert_allclose(one[~np.isnan(one)], many[~np.isnan(many)], rtol=1e-9)
+
+
+def test_a_blocked_sigma_fit_still_catches_the_seasonal_outlier(tmp_path):
+    """The 365-day harmonic case, blocked 30 days at a time.
+
+    Two things could break it and both are silent: a per-block climatology would fit each
+    month's own mean, and a per-block answer to "is the DOY span long enough for a harmonic?"
+    is "no" for every block -- degrading to a constant climatology, which this fixture proves
+    misses the outlier entirely.
+    """
+    proj, g = _setup(tmp_path, {"filter_clouds": {"method": "sigma", "seasonality": "harmonic"}})
+    H, W = g.height, g.width
+    times = pd.date_range("2026-01-01", periods=365)
+    doy = np.arange(1, 366)
+    seasonal = 285.0 + 8.0 * np.sin(2 * np.pi * doy / 365.25) + 0.3 * np.sin(2 * np.pi * doy / 30)
+    mur = np.broadcast_to(seasonal[:, None, None], (365, H, W)).astype("float32")
+    day = 90
+    eco = np.full((365, H, W), np.nan, "float32")
+    eco[day] = 295.0
+    eco[day, :, 5] = 283.0                                   # summer cloud pixel
+    cube = _hand_cube(g, times, eco_sst_v002=eco, eco_valid_v002=_ones_valid(365, H, W),
+                      mur_sst=mur)
+
+    flag = _pp_blocked(proj, g, cube, 30)["eco_sst_v002_clean_cloudfiltered"]
+    flag = flag.isel(time=day).values
+    assert (flag[:, 5] == 1).all(), "a blocked fit no longer sees the seasonal outlier"
+    assert (flag[:, 6] == 0).all()
 
 
 def test_filter_clouds_harmonic_short_span_falls_back_to_constant(tmp_path, caplog):
@@ -572,6 +633,168 @@ def _assembled(project, grids, days):
     zpath = project.output_dir / "datacube" / f"{AOI}.zarr"
     with xr.open_zarr(zpath) as ds:
         return zpath, _snapshot(ds)
+
+
+# --------------------------------------------------------------------------- #
+# Blocked rewrite
+#
+# A cube too large to hold at once is preprocessed a BLOCK of days at a time. The contract is
+# that this changes nothing about the result, so the central test compares a blocked rewrite
+# against a single-pass one, channel for channel.
+# --------------------------------------------------------------------------- #
+def _long_pp_project(tmp_path, n_days=10, **preprocess_cfg):
+    """`_project`'s selection over a longer window -- 3 days cannot be split into blocks."""
+    end = (pd.Timestamp("2026-06-01") + pd.Timedelta(days=n_days - 1)).date().isoformat()
+    return parse_config({
+        "name": "pp", "output_dir": str(tmp_path),
+        "time": {"start_date": "2026-06-01", "end_date": end},
+        "products": {"bathymetry": None, "tides": None, "mur": None, "cmems": None,
+                     "landcover": None, "ecostress": None},
+        "regions": [{"name": "r", "areas": [
+            {"name": AOI, "center_lat": 45.5, "center_lon": -123.9,
+             "buffer_ns_km": 2, "buffer_ew_km": 2}]}],
+        "auth": {"earthdata": {"auth_strategy": "netrc"},
+                 "copernicus": {"auth_strategy": "netrc"}},
+        "preprocess": {"enabled": True, **preprocess_cfg},
+    })
+
+
+def _assemble_and_preprocess(tmp_path, *, n_days, block_days, steps=None, chunks=None):
+    """Assemble the full fixture, preprocess it at `block_days`, and snapshot the result."""
+    p = _long_pp_project(tmp_path, n_days=n_days,
+                         steps=steps or {"water_line": None, "fill_water": None,
+                                         "filter_clouds": None})
+    if chunks:
+        p.datacube.chunks.update(chunks)
+    grids = grid.project_grids(p)
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    _write_full_fixture(p, grids[AOI], days)
+    datacube.assemble(p, grids=grids)
+
+    eff = preprocess._build_eff(p)
+    eff["block_days"] = block_days
+    preprocess.run(eff, grids, None, False)
+    zpath = p.output_dir / "datacube" / f"{AOI}.zarr"
+    with xr.open_zarr(zpath) as ds:
+        return p, zpath, _snapshot(ds)
+
+
+def test_blocked_and_unblocked_preprocessed_cubes_are_identical(tmp_path):
+    """HOW the cube is rewritten must not change WHAT it holds.
+
+    With the default step selection every step is day-local, so this is exact -- values, dtypes,
+    dims, per-variable attrs, coverage, insitu_stations and the channel set, in one assertion.
+    """
+    _, _, one = _assemble_and_preprocess(tmp_path / "one", n_days=10, block_days=10)
+    _, _, many = _assemble_and_preprocess(tmp_path / "many", n_days=10, block_days=3)
+
+    problems = _diff_snapshots(one, many)
+    assert problems == [], ("a blocked rewrite differs from a single-pass one:\n  "
+                           + "\n  ".join(problems))
+
+
+def test_a_blocked_rewrite_keeps_the_assembled_channels_untouched(tmp_path):
+    """The failure that would matter most: the stage rewrites the cube it reads, so a blocked
+    write that mangled a source channel would destroy the assembled data, not just its own."""
+    p = _long_pp_project(tmp_path, n_days=8,
+                         steps={"water_line": None, "fill_water": None})
+    grids = grid.project_grids(p)
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    _write_full_fixture(p, grids[AOI], days)
+    datacube.assemble(p, grids=grids)
+    zpath = p.output_dir / "datacube" / f"{AOI}.zarr"
+    with xr.open_zarr(zpath) as ds:
+        before = _snapshot(ds)
+
+    eff = preprocess._build_eff(p)
+    eff["block_days"] = 3
+    preprocess.run(eff, grids, None, False)
+
+    with xr.open_zarr(zpath) as ds:
+        after = _snapshot(ds)
+    assert set(before["data_vars"]) < set(after["data_vars"])
+    for name, snap in before["data_vars"].items():
+        assert after["data_vars"][name] == snap, f"{name} was modified by a blocked preprocess"
+    for c in ("time", "y", "x"):
+        assert after["coords"][c] == before["coords"][c]
+
+
+def test_staleness_and_the_channel_ledger_survive_a_blocked_write(tmp_path):
+    """Appending REPLACES a Zarr group's attrs, so the whole-cube ones are re-stamped at the end.
+
+    Three runs, because two are not enough to catch the real failure: `preprocess_steps_stale`
+    reads only `preprocess` and `code_version`, so a lost `preprocess_channels` still looks
+    idempotent on run 2. It surfaces on run 3 with `overwrite`, where `was_derived` is empty and
+    every derived channel the cube already holds looks like an assembled one being clobbered.
+    """
+    p, zpath, _ = _assemble_and_preprocess(tmp_path, n_days=8, block_days=3)
+    grids = grid.project_grids(p)
+
+    eff = preprocess._build_eff(p)
+    eff["block_days"] = 3
+    rep = preprocess.run(eff, grids, None, False)          # run 2: nothing to do
+    assert rep.skipped == 1, "a blocked cube did not look finished to the next run"
+
+    eff["overwrite"] = True
+    rep = preprocess.run(eff, grids, None, False)          # run 3: must not raise
+    assert rep.written == 1
+
+    with xr.open_zarr(zpath) as ds:
+        owned = json.loads(ds.attrs["preprocess_channels"])
+        assert "mur_sst_gapfilled" in owned and "eco_water_elev" in owned
+        for key in ("preprocess", "code_version", "provenance", "config_yaml",
+                    "coverage", "insitu_stations", "preprocessed_at"):
+            assert key in ds.attrs, f"{key} did not survive the blocked write"
+        assert ds.attrs["created_at"] != ds.attrs["preprocessed_at"]
+
+
+def test_a_blocked_rewrite_preserves_the_stores_time_chunk(tmp_path):
+    """Preprocess must not re-chunk the store back to the configured value: the assembler may
+    have reduced it deliberately, and undoing that silently is how the cube stops being
+    writable at all."""
+    _, zpath, _ = _assemble_and_preprocess(tmp_path, n_days=10, block_days=4,
+                                           chunks={"time": 2})
+    with xr.open_zarr(zpath) as ds:
+        for name in ("mur_sst", "mur_sst_gapfilled"):
+            assert ds[name].encoding["chunks"][0] == 2, (
+                f"{name} was re-chunked to {ds[name].encoding['chunks'][0]}, not the store's 2")
+
+
+def test_a_failure_part_way_through_a_blocked_rewrite_keeps_the_assembled_cube(
+        tmp_path, monkeypatch):
+    """The stage reads and writes the same path, so a half-finished write would take the
+    assembled cube with it. `store.atomic` is what stops that -- pinned here."""
+    p, zpath, before = _assemble_and_preprocess(tmp_path, n_days=8, block_days=2)
+    grids = grid.project_grids(p)
+
+    calls = {"n": 0}
+    real = datacube.append_zarr
+
+    def flaky(ds, path, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ConnectionError("the filesystem went away mid-cube")
+        return real(ds, path, **kw)
+
+    monkeypatch.setattr(datacube, "append_zarr", flaky)
+    eff = preprocess._build_eff(p)
+    eff["block_days"] = 2
+    eff["overwrite"] = True
+    with pytest.raises(ConnectionError):
+        preprocess.run(eff, grids, None, False)
+
+    with xr.open_zarr(zpath) as ds:
+        assert _diff_snapshots(before, _snapshot(ds)) == []
+    assert not list(zpath.parent.glob(f"{AOI}.zarr.part-*")), "scratch left behind"
+    assert not list(zpath.parent.glob(f"{AOI}.zarr.old-*")), "stash left behind"
+
+
+def test_preprocess_block_days_falls_back_to_the_datacube_value(tmp_path):
+    p = _long_pp_project(tmp_path, n_days=4, steps={"fill_water": None})
+    p.datacube.block_days = 7
+    assert preprocess._build_eff(p)["block_days"] == 7      # unset -> inherit
+    p.preprocess.block_days = 3
+    assert preprocess._build_eff(p)["block_days"] == 3      # set -> wins
 
 
 def test_run_adds_derived_channels_to_the_assembled_cube(project, grids, days):

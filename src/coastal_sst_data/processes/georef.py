@@ -45,6 +45,7 @@ import numpy as np
 from scipy import ndimage
 
 from .channels import CLEAN, CORRECTED
+from .datacube import _cached
 
 if TYPE_CHECKING:                          # avoid an import cycle: only a type hint needs it
     from .preprocess import PreprocessContext
@@ -384,10 +385,15 @@ def _step_flag_georef(ctx: "PreprocessContext") -> None:
     water = _ref_water_mask(ctx)
     if water is None:
         return
-    ref = water_boundary(water)                        # one-cell reference coastline, water side
+    # One distance transform per AoI, reused by every scene's scoring -- and cached, because
+    # under blocked preprocessing this function is called once per BLOCK, and an EDT over the
+    # whole grid per block is pure repeated work: the reference coastline comes from the static
+    # land-cover mask, so it cannot vary with the days in hand.
+    def _reference():
+        r = water_boundary(water)                      # one-cell reference coastline, water side
+        return r, ndimage.distance_transform_edt(~r)
 
-    # One distance transform per AoI, reused by every scene's scoring.
-    dref = ndimage.distance_transform_edt(~ref)
+    ref, dref = _cached(ctx.cache, ("georef_ref", ctx.aid), _reference)
     res_m = _res_m(ctx)
     tol_cells = float(opts["tol_m"]) / res_m
     max_cells = int(round(float(opts["max_shift_m"]) / res_m))

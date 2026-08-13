@@ -337,6 +337,34 @@ If your product is daily and you set a `coverage_channel`, the coverage check pi
 `DAILY_CHANNELS` automatically — no wiring. If your product deliberately ships **no** cube channel,
 set `cube_opt_out=True` on its `ProductSpec` so the invariant knows the omission is intentional.
 
+#### The two rules a contributor must follow about time
+
+A cube too large to hold in memory is assembled a **block of days at a time** (see
+`datacube.block_days`), so `ctx.days` may be one slice of the cube's axis rather than the whole
+thing. Your contributor is called once per block, with a fresh `ctx` each time. Two rules follow,
+and both are enforced — you will get a `RuntimeError` naming your contributor, not a broken cube.
+
+1. **Emit on `ctx.days`, decide on `ctx.all_days`.** Arrays you emit are indexed by the block
+   (`ctx.days`). But any question whose answer describes the *cube* — which variant of a product
+   feeds it, whether a layer exists anywhere in the tree — must be asked of `ctx.all_days`.
+   `met_prefix` is the worked example: asked about one block's days it answers "these are daily
+   means", and the cube ends up splicing two different times of day into one channel.
+
+2. **Your channel SET may depend on the files, never on the days.** Emit `chl` on every block or on
+   none. A channel that appears in some blocks and not others produces a store whose variables
+   disagree about the length of the time axis — which *writes* without error and then fails on
+   `open_zarr` with `conflicting sizes for dimension 'time'`, long after the run that caused it.
+   `_check_channel_set` compares each block against `channel_census` and stops the run instead.
+
+   If a channel's existence genuinely depends on file contents, resolve it once over the whole
+   window and pass the answer down, as `footprint_available` does for `<sensor>_footprint_id` — the
+   only channel in the assembler that has this property.
+
+`ctx.cache` is shared across an AoI's blocks. Pass it to any loader that accepts `cache=` so a
+directory is scanned once per AoI rather than once per block; `_cached(cache, key, build)` is the
+helper if you add a loader of your own. Anything the cache holds **open** must be released in
+`close_cache`.
+
 ### 3d. Teaching provenance about new channels
 
 Every cube channel must resolve to a source in
@@ -519,6 +547,39 @@ provenance mapping:
    (§3d) — a *derived* channel lists **all** its inputs (e.g. `<sensor>_water_elev` →
    `["bathymetry", "tides", sensor]`). Channels that keep a raw name (a filled `mur_sst`, a
    `mur_sst_filled` mask) already resolve via the existing `mur_`/`cmems_` prefixes.
+
+#### The two rules a step must follow about time
+
+A cube too large to hold in memory is preprocessed a **block of days at a time**
+(`preprocess.block_days`), so `ctx.ds_cube` may be one time slice of the store and your step is
+called once per block with a fresh `ctx`. Because `ctx.read` reads off `ctx.ds_cube`, a **day-local**
+step — one whose output for a day depends only on that day's input — needs no changes at all for
+this: it asks for a channel and gets that block's days. Nine of the ten shipped steps are day-local.
+
+1. **Emit on `ctx.days`, decide on `ctx.all_days`.** Any question whose answer describes the *cube*
+   rather than the block must be asked of `ctx.all_days` / `ctx.read_all`. `cloud_filter`'s "is the
+   day-of-year span long enough to fit a seasonal harmonic?" is the worked example — asked of a
+   block it answers *no* every time, and a ten-year cube silently fits a constant climatology
+   everywhere while the config says `harmonic`.
+
+2. **Your channel SET may depend on the cube's channels, never on the days.** Emit a channel for
+   every block or for none. A channel present in some blocks and not others builds a store whose
+   variables disagree about the length of the time axis — which *writes* without error and then
+   fails on `open_zarr` with `conflicting sizes for dimension 'time'`. `_check_channel_set` compares
+   each block against `preprocess_census` and stops the run instead.
+
+**If your step reduces over the time axis** — a climatology, a trend, anything needing all days at
+once — it cannot be answered from one block. Declare a `WindowStat` on its registration:
+`passes(ctx)` says how many prepasses your *config* needs (return `0` when it is configured
+day-locally, and you pay nothing), `accumulate(ctx, i)` folds in one block, and `reduce(ctx, i)`
+turns the accumulators into the statistic, which lands in `ctx.window` for your `fn` to read per
+block. `cloud_filter`'s sigma climatology is the worked example: its fit is masked normal
+equations, every term a plain sum over `t`, so accumulating block by block is the same arithmetic
+in a different order — exact, not approximate.
+
+Use `ctx.cache` (shared across an AoI's blocks) for anything derived from the grid or the tree
+rather than from the days — `flag_georef`'s coastline distance transform is cached this way, or it
+would run once per block.
 
 Config, invocation, and testing:
 

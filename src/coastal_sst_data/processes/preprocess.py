@@ -74,7 +74,8 @@ from .. import entry, products, provenance, report, store
 from . import datacube, water_level
 from .channels import GAPFILLED, is_derived
 from .cloud_filter import (_step_filter_clouds, _step_filter_cloud_cover,
-                           _step_filter_land_clouds)
+                           _step_filter_land_clouds,
+                           sigma_passes, sigma_accumulate_step, sigma_reduce_step)
 from .georef import _step_flag_georef, _step_correct_georef
 from .datacube import build_encoding, write_zarr
 from .water_level import EXPOSED, SUBMERGED, UNKNOWN
@@ -118,6 +119,29 @@ def fill_water_nn(arr, water):
 # primary ordering mechanism (mirrors ProductSpec.depends_on / pipeline.process_order).
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
+class WindowStat:
+    """A whole-window statistic a step needs before it can be evaluated on any single block.
+
+    Every other step is DAY-LOCAL: hand it a block and it gives the same answer it would have
+    given for those days inside the whole cube. A step that REDUCES over the time axis cannot --
+    a climatology fitted to one block is a different climatology. So the orchestrator streams
+    the blocks past this first, accumulating, and the step's own `fn` then reads the finished
+    statistic out of `ctx.window`.
+
+    `passes(ctx)` is asked ONCE, on the zero-day census context, how many prepasses this step's
+    CONFIG needs -- 0 when it is configured day-locally, so an `offset` cloud filter pays
+    nothing at all. `accumulate(ctx, i)` runs on every block of pass `i`; `reduce(ctx, i)` runs
+    once after that pass, turning accumulators into the statistic.
+
+    More than one pass exists because a residual needs the fit it is a residual ABOUT: pass 0
+    accumulates the normal equations and solves them, pass 1 accumulates the squared residuals.
+    """
+    passes: "Callable[[PreprocessContext], int]"
+    accumulate: "Callable[[PreprocessContext, int], None]"
+    reduce: "Callable[[PreprocessContext, int], None]"
+
+
+@dataclass(frozen=True)
 class PreprocessStep:
     key: str                                       # step name; also the config selector key
     reads: tuple[str, ...]                         # cube channel families it consumes
@@ -127,6 +151,7 @@ class PreprocessStep:
     option_keys: frozenset[str] = frozenset()      # per-step config options it reads
     region_option_keys: frozenset[str] = frozenset()   # subset a region may override (<= option_keys)
     provenance_inputs: tuple[str, ...] = ()        # products a derived channel attributes to
+    window: WindowStat | None = None               # set only by a step that reduces over time
 
 
 @dataclass
@@ -140,6 +165,28 @@ class PreprocessContext:
     `ds_cube` may already hold the derived channels of an EARLIER preprocess run -- the stage
     rewrites the cube in place. So a step scans for its inputs with `base_channels`, which hides
     them, and seeds its outputs from the raw channel rather than from whatever is on disk.
+
+    TIME BLOCKS. A cube too large to hold at once is preprocessed a BLOCK of days at a time, so
+    `ds_cube` may be one time slice of the store and `days` its days. Because `read` reads off
+    `ds_cube`, a DAY-LOCAL step needs no changes at all for this -- it asks for a channel and
+    gets that block's days. Two rules cover the rest:
+
+      * `days` / `ds_cube` are THIS BLOCK. Emit on that axis.
+      * `all_days` / `ds_all` are the WHOLE CUBE. Use them for any question whose answer is a
+        property of the cube rather than of the block -- `_harmonic_design`'s "is the window
+        long enough to fit a seasonal cycle" is the worked example, and asked of a block it
+        answers "no" every time.
+
+    A step that must REDUCE over the time axis cannot be answered from one block at all; it
+    declares a `WindowStat` on its registration, and reads the finished statistic out of
+    `window` (see `WindowStat` and `_run_window_stats`).
+
+    A step's CHANNEL SET must be a function of the cube's channels, never of `days` -- a channel
+    emitted for some blocks and not others builds a store whose variables disagree about the
+    length of the time axis, which writes cleanly and then cannot be opened.
+
+    `cache` is shared across an AoI's blocks: use it for anything derived from the grid or the
+    tree rather than from the days (georef's distance transform, the tide series).
     """
     g: AoiGrid
     eff: dict
@@ -151,6 +198,20 @@ class PreprocessContext:
     channels: dict[str, tuple] = field(default_factory=dict)
     var_attrs: dict[str, dict] = field(default_factory=dict)
     global_attrs: dict[str, Any] = field(default_factory=dict)
+    all_days: pd.DatetimeIndex | None = None      # the whole cube's axis; defaults to `days`
+    ds_all: xr.Dataset | None = None              # the whole cube; defaults to `ds_cube`
+    window: dict = field(default_factory=dict)    # whole-window statistics, by WindowStat key
+    cache: dict = field(default_factory=dict)     # per-AoI scratch, shared across blocks
+    # {name: (dims, dtype)} for every channel READ through `read` -- collected during the census
+    # so the memory model can count what a step materialises, not just what it emits.
+    reads_seen: dict = field(default_factory=dict)
+    _read_cache: dict = field(default_factory=dict, repr=False)
+
+    def __post_init__(self):
+        if self.all_days is None:
+            self.all_days = self.days
+        if self.ds_all is None:
+            self.ds_all = self.ds_cube
 
     # ---- reading the cube (defensive: a missing/misshaped channel -> None) ----------- #
     def has(self, name: str) -> bool:
@@ -161,11 +222,41 @@ class PreprocessContext:
 
         Mirrors the datacube loaders' discipline: a step must degrade (skip, or emit
         all-UNKNOWN) when an input product was never selected, not crash the whole stage.
+
+        Memoised for the life of one block. Several steps read the same channel independently
+        (`_working`, `_target`, `_baseline_field` all call this), and each call used to
+        decompress and materialise the whole array again -- a hidden multiplier on the peak
+        that the block size is supposed to bound. The cached array is made READ-ONLY so a
+        future in-place mutation fails loudly here rather than corrupting a later reader; every
+        caller today copies before it writes.
         """
+        key = (name, tuple(dims) if dims is not None else None, dtype)
+        if key in self._read_cache:
+            return self._read_cache[key]
         if name not in self.ds_cube.variables:
             return None
         da = self.ds_cube[name]
         if dims is not None and tuple(da.dims) != tuple(dims):
+            return None
+        arr = np.asarray(da.values).astype(dtype, copy=False)
+        arr.setflags(write=False)
+        self._read_cache[key] = arr
+        self.reads_seen[name] = (tuple(da.dims), np.dtype(dtype))
+        return arr
+
+    def read_all(self, name: str, *, dims=("time",), dtype="float32") -> np.ndarray | None:
+        """A channel over the WHOLE cube, for a whole-window decision.
+
+        Only 1-D (`time`,) reads are legal: pulling a (time,y,x) channel through here would
+        materialise the full cube and undo the blocking this exists to support.
+        """
+        if tuple(dims) != ("time",):
+            raise ValueError("read_all is for 1-D (time,) channels only; a (t,y,x) read over "
+                             f"the whole window would defeat blocking (asked for {name!r})")
+        if self.ds_all is None or name not in self.ds_all.variables:
+            return None
+        da = self.ds_all[name]
+        if tuple(da.dims) != tuple(dims):
             return None
         return np.asarray(da.values).astype(dtype, copy=False)
 
@@ -413,6 +504,12 @@ STEPS: tuple[PreprocessStep, ...] = (
         writes=("_clean", "_cloudfiltered"),
         fn=_step_filter_clouds,
         depends_on=("fill_water",),        # so offset mode sees the gap-filled baseline
+        # `method: sigma` fits a climatology over the WHOLE time axis, so it cannot be answered
+        # from one block; `method: offset` declares 0 passes and pays nothing.
+        window=WindowStat(
+            passes=partial(sigma_passes, key="filter_clouds"),
+            accumulate=partial(sigma_accumulate_step, key="filter_clouds"),
+            reduce=partial(sigma_reduce_step, key="filter_clouds")),
         option_keys=_CLOUDS_OPTS,
         provenance_inputs=("ecostress", "mur"),
     ),
@@ -473,6 +570,15 @@ STEPS: tuple[PreprocessStep, ...] = (
         fn=partial(_step_filter_clouds, key="filter_clouds_corrected",
                    base_key="filter_clouds", mode="corrected"),
         depends_on=("correct_georef",),
+        # Same climatology as the raw pass -- the corrected geometry never touches the baseline
+        # -- and `_sigma_key` is keyed on the maths, so the two share one prepass.
+        window=WindowStat(
+            passes=partial(sigma_passes, key="filter_clouds_corrected",
+                           base_key="filter_clouds"),
+            accumulate=partial(sigma_accumulate_step, key="filter_clouds_corrected",
+                               base_key="filter_clouds"),
+            reduce=partial(sigma_reduce_step, key="filter_clouds_corrected",
+                           base_key="filter_clouds")),
         option_keys=_CLOUDS_OPTS,
         provenance_inputs=("ecostress", "landcover", "mur"),
     ),
@@ -601,32 +707,59 @@ def _check_step_options(eff: dict) -> None:
 # --------------------------------------------------------------------------- #
 # Build one AoI's cube: the assembled channels + this stage's derived ones
 # --------------------------------------------------------------------------- #
-def preprocess_aoi(ds_cube: xr.Dataset, g: AoiGrid, eff: dict) -> xr.Dataset:
-    """The assembled cube for one AoI WITH the selected steps' derived channels merged in.
+def _new_ctx(ds_cube: xr.Dataset, g: AoiGrid, eff: dict, days, **kw) -> PreprocessContext:
+    return PreprocessContext(
+        g=g, eff=eff, days=days, aid=g.name,
+        H=int(ds_cube.sizes["y"]), W=int(ds_cube.sizes["x"]), ds_cube=ds_cube, **kw)
 
-    Every selected step runs through the uniform `(ctx) -> None` protocol in `depends_on`
-    order, then its emissions are assigned onto the cube it read them from -- on the cube's own
-    coords, never re-derived, so nothing can drift out of alignment.
 
-    A derived channel never takes an assembled channel's name (`processes.channels`), so this
-    only ever ADDS variables; re-running replaces the previous run's derived channels in place.
-    `preprocess_steps_stale` is what decides whether that re-run is worth doing.
+def selected_steps(eff: dict) -> list["PreprocessStep"]:
+    """The selected steps in run order (registry order, then topologically sorted)."""
+    return _topo_order([s for s in STEPS if s.key in eff["steps"]])
+
+
+def preprocess_census(ds_cube: xr.Dataset, g: AoiGrid, eff: dict, all_days,
+                      *, window=None, cache=None) -> tuple[dict, dict]:
+    """({emitted: (dims, dtype)}, {read: (dims, dtype)}) for this cube and step selection.
+
+    Runs the REAL steps over a ZERO-LENGTH time slice, so every channel is named by the code
+    that emits it -- there is no second list to drift -- and nothing is materialised: each array
+    is (0,H,W). This is legitimate precisely because a step's channel SET is a function of the
+    cube's channels, never of the days (`_channel_sets`, `base_channels` and `_fill_channels`
+    all scan variable NAMES).
+
+    The reads are collected too, by instrumenting `ctx.read`: they are what a block actually
+    materialises, and the memory model needs them as much as it needs the emissions.
+
+    Stops after the step loop -- deliberately. `preprocess_aoi` goes on to collect provenance
+    over the whole aligned tree, which is the most expensive call in the stage and has nothing
+    to say about which channels exist.
     """
-    days = pd.DatetimeIndex(ds_cube["time"].values)
-    ctx = PreprocessContext(g=g, eff=eff, days=days, aid=g.name,
-                            H=int(ds_cube.sizes["y"]), W=int(ds_cube.sizes["x"]), ds_cube=ds_cube)
+    ctx = _new_ctx(ds_cube.isel(time=slice(0, 0)), g, eff, all_days[:0],
+                   all_days=all_days, ds_all=ds_cube,
+                   window={} if window is None else window,
+                   cache={} if cache is None else cache)
+    with datacube._quiet(logging.getLogger(__package__.split(".")[0])):
+        for step in selected_steps(eff):
+            step.fn(ctx)
+    emitted = {n: (dims, np.asarray(arr).dtype) for n, (dims, arr) in ctx.channels.items()}
+    return emitted, dict(ctx.reads_seen)
 
-    selected = [s for s in STEPS if s.key in eff["steps"]]
-    for step in _topo_order(selected):
-        step.fn(ctx)
 
+def resolve_channel_plan(ds_cube: xr.Dataset, census: dict) -> tuple[list[str], dict]:
+    """(stale, expected) for this rewrite. Raises if a step would clobber an assembled channel.
+
+    Both are whole-cube facts, and both used to be answered after the steps had run over the
+    whole cube. A blocked rewrite has no such moment: block 0 must ALREADY know which variables
+    to drop, because a variable dropped from only some blocks is either never extended or
+    created at one block's length -- and the cube then fails to open.
+    """
     # What the LAST run added, so this one can tell its own output from the assembler's. Without
     # it a re-run cannot distinguish "replacing my `eco_georef_flag`" from "clobbering a channel
     # the assembler wrote", since neither name carries a derived suffix.
     was_derived = set(json.loads(ds_cube.attrs.get("preprocess_channels", "[]")))
 
-    clobbered = sorted(n for n in ctx.channels
-                       if n in ds_cube.variables and n not in was_derived)
+    clobbered = sorted(n for n in census if n in ds_cube.variables and n not in was_derived)
     if clobbered:
         # An import-time check can't catch this: what a step emits depends on the channels the
         # cube happens to hold. Failing here beats silently overwriting the sensor's own data.
@@ -636,40 +769,235 @@ def preprocess_aoi(ds_cube: xr.Dataset, g: AoiGrid, eff: dict) -> xr.Dataset:
 
     # Channels the last run added that this step selection no longer produces: drop them, or the
     # cube keeps shipping output its own `preprocess` attr no longer claims.
-    stale = sorted(n for n in was_derived - set(ctx.channels) if n in ds_cube.variables)
+    stale = sorted(n for n in was_derived - set(census) if n in ds_cube.variables)
     if stale:
         log.info("  dropping %d channel(s) from a previous step selection: %s",
                  len(stale), ", ".join(stale))
+    expected = {n: (ds_cube[n].dims, ds_cube[n].dtype)
+                for n in ds_cube.data_vars if n not in stale}
+    expected.update(census)                 # a re-emitted derived channel: the census wins
+    return stale, expected
 
-    ds_out = ds_cube.drop_vars(stale).assign(
+
+def preprocess_block(ds_cube: xr.Dataset, g: AoiGrid, eff: dict, *, all_days=None, ds_all=None,
+                     stale=(), window=None, cache=None) -> xr.Dataset:
+    """One span of days, with the selected steps' derived channels merged onto it.
+
+    Every selected step runs through the uniform `(ctx) -> None` protocol in `depends_on`
+    order, then its emissions are assigned onto the cube it read them from -- on the cube's own
+    coords, never re-derived, so nothing can drift out of alignment.
+
+    `ds_cube` may be one time BLOCK of the store; `all_days`/`ds_all` are then the whole cube,
+    for the steps that must ask a whole-window question. The whole-cube attrs are NOT stamped
+    here -- see `finalize_preprocess_attrs`.
+    """
+    days = pd.DatetimeIndex(ds_cube["time"].values)
+    ctx = _new_ctx(ds_cube, g, eff, days, all_days=all_days, ds_all=ds_all,
+                   window={} if window is None else window,
+                   cache={} if cache is None else cache)
+    for step in selected_steps(eff):
+        step.fn(ctx)
+
+    ds_out = ds_cube.drop_vars(list(stale)).assign(
         {n: (dims, arr) for n, (dims, arr) in ctx.channels.items()})
-    ds_out.attrs.update(
-        aoi_id=ctx.aid,
-        crs=ds_cube.attrs.get("crs", g.target_crs),
-        preprocess=json.dumps({k: eff["steps"][k] for k in
-                               (s.key for s in selected)}, sort_keys=True),
-        # Which channels this stage owns -- the next run reads it back (above), and a consumer
-        # can tell a derived channel from an observed one without parsing names.
-        preprocess_channels=json.dumps(sorted(ctx.channels), sort_keys=True))
     ds_out.attrs.update(ctx.global_attrs)
     for name, attrs in ctx.var_attrs.items():
         if name in ds_out:
             ds_out[name].attrs.update(attrs)
+    return ds_out
 
+
+def preprocess_aoi(ds_cube: xr.Dataset, g: AoiGrid, eff: dict) -> xr.Dataset:
+    """The assembled cube for one AoI WITH the selected steps' derived channels merged in.
+
+    The whole cube in one pass: what `run` still does for a cube that fits in memory. A
+    derived channel never takes an assembled channel's name (`processes.channels`), so this
+    only ever ADDS variables; re-running replaces the previous run's derived channels in place.
+    `preprocess_steps_stale` is what decides whether that re-run is worth doing.
+    """
+    all_days = pd.DatetimeIndex(ds_cube["time"].values)
+    census, _reads = preprocess_census(ds_cube, g, eff, all_days)
+    stale, _expected = resolve_channel_plan(ds_cube, census)
+    ds_out = preprocess_block(ds_cube, g, eff, all_days=all_days, stale=stale)
+    ds_out.attrs.update(finalize_preprocess_attrs(
+        dict(ds_cube.attrs), {}, eff, g, list(ds_out.data_vars), census))
+    return ds_out
+
+
+def finalize_preprocess_attrs(src_attrs: dict, block_attrs: dict, eff: dict, g: AoiGrid,
+                              fields, census: dict) -> dict:
+    """Every global attr the rewritten cube must carry.
+
+    Split out because a blocked rewrite has no in-memory whole cube to hang them on -- and
+    because appending to a Zarr store REPLACES the group's attrs, so they have to be re-stamped
+    once at the end whatever the path. Losing them is quiet and expensive: without
+    `preprocess_channels` the NEXT run cannot tell its own output from the assembler's and
+    refuses to run at all; without `preprocess`/`code_version` the stage never looks finished
+    and silently redoes itself on every invocation.
+
+    `src_attrs` is the cube's attrs as OPENED -- it carries everything the assembler stamped
+    (coverage, provenance of the raw products, the in-situ station table), which this stage must
+    not drop. Spread first, so this run's values win over a previous run's.
+    """
     # PROVENANCE: re-stamped over the WHOLE cube, so the derived fields are recorded beside the
     # assembled ones. `created_at` stays the assembly's -- it dates the observations, which this
     # stage does not touch -- and `preprocessed_at` dates the derivation.
-    prod = provenance.collect(eff["aligned_root"], ctx.aid, datacube.PRODUCT_DIRS)
-    rec = provenance.build(eff["project"], list(ds_out.data_vars), prod)
-    ds_out.attrs.update(
-        created_at=ds_cube.attrs.get("created_at", rec["created_at"]),
-        preprocessed_at=rec["created_at"],
-        package_version=rec["package_version"], code_version=rec["code_version"],
-        config_sha256=rec["config_sha256"] or "", config_path=rec["config_path"] or "",
-        config_yaml=rec["config_yaml"] or "",
-        provenance=json.dumps(rec["fields"], sort_keys=True),
-        provenance_products=json.dumps(rec["products"], sort_keys=True))
-    return ds_out
+    prod = provenance.collect(eff["aligned_root"], g.name, datacube.PRODUCT_DIRS)
+    rec = provenance.build(eff["project"], sorted(fields), prod)
+    selected = selected_steps(eff)
+    return {
+        **src_attrs,
+        **block_attrs,
+        "aoi_id": g.name,
+        "crs": src_attrs.get("crs", g.target_crs),
+        "preprocess": json.dumps({k: eff["steps"][k] for k in (s.key for s in selected)},
+                                 sort_keys=True),
+        # Which channels this stage owns -- the next run reads it back, and a consumer can tell
+        # a derived channel from an observed one without parsing names.
+        "preprocess_channels": json.dumps(sorted(census), sort_keys=True),
+        "created_at": src_attrs.get("created_at", rec["created_at"]),
+        "preprocessed_at": rec["created_at"],
+        "package_version": rec["package_version"], "code_version": rec["code_version"],
+        "config_sha256": rec["config_sha256"] or "", "config_path": rec["config_path"] or "",
+        "config_yaml": rec["config_yaml"] or "",
+        "provenance": json.dumps(rec["fields"], sort_keys=True),
+        "provenance_products": json.dumps(rec["products"], sort_keys=True),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Blocked rewrite
+# --------------------------------------------------------------------------- #
+# Preprocess holds more per day than the assembler does at the same block size: the baseline
+# climatology promotes to float64, every filter copies its target to fold drops into it, and a
+# step reads channels it does not emit. So the channel arithmetic is scaled harder here.
+_PP_TRANSIENT_FACTOR = 3.0
+
+
+def source_time_chunk(ds_cube: xr.Dataset) -> int | None:
+    """The on-disk time chunk of the store `ds_cube` was opened from, or None.
+
+    From `encoding["chunks"]`, which the Zarr backend fills with the array's REAL chunk shape --
+    not `.chunks`, which is the dask chunking `chunks="auto"` may have fused, and not
+    `datacube.chunks.time`, which is the CONFIGURED value. Those differ on exactly the cubes
+    this matters for: the assembler reduces the time chunk when the memory budget cannot hold
+    one chunk's worth of days, and preprocess must inherit that reduction rather than quietly
+    undo it by re-chunking the whole store back to the config.
+    """
+    seen = set()
+    for name, da in ds_cube.data_vars.items():
+        if "time" not in da.dims:
+            continue
+        ch = da.encoding.get("chunks")
+        if ch:
+            seen.add(int(ch[list(da.dims).index("time")]))
+    if not seen:
+        return None
+    if len(seen) > 1:
+        log.warning("  the cube's variables disagree on their time chunk (%s); taking the "
+                    "largest so every append stays aligned", sorted(seen))
+    return max(seen)
+
+
+def _run_window_stats(eff: dict, ds_cube: xr.Dataset, g: AoiGrid, all_days, blocks,
+                      *, window: dict, cache: dict) -> None:
+    """Build every selected step's whole-window statistics, streaming the blocks.
+
+    In topological order, because one step's statistic could in principle need an earlier one's.
+    None does today: the sigma climatology reads the RAW baseline through `ctx.read` -- never
+    fill_water's invented cells, which would collapse sigma -- so it depends on no other step's
+    output, which is exactly what makes a prepass legal.
+    """
+    for step in selected_steps(eff):
+        if step.window is None:
+            continue
+        probe = _new_ctx(ds_cube.isel(time=slice(0, 0)), g, eff, all_days[:0],
+                         all_days=all_days, ds_all=ds_cube, window=window, cache=cache)
+        n = int(step.window.passes(probe))
+        if n:
+            log.info("    %s: %d whole-window pass(es) over %d block(s)", step.key, n, len(blocks))
+        for p in range(n):
+            for sl in blocks:
+                step.window.accumulate(
+                    _new_ctx(ds_cube.isel(time=sl), g, eff,
+                             pd.DatetimeIndex(all_days[sl]), all_days=all_days, ds_all=ds_cube,
+                             window=window, cache=cache), p)
+            step.window.reduce(probe, p)
+
+
+def _for_write(ds_blk: xr.Dataset, eff: dict, time_chunk: int) -> xr.Dataset:
+    """A block ready for `to_zarr`: the SOURCE store's encoding scrubbed, dask chunks matched.
+
+    A block is `ds_cube.isel(time=...)`, so every channel carried over from the source still
+    holds the encoding of the store it was OPENED from -- `chunks`, `preferred_chunks`, codecs,
+    all measured against the OLD layout. Zarr would then be told two different chunkings for one
+    array, and on an append (which passes no `encoding=`) the stale one wins. The assembler
+    never had this problem: its blocks are freshly built arrays.
+
+    The rechunk is the other half. A zarr chunk spanning more than one dask chunk makes xarray
+    refuse the write outright; a dask chunk spanning the whole grid makes every `to_zarr` task
+    materialise a full slab, times the thread pool -- which is how the untouched channels, the
+    ones that are supposed to just stream through, would blow the budget anyway.
+    """
+    out = ds_blk.copy()
+    for v in out.data_vars:            # data_vars only: the `time` coord's units/calendar must
+        out[v].encoding = {}           # survive, or the axis is rewritten in a different epoch
+    return out.chunk({"time": time_chunk,
+                      "y": eff["chunks"].get("y", -1), "x": eff["chunks"].get("x", -1)})
+
+
+def _preprocess_blocked(ds_cube: xr.Dataset, g: AoiGrid, eff: dict, zpath: Path, *,
+                        all_days, block_days: int, time_chunk: int, census: dict,
+                        expected: dict, stale: list, src_attrs: dict,
+                        window: dict, cache: dict) -> None:
+    """Rewrite one AoI's cube a block of days at a time, inside one atomic swap.
+
+    The stage reads and writes the SAME path, so the atomicity matters more here than anywhere
+    else in the package: a botched write destroys the assembled cube, not merely this stage's
+    derived channels. `store.atomic` builds the new cube beside the old one and swaps only on a
+    clean return, and the source stays open for the whole loop -- which is why the source's
+    `with` must enclose this call, and the swap happen after it closes.
+    """
+    n = len(all_days)
+    blocks = [slice(i, min(i + block_days, n)) for i in range(0, n, block_days)]
+    _run_window_stats(eff, ds_cube, g, all_days, blocks, window=window, cache=cache)
+
+    block_attrs: dict = {}
+    quiet = datacube._LogOnce()
+    # One filter per EMITTING logger: a Logger's filters are skipped for records propagating up
+    # from a child, so filtering the package logger would catch none of these.
+    loggers = [log, logging.getLogger("coastal_sst_data.processes.cloud_filter"),
+               logging.getLogger("coastal_sst_data.processes.georef")]
+    for lg in loggers:
+        lg.addFilter(quiet)
+    try:
+        with store.atomic(zpath) as tmp:
+            for i, sl in enumerate(blocks):
+                ds_blk = preprocess_block(
+                    ds_cube.isel(time=sl), g, eff, all_days=all_days, ds_all=ds_cube,
+                    stale=stale, window=window, cache=cache)
+                datacube._check_channel_set(
+                    {k: (ds_blk[k].dims, ds_blk[k].dtype) for k in ds_blk.data_vars},
+                    expected, i, pd.DatetimeIndex(all_days[sl]))
+                datacube._merge_block_attrs(block_attrs, dict(ds_blk.attrs), i)
+                ds_blk = _for_write(ds_blk, eff, time_chunk)
+                if i == 0:
+                    # Encoding settled here, against the FINISHED cube's time length -- this
+                    # block's would chunk the new store in blocks.
+                    write_zarr(ds_blk, tmp, build_encoding(
+                        ds_blk, eff["compression"], {**eff["chunks"], "time": time_chunk},
+                        sizes={"time": n}), consolidated=False)
+                else:
+                    datacube.append_zarr(ds_blk, tmp)
+                log.info("    block %d/%d: %s..%s", i + 1, len(blocks),
+                         all_days[sl][0].date(), all_days[sl][-1].date())
+                del ds_blk
+            fields = (set(ds_cube.data_vars) - set(stale)) | set(census)
+            datacube.finalize_cube(tmp, finalize_preprocess_attrs(
+                src_attrs, block_attrs, eff, g, fields, census))
+    finally:
+        for lg in loggers:
+            lg.removeFilter(quiet)
 
 
 def preprocess_steps_stale(ds_cube: xr.Dataset, eff: dict) -> bool:
@@ -703,6 +1031,12 @@ def _build_eff(project: Project) -> dict:
         "chunks": dict(project.datacube.chunks),
         "compression": project.datacube.compression,
         "overwrite": bool(pp.overwrite),
+        # Blocking: this stage's own knobs, falling back to the assembler's. `None` (unset) is
+        # distinct from an explicit "auto", so "inherit" and "size it yourself" are separable.
+        "block_days": (pp.block_days if pp.block_days is not None
+                       else project.datacube.block_days),
+        "memory_budget_gb": (pp.memory_budget_gb if pp.memory_budget_gb is not None
+                             else project.datacube.memory_budget_gb),
     }
 
 
@@ -747,14 +1081,56 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         # happen after the source is CLOSED, which is why this drives `atomic` itself instead
         # of handing the finished dataset to `write_zarr_safe`. A run killed part-way leaves
         # the assembled cube exactly as it was.
-        with store.atomic(zpath) as tmp:
-            with xr.open_zarr(zpath) as ds_cube:
-                n_before = len(ds_cube.data_vars)
-                ds_out = preprocess_aoi(ds_cube, g, eff)
-                shape = (ds_out.sizes["time"], ds_out.sizes["y"], ds_out.sizes["x"])
-                n_after = len(ds_out.data_vars)
-                write_zarr(ds_out, tmp,
-                           build_encoding(ds_out, eff["compression"], eff["chunks"]))
+        with xr.open_zarr(zpath) as ds_cube:
+            src_attrs = dict(ds_cube.attrs)          # BEFORE anything; not re-readable later
+            all_days = pd.DatetimeIndex(ds_cube["time"].values)
+            H, W = int(ds_cube.sizes["y"]), int(ds_cube.sizes["x"])
+            n_before = len(ds_cube.data_vars)
+            window: dict = {}
+            cache: dict = {}
+
+            # What this rewrite will hold, and what it will cost per day -- both asked of the
+            # real steps over a zero-length slice, so neither can drift from what they emit.
+            census, reads = preprocess_census(ds_cube, g, eff, all_days,
+                                              window=window, cache=cache)
+            stale, expected = resolve_channel_plan(ds_cube, census)
+            per_day = (datacube.bytes_per_day(census, H, W)
+                       + datacube.bytes_per_day(reads, H, W))
+            # The block must not outrun the store it READS: inherit the on-disk time chunk
+            # rather than the configured one, which the assembler may have deliberately reduced.
+            tc_src = source_time_chunk(ds_cube) or eff["chunks"].get("time", len(all_days))
+            block_days, time_chunk = datacube.resolve_block_days(
+                {**eff, "chunks": {**eff["chunks"], "time": tc_src}}, per_day, len(all_days),
+                transient=_PP_TRANSIENT_FACTOR)
+            budget, src = datacube.budget_bytes(eff)
+            log.info("  %d derived + %d read channel(s): %.0f MB/day; budget %.1f GiB (%s) "
+                     "-> %d block(s) of %d day(s), time chunk %d",
+                     len(census), len(reads), per_day / 1e6, budget / 1024**3, src,
+                     -(-len(all_days) // block_days), block_days, time_chunk)
+            if time_chunk != tc_src:
+                log.warning("  %s: the memory budget fits only %d day(s) per block, fewer than "
+                            "the store's time chunk of %d; the rewritten cube is chunked at %d "
+                            "instead. Raise preprocess.memory_budget_gb to keep the layout.",
+                            name, block_days, tc_src, time_chunk)
+
+            if block_days >= len(all_days):
+                # The cube fits: rewrite it in one pass, exactly as before.
+                with store.atomic(zpath) as tmp:
+                    ds_out = preprocess_block(ds_cube, g, eff, all_days=all_days,
+                                              stale=stale, window=window, cache=cache)
+                    ds_out.attrs.update(finalize_preprocess_attrs(
+                        src_attrs, {}, eff, g, list(ds_out.data_vars), census))
+                    shape = (ds_out.sizes["time"], ds_out.sizes["y"], ds_out.sizes["x"])
+                    n_after = len(ds_out.data_vars)
+                    write_zarr(ds_out, tmp,
+                               build_encoding(ds_out, eff["compression"], eff["chunks"]))
+            else:
+                _preprocess_blocked(ds_cube, g, eff, zpath, all_days=all_days,
+                                    block_days=block_days, time_chunk=time_chunk,
+                                    census=census, expected=expected, stale=stale,
+                                    src_attrs=src_attrs, window=window, cache=cache)
+                n_after = n_before - len(stale) + len(census)
+                shape = (len(all_days), H, W)
         log.info("  rewrote %s  vars=%d (+%d derived) shape=(t=%d,y=%d,x=%d)",
                  zpath.name, n_after, n_after - n_before, *shape)
         rep.wrote()

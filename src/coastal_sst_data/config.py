@@ -407,6 +407,23 @@ class DataCubeSpec(BaseModel):
     compression: CompressionSpec = Field(default_factory=CompressionSpec)
     output_subdir: str = "datacube"            # cube dir under output_dir
     overwrite: bool = False                    # rebuild existing <aoi>.zarr cubes
+    # How many days the assembler builds and writes at a time. The whole cube used to be held
+    # in memory before anything was written, so peak memory was
+    #     channels x days x height x width x 4 bytes
+    # -- a number that grows with the AoI AND with the date range, and that killed a large
+    # region outright. Blocking makes it `channels x block_days x height x width x 4`, i.e.
+    # independent of how long the window is.
+    #
+    # "auto" sizes the block from a memory budget and the AoI's own grid, per AoI (a cube that
+    # fits is still assembled in ONE pass, exactly as before). An integer forces it.
+    block_days: int | Literal["auto"] = "auto"
+    # The budget "auto" spends, in GB. None detects it: $COASTAL_SST_DATA_MEM_GB, then
+    # $SLURM_MEM_PER_NODE, then the cgroup limit, then physical RAM -- and takes HALF of
+    # whatever it detects. Set this when the assembler shares a machine, or when the detected
+    # figure is not the allowance the job actually has (physical RAM on a scheduled node is
+    # the case that bites: the kernel kills the process at the cgroup limit, not at the
+    # hardware's). An explicit value is used as given, not halved.
+    memory_budget_gb: float | None = Field(None, gt=0)
 
 
 class PreprocessSpec(BaseModel):
@@ -427,6 +444,13 @@ class PreprocessSpec(BaseModel):
     model_config = {"extra": "forbid"}
     enabled: bool = False                      # opt-in; nothing runs unless set true
     steps: dict[str, PreprocessStepOptions] = Field(default_factory=dict)
+    # Memory blocking, exactly as `datacube.block_days` / `memory_budget_gb` -- this stage reads
+    # a whole cube and writes a larger one, so it has the same problem. Both default to None
+    # meaning "use the datacube value": the stages usually want the same answer, and one knob is
+    # enough until they do not. Set these when preprocessing needs a smaller block than assembly
+    # did, which it can: it holds the channels it READS as well as the ones it derives.
+    block_days: int | Literal["auto"] | None = None
+    memory_budget_gb: float | None = Field(None, gt=0)
     # Re-derive channels a cube already carries. Off by default because the stage detects a
     # changed step selection on its own; this is for forcing a rebuild after a code change.
     overwrite: bool = False

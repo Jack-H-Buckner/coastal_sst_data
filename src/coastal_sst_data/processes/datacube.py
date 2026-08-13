@@ -15,6 +15,14 @@ the grid every product was regridded onto (no grid is re-derived here).
 
 Design (locked with the maintainer):
   * Zarr per AoI, chunked in (time, y, x), lossless float32 + Blosc(zstd) codec.
+  * BLOCKED ASSEMBLY. A cube costs `channels x days x height x width x 4` bytes to build, which
+    grows with the AoI AND with the window -- a multi-year run on a large grid wants hundreds
+    of GB and is simply killed. So the time axis is assembled and written a BLOCK of days at a
+    time (`datacube.block_days`, sized per AoI from a memory budget), which bounds peak memory
+    by the block rather than the window. An AoI that fits is still built in one pass, by the
+    same code as before. Two things make this safe, and both are enforced rather than trusted:
+    a contributor must answer whole-cube questions from `ctx.all_days` (not its block), and
+    every block must emit the SAME channel set -- see AssemblyContext and `_check_channel_set`.
   * SST kept SEPARATE per sensor (mur/eco/lst/modis) so the model's learned
     per-source offsets survive; each high-res sensor carries its own valid mask
     and overpass hour.
@@ -70,10 +78,12 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -103,7 +113,74 @@ def _empty3d(days, H, W):
     return np.full((len(days), H, W), np.nan, dtype="float32")
 
 
-def load_daily_sensor(d: Path, aoi_id, days, H, W, var, *, prefix=""):
+def _cached(cache, key, build):
+    """`build()`, memoised in `cache` under `key`. Uncached (a plain call) when `cache` is None.
+
+    Every loader here discovers its inputs by globbing its own directory. That is paid once per
+    AoI today, but the assembler walks the time axis in BLOCKS for a cube too large to hold at
+    once (see `run`), and a per-block rescan of a directory holding thousands of scenes -- times
+    the number of products, times the number of blocks -- would trade the memory problem for a
+    wall-clock one. One dict per AoI, threaded through the loaders, keeps it at once.
+
+    `cache=None` is the default everywhere, so a contributor written against the documented
+    loader signatures (which take no cache) keeps working, just uncached.
+    """
+    if cache is None:
+        return build()
+    if key not in cache:
+        cache[key] = build()
+    return cache[key]
+
+
+def scene_index(d: Path, aoi_id, *, cache=None) -> dict[str, list]:
+    """{day_stamp: [(datetime, path), ...]} for a per-overpass sensor's aligned directory.
+
+    Built from FILENAMES alone -- nothing is opened -- so `load_clearest_overpass` can work
+    through one day's granules at a time instead of globbing the whole directory and holding
+    every day's chosen scene until the end.
+
+    Each day's granules are sorted by (time, name). That also settles a tie in the
+    clearest-scene contest deterministically (the earliest scene wins) where it used to fall
+    to whatever order the filesystem happened to hand back.
+    """
+    def build() -> dict[str, list]:
+        out: dict[str, list] = {}
+        if not d.exists():
+            return out
+        for f in d.glob(f"{aoi_id}_*T*.nc"):
+            dt = naming.parse_time(f.name)
+            if dt is None:
+                continue
+            out.setdefault(naming.day_stamp(dt), []).append((dt, f))
+        for granules in out.values():
+            granules.sort(key=lambda g: (g[0], g[1].name))
+        return out
+
+    return _cached(cache, ("scenes", str(d)), build)
+
+
+def day_index(d: Path, aoi_id, prefix="", *, cache=None) -> dict[str, Path]:
+    """{day_stamp: path} for a one-file-per-day product's aligned directory.
+
+    Names only -- nothing is opened. `prefix` selects a variant written into the same
+    directory (see `load_daily_sensor`), and is part of the cache key: met's daily mean and
+    its reference snapshot live side by side and must not be conflated.
+    """
+    def build() -> dict[str, Path]:
+        out: dict[str, Path] = {}
+        if not d.exists():
+            return out
+        pat = naming.day_pattern(aoi_id, prefix)
+        for f in d.glob(f"{aoi_id}_{prefix}*.nc"):
+            m = pat.match(f.name)
+            if m:
+                out[m.group(1)] = f
+        return out
+
+    return _cached(cache, ("dayfiles", str(d), prefix), build)
+
+
+def load_daily_sensor(d: Path, aoi_id, days, H, W, var, *, prefix="", cache=None):
     """MUR/met style: one file per day (<aoi>_<prefix><YYYYMMDD>.nc) -> (T,H,W).
 
     `prefix` selects a variant written into the same directory -- met writes both a
@@ -112,19 +189,18 @@ def load_daily_sensor(d: Path, aoi_id, days, H, W, var, *, prefix=""):
     two cannot be confused for each other.
     """
     out = _empty3d(days, H, W)
-    if not d.exists():
+    files = day_index(d, aoi_id, prefix, cache=cache)
+    if not files:
         return out
-    pat = naming.day_pattern(aoi_id, prefix)
-    didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
-    for f in d.glob(f"{aoi_id}_{prefix}*.nc"):
-        m = pat.match(f.name)
-        if not m or m.group(1) not in didx:
+    for i, dd in enumerate(days):
+        f = files.get(naming.day_stamp(dd))
+        if f is None:
             continue
         ds = xr.open_dataset(f)
         if var in ds:
             arr = ds[var].isel(time=0).values if "time" in ds[var].dims else ds[var].values
             if arr.shape == (H, W):
-                out[didx[m.group(1)]] = arr
+                out[i] = arr
         ds.close()
     return out
 
@@ -154,31 +230,74 @@ def load_at_times(d: Path, aoi_id, times, H, W, var):
     return out
 
 
-def met_prefix(d: Path, aoi_id, days, want: str) -> tuple[str, str]:
+def met_prefix(d: Path, aoi_id, days, want: str, *, cache=None) -> tuple[str, str]:
     """Which met variant to feed the cube's met channels: ('ref_'|'', label).
 
     Honours `datacube.met_time`, but falls back to the other variant if the one asked
     for was never written (e.g. an older MET tree with no reference snapshots) rather
     than silently emitting an all-NaN forcing channel.
+
+    WHOLE-WINDOW DECISION. `days` must be the cube's full time axis (`ctx.all_days`), never
+    one block of it. The answer is a property of the TREE, not of a slice: asked about a
+    block that happens to hold only daily means, this would answer "daily_mean" for that
+    block and "reference" for another, silently splicing two different times of day into one
+    forcing channel -- with a `met_time` attr describing whichever block wrote last.
     """
     def has(prefix):
         return any((d / f"{naming.day_stem(aoi_id, dd, prefix)}.nc").exists()
                    for dd in days)
 
-    want_prefix = "ref_" if want == "reference" else ""
-    if has(want_prefix):
+    def build():
+        want_prefix = "ref_" if want == "reference" else ""
+        if has(want_prefix):
+            return want_prefix, ("reference" if want_prefix else "daily_mean")
+        other = "" if want_prefix else "ref_"
+        if has(other):
+            label = "reference" if other else "daily_mean"
+            log.warning("  no %s met files; falling back to the %s", want, label)
+            return other, label
         return want_prefix, ("reference" if want_prefix else "daily_mean")
-    other = "" if want_prefix else "ref_"
-    if has(other):
-        label = "reference" if other else "daily_mean"
-        log.warning("  no %s met files; falling back to the %s", want, label)
-        return other, label
-    return want_prefix, ("reference" if want_prefix else "daily_mean")
+
+    return _cached(cache, ("met_prefix", str(d), want), build)
+
+
+def footprint_available(d: Path, aoi_id, days, H, W, *, cache=None) -> bool:
+    """Did ANY granule in the WINDOW carry a usable `footprint_id`?
+
+    Exactly the rule `load_clearest_overpass` applies while it reads, hoisted to a decision
+    about the whole window -- because under blocked assembly it can no longer be made from
+    the granules one block happens to hold. `<sensor>_footprint_id` is the only channel whose
+    existence depends on file CONTENTS rather than on which files exist, so it is the only
+    one that can differ between blocks; and a cube whose variables disagree on their time
+    length does not fail to write, it fails to READ:
+
+        ValueError: conflicting sizes for dimension 'time'
+
+    Early-exits on the first granule that carries the layer, so the common case is one open.
+    """
+    def build() -> bool:
+        want = {naming.day_stamp(dd) for dd in days}
+        for day, granules in scene_index(d, aoi_id, cache=cache).items():
+            if day not in want:
+                continue
+            for _dt, f in granules:
+                with xr.open_dataset(f) as ds:
+                    if "time" in ds.dims:
+                        ds = ds.isel(time=0)
+                    # Same guards, same order as the loader: a granule whose sst is off-grid
+                    # is skipped there before its footprint is ever looked at.
+                    if "sst" not in ds or ds["sst"].shape != (H, W):
+                        continue
+                    if "footprint_id" in ds and ds["footprint_id"].shape == (H, W):
+                        return True
+        return False
+
+    return _cached(cache, ("footprint", str(d)), build)
 
 
 def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                            use_cloud=True, qc_levels=None, trust_valid=False,
-                           read_footprint=False):
+                           read_footprint=False, footprint_present=None, cache=None):
     """Per-overpass sensors (ECOSTRESS/Landsat/MODIS): keep the clearest scene/day.
 
     Validity per sensor:
@@ -189,10 +308,15 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
           - use_cloud gates on the binary cloud layer (Landsat: reliable).
           - qc_levels (e.g. {0,1}) gates on QC mandatory-QA bits 0-1 instead of
             cloud (ECOSTRESS: cloud over-masks cold water, so gate on QC).
-    Returns (sst, cloud, valid, hour, water_union, times, footprint). `water_union` is the
-    OR of the water mask over scenes -- a high-res static water hint for narrow estuaries.
+    Returns (sst, cloud, valid, hour, times, footprint).
     `times` is the CHOSEN scene's datetime per day (None where the sensor had no scene), so
     the tide and the met snapshot can be matched to that exact scene rather than to the day.
+
+    ONE DAY AT A TIME. The scenes are walked per day (via `scene_index`) and the day's winner
+    is written into the output before the next day is read, so the only scene arrays alive at
+    once are the contender and the incumbent. Accumulating every day's winner first and
+    copying afterwards -- which is what this did -- held a WHOLE WINDOW of scenes alongside
+    the outputs that were already allocated, roughly doubling the peak for no benefit.
 
     `footprint` is the native sensor-pixel index per grid cell, read only when
     `read_footprint` and returned as None when NO granule on disk carried the layer -- it is
@@ -200,109 +324,141 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
     Collapsing "we saw one" into the value is what lets the caller emit the channel or not
     with a plain `is not None`, rather than shipping an all -1 array that reads as data.
     It rides the SAME clearest-scene choice as the SST: read outside that selection it would
-    pair one granule's pixel indices with another granule's temperatures.
+    pair one granule's pixel indices with another granule's temperatures. The array is
+    allocated only once a scene actually yields one: it is int32 (T,H,W), the same size as an
+    SST channel, and eagerly filling one with -1 for a sensor that never carried the layer
+    cost a large AoI many GB to build something the caller then threw away.
     """
     sst, cloud = _empty3d(days, H, W), _empty3d(days, H, W)
     valid = np.zeros((len(days), H, W), dtype="uint8")
     hour = np.full(len(days), np.nan, dtype="float32")
     times: list = [None] * len(days)
-    water_union = np.zeros((H, W), dtype=bool)
-    # -1 (no native pixel), never NaN: this is an INDEX, and _empty3d is float.
-    footprint = np.full((len(days), H, W), -1, dtype="int32")
-    saw_footprint = False
-    if not d.exists():
-        return sst, cloud, valid, hour, water_union, times, None
+    footprint = None
+    # `footprint_present` is `footprint_available`'s whole-window answer, so that every time
+    # block emits the same channel set (see that function). None keeps the self-contained
+    # behaviour -- decide from the granules actually read -- for a caller holding one window.
+    saw_footprint = bool(footprint_present)
+    read_fp = read_footprint and footprint_present is not False
     qset = list(qc_levels) if qc_levels is not None else None
     didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
-    best = {}  # day -> (valid_count, sst, cloud, valid, footprint|None, datetime)
-    for f in d.glob(f"{aoi_id}_*T*.nc"):
-        dt = naming.parse_time(f.name)
-        if dt is None:
-            continue
-        day = naming.day_stamp(dt)
-        if day not in didx:
-            continue
-        ds = xr.open_dataset(f)
-        if "time" in ds.dims:
-            ds = ds.isel(time=0)
-        if "sst" not in ds or ds["sst"].shape != (H, W):
-            ds.close(); continue
-        s = ds["sst"].values.astype("float32")
-        c = (ds["cloud"].values.astype("float32")
-             if "cloud" in ds and ds["cloud"].shape == (H, W) else np.zeros((H, W), "float32"))
-        fp = None
-        if read_footprint and "footprint_id" in ds and ds["footprint_id"].shape == (H, W):
-            fp = ds["footprint_id"].values.astype("int32")
-            saw_footprint = True
-        if trust_valid and "valid" in ds and ds["valid"].shape == (H, W):
-            v = (ds["valid"].values > 0) & np.isfinite(s)
-            wp = np.zeros((H, W), dtype=bool)              # no water layer to contribute
-        else:
-            if "water" in ds and ds["water"].shape == (H, W):
-                w = ds["water"].values.astype("float32")
-                wp = np.isfinite(w) & ((w < 0.5) if water_is_land else (w > 0.5))
-            else:
-                wp = np.zeros((H, W), dtype=bool)          # no water layer -> claim NOTHING
-            q = (ds["quality"].values if "quality" in ds and ds["quality"].shape == (H, W) else None)
-            v = np.isfinite(s) & wp
-            if use_cloud:
-                v &= ~(np.nan_to_num(c, nan=1.0) > 0)
-            if qset is not None and q is not None:
-                mqa = np.full((H, W), -1, dtype="int64")
-                fin = np.isfinite(q)
-                mqa[fin] = q[fin].astype("int64") & 0b11   # mandatory-QA bits 0-1
-                v &= np.isin(mqa, qset)
-        ds.close()
-
-        water_union |= wp
-        vc = int(v.sum())
-        if day not in best or vc > best[day][0]:
-            best[day] = (vc, s, c, v, fp, dt)
     missing_fp = 0
-    for day, (_, s, c, v, fp, dt) in best.items():
-        i = didx[day]
+    scene_days = 0
+    for day, granules in scene_index(d, aoi_id, cache=cache).items():
+        i = didx.get(day)
+        if i is None:
+            continue
+        best = None  # (valid_count, sst, cloud, valid, footprint|None, datetime)
+        for dt, f in granules:
+            ds = xr.open_dataset(f)
+            if "time" in ds.dims:
+                ds = ds.isel(time=0)
+            if "sst" not in ds or ds["sst"].shape != (H, W):
+                ds.close(); continue
+            s = ds["sst"].values.astype("float32")
+            c = (ds["cloud"].values.astype("float32")
+                 if "cloud" in ds and ds["cloud"].shape == (H, W) else np.zeros((H, W), "float32"))
+            fp = None
+            if read_fp and "footprint_id" in ds and ds["footprint_id"].shape == (H, W):
+                fp = ds["footprint_id"].values.astype("int32")
+                saw_footprint = True
+            if trust_valid and "valid" in ds and ds["valid"].shape == (H, W):
+                v = (ds["valid"].values > 0) & np.isfinite(s)
+            else:
+                if "water" in ds and ds["water"].shape == (H, W):
+                    w = ds["water"].values.astype("float32")
+                    wp = np.isfinite(w) & ((w < 0.5) if water_is_land else (w > 0.5))
+                else:
+                    wp = np.zeros((H, W), dtype=bool)      # no water layer -> claim NOTHING
+                q = (ds["quality"].values if "quality" in ds and ds["quality"].shape == (H, W)
+                     else None)
+                v = np.isfinite(s) & wp
+                if use_cloud:
+                    v &= ~(np.nan_to_num(c, nan=1.0) > 0)
+                if qset is not None and q is not None:
+                    mqa = np.full((H, W), -1, dtype="int64")
+                    fin = np.isfinite(q)
+                    mqa[fin] = q[fin].astype("int64") & 0b11   # mandatory-QA bits 0-1
+                    v &= np.isin(mqa, qset)
+            ds.close()
+
+            vc = int(v.sum())
+            if best is None or vc > best[0]:
+                best = (vc, s, c, v, fp, dt)
+        if best is None:
+            continue                                       # every granule failed the shape check
+        _, s, c, v, fp, dt = best
         sst[i] = s
         cloud[i] = np.nan_to_num(c, nan=0.0)
         valid[i] = v.astype("uint8")
         hour[i] = dt.hour + dt.minute / 60.0
         times[i] = dt
-        if fp is not None:
-            footprint[i] = fp
-        else:
+        scene_days += 1
+        if fp is None:
             missing_fp += 1
+        else:
+            if footprint is None:
+                # -1 (no native pixel), never NaN: this is an INDEX, and _empty3d is float.
+                footprint = np.full((len(days), H, W), -1, dtype="int32")
+            footprint[i] = fp
+    if saw_footprint and footprint is None:
+        # Granules carried the layer but no CHOSEN scene did -- an all -1 channel, which the
+        # warning below explains. Kept distinct from "no granule ever had one" (-> None, no
+        # channel at all), because those say different things about the tree.
+        footprint = np.full((len(days), H, W), -1, dtype="int32")
     if saw_footprint and missing_fp:
         # A partly backfilled directory: some granules predate the layer, or were acquired
         # with `footprint_id: false`. Those days stay -1, which is indistinguishable from
         # "off-swath" unless we say so here. Re-acquire with --overwrite to fill them.
         log.warning("  %s: %d of %d scene-days have no footprint_id layer; those days are "
-                    "all -1 in the footprint channel", d.name, missing_fp, len(best))
-    return (sst, cloud, valid, hour, water_union, times,
-            footprint if saw_footprint else None)
+                    "all -1 in the footprint channel", d.name, missing_fp, scene_days)
+    return sst, cloud, valid, hour, times, footprint
 
 
-def load_tide_daily(d: Path, aoi_id, days):
+def tide_daily_lut(d: Path, aoi_id, *, cache=None) -> tuple[dict, dict]:
+    """({day: daily mean}, {day: daily range}) from a source's whole tide series.
+
+    A tide source writes ONE file spanning the entire window, so this resamples the whole
+    multi-year series however few days are being asked about -- which is why the result is
+    cached per directory rather than recomputed per block.
+    """
+    def build() -> tuple[dict, dict]:
+        f = d / f"{aoi_id}_tides.nc"
+        if not f.exists():
+            return {}, {}
+        with xr.open_dataset(f) as ds:
+            t = ds["tide"]
+            dm = t.resample(time="1D").mean()
+            dr = t.resample(time="1D").max() - t.resample(time="1D").min()
+            return (dict(zip(dm["time"].dt.strftime(naming.DAY_FMT).values, dm.values)),
+                    dict(zip(dr["time"].dt.strftime(naming.DAY_FMT).values, dr.values)))
+
+    return _cached(cache, ("tide_daily", str(d)), build)
+
+
+def load_tide_daily(d: Path, aoi_id, days, *, cache=None):
     """Tide 1D series -> (daily_mean, daily_range) on the daily axis."""
     mean = np.full(len(days), np.nan, "float32")
     rng = np.full(len(days), np.nan, "float32")
-    f = d / f"{aoi_id}_tides.nc"
-    if not f.exists():
-        return mean, rng
-    ds = xr.open_dataset(f)
-    t = ds["tide"]
-    dm = t.resample(time="1D").mean()
-    dr = t.resample(time="1D").max() - t.resample(time="1D").min()
-    lut_m = dict(zip(dm["time"].dt.strftime(naming.DAY_FMT).values, dm.values))
-    lut_r = dict(zip(dr["time"].dt.strftime(naming.DAY_FMT).values, dr.values))
+    lut_m, lut_r = tide_daily_lut(d, aoi_id, cache=cache)
     for i, dd in enumerate(days):
         k = naming.day_stamp(dd)
         if k in lut_m:
             mean[i] = lut_m[k]
             rng[i] = lut_r[k]
-    ds.close()
     return mean, rng
 
 
-def load_bathy(d: Path, aoi_id, H, W):
+def tide_series(d: Path, aoi_id, *, cache=None):
+    """The raw sub-daily tide series for a source, cached per directory.
+
+    Wraps `water_level.load_tide_series` here rather than caching inside that module, which
+    stays a pure function of its arguments.
+    """
+    return _cached(cache, ("tide_series", str(d)),
+                   lambda: water_level.load_tide_series(d, aoi_id))
+
+
+def load_bathy(d: Path, aoi_id, H, W, *, cache=None):
     """Static bathymetry: (elevation, depth, depth_p25, depth_p75), NaN where absent.
 
     An ABSENT DEM must produce NaN, never zeros. The obvious derivation --
@@ -312,35 +468,40 @@ def load_bathy(d: Path, aoi_id, H, W):
     bathymetry. That is fabricated data wearing the costume of real data, and downstream
     reconstructs water level from `elevation` + `depth`. Depth is therefore derived only
     where the elevation is actually KNOWN.
+
+    Static, so it is cached per directory: it does not vary with the days being assembled.
     """
-    elev = np.full((H, W), np.nan, "float32")
-    depth = dp25 = dp75 = None
-    f = d / f"{aoi_id}.nc"
-    if not f.exists():
-        log.warning("  %s: no bathymetry file (%s); elevation/depth/depth_p25/depth_p75 "
-                    "will be NaN", aoi_id, f.name)
-    else:
-        ds = xr.open_dataset(f)
-
-        def g(name):
-            return (ds[name].values.astype("float32")
-                    if name in ds and ds[name].shape == (H, W) else None)
-        if g("elevation") is not None:
-            elev = g("elevation")
+    def build():
+        elev = np.full((H, W), np.nan, "float32")
+        depth = dp25 = dp75 = None
+        f = d / f"{aoi_id}.nc"
+        if not f.exists():
+            log.warning("  %s: no bathymetry file (%s); elevation/depth/depth_p25/depth_p75 "
+                        "will be NaN", aoi_id, f.name)
         else:
-            log.warning("  %s: bathymetry file has no usable `elevation` on this grid; "
-                        "depth fields will be NaN", aoi_id)
-        depth, dp25, dp75 = g("depth"), g("depth_p25"), g("depth_p75")
-        ds.close()
+            ds = xr.open_dataset(f)
 
-    known = np.isfinite(elev)
-    if depth is None:      # derive mean depth from elevation -- ONLY where it is known
-        depth = np.where(known, np.where(elev < 0, -elev, 0.0), np.nan).astype("float32")
-    if dp25 is None:
-        dp25 = depth.copy()
-    if dp75 is None:
-        dp75 = depth.copy()
-    return elev, depth, dp25, dp75
+            def g(name):
+                return (ds[name].values.astype("float32")
+                        if name in ds and ds[name].shape == (H, W) else None)
+            if g("elevation") is not None:
+                elev = g("elevation")
+            else:
+                log.warning("  %s: bathymetry file has no usable `elevation` on this grid; "
+                            "depth fields will be NaN", aoi_id)
+            depth, dp25, dp75 = g("depth"), g("depth_p25"), g("depth_p75")
+            ds.close()
+
+        known = np.isfinite(elev)
+        if depth is None:  # derive mean depth from elevation -- ONLY where it is known
+            depth = np.where(known, np.where(elev < 0, -elev, 0.0), np.nan).astype("float32")
+        if dp25 is None:
+            dp25 = depth.copy()
+        if dp75 is None:
+            dp75 = depth.copy()
+        return elev, depth, dp25, dp75
+
+    return _cached(cache, ("bathy", str(d)), build)
 
 
 def load_insitu(base: Path, aoi_id) -> list[tuple[str, xr.Dataset]]:
@@ -384,8 +545,35 @@ def load_insitu(base: Path, aoi_id) -> list[tuple[str, xr.Dataset]]:
     return out
 
 
+def insitu_sources(base: Path, aoi_id, *, cache=None) -> list[tuple[str, xr.Dataset]]:
+    """`load_insitu`, cached per tree.
+
+    An in-situ source writes ONE file spanning the whole window, so re-opening it per time
+    block would re-parse a multi-year station table for every block. When cached, the
+    Datasets are owned by the CACHE -- `close_cache` closes them once the AoI is done, and
+    the caller must not close them itself.
+    """
+    return _cached(cache, ("insitu", str(base)), lambda: load_insitu(base, aoi_id))
+
+
+def close_cache(cache) -> None:
+    """Release anything an assembly cache holds open, and empty it.
+
+    Only the in-situ tables are open handles; everything else the cache keeps is plain data.
+    Called once per AoI, after the last time block -- not per block, which is the whole point
+    of caching them.
+    """
+    if not cache:
+        return
+    for key, val in cache.items():
+        if isinstance(key, tuple) and key and key[0] == "insitu":
+            for _src, ds in val:
+                ds.close()
+    cache.clear()
+
+
 def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, targets: dict,
-                 max_dt_min):
+                 max_dt_min, *, cache=None):
     """In-situ channels: the station's value at each target time, in the station's pixel.
 
     `targets` maps a channel prefix to one target datetime per day -- 'insitu' (the daily
@@ -415,17 +603,24 @@ def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, target
     counts = np.zeros((len(days), H, W), dtype="float32")   # stations sharing a cell
     station_map = np.zeros((H, W), dtype="uint16")          # 0 = no station
     table = []
-    # Sums + contributor counts per cell, so N co-located stations give their true MEAN. A
-    # running `(prev + v) / 2` is not one for N > 2 -- it yields a/4 + b/4 + c/2.
-    sums = {k: np.zeros((len(days), H, W), dtype="float64") for k in targets}
-    dt_sums = {k: np.zeros((len(days), H, W), dtype="float64") for k in dts}
-    hits = {k: np.zeros((len(days), H, W), dtype="int32") for k in targets}
+    # Sums + contributor counts, so N co-located stations give their true MEAN. A running
+    # `(prev + v) / 2` is not one for N > 2 -- it yields a/4 + b/4 + c/2.
+    #
+    # Accumulated PER STATION CELL -- {(row, col): {sums/dt_sums/hits: {key: (T,) array}}} --
+    # not as dense (T,H,W) grids. The values exist in a handful of pixels, so the dense form
+    # spent three arrays per target (two of them float64) on a grid that is NaN almost
+    # everywhere: 104 bytes per cell per day, of which 72 were these accumulators. On a large
+    # AoI that is hundreds of GB to hold a few buoys. Only the EMITTED channels are dense.
+    cells: dict[tuple[int, int], dict] = {}
     seen_ids: dict[str, str] = {}                           # station id -> its source
 
     for src, ids in sources:
         lons = np.asarray(ids["lon"].values, dtype="float64")
         lats = np.asarray(ids["lat"].values, dtype="float64")
-        placed = insitu.station_pixels(lons, lats, g)         # water=None: no snapping
+        # water=None: no snapping. Cached per source -- the placement is a property of the
+        # stations and the grid, and building it spins up a pyproj Transformer each time.
+        placed = _cached(cache, ("insitu_pixels", src),
+                         lambda: insitu.station_pixels(lons, lats, g))
 
         times = pd.DatetimeIndex(ids["time"].values)
         sst = ids["sst"].values                     # (station, time)
@@ -453,25 +648,38 @@ def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, target
                           "row": r, "col": c})
             station_map[r, c] = len(table)
 
+            acc = cells.setdefault((r, c), {
+                "sums": {k: np.zeros(len(days), dtype="float64") for k in targets},
+                "dt_sums": {k: np.zeros(len(days), dtype="float64") for k in dts},
+                "hits": {k: np.zeros(len(days), dtype="int32") for k in targets},
+            })
             for i in range(len(days)):
                 for key, tgt in targets.items():
                     v, dt = insitu.value_at(times, sst[s], tgt[i], max_dt_min)
                     if not np.isfinite(v):
                         continue
-                    sums[key][i, r, c] += v
-                    hits[key][i, r, c] += 1
-                    if key in dt_sums:
-                        dt_sums[key][i, r, c] += dt
+                    acc["sums"][key][i] += v
+                    acc["hits"][key][i] += 1
+                    if key in acc["dt_sums"]:
+                        acc["dt_sums"][key][i] += dt
                 counts[i, r, c] += 1
 
-    for key in targets:
-        got = hits[key] > 0
-        np.divide(sums[key], hits[key], out=chans[key], where=got,
-                  casting="unsafe")
-        chans[key][~got] = np.nan
-        if key in dts:
-            np.divide(dt_sums[key], hits[key], out=dts[key], where=got, casting="unsafe")
-            dts[key][~got] = np.nan
+    # Densify, one station cell at a time. The dtypes going into `np.divide` are the ones the
+    # dense form used (float64 sums / int32 hits -> float32 out, casting="unsafe"): the ufunc
+    # picks its loop from them, so widening `hits` here could move a value in the last bit.
+    # Everything not written stays NaN from `_empty3d`, which is what a cell with no station
+    # -- or a day with no observation in tolerance -- means.
+    for (r, c), acc in cells.items():
+        for key in targets:
+            hit = acc["hits"][key]
+            got = hit > 0
+            col = np.full(len(days), np.nan, dtype="float32")
+            np.divide(acc["sums"][key], hit, out=col, where=got, casting="unsafe")
+            chans[key][:, r, c] = col
+            if key in dts:
+                dcol = np.full(len(days), np.nan, dtype="float32")
+                np.divide(acc["dt_sums"][key], hit, out=dcol, where=got, casting="unsafe")
+                dts[key][:, r, c] = dcol
 
     out = {}
     for key in targets:
@@ -483,39 +691,48 @@ def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, target
     return out, table, station_map
 
 
-def cmems_channels(d: Path, aoi_id) -> list[str]:
+def cmems_channels(d: Path, aoi_id, *, cache=None) -> list[str]:
     """The CMEMS variables actually on disk (thetao_0m, thetao_10m, zos, ...).
 
     Discovered from the files rather than re-derived from config, so the cube carries
     exactly the variables x depths that were acquired -- no second list to keep in sync.
     """
-    if not d.exists():
+    def build() -> list[str]:
+        if not d.exists():
+            return []
+        for f in sorted(d.glob(f"{aoi_id}_*.nc")):
+            with xr.open_dataset(f) as ds:
+                return [v for v in ds.data_vars if v != "valid"]
         return []
-    for f in sorted(d.glob(f"{aoi_id}_*.nc")):
-        with xr.open_dataset(f) as ds:
-            return [v for v in ds.data_vars if v != "valid"]
-    return []
+
+    return _cached(cache, ("cmems_vars", str(d)), build)
 
 
-def load_bathy_attrs(d: Path, aoi_id) -> dict:
+def load_bathy_attrs(d: Path, aoi_id, *, cache=None) -> dict:
     """The bathymetry file's global attrs (its `source` is the DEM fingerprint)."""
-    f = d / f"{aoi_id}.nc"
-    if not f.exists():
-        return {}
-    with xr.open_dataset(f) as ds:
-        return dict(ds.attrs)
+    def build() -> dict:
+        f = d / f"{aoi_id}.nc"
+        if not f.exists():
+            return {}
+        with xr.open_dataset(f) as ds:
+            return dict(ds.attrs)
+
+    return _cached(cache, ("bathy_attrs", str(d)), build)
 
 
-def load_landcover(d: Path, aoi_id, H, W):
+def load_landcover(d: Path, aoi_id, H, W, *, cache=None):
     """Static land-cover water mask -> float (1=water, 0=land, NaN=unknown/absent)."""
-    water = np.full((H, W), np.nan, "float32")
-    f = d / f"{aoi_id}.nc"
-    if f.exists():
-        ds = xr.open_dataset(f)
-        if "water" in ds and ds["water"].shape == (H, W):
-            water = ds["water"].values.astype("float32")
-        ds.close()
-    return water
+    def build():
+        water = np.full((H, W), np.nan, "float32")
+        f = d / f"{aoi_id}.nc"
+        if f.exists():
+            ds = xr.open_dataset(f)
+            if "water" in ds and ds["water"].shape == (H, W):
+                water = ds["water"].values.astype("float32")
+            ds.close()
+        return water
+
+    return _cached(cache, ("landcover", str(d)), build)
 
 
 # --------------------------------------------------------------------------- #
@@ -548,6 +765,21 @@ class AssemblyContext:
     `slots` (shared intermediates keyed by SLOT_*), `global_attrs` (ds.attrs), and
     `var_attrs` (per-channel attrs). It never touches the Dataset object directly -- the
     orchestrator builds that once every contributor has run.
+
+    `days` may be ONE TIME BLOCK of the cube rather than the whole axis (see `run`), so a
+    contributor gets two views of time and must pick deliberately:
+
+      * `days`     -- the block being built. Emit arrays on THIS axis.
+      * `all_days` -- the cube's full axis. Use it for any question whose answer is a
+                      property of the whole cube rather than of this block; `met_prefix`
+                      (which met variant feeds the cube) is the worked example.
+
+    A contributor's CHANNEL SET must depend only on the files on disk, never on `days` --
+    blocks that emit different channels build a cube whose variables disagree on their time
+    length, which writes cleanly and then cannot be opened (`_check_channel_set` catches it).
+
+    `cache` is shared across every block of one AoI; pass it to the loaders that take it so
+    a directory is scanned once per AoI rather than once per block.
     """
     g: AoiGrid
     eff: dict
@@ -559,6 +791,12 @@ class AssemblyContext:
     channels: dict[str, tuple]
     global_attrs: dict[str, Any]
     var_attrs: dict[str, dict]
+    all_days: Any = None
+    cache: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.all_days is None:
+            self.all_days = self.days
 
     def adir(self, product: str, source: str | None = None) -> Path:
         """The `<DIR>[/<source>]/aligned/<aoi>` folder a product's acquisition stage wrote.
@@ -611,8 +849,9 @@ def _contribute_bathymetry(ctx: AssemblyContext) -> None:
         adir = ctx.adir("bathymetry", src)
         if not (adir / f"{ctx.aid}.nc").exists():
             continue                              # e.g. the _tmp scratch dir, or a lost AoI
-        elev, depth, depth_p25, depth_p75 = load_bathy(adir, ctx.aid, ctx.H, ctx.W)
-        attrs = load_bathy_attrs(adir, ctx.aid)
+        elev, depth, depth_p25, depth_p75 = load_bathy(adir, ctx.aid, ctx.H, ctx.W,
+                                                        cache=ctx.cache)
+        attrs = load_bathy_attrs(adir, ctx.aid, cache=ctx.cache)
         datum = {k: attrs[k] for k in _DATUM_ATTRS if k in attrs}
         ctx.emit(f"elevation_{src}", ("y", "x"), elev, units="m",
                  long_name=f"{src} DEM elevation in its native vertical datum (+ up); add "
@@ -629,7 +868,12 @@ def _load_sensor(ctx: AssemblyContext, sp, adir):
         adir, ctx.aid, ctx.days, ctx.H, ctx.W,
         water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
         qc_levels=list(sp.qc_levels) if sp.qc_levels is not None else None,
-        trust_valid=sp.trust_valid, read_footprint=sp.has_footprint)
+        trust_valid=sp.trust_valid, read_footprint=sp.has_footprint,
+        # Decided over the WHOLE cube axis, not this block's days -- see footprint_available.
+        footprint_present=(footprint_available(adir, ctx.aid, ctx.all_days, ctx.H, ctx.W,
+                                               cache=ctx.cache)
+                           if sp.has_footprint else False),
+        cache=ctx.cache)
 
 
 # The footprint index is a per-day identity, and saying so on the variable is the only place a
@@ -645,7 +889,7 @@ def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None
     """A single-collection sensor (Landsat, MODIS): one flat `<DIR>/aligned/<aoi>` tree, one
     channel-set under the bare prefix, one entry in `sensor_times`."""
     sp = s.sensor
-    sst, cloud, valid, hour, _water_union, times, footprint = _load_sensor(
+    sst, cloud, valid, hour, times, footprint = _load_sensor(
         ctx, sp, ctx.adir(s.product.value))
     pre = sp.prefix
     ctx.emit(f"{pre}_sst", T3, sst)
@@ -685,7 +929,7 @@ def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> N
 
     per_tag_times: dict[str, list] = {}
     for tag in ordered:
-        sst, cloud, valid, hour, _wu, times, footprint = _load_sensor(
+        sst, cloud, valid, hour, times, footprint = _load_sensor(
             ctx, sp, ctx.adir(s.product.value, tag))
         pre = sp.prefix
         ctx.emit(f"{pre}_sst_{tag}", T3, sst)
@@ -728,7 +972,8 @@ def _contribute_sensors(ctx: AssemblyContext) -> None:
 def _contribute_mur(ctx: AssemblyContext) -> None:
     # MUR ships its OBSERVED values with honest NaN gaps -- no NN water fill (S1). Filling is
     # a downstream determination the model makes per-process from the raw channels.
-    ctx.emit("mur_sst", T3, load_daily_sensor(ctx.adir("mur"), ctx.aid, ctx.days, ctx.H, ctx.W, "sst"))
+    ctx.emit("mur_sst", T3, load_daily_sensor(ctx.adir("mur"), ctx.aid, ctx.days, ctx.H, ctx.W,
+                                              "sst", cache=ctx.cache))
 
 
 _MET_FORCING_VARS = ("airtemp", "wind_u", "wind_v", "wind_speed", "swrad", "cloud_cover")
@@ -750,23 +995,30 @@ def _contribute_met(ctx: AssemblyContext) -> None:
     if base.exists():
         for src in sorted(dd.name for dd in base.iterdir() if dd.is_dir()):
             d = ctx.adir("met", src)
-            mprefix, mlabel = met_prefix(d, ctx.aid, ctx.days, ctx.eff["met_time"])
+            # ctx.all_days: which variant feeds the cube is a fact about the TREE, and a
+            # per-block answer would splice two times of day into one channel.
+            mprefix, mlabel = met_prefix(d, ctx.aid, ctx.all_days, ctx.eff["met_time"],
+                                         cache=ctx.cache)
             label = mlabel
             for var in _MET_FORCING_VARS:
                 ctx.emit(f"{var}_{src}", T3,
-                         load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var, prefix=mprefix))
+                         load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var,
+                                           prefix=mprefix, cache=ctx.cache))
     ctx.global_attrs["met_time"] = label
 
 
-def _overpass_met_vars(d: Path, aoi_id) -> list[str]:
+def _overpass_met_vars(d: Path, aoi_id, *, cache=None) -> list[str]:
     """The output variables in a met_overpass source's snapshot files (discovered from disk,
     like CMEMS -- so the channel set is exactly what was acquired)."""
-    if not d.exists():
+    def build() -> list[str]:
+        if not d.exists():
+            return []
+        for f in sorted(d.glob(f"{aoi_id}_*T*.nc")):
+            with xr.open_dataset(f) as ds:
+                return list(ds.data_vars)
         return []
-    for f in sorted(d.glob(f"{aoi_id}_*T*.nc")):
-        with xr.open_dataset(f) as ds:
-            return list(ds.data_vars)
-    return []
+
+    return _cached(cache, ("overpass_vars", str(d)), build)
 
 
 def _contribute_met_overpass(ctx: AssemblyContext) -> None:
@@ -781,7 +1033,7 @@ def _contribute_met_overpass(ctx: AssemblyContext) -> None:
         if tt is None:                    # a combo naming an unloaded sensor -> nothing to align
             continue
         d = ctx.adir("met_overpass", src)
-        for var in _overpass_met_vars(d, ctx.aid):
+        for var in _overpass_met_vars(d, ctx.aid, cache=ctx.cache):
             ctx.emit(f"{sensor}_{var}_{src}", T3,
                      load_at_times(d, ctx.aid, tt, ctx.H, ctx.W, var),
                      long_name=f"{var} at the {sensor} overpass ({src})")
@@ -798,7 +1050,7 @@ def _contribute_tides(ctx: AssemblyContext) -> None:
         d = ctx.adir("tides", src)
         if not (d / f"{ctx.aid}_tides.nc").exists():
             continue
-        tide, tide_range = load_tide_daily(d, ctx.aid, ctx.days)
+        tide, tide_range = load_tide_daily(d, ctx.aid, ctx.days, cache=ctx.cache)
         ctx.emit(f"tide_{src}", ("time",), tide)
         ctx.emit(f"tide_range_{src}", ("time",), tide_range)
 
@@ -818,7 +1070,7 @@ def _contribute_tide_overpass(ctx: AssemblyContext) -> None:
         tt = sensor_times.get(sensor)
         if tt is None:                    # a combo naming an unloaded sensor -> nothing to align
             continue
-        series = water_level.load_tide_series(ctx.adir("tides", src), ctx.aid)
+        series = tide_series(ctx.adir("tides", src), ctx.aid, cache=ctx.cache)
         hours = [t.hour + t.minute / 60.0 if t is not None else np.nan for t in tt]
         th = water_level.tide_at_overpass(series, ctx.days, hours)
         ctx.emit(f"{sensor}_tide_{src}", ("time",), th,
@@ -835,15 +1087,16 @@ def _contribute_cmems(ctx: AssemblyContext) -> None:
         return
     for src in sorted(d.name for d in base.iterdir() if d.is_dir()):
         d = ctx.adir("cmems", src)
-        for var in cmems_channels(d, ctx.aid):
+        for var in cmems_channels(d, ctx.aid, cache=ctx.cache):
             ctx.emit(f"cmems_{var}_{src}", T3,
-                     load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var))
+                     load_daily_sensor(d, ctx.aid, ctx.days, ctx.H, ctx.W, var,
+                                       cache=ctx.cache))
 
 
 def _contribute_landcover(ctx: AssemblyContext) -> None:
     # Land-cover water, shipped RAW as a loss-filter channel (1=water, 0=land; unknown ->
     # water, a no-op filter). Land-masking is a downstream MODELLING determination now (S1).
-    lc_raw = load_landcover(ctx.adir("landcover"), ctx.aid, ctx.H, ctx.W)
+    lc_raw = load_landcover(ctx.adir("landcover"), ctx.aid, ctx.H, ctx.W, cache=ctx.cache)
     lc_known = np.isfinite(lc_raw)
     ctx.emit("landcover_water", ("y", "x"), np.where(lc_known, lc_raw > 0.5, True).astype("uint8"))
 
@@ -856,14 +1109,14 @@ def _contribute_insitu(ctx: AssemblyContext) -> None:
     """
     if not ctx.eff["insitu"]:
         return
-    sources = load_insitu(ctx.eff["aligned_root"] / PRODUCT_DIRS["insitu"], ctx.aid)
+    sources = insitu_sources(ctx.eff["aligned_root"] / PRODUCT_DIRS["insitu"], ctx.aid,
+                             cache=ctx.cache)
     if not sources:
         return
     targets = {"insitu": ctx.slots[SLOT_REF_UTC], **ctx.slots[SLOT_SENSOR_TIMES]}
     insitu_vars, station_table, station_map = build_insitu(
-        sources, ctx.g, ctx.days, targets, ctx.eff["insitu_max_dt_min"])
-    for _, ids in sources:
-        ids.close()
+        sources, ctx.g, ctx.days, targets, ctx.eff["insitu_max_dt_min"], cache=ctx.cache)
+    # The Datasets belong to the cache now; `close_cache` releases them once the AoI is done.
     log.info("  in-situ: %d station(s) placed from %d source(s): %s",
              len(station_table), len(sources), ", ".join(s for s, _ in sources))
     for name, (dims, arr) in insitu_vars.items():
@@ -969,8 +1222,8 @@ def _check_contributors() -> None:
 _check_contributors()
 
 
-def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
-    """Build the analysis-ready Dataset for one AoI from its aligned files.
+def assemble_block(g: AoiGrid, eff: dict, days, *, all_days=None, cache=None) -> xr.Dataset:
+    """The cube's channels for ONE span of days -- no coverage, no provenance.
 
     UNIFORM CONTRIBUTOR PROTOCOL: every product -- sensor and non-sensor alike -- contributes
     through one `(ctx) -> channels` mechanism (`CONTRIBUTORS`), run in an order derived by
@@ -978,10 +1231,21 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     covariate needs a `ProductSpec`, a module, and a registered `Contributor`; forgetting the
     last is a hard error at import (`_check_contributors`), not a silent omission. See
     docs/DEVELOPMENT.md.
+
+    `days` is a BLOCK of `all_days` when the cube is too large to build at once; the two are
+    the same object for a whole-window call. `cache` is shared across an AoI's blocks and
+    belongs to the CALLER, who must `close_cache` it -- this function does not, because the
+    next block still needs what is in it.
+
+    The attrs set here are the ones contributors produce. The whole-cube attrs (coverage,
+    provenance) are `finalize_attrs`'s job: they describe the finished cube, so a block cannot
+    know them, and appending to a Zarr store overwrites the group attrs anyway.
     """
     ctx = AssemblyContext(
         g=g, eff=eff, days=days, aid=g.name, H=g.height, W=g.width,
-        slots={}, channels={}, global_attrs={}, var_attrs={})
+        slots={}, channels={}, global_attrs={}, var_attrs={},
+        all_days=all_days if all_days is not None else days,
+        cache=cache if cache is not None else {})
     for c in _topo_order(CONTRIBUTORS):
         c.fn(ctx)
 
@@ -991,46 +1255,88 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
     ds.attrs.update(ctx.global_attrs)
     for name, attrs in ctx.var_attrs.items():
         ds[name].attrs.update(attrs)
+    return ds
 
-    # COVERAGE. The time axis is built from the CONFIG (start..end), not from the data, and
-    # every loader defaults a missing day to NaN. So a run that lost 40 of 100 days to a
-    # flaky network still yields a 100-step cube whose gaps are indistinguishable from cloudy
-    # days. Count what actually landed, stamp it on the cube, and say so when a product is
-    # thin. `prod` (which products wrote files) also feeds provenance, so it is collected once.
-    prod = provenance.collect(eff["aligned_root"], ctx.aid, PRODUCT_DIRS)
-    cov = coverage(ds, days, present=set(prod),
-                   sparse=eff.get("sparse_daily", {}).get(ctx.aid))
-    ds.attrs["coverage"] = json.dumps(cov, sort_keys=True)
+
+def finalize_attrs(eff: dict, aid: str, fields, days, cov: dict, prod: dict) -> dict:
+    """The whole-cube attrs: coverage (already tallied) plus provenance.
+
+    Split out of `assemble_aoi` because both are properties of the FINISHED cube -- a blocked
+    assembly can only compute them once every block has landed.
+
+    `prod` is `provenance.collect`'s result, passed in rather than gathered here: it feeds
+    BOTH the coverage tally (which products wrote files at all) and provenance, and it opens
+    every aligned file in the tree, so it is collected exactly once per AoI.
+    """
+    # (The DEM->MSL datum offset ships PER SOURCE, as attributes on each `elevation_<src>`
+    # channel -- resolved and stamped by the bathymetry module when it acquired that DEM, and
+    # surfaced by `_contribute_bathymetry`. CUDEM/NAVD88 and GMRT/MSL need different offsets,
+    # so a single global attr would be wrong for one of them.)
     for product, c in sorted(cov.items()):
         # A product the config deliberately fetched on only some days is thin ON PURPOSE.
         if c["fraction"] < COVERAGE_WARN and not c.get("sparse"):
             log.warning("  %s: %s covers only %d of %d day(s) (%.0f%%) -- the rest are NaN "
                         "slices, which look exactly like cloudy days. Check the run report "
                         "for what failed.",
-                        ctx.aid, product, c["days_with_data"], c["days_expected"],
+                        aid, product, c["days_with_data"], c["days_expected"],
                         100 * c["fraction"])
-
-    # (The DEM->MSL datum offset ships PER SOURCE, as attributes on each `elevation_<src>`
-    # channel -- resolved and stamped by the bathymetry module when it acquired that DEM, and
-    # surfaced by `_contribute_bathymetry`. CUDEM/NAVD88 and GMRT/MSL need different offsets,
-    # so a single global attr would be wrong for one of them.)
 
     # PROVENANCE: the config that built this cube, and for every field the source(s) it came
     # from and when they were accessed. Zarr attrs must be JSON-serialisable, so the structured
     # parts are JSON strings.
-    rec = provenance.build(eff["project"], list(ds.data_vars), prod)
-    ds.attrs.update(
+    rec = provenance.build(eff["project"], list(fields), prod)
+    guessed = [p for p, r in prod.items() if r["basis"] == provenance.FILE_MTIME]
+    if guessed:
+        log.warning("  %s: access dates for %s came from FILE MTIMES, not recorded stamps "
+                    "(acquired before provenance existed, or the tree was copied)",
+                    aid, ", ".join(sorted(guessed)))
+    return dict(
+        coverage=json.dumps(cov, sort_keys=True),
         created_at=rec["created_at"], package_version=rec["package_version"],
         code_version=rec["code_version"],
         config_sha256=rec["config_sha256"] or "", config_path=rec["config_path"] or "",
         config_yaml=rec["config_yaml"] or "",
         provenance=json.dumps(rec["fields"], sort_keys=True),
         provenance_products=json.dumps(rec["products"], sort_keys=True))
-    guessed = [p for p, r in prod.items() if r["basis"] == provenance.FILE_MTIME]
-    if guessed:
-        log.warning("  %s: access dates for %s came from FILE MTIMES, not recorded stamps "
-                    "(acquired before provenance existed, or the tree was copied)",
-                    ctx.aid, ", ".join(sorted(guessed)))
+
+
+def finish_cube(ds: xr.Dataset, g: AoiGrid, eff: dict, days, cache: dict, hits=None) -> dict:
+    """Release the AoI's cache, then stamp the whole-cube attrs on `ds`. Returns the coverage.
+
+    Closing the cache FIRST is not tidiness: `provenance.collect` re-opens every aligned file
+    in the tree, and doing that while the cached in-situ tables are still open segfaults the
+    netCDF library outright.
+
+    `hits` are pre-tallied coverage counts, for a caller that assembled the cube in blocks and
+    no longer has it in hand. Without them the counts are taken from `ds`.
+    """
+    close_cache(cache)
+
+    # COVERAGE. The time axis is built from the CONFIG (start..end), not from the data, and
+    # every loader defaults a missing day to NaN. So a run that lost 40 of 100 days to a
+    # flaky network still yields a 100-step cube whose gaps are indistinguishable from cloudy
+    # days. Count what actually landed, stamp it on the cube, and say so when a product is
+    # thin. `prod` (which products wrote files at all) feeds both coverage and provenance.
+    prod = provenance.collect(eff["aligned_root"], g.name, PRODUCT_DIRS)
+    cov = coverage_from_hits(coverage_hits(ds) if hits is None else hits, len(days),
+                             present=set(prod),
+                             sparse=eff.get("sparse_daily", {}).get(g.name))
+    ds.attrs.update(finalize_attrs(eff, g.name, list(ds.data_vars), days, cov, prod))
+    return cov
+
+
+def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
+    """Build the complete analysis-ready Dataset for one AoI, in memory, in one pass.
+
+    The whole cube at once: fine for an AoI that fits in memory, and the path `run` still
+    takes when it does. `run` blocks the time axis instead when it does not.
+    """
+    cache: dict = {}
+    try:
+        ds = assemble_block(g, eff, days, cache=cache)
+        finish_cube(ds, g, eff, days, cache)
+    finally:
+        close_cache(cache)
     return ds
 
 
@@ -1068,7 +1374,20 @@ def coverage(ds: xr.Dataset, days, present=None, sparse=None) -> dict:
     warn about a gap the user chose. A warning that fires on every run of a correct config is
     how a real one gets ignored.
     """
-    out = {}
+    return coverage_from_hits(coverage_hits(ds), len(days), present=present, sparse=sparse)
+
+
+def coverage_hits(ds: xr.Dataset) -> dict[str, int]:
+    """{product: days in THIS dataset that hold data}. The per-block half of `coverage`.
+
+    Blocks are disjoint spans of the time axis, so a cube's totals are the sum of its blocks'
+    -- which is what lets a cube too large to hold at once still report honest coverage.
+
+    Deliberately unfiltered: which products EXIST comes from `provenance.collect`, which
+    re-opens every aligned file and so cannot run until the assembly cache has been released.
+    Tally everything here and drop the absent products in `coverage_from_hits`.
+    """
+    out: dict[str, int] = {}
     # Coverage-channel PREFIXES. A per-source product (D5) has no single channel any more, so
     # judge it present on a day if ANY of its per-source channels is finite (S4.7): met's
     # `airtemp` prefix matches `airtemp_hrrr`/`airtemp_era5`, tides' `tide` matches
@@ -1078,26 +1397,194 @@ def coverage(ds: xr.Dataset, days, present=None, sparse=None) -> dict:
     prefixes = dict(DAILY_CHANNELS)
     prefixes["cmems"] = "cmems"
 
+    n_time = ds.sizes.get("time", 0)
     for product, c in prefixes.items():
-        # `present` is keyed by the product's own name, and so is `prefixes` -- one registry,
-        # one name. The alias table that used to reconcile `tide` with `tides` is gone.
-        if present is not None and product not in present:
-            continue
         chans = [v for v in ds.data_vars
                  if (v == c or v.startswith(c + "_")) and "time" in ds[v].dims]
         if not chans:
             continue
-        has = np.zeros(len(days), dtype=bool)
+        has = np.zeros(n_time, dtype=bool)
         for v in chans:
             finite = np.isfinite(ds[v].values)
             axes = tuple(range(1, finite.ndim))       # everything but time
             has |= (finite.any(axis=axes) if axes else finite)
-        n = int(has.sum())
-        out[product] = {"days_with_data": n, "days_expected": len(days),
-                        "fraction": (n / len(days)) if len(days) else 0.0}
+        out[product] = int(has.sum())
+    return out
+
+
+def coverage_from_hits(hits: dict[str, int], n_days: int, present=None, sparse=None) -> dict:
+    """Per-block tallies -> the cube's coverage report.
+
+    `n_days` is the FULL axis however the tallies were gathered: coverage exists to say how
+    much of the configured window actually landed, so a per-block denominator would report
+    100% on every block of a cube that is mostly holes.
+    """
+    out = {}
+    for product, n in hits.items():
+        # `present` is keyed by the product's own name, and so are the tallies -- one
+        # registry, one name. The alias table that reconciled `tide` with `tides` is gone.
+        if present is not None and product not in present:
+            continue
+        out[product] = {"days_with_data": n, "days_expected": n_days,
+                        "fraction": (n / n_days) if n_days else 0.0}
         if sparse and product in sparse:
             out[product]["sparse"] = True
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Sizing the time block
+# --------------------------------------------------------------------------- #
+# Peak memory is more than the channels the cube keeps: a loader holds a scene or two beyond
+# its output, Blosc needs somewhere to compress into, and the interpreter is not free. The
+# channel arithmetic is the part that can be computed, so it is doubled to stand in for the
+# rest -- with detection already taking half of what it finds, that is a ~4x margin.
+_TRANSIENT_FACTOR = 2.0
+_BUDGET_HEADROOM = 512 * 1024**2
+_MIN_BUDGET = 4 * 1024**3
+# Halving, so every value divides the one above it: a block that is a whole number of chunks
+# stays a whole number of chunks after stepping down.
+_TIME_CHUNK_LADDER = (64, 32, 16, 8, 4, 2, 1)
+
+
+@contextlib.contextmanager
+def _quiet(logger):
+    """Silence a logger for the duration. Used for the census pass, which runs the real
+    contributors and would otherwise duplicate every file-presence warning of the real run."""
+    prev = logger.level
+    logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        logger.setLevel(prev)
+
+
+def channel_census(g: AoiGrid, eff: dict, days, *, cache=None) -> dict:
+    """{name: (dims, dtype)} for the cube `assemble_aoi(g, eff, days)` would build.
+
+    Runs the REAL contributors over a zero-length day index. Every channel is therefore named
+    by the code that emits it -- there is no second list to drift out of sync -- and nothing
+    is materialised: each array is (0, H, W). The loaders skip every file before opening it,
+    because no day matches.
+
+    Used to predict what a day of cube costs before committing to a block size, and as the
+    frozen channel set each block is checked against (`_check_channel_set`).
+
+    It shares the blocks' `cache`, so the scan it does -- directories, tide tables, station
+    placement, which met variant, whether a footprint layer exists -- is the scan they would
+    have done anyway.
+    """
+    with _quiet(logging.getLogger(__package__.split(".")[0])):
+        ctx = AssemblyContext(
+            g=g, eff=eff, days=days[:0], aid=g.name, H=g.height, W=g.width,
+            slots={}, channels={}, global_attrs={}, var_attrs={},
+            all_days=days, cache=cache if cache is not None else {})
+        for c in _topo_order(CONTRIBUTORS):
+            c.fn(ctx)
+    return {name: (dims, np.asarray(arr).dtype) for name, (dims, arr) in ctx.channels.items()}
+
+
+def bytes_per_day(census: dict, H: int, W: int) -> int:
+    """Resident bytes one day of cube costs, from a channel census.
+
+    Only the channels that GROW with the time axis count. The static (y,x) rasters are paid
+    once however the axis is split, and the 1-D per-day channels are noise beside a raster,
+    but they are counted for completeness.
+    """
+    n = 0
+    for dims, dtype in census.values():
+        if dims == T3:
+            n += H * W * dtype.itemsize
+        elif dims == ("time",):
+            n += dtype.itemsize
+    return n
+
+
+def _detected_budget_bytes() -> tuple[int, str]:
+    """(bytes, where it came from) -- what this machine will actually let the assembler have.
+
+    Order matters. Physical RAM is the LAST resort because on a scheduled node it is the
+    wrong number: the job is killed at its cgroup or scheduler limit, which can be a small
+    fraction of the hardware. Reading that limit first is what makes the default safe in the
+    place the unbounded assembler died.
+    """
+    env = os.environ.get("COASTAL_SST_DATA_MEM_GB")
+    if env:
+        try:
+            return int(float(env) * 1024**3), "$COASTAL_SST_DATA_MEM_GB"
+        except ValueError:
+            log.warning("  COASTAL_SST_DATA_MEM_GB=%r is not a number; ignoring", env)
+    slurm = os.environ.get("SLURM_MEM_PER_NODE")            # megabytes
+    if slurm:
+        try:
+            return int(float(slurm) * 1024**2), "$SLURM_MEM_PER_NODE"
+        except ValueError:
+            pass
+    for p, label in ((Path("/sys/fs/cgroup/memory.max"), "cgroup v2"),
+                     (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"), "cgroup v1")):
+        try:
+            raw = p.read_text().strip()
+        except OSError:
+            continue
+        if raw and raw != "max":
+            try:
+                v = int(raw)
+            except ValueError:
+                continue
+            # cgroup v1 reports a sentinel near 2**63 when no limit is set.
+            if 0 < v < 2**62:
+                return v, label
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"), "physical RAM"
+    except (ValueError, OSError, AttributeError):
+        return _MIN_BUDGET, "fallback"
+
+
+def budget_bytes(eff: dict) -> tuple[int, str]:
+    """The memory the assembler may use, and a phrase describing where the number came from.
+
+    A configured budget is taken as given -- the user said what the job has. A DETECTED one is
+    halved: the assembler is not the only thing on the machine, and being wrong here costs the
+    whole AoI.
+    """
+    gb = eff.get("memory_budget_gb")
+    if gb:
+        return int(float(gb) * 1024**3), "datacube.memory_budget_gb"
+    raw, src = _detected_budget_bytes()
+    return max(int(raw * 0.5), _MIN_BUDGET), f"half of {src}"
+
+
+def resolve_block_days(eff: dict, per_day: int, n_days: int,
+                       *, transient: float = _TRANSIENT_FACTOR) -> tuple[int, int]:
+    """(block_days, time_chunk) for one AoI.
+
+    `transient` scales the channel arithmetic to stand in for what a stage holds BESIDE its
+    channels. The default is calibrated on the assembler, whose transients are a scene or two;
+    a stage with heavier ones (preprocess promotes its baseline to float64 and copies arrays to
+    fold drops into) passes a larger factor.
+
+    Every block boundary lands on a chunk boundary. An append that starts mid-chunk makes Zarr
+    read, decompress, merge, recompress and rewrite every chunk it touches -- on a large grid
+    that is tens of GB of pointless work per boundary -- so the block is a whole number of
+    chunks, and when the budget cannot afford even one chunk's worth of days it is the CHUNK
+    that gives way, not the alignment.
+    """
+    tc = int(eff.get("chunks", {}).get("time", n_days) or n_days)
+    tc = max(1, min(tc, n_days))
+    forced = eff.get("block_days", "auto")
+    if forced != "auto" and forced is not None:
+        block = max(1, min(int(forced), n_days))
+        return block, min(tc, block)
+
+    budget, _src = budget_bytes(eff)
+    max_days = max(1, int((budget - _BUDGET_HEADROOM) // (per_day * transient))
+                   if per_day > 0 else n_days)
+    if max_days >= n_days:                       # the whole cube fits: one pass, as before
+        return n_days, tc
+    if max_days >= tc:
+        return (max_days // tc) * tc, tc
+    tc_eff = next((c for c in _TIME_CHUNK_LADDER if c <= max_days and c <= tc), 1)
+    return tc_eff, tc_eff
 
 
 # --------------------------------------------------------------------------- #
@@ -1116,17 +1603,24 @@ def _blosc_codec(cname: str, clevel: int, shuffle: str):
     return Blosc(cname=cname, clevel=clevel, shuffle=_SHUFFLE[shuffle]), "compressor"
 
 
-def build_encoding(ds: xr.Dataset, compression: CompressionSpec, chunks: dict) -> dict:
+def build_encoding(ds: xr.Dataset, compression: CompressionSpec, chunks: dict,
+                   *, sizes=None) -> dict:
     """Per-variable chunk + Blosc(zstd) encoding.
 
     Lossless: dtypes are untouched. Integer masks get BITSHUFFLE (long runs of a
     constant class compress hard); floats get the configured shuffle. The result
     keys ('compressors' for Zarr v3, 'compressor' for v2) match the installed Zarr.
+
+    `sizes` overrides the dimension lengths the chunk clamp is measured against. A chunk is
+    capped at its axis so a short cube is not given chunks longer than itself -- but when the
+    dataset in hand is one BLOCK of a larger cube, its own `time` length is the block, not the
+    axis, and the store would silently be chunked in blocks. Pass the finished cube's sizes.
     """
+    dim_sizes = {**ds.sizes, **(sizes or {})}
     enc = {}
     for v in ds.data_vars:
         dims = ds[v].dims
-        ch = tuple(min(chunks.get(d, ds.sizes[d]), ds.sizes[d]) for d in dims)
+        ch = tuple(min(chunks.get(d, dim_sizes[d]), dim_sizes[d]) for d in dims)
         shuffle = "bitshuffle" if ds[v].dtype == np.uint8 else compression.shuffle
         codec, key = _blosc_codec(compression.codec, compression.level, shuffle)
         e = {key: (codec,) if key == "compressors" else codec}
@@ -1139,19 +1633,56 @@ def build_encoding(ds: xr.Dataset, compression: CompressionSpec, chunks: dict) -
 # --------------------------------------------------------------------------- #
 # Write (atomic, NFS-safe)
 # --------------------------------------------------------------------------- #
-def write_zarr(ds: xr.Dataset, zpath: Path, encoding: dict):
+def write_zarr(ds: xr.Dataset, zpath: Path, encoding: dict, *, consolidated: bool = True):
     """Write a Zarr cube to `zpath`, which must not exist. NOT atomic -- see `write_zarr_safe`.
 
     Exposed on its own for the one caller that has to keep its SOURCE store open across the
     write and so cannot let the swap happen inside `write_zarr_safe`: `preprocess.run`, which
     rewrites the cube it is reading (it drives `store.atomic` itself, writing here and closing
     the source before the block ends).
+
+    `consolidated=False` is for the first of several writes: xarray re-consolidates the whole
+    group on every call, so a blocked write consolidates once at the end (`finalize_cube`)
+    instead of once per block.
     """
     with warnings.catch_warnings():
         # Zarr v3 warns that consolidated metadata isn't in the v3 spec; xarray
         # still writes+reads it and it speeds opening a many-variable cube.
         warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
-        ds.to_zarr(zpath, mode="w-", consolidated=True, encoding=encoding)
+        ds.to_zarr(zpath, mode="w-", consolidated=consolidated, encoding=encoding)
+
+
+def append_zarr(ds: xr.Dataset, zpath: Path, *, append_dim: str = "time"):
+    """Extend an existing Zarr cube along `append_dim` with one more block.
+
+    NO encoding argument, deliberately: xarray raises for a variable that is already in the
+    store ("already exists, but encoding was provided"). Chunking and codecs are settled once,
+    by the first write, and every later block inherits them.
+
+    `mode="a-"` -- not `"a"` -- so a variable WITHOUT the append dim is left alone rather than
+    rewritten. The static (y,x) channels (bathymetry, land cover, the station map) are the
+    same array in every block; with `"a"` each block would rewrite all of them.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
+        ds.to_zarr(zpath, mode="a-", append_dim=append_dim, consolidated=False)
+
+
+def finalize_cube(zpath: Path, attrs: dict):
+    """Stamp the cube's global attrs and consolidate its metadata -- once, after the last block.
+
+    Appending REPLACES a Zarr group's attrs (zarr's `Attributes.put` clears before it writes),
+    so after the final block the store carries only that block's attrs. Coverage, provenance,
+    the config that built the cube and the in-situ station table would all be silently gone --
+    silently, because the cube still opens and still holds every value. Hence a merge here
+    rather than trusting the last write.
+    """
+    import zarr
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
+        g = zarr.open_group(str(zpath), mode="r+")
+        g.attrs.put({**dict(g.attrs), **attrs})
+        zarr.consolidate_metadata(g.store)
 
 
 def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
@@ -1166,6 +1697,118 @@ def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
     """
     with store.atomic(Path(zpath)) as tmp:
         write_zarr(ds, tmp, encoding)
+
+
+# --------------------------------------------------------------------------- #
+# Blocked assembly
+# --------------------------------------------------------------------------- #
+class _LogOnce(logging.Filter):
+    """Drop a log record this AoI has already emitted.
+
+    Every block re-runs every contributor over the same tree, so a message about the TREE --
+    no bathymetry file, a station outside the grid, a partly backfilled footprint layer -- is
+    true once and repeated once per block. Seventy identical warnings do not inform anyone;
+    they bury the one message that is about a specific block.
+
+    Attach to the logger that EMITS the records (this module's), not to the package logger: a
+    Logger's filters run only for records logged on it directly, and are skipped entirely for
+    records propagating up from a child. (Levels are the opposite -- a child with no level of
+    its own defers to its parent -- which is why `_quiet` can work the other way round.)
+    """
+    def __init__(self):
+        super().__init__()
+        self.seen: set = set()
+
+    def filter(self, record) -> bool:
+        key = (record.levelno, record.msg, repr(record.args))
+        if key in self.seen:
+            return False
+        self.seen.add(key)
+        return True
+
+
+def _check_channel_set(got: dict, census: dict, block_i: int, days) -> None:
+    """Every block must emit the SAME channels, with the same dims and dtypes.
+
+    A contributor whose channel set depends on WHICH days it was handed corrupts a blocked
+    cube in a way that does not surface until someone reads it: a variable that misses one
+    append is permanently shorter than the time axis, and
+
+        ValueError: conflicting sizes for dimension 'time'
+
+    is raised by `open_zarr`, long after the run that caused it. Fail here instead, naming the
+    channel and the block. See `footprint_available` for the one channel this really applies
+    to, and AssemblyContext for the rule contributors are held to.
+    """
+    problems = [f"{name}: census {census.get(name)}, block {got.get(name)}"
+                for name in sorted(set(census) | set(got)) if census.get(name) != got.get(name)]
+    if problems:
+        raise RuntimeError(
+            f"block {block_i} ({days[0].date()}..{days[-1].date()}) does not emit the cube's "
+            f"channel set; a contributor is deciding what to emit from the days it was given, "
+            f"which cannot work when the cube is assembled in blocks:\n  "
+            + "\n  ".join(problems))
+
+
+def _merge_block_attrs(acc: dict, new: dict, block_i: int) -> None:
+    """Fold one block's global attrs into the cube's, refusing to let a value change.
+
+    A key whose value differs between blocks means a contributor answered a whole-cube
+    question from one block's days -- `met_time` flipping between "reference" and
+    "daily_mean" is the concrete case -- and the cube would then describe itself by whichever
+    block wrote last while holding a mixture.
+    """
+    for k, v in new.items():
+        if k in acc and acc[k] != v:
+            raise RuntimeError(
+                f"block {block_i} reports {k}={v!r} but an earlier block reported "
+                f"{acc[k]!r}. This attr describes the whole cube, so a contributor computed "
+                f"it from one block's days; it must use ctx.all_days.")
+        acc[k] = v
+
+
+def _assemble_blocked(g: AoiGrid, eff: dict, days, zpath: Path, *, block_days: int,
+                      time_chunk: int, census: dict, cache: dict) -> dict:
+    """Assemble and write one AoI a block of days at a time. Returns its coverage report.
+
+    The whole run happens inside ONE `store.atomic`, so the cube at `zpath` is either the
+    previous one or the finished new one -- never a half-appended store. That matters more
+    here than for a single write: this loop can run for hours.
+    """
+    hits: dict[str, int] = {}
+    attrs: dict = {}
+    blocks = [days[i:i + block_days] for i in range(0, len(days), block_days)]
+    quiet = _LogOnce()
+    log.addFilter(quiet)
+    try:
+        with store.atomic(Path(zpath)) as tmp:
+            for i, blk in enumerate(blocks):
+                ds = assemble_block(g, eff, blk, all_days=days, cache=cache)
+                _check_channel_set({k: (ds[k].dims, ds[k].dtype) for k in ds.data_vars},
+                                   census, i, blk)
+                _merge_block_attrs(attrs, dict(ds.attrs), i)
+                for product, n in coverage_hits(ds).items():
+                    hits[product] = hits.get(product, 0) + n
+                if i == 0:
+                    # The encoding is settled here, against the FINISHED cube's shape -- not
+                    # this block's, which would chunk the time axis in blocks.
+                    write_zarr(ds, tmp, build_encoding(
+                        ds, eff["compression"], {**eff["chunks"], "time": time_chunk},
+                        sizes={"time": len(days)}), consolidated=False)
+                else:
+                    append_zarr(ds, tmp)
+                log.info("    block %d/%d: %s..%s", i + 1, len(blocks),
+                         blk[0].date(), blk[-1].date())
+                if i < len(blocks) - 1:
+                    del ds                                    # before the next block is built
+            # `ds` is the LAST block, kept only so `finish_cube` can name the cube's fields
+            # and hang the finished attrs somewhere; the values are already on disk.
+            cov = finish_cube(ds, g, eff, days, cache, hits=hits)
+            attrs.update(ds.attrs)      # + the whole-cube attrs finish_cube just stamped on
+            finalize_cube(tmp, attrs)
+    finally:
+        log.removeFilter(quiet)
+    return cov
 
 
 # --------------------------------------------------------------------------- #
@@ -1236,6 +1879,9 @@ def _build_eff(project: Project) -> dict:
         "sensor_version_pref": _sensor_version_pref(project),
         "out_dir": root / dc.output_subdir,
         "chunks": dict(dc.chunks),
+        # Time-blocking: "auto" is resolved PER AOI in `run` (it needs that AoI's grid).
+        "block_days": dc.block_days,
+        "memory_budget_gb": dc.memory_budget_gb,
         "met_time": str(dc.met_time),
         # The (sensor, source) overpass-met combos come from the met_overpass PRODUCT now
         # (D14/D15), not datacube.overpass_met. The cube emits <sensor>_<var>_<src> for these.
@@ -1291,16 +1937,50 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             continue
 
         log.info("=== assembling %s (%d days, grid=%dx%d) ===", name, len(days), g.width, g.height)
-        ds = assemble_aoi(g, eff, days)
-        write_zarr_safe(ds, zpath, build_encoding(ds, eff["compression"], eff["chunks"]))
+
+        # How much cube is one day? Ask the contributors, over a zero-length axis, before
+        # committing to anything -- and keep the scan they do for the blocks that follow.
+        cache: dict = {}
+        try:
+            census = channel_census(g, eff, days, cache=cache)
+            per_day = bytes_per_day(census, g.height, g.width)
+            block_days, time_chunk = resolve_block_days(eff, per_day, len(days))
+            budget, src = budget_bytes(eff)
+            n3 = sum(1 for dims, _ in census.values() if dims == T3)
+            log.info("  %d channel(s), %d of them (t,y,x): %.0f MB/day; budget %.1f GiB (%s) "
+                     "-> %d block(s) of %d day(s), time chunk %d, peak ~%.1f GiB",
+                     len(census), n3, per_day / 1e6, budget / 1024**3, src,
+                     -(-len(days) // block_days), block_days, time_chunk,
+                     block_days * per_day * _TRANSIENT_FACTOR / 1024**3)
+            if time_chunk < int(eff.get("chunks", {}).get("time", time_chunk) or time_chunk):
+                log.warning("  %s: the memory budget fits only %d day(s) per block, fewer than "
+                            "the configured time chunk; reducing the cube's time chunk to %d so "
+                            "every block boundary stays chunk-aligned. Raise "
+                            "datacube.memory_budget_gb, or lower datacube.chunks.time, to "
+                            "choose this yourself.", name, block_days, time_chunk)
+
+            if block_days >= len(days):
+                # The cube fits: build it whole and write it once, exactly as before. Built
+                # through assemble_block rather than assemble_aoi so it inherits the scan the
+                # census already paid for, instead of repeating it.
+                ds = assemble_block(g, eff, days, all_days=days, cache=cache)
+                cov = finish_cube(ds, g, eff, days, cache)
+                write_zarr_safe(ds, zpath,
+                                build_encoding(ds, eff["compression"], eff["chunks"]))
+                nvars, shape = len(ds.data_vars), (ds.sizes["time"], ds.sizes["y"], ds.sizes["x"])
+                del ds
+            else:
+                cov = _assemble_blocked(g, eff, days, zpath, block_days=block_days,
+                                        time_chunk=time_chunk, census=census, cache=cache)
+                nvars, shape = len(census), (len(days), g.height, g.width)
+        finally:
+            close_cache(cache)
 
         # `t=%d` was always len(days) -- it said nothing about how much of the cube is real.
         # Report the coverage the cube actually has, so a thin product is visible here.
-        cov = json.loads(ds.attrs.get("coverage", "{}"))
         cov_str = ", ".join(f"{p} {100 * c['fraction']:.0f}%" for p, c in sorted(cov.items()))
         log.info("  wrote %s  vars=%d shape=(t=%d,y=%d,x=%d)  coverage: %s", zpath.name,
-                 len(ds.data_vars), ds.sizes["time"], ds.sizes["y"], ds.sizes["x"],
-                 cov_str or "n/a")
+                 nvars, *shape, cov_str or "n/a")
         rep.wrote()
         thin = [p for p, c in cov.items() if c["fraction"] < COVERAGE_WARN]
         if thin:

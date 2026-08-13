@@ -271,13 +271,45 @@ def _baseline_field(ctx: "PreprocessContext", name: str):
     return ctx.read(name, dims=T3), name
 
 
+def _harmonic_ok(ctx: "PreprocessContext") -> bool:
+    """Can a seasonal harmonic be constrained by this CUBE's day-of-year span?
+
+    A WHOLE-WINDOW question, answered from `ctx.all_days` and cached, never from `ctx.days`.
+    Asked of one time block it answers "no" for every block of any sensible size -- a ten-year
+    cube would then fit a CONSTANT climatology everywhere while the config said `harmonic`,
+    reported only by an INFO line repeated once per block.
+    """
+    if "harmonic_ok" in ctx.window:
+        return ctx.window["harmonic_ok"]
+    days = ctx.all_days
+    s = ctx.read_all("doy_sin")
+    c = ctx.read_all("doy_cos")
+    if s is None or c is None:
+        doy = days.dayofyear.values.astype("float64")
+        s = np.sin(2 * np.pi * doy / 365.25)
+        c = np.cos(2 * np.pi * doy / 365.25)
+    s = np.asarray(s, "float64")
+    c = np.asarray(c, "float64")
+    ok = not (len(days) == 0
+              or np.ptp(days.dayofyear.values) < 60
+              or (np.std(s) < 1e-3 and np.std(c) < 1e-3))
+    if not ok:
+        log.info("  filter_clouds: DOY span too short for a seasonal harmonic; "
+                 "using a constant climatology")
+    ctx.window["harmonic_ok"] = ok
+    return ok
+
+
 def _harmonic_design(ctx: "PreprocessContext", seasonality: str) -> np.ndarray:
-    """The climatology design matrix X (T,k): a constant column (k=1), plus -- for a day-of-year
-    `harmonic` -- annual sin/cos columns (k=3, reusing the cube's doy_sin/doy_cos). Falls back to
-    the constant when the cube's DOY span is too short to constrain the seasonal cycle."""
-    T = len(ctx.days)
-    ones = np.ones(T)
-    if seasonality != "harmonic":
+    """The climatology design matrix X (len(ctx.days), k) for THIS BLOCK's days: a constant
+    column (k=1), plus -- for a day-of-year `harmonic` -- annual sin/cos columns (k=3, reusing
+    the cube's doy_sin/doy_cos).
+
+    The columns are the block's; the harmonic-vs-constant DECISION is the whole cube's
+    (`_harmonic_ok`), so every block fits the same model.
+    """
+    ones = np.ones(len(ctx.days))
+    if seasonality != "harmonic" or not _harmonic_ok(ctx):
         return ones[:, None]
     s = ctx.read("doy_sin", dims=("time",))
     c = ctx.read("doy_cos", dims=("time",))
@@ -285,13 +317,7 @@ def _harmonic_design(ctx: "PreprocessContext", seasonality: str) -> np.ndarray:
         doy = ctx.days.dayofyear.values.astype("float64")
         s = np.sin(2 * np.pi * doy / 365.25)
         c = np.cos(2 * np.pi * doy / 365.25)
-    s = np.asarray(s, "float64")
-    c = np.asarray(c, "float64")
-    if np.ptp(ctx.days.dayofyear.values) < 60 or (np.std(s) < 1e-3 and np.std(c) < 1e-3):
-        log.info("  filter_clouds: DOY span too short for a seasonal harmonic; "
-                 "using a constant climatology")
-        return ones[:, None]
-    return np.column_stack([ones, s, c])
+    return np.column_stack([ones, np.asarray(s, "float64"), np.asarray(c, "float64")])
 
 
 def _batched_solve(XtX: np.ndarray, Xtb: np.ndarray) -> np.ndarray:
@@ -309,6 +335,154 @@ def _batched_solve(XtX: np.ndarray, Xtb: np.ndarray) -> np.ndarray:
     return out.reshape(H, W, k)
 
 
+_SIGMA = "sigma_climatology"
+
+
+def _sigma_key(opts: dict) -> tuple:
+    """The window-statistic key for a sigma climatology.
+
+    Keyed on the MATHS -- baseline, scope, seasonality -- not on the step. `filter_clouds` and
+    `filter_clouds_corrected` fit the same climatology (the corrected geometry never touches the
+    baseline), so keying this way lets them share one prepass instead of streaming the cube
+    twice over. `n_sigma` is deliberately absent: it scales the finished sigma at evaluation
+    time and does not change the fit.
+    """
+    return (_SIGMA, str(opts.get("baseline", "mur_sst")),
+            str(opts.get("stat_scope", "pixel")).lower(),
+            str(opts.get("seasonality", "off")).lower())
+
+
+def sigma_accumulate(ctx: "PreprocessContext", pass_i: int, opts: dict) -> None:
+    """Fold ONE block into the baseline's climatology accumulators.
+
+    Pass 0 builds the masked normal equations; pass 1 the squared residuals about the fit those
+    equations gave. Every term is a plain sum over `t`, so summing per block and adding is the
+    same arithmetic in a different order -- the blocked climatology is exact, not approximate.
+
+    TWO passes rather than one. The identity `ssr = sum(b^2) - beta.Xtb` would let a single pass
+    do it, but the baseline is in KELVIN: `b^2` is ~8e4 per sample against a residual variance
+    of order 1, so the subtraction cancels away the answer. Re-reading one channel is cheap;
+    a wrong sigma is not.
+    """
+    base = ctx.read(opts["_name"], dims=T3)
+    if base is None:
+        return
+    acc = ctx.window.setdefault(_sigma_key(opts), {})
+    base = base.astype("float64", copy=False)
+    X = _harmonic_design(ctx, opts["_seasonality"])
+    k = X.shape[1]
+    finite = np.isfinite(base)
+    M = finite.astype("float64")
+    pooled = opts["_scope"] == "pooled"
+
+    if pass_i == 0:
+        Bz = np.where(finite, base, 0.0)
+        if pooled:
+            acc["XtX"] = acc.get("XtX", 0.0) + np.einsum("ti,tj,tyx->ij", X, X, M)
+            acc["Xtb"] = acc.get("Xtb", 0.0) + np.einsum("ti,tyx->i", X, Bz)
+            acc["cnt"] = acc.get("cnt", 0.0) + float(M.sum())
+        else:
+            acc["XtX"] = acc.get("XtX", 0.0) + np.einsum("ti,tj,tyx->yxij", X, X, M)
+            acc["Xtb"] = acc.get("Xtb", 0.0) + np.einsum("ti,tyx->yxi", X, Bz)
+            acc["cnt"] = acc.get("cnt", 0.0) + M.sum(axis=0)
+        acc["k"] = k
+        return
+
+    beta = acc.get("beta")
+    if beta is None:
+        return
+    if pooled:
+        mu_t = X @ beta                                        # (T,)
+        acc["ssr"] = acc.get("ssr", 0.0) + float(
+            np.sum(np.where(finite, (base - mu_t[:, None, None]) ** 2, 0.0)))
+    else:
+        mu = np.einsum("ti,yxi->tyx", X, beta)                 # (block,H,W)
+        acc["ssr"] = acc.get("ssr", 0.0) + np.sum(
+            np.where(finite, (base - mu) ** 2, 0.0), axis=0)
+
+
+def sigma_reduce(ctx: "PreprocessContext", pass_i: int, opts: dict) -> None:
+    """Turn one pass's accumulators into the statistic the next pass (or the step) needs."""
+    acc = ctx.window.get(_sigma_key(opts))
+    if not acc or "k" not in acc:
+        return                                  # the baseline was absent: nothing accumulated
+    k = acc["k"]
+    if pass_i == 0:
+        if opts["_scope"] == "pooled":
+            det = np.linalg.det(acc["XtX"])
+            acc["beta"] = (None if not np.isfinite(det) or abs(det) < 1e-9
+                           else np.linalg.solve(acc["XtX"], acc["Xtb"]))
+        else:
+            acc["beta"] = _batched_solve(acc["XtX"], acc["Xtb"])
+        # (H,W,k,k) is the largest thing here and pass 1 does not need it.
+        acc.pop("XtX", None)
+        acc.pop("Xtb", None)
+        return
+
+    cnt = acc["cnt"]
+    if opts["_scope"] == "pooled":
+        acc["sigma"] = np.sqrt(acc.get("ssr", 0.0) / max(float(cnt) - k, 1.0))
+    else:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            sigma = np.sqrt(acc.get("ssr", 0.0) / np.maximum(cnt - k, 1.0))
+        acc["sigma"] = np.where(cnt > k, sigma, np.nan)
+    acc.pop("ssr", None)
+
+
+def sigma_cutoff_block(ctx: "PreprocessContext", opts: dict, n_sigma: float) -> np.ndarray | None:
+    """`mean - n_sigma*sigma` for THIS block's days, from the fitted climatology.
+
+    Evaluated per block and never held as (T,H,W): the cutoff IS `X @ beta - n_sigma*sigma`, so
+    materialising it for the whole cube -- as this used to -- was one more full-size float array
+    for something two per-pixel parameters already describe.
+    """
+    acc = ctx.window.get(_sigma_key(opts))
+    if acc is None or "sigma" not in acc:
+        return None
+    beta, sigma = acc.get("beta"), acc["sigma"]
+    X = _harmonic_design(ctx, opts["_seasonality"])
+    if opts["_scope"] == "pooled":
+        if beta is None:                       # singular system: no cutoff, so nothing is cold
+            return np.full((len(ctx.days), ctx.H, ctx.W), np.nan, "float32")
+        mu_t = X @ beta
+        cutoff = (mu_t - n_sigma * sigma)[:, None, None]
+        return np.broadcast_to(cutoff, (len(ctx.days), ctx.H, ctx.W)).astype("float32")
+    mu = np.einsum("ti,yxi->tyx", X, beta)
+    return (mu - n_sigma * sigma[None, :, :]).astype("float32")
+
+
+def _sigma_opts(ctx: "PreprocessContext", key: str, base_key: str | None) -> dict | None:
+    """The climatology this filter's config asks for, or None when it is configured day-locally.
+
+    `method: offset` needs no whole-window statistic at all, so an offset-configured filter
+    costs nothing: `passes` returns 0 and the orchestrator never streams the cube for it.
+    """
+    o = _resolve_opts(ctx, key, base_key)
+    if str(o.get("method", "offset")).lower() != "sigma":
+        return None
+    return {"_name": o.get("baseline", "mur_sst"),
+            "_scope": str(o.get("stat_scope", "pixel")).lower(),
+            "_seasonality": str(o.get("seasonality", "off")).lower()}
+
+
+def sigma_passes(ctx: "PreprocessContext", *, key: str, base_key: str | None = None) -> int:
+    return 2 if _sigma_opts(ctx, key, base_key) else 0
+
+
+def sigma_accumulate_step(ctx: "PreprocessContext", pass_i: int, *, key: str,
+                          base_key: str | None = None) -> None:
+    o = _sigma_opts(ctx, key, base_key)
+    if o is not None:
+        sigma_accumulate(ctx, pass_i, o)
+
+
+def sigma_reduce_step(ctx: "PreprocessContext", pass_i: int, *, key: str,
+                      base_key: str | None = None) -> None:
+    o = _sigma_opts(ctx, key, base_key)
+    if o is not None:
+        sigma_reduce(ctx, pass_i, o)
+
+
 def _baseline_cutoff(ctx: "PreprocessContext", name: str, n_sigma: float,
                      scope: str, seasonality: str) -> np.ndarray | None:
     """The cold cutoff field `mean - n_sigma*sigma` (T,y,x) from the baseline's OWN climatology.
@@ -318,42 +492,19 @@ def _baseline_cutoff(ctx: "PreprocessContext", name: str, n_sigma: float,
     `ctx.read`, never fill_water's invented cells, which would collapse sigma). `pixel` scope
     fits a per-cell climatology; `pooled` fits one over all cells & times. Cells/scenes with too
     few finite samples get a NaN cutoff (-> pixel kept). None if the baseline is absent.
+
+    The WHOLE-WINDOW path: one block covering every day, fitted and evaluated here. When the
+    cube is preprocessed in blocks the same three functions are driven by the orchestrator
+    instead (`WindowStat`), which is why there is only one implementation of the maths.
     """
-    base = ctx.read(name, dims=T3)
-    if base is None:
+    if ctx.read(name, dims=T3) is None:
         return None
-    base = base.astype("float64", copy=False)
-    X = _harmonic_design(ctx, seasonality)
-    k = X.shape[1]
-    finite = np.isfinite(base)
-    M = finite.astype("float64")
-    Bz = np.where(finite, base, 0.0)
-
-    if scope == "pooled":
-        XtX = np.einsum("ti,tj,tyx->ij", X, X, M)
-        Xtb = np.einsum("ti,tyx->i", X, Bz)
-        if not np.isfinite(np.linalg.det(XtX)) or abs(np.linalg.det(XtX)) < 1e-9:
-            return np.full(base.shape, np.nan, "float32")
-        beta = np.linalg.solve(XtX, Xtb)
-        mu_t = X @ beta                                        # (T,)
-        ssr = float(np.sum(np.where(finite, (base - mu_t[:, None, None]) ** 2, 0.0)))
-        dof = max(float(M.sum()) - k, 1.0)
-        sigma = np.sqrt(ssr / dof)
-        cutoff = (mu_t - n_sigma * sigma)[:, None, None]
-        return np.broadcast_to(cutoff, base.shape).astype("float32")
-
-    # pixel scope: a per-cell climatology (masked normal equations, fully vectorised).
-    XtX = np.einsum("ti,tj,tyx->yxij", X, X, M)                # (H,W,k,k)
-    Xtb = np.einsum("ti,tyx->yxi", X, Bz)                      # (H,W,k)
-    beta = _batched_solve(XtX, Xtb)                            # (H,W,k)
-    mu = np.einsum("ti,yxi->tyx", X, beta)                     # (T,H,W)
-    cnt = M.sum(axis=0)                                        # (H,W)
-    ssr = np.sum(np.where(finite, (base - mu) ** 2, 0.0), axis=0)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        sigma = np.sqrt(ssr / np.maximum(cnt - k, 1.0))
-    sigma = np.where(cnt > k, sigma, np.nan)
-    cutoff = mu - n_sigma * sigma[None, :, :]
-    return cutoff.astype("float32")
+    opts = {"_name": name, "_scope": scope, "_seasonality": seasonality}
+    if _sigma_key(opts) not in ctx.window:
+        for p in (0, 1):
+            sigma_accumulate(ctx, p, opts)
+            sigma_reduce(ctx, p, opts)
+    return sigma_cutoff_block(ctx, opts, n_sigma)
 
 
 # --------------------------------------------------------------------------- #
