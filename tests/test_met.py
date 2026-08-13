@@ -213,13 +213,16 @@ def test_fetch_one_no_data_returns_none_no_substitution(monkeypatch, aoi_grid):
     assert met._fetch_one("hrrr", aoi_grid, datetime(2023, 7, 15, 18), {}) is None
 
 
-def test_fetch_one_swallows_a_source_error(monkeypatch, aoi_grid, caplog):
+def test_fetch_one_raises_a_source_error_rather_than_swallowing_it(monkeypatch, aoi_grid):
+    """A FAILED read and an ABSENCE of data are different answers, and `_fetch_one` used to
+    give both of them as None. The caller then tallied that None as `"<src>: no data"`, so a
+    lost download reached the run report wearing the words of a coverage gap -- exactly the
+    "one blip becomes a permanent hole in the cube" failure net.py exists to remove."""
     def boom(g, dt, cfg):
         raise RuntimeError("herbie exploded")
     _stub_sources(monkeypatch, hrrr=boom)
-    with caplog.at_level("WARNING"):
-        assert met._fetch_one("hrrr", aoi_grid, datetime(2023, 7, 15, 18), {}) is None
-    assert "hrrr failed" in caplog.text
+    with pytest.raises(RuntimeError, match="herbie exploded"):
+        met._fetch_one("hrrr", aoi_grid, datetime(2023, 7, 15, 18), {})
 
 
 def test_daily_mean_records_the_hours_that_ACTUALLY_contributed(monkeypatch, tmp_path,
@@ -253,6 +256,158 @@ def test_daily_mean_records_the_hours_that_ACTUALLY_contributed(monkeypatch, tmp
         assert ds.attrs["daily_mean_hours_requested"] == "[0, 6, 12, 18]"   # what we asked
     assert "built from 1 of 4 hours" in caplog.text
     assert "NOT a full-day mean" in caplog.text
+
+# --------------------------------------------------------------------------- #
+# Network hardening
+#
+# met was the last module reading the network without a timeout, a retry or a backoff --
+# and `_fetch_one` swallowed every exception into None, which the caller then tallied with
+# the SAME WORDS as a genuine coverage gap. A lost download was therefore indistinguishable
+# from an AoI the model does not cover, in the log and in the run report alike.
+# --------------------------------------------------------------------------- #
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+
+def _met_eff(tmp_path, aoi, **ds):
+    cfg = {"sources": ["hrrr"], "daily_mean_hours": [], "reference_time": "10:30",
+           "reference_basis": "solar", "variables": ["airtemp"], "model": "auto",
+           "fxx": 0, "product": "sfc", "regrid_radius_m": 6000.0}
+    cfg.update(ds)
+    return {
+        "ds": {aoi.name: cfg}, "grid": {"to_celsius": False},
+        "met_root": tmp_path, "fmt": "netcdf", "overwrite": False,
+        "time": {"start_date": "2023-07-15", "end_date": "2023-07-15"},
+        "config_sha256": "x",
+    }
+
+
+def test_hrrr_cycle_is_retried_on_a_transient_failure(monkeypatch, aoi_grid):
+    """Herbie had no retry at all, so one 503 permanently lost that cycle -- and because the
+    skip guard treats a written output as done, a later run never went back for it."""
+    _no_sleep(monkeypatch)
+    calls = []
+
+    def flaky(model, dt, fxx, product, var_keys):
+        calls.append(dt)
+        if len(calls) < 3:
+            raise TimeoutError("connection reset by peer")
+        return {"airtemp": np.zeros((2, 2), "float32")}, np.zeros((2, 2)), np.zeros((2, 2))
+
+    monkeypatch.setattr(met, "_hrrr_fetch_cycle", flaky)
+    monkeypatch.setattr(met, "_regrid_nearest",
+                        lambda fields, lon2d, lat2d, g, radius: fields)
+
+    got = met._fetch_hrrr(aoi_grid, datetime(2023, 7, 15, 18),
+                          {"model": "auto", "fxx": 0, "product": "sfc",
+                           "variables": ["airtemp"], "regrid_radius_m": 6000.0})
+    assert len(calls) == 3 and got is not None
+
+
+def test_a_failed_reference_is_reported_as_a_loss_not_as_no_data(monkeypatch, tmp_path,
+                                                                 aoi_grid):
+    """THE bug this hardening exists for. Both outcomes used to reach the run report as
+    `hrrr: no data`, so a flaky network read like a region the model does not cover."""
+    _no_sleep(monkeypatch)
+
+    def boom(g, dt, cfg):
+        raise TimeoutError("herbie mirror stalled")
+    _stub_sources(monkeypatch, hrrr=boom)
+
+    rep = met.run(_met_eff(tmp_path, aoi_grid), {aoi_grid.name: aoi_grid}, None, False)
+
+    assert rep.failed == 1 and rep.written == 0
+    (_item, why), = rep.failures
+    assert "herbie mirror stalled" in why
+    assert "no data" not in why
+    # And nothing on disk, so the next run retries the day instead of skipping it forever.
+    assert not list(tmp_path.rglob("*.nc"))
+
+
+def test_a_genuinely_absent_reference_still_reports_no_data(monkeypatch, tmp_path, aoi_grid):
+    """The other half of the split: HRRR is North America only, and an AoI outside it is a
+    fact about the DATA. That must keep reading as `no data`, not as a failure."""
+    _stub_sources(monkeypatch, hrrr=lambda g, dt, cfg: None)
+
+    rep = met.run(_met_eff(tmp_path, aoi_grid), {aoi_grid.name: aoi_grid}, None, False)
+
+    assert rep.failed == 1
+    (_item, why), = rep.failures
+    assert why == "hrrr: no data"
+
+
+def test_a_lost_hour_abandons_the_daily_mean_rather_than_writing_a_partial(
+        monkeypatch, tmp_path, aoi_grid):
+    """A partial mean written over a LOST hour would be permanent: the file exists, so the
+    skip guard takes the day for done on every later run and the lost hour is never
+    re-fetched. A transient blip must not become a permanent hole."""
+    _no_sleep(monkeypatch)
+
+    def dies_at_noon(g, dt, cfg):
+        if dt.hour == 12:
+            raise TimeoutError("GCS said 503")
+        return {"airtemp": np.full((aoi_grid.height, aoi_grid.width), 290.0, "float32")}
+    _stub_sources(monkeypatch, hrrr=dies_at_noon)
+
+    eff = _met_eff(tmp_path, aoi_grid, reference_time=None, daily_mean_hours=[0, 6, 12, 18])
+    rep = met.run(eff, {aoi_grid.name: aoi_grid}, None, False)
+
+    assert rep.written == 0 and rep.failed == 1
+    (_item, why), = rep.failures
+    assert "GCS said 503" in why
+    assert not list(tmp_path.rglob("*.nc"))
+
+
+def test_a_no_data_hour_still_builds_a_partial_daily_mean(monkeypatch, tmp_path, aoi_grid):
+    """Contrast with the test above: a MISSING hour is a fact about the data, so the partial
+    mean is still built (and still labelled with the hours that actually contributed)."""
+    def only_noon(g, dt, cfg):
+        if dt.hour != 12:
+            return None
+        return {"airtemp": np.full((aoi_grid.height, aoi_grid.width), 290.0, "float32")}
+    _stub_sources(monkeypatch, hrrr=only_noon)
+
+    eff = _met_eff(tmp_path, aoi_grid, reference_time=None, daily_mean_hours=[0, 6, 12, 18])
+    rep = met.run(eff, {aoi_grid.name: aoi_grid}, None, False)
+
+    assert rep.written == 1 and rep.failed == 0
+    f = tmp_path / "hrrr" / "aligned" / aoi_grid.name / f"{aoi_grid.name}_20230715.nc"
+    with xr.open_dataset(f) as ds:
+        assert ds.attrs["daily_mean_hours"] == "[12]"
+
+
+def test_era5_store_is_opened_once_under_concurrency(monkeypatch):
+    """The cache holds a live gcsfs handle and the check-then-open was not atomic, so two
+    workers would both miss, both open the store, and one would silently discard the
+    other's handle -- a doubled metadata fetch and an orphaned client."""
+    import threading
+    import time as _time
+
+    met._ERA5_CACHE.clear()
+    opens = []
+
+    def slow_open(uri, **kw):
+        # Wide enough that every other thread reaches the check while this one is inside it.
+        # Unlocked, all four would miss the cache and open the store; locked, the three that
+        # follow find it populated and open nothing.
+        _time.sleep(0.05)
+        opens.append(uri)
+        return object()
+
+    monkeypatch.setattr(met.xr, "open_zarr", slow_open)
+
+    threads = [threading.Thread(target=met._era5_store, args=("gs://fake",))
+               for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    try:
+        assert opens == ["gs://fake"]
+    finally:
+        met._ERA5_CACHE.clear()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])

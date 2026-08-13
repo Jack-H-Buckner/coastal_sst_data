@@ -300,3 +300,251 @@ def test_no_verify_skips_preflight(acquire_calls, monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
+
+# ---------------------------------------------------------------------------
+# G. Parallel acquisition
+#
+# The unit of work is (product, AoI), and the dependency edges are PER-AoI: MODIS's
+# coincidence filter reads Landsat's aligned files FOR THAT AoI (`match_landsat`), and MUR's
+# `overpass_sensors` reads the sensor dirs FOR THAT AoI. So `mur(a1)` waits for
+# `landsat(a1)`, not for `landsat(a2)` -- which is what removes the barriers between AoIs.
+# ---------------------------------------------------------------------------
+A2 = {"name": "a2", "center_lat": 46.5, "center_lon": -124.0,
+      "buffer_ns_km": 8, "buffer_ew_km": 8}
+
+
+@pytest.fixture
+def timed_calls(monkeypatch):
+    """Record (name, aoi, start, end) for every acquire(), with a real pause so overlap is
+    observable."""
+    import threading
+    import time
+    calls, lock = [], threading.Lock()
+
+    def make(name):
+        def f(project, *, grids=None, aois=None, dry_run=False, overwrite=False, **kw):
+            t0 = time.monotonic()
+            time.sleep(0.02)
+            with lock:
+                calls.append({"name": name, "aoi": (aois or [None])[0],
+                              "start": t0, "end": time.monotonic()})
+        return f
+
+    for name, m in [("bathymetry", bathymetry), ("ecostress", ecostress),
+                    ("mur", mur), ("landsat_pc", landsat_pc), ("met", met),
+                    ("modis", modis), ("tides", tides), ("landcover_esa", landcover_esa)]:
+        monkeypatch.setattr(m, "acquire", make(name))
+    return calls
+
+
+def _span(calls, name, aoi):
+    got, = [c for c in calls if c["name"] == name and c["aoi"] == aoi]
+    return got["start"], got["end"]
+
+
+def test_parallel_dispatches_one_call_per_aoi(timed_calls):
+    """Splitting an AoI list into one call per AoI is what makes AoIs parallelisable, and it
+    needs no change inside any module -- acquire() already takes a list."""
+    proj = _make_project({"bathymetry": None}, extra_area=A2)
+    pipeline.run_pipeline(proj, dry_run=True, jobs=4)
+    assert sorted(c["aoi"] for c in timed_calls) == ["a1", "a2"]
+
+
+def test_parallel_honours_the_dependency_within_each_aoi(timed_calls):
+    proj = _make_project({"modis": None, "landsat": None}, auth=EARTHDATA, extra_area=A2)
+    pipeline.run_pipeline(proj, dry_run=True, jobs=4)
+
+    for aoi in ("a1", "a2"):
+        _, landsat_end = _span(timed_calls, "landsat_pc", aoi)
+        modis_start, _ = _span(timed_calls, "modis", aoi)
+        assert modis_start >= landsat_end, f"{aoi}: modis started before landsat finished"
+
+
+def test_parallel_does_not_serialise_across_aois(timed_calls):
+    """The payoff of per-AoI edges: a2's Landsat must not wait for a1's."""
+    proj = _make_project({"modis": None, "landsat": None}, auth=EARTHDATA, extra_area=A2)
+    pipeline.run_pipeline(proj, dry_run=True, jobs=4)
+
+    a1 = _span(timed_calls, "landsat_pc", "a1")
+    a2 = _span(timed_calls, "landsat_pc", "a2")
+    assert a1[0] < a2[1] and a2[0] < a1[1], "the two AoIs' Landsat stages did not overlap"
+
+
+def test_parallel_runs_independent_products_together(timed_calls):
+    proj = _make_project({"bathymetry": None, "tides": None, "landcover": None})
+    pipeline.run_pipeline(proj, dry_run=True, jobs=4)
+
+    spans = [(c["start"], c["end"]) for c in timed_calls]
+    overlap = any(a[0] < b[1] and b[0] < a[1]
+                  for i, a in enumerate(spans) for b in spans[i + 1:])
+    assert overlap, "independent products ran strictly one after another"
+
+
+def test_a_service_gate_caps_its_products(monkeypatch, timed_calls):
+    """mur/modis/ecostress are three products behind ONE Earthdata account, so the cap has
+    to apply to the service, not to each product separately."""
+    proj = _make_project({"mur": None, "ecostress": None}, auth=EARTHDATA, extra_area=A2)
+    monkeypatch.setattr(proj.runtime, "gates", {"earthdata": 1})
+    pipeline.run_pipeline(proj, dry_run=True, jobs=8)
+
+    spans = sorted((c["start"], c["end"]) for c in timed_calls)
+    assert len(spans) == 4
+    for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
+        assert next_start >= prev_end, "two Earthdata tasks overlapped under a cap of 1"
+
+
+def test_a_failure_in_one_aoi_does_not_stop_another(monkeypatch, acquire_calls):
+    def boom(project, *, grids=None, aois=None, **kw):
+        if aois == ["a1"]:
+            raise RuntimeError("a1 landsat died")
+        acquire_calls.append({"name": "landsat_pc", "aois": aois})
+    monkeypatch.setattr(landsat_pc, "acquire", boom)
+
+    proj = _make_project({"landsat": None}, extra_area=A2)
+    outcomes = pipeline.run_pipeline(proj, dry_run=True, jobs=4)
+
+    assert [c["aois"] for c in acquire_calls] == [["a2"]]
+    assert "failed" in outcomes[DataProduct.landsat]
+
+
+def test_a_dependent_is_skipped_when_its_aois_dependency_fails(monkeypatch, acquire_calls):
+    """MODIS reading a Landsat directory that was never written produces a channel that
+    looks like 'no scenes matched' rather than 'the stage it depends on failed'."""
+    def boom(project, *, grids=None, aois=None, **kw):
+        raise RuntimeError("landsat died")
+    monkeypatch.setattr(landsat_pc, "acquire", boom)
+
+    ran = []
+    monkeypatch.setattr(modis, "acquire",
+                        lambda project, **kw: ran.append(kw.get("aois")))
+
+    proj = _make_project({"landsat": None, "modis": None}, auth=EARTHDATA)
+    outcomes = pipeline.run_pipeline(proj, dry_run=True, jobs=4)
+
+    assert ran == []
+    assert "skipped" in outcomes[DataProduct.modis]
+    assert "dependency failed" in outcomes[DataProduct.modis]
+
+
+def test_jobs_1_takes_the_original_serial_path(acquire_calls):
+    """The escape hatch is a different code path, not a differently-tuned one: one batched
+    call per module, exactly as before."""
+    proj = _make_project({"bathymetry": None}, extra_area=A2)
+    pipeline.run_pipeline(proj, dry_run=True, jobs=1)
+    assert [c["aois"] for c in acquire_calls] == [["a1", "a2"]]
+
+
+def test_jobs_defaults_to_the_config(acquire_calls):
+    proj = _make_project({"bathymetry": None}, extra_area=A2)
+    proj.runtime.jobs = 4
+    pipeline.run_pipeline(proj, dry_run=True)
+    assert sorted(c["aois"] for c in acquire_calls) == [["a1"], ["a2"]]
+
+
+# ---------------------------------------------------------------------------
+# H. Parallel terminal stages (assemble -> preprocess), on a DIVIDED memory budget
+#
+# Each AoI owns its own <aoi>.zarr, so AoIs are independent. assemble(aoi) and
+# preprocess(aoi) are NOT: preprocess reads and rewrites the very store assemble wrote, so
+# that pair is a dependency edge rather than two phases -- which is also the win, since AoI A
+# can preprocess while AoI B is still assembling.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def terminal_calls(monkeypatch, acquire_calls):
+    """Record (stage, aoi, budget, start, end) for assemble/preprocess.
+
+    Depends on `acquire_calls` so the ACQUISITION stages are stubbed too -- these tests run
+    with dry_run=False (the terminal stages are skipped under --dry-run), and an unstubbed
+    acquire would go to the network.
+    """
+    import threading
+    import time
+    from coastal_sst_data.processes import datacube
+    calls, lock = [], threading.Lock()
+
+    def make(stage):
+        def f(project, *, grids=None, aois=None, dry_run=False, overwrite=False,
+              memory_budget_gb=None):
+            t0 = time.monotonic()
+            time.sleep(0.02)
+            with lock:
+                calls.append({"stage": stage, "aoi": (aois or [None])[0],
+                              "budget": memory_budget_gb,
+                              "start": t0, "end": time.monotonic()})
+        return f
+
+    monkeypatch.setattr(pipeline.datacube, "assemble", make("assemble"))
+    monkeypatch.setattr(pipeline.preprocess_stage, "preprocess", make("preprocess"))
+    # A fixed budget, so the division is checked rather than the detection chain.
+    monkeypatch.setattr(datacube, "budget_bytes", lambda eff: (64 * 1024**3, "test"))
+    return calls
+
+
+def _pp_project(**kw):
+    proj = _make_project({"bathymetry": None}, extra_area=A2, **kw)
+    proj.preprocess.enabled = True
+    return proj
+
+
+def test_terminal_stages_run_per_aoi_and_divide_the_budget(terminal_calls):
+    """`budget_bytes` halves the detected memory on the assumption it owns the machine.
+    Four AoIs each claiming half of 200 GB is a 400 GB working set -- and this stage is
+    exactly the one that gets OOM-killed when that arithmetic is wrong."""
+    proj = _pp_project()
+    proj.runtime.assemble_jobs = 2
+    pipeline.run_pipeline(proj, jobs=1, assemble=True, preprocess=True, verify_auth=False)
+
+    assembles = [c for c in terminal_calls if c["stage"] == "assemble"]
+    assert sorted(c["aoi"] for c in assembles) == ["a1", "a2"]
+    assert all(c["budget"] == pytest.approx(32.0) for c in assembles)   # 64 GiB / 2
+
+
+def test_preprocess_waits_for_its_own_aois_assembly(terminal_calls):
+    """They read and write the SAME <aoi>.zarr; overlapping them would corrupt it."""
+    proj = _pp_project()
+    proj.runtime.assemble_jobs = 4
+    pipeline.run_pipeline(proj, jobs=1, assemble=True, preprocess=True, verify_auth=False)
+
+    for aoi in ("a1", "a2"):
+        asm, = [c for c in terminal_calls if c["stage"] == "assemble" and c["aoi"] == aoi]
+        pre, = [c for c in terminal_calls if c["stage"] == "preprocess" and c["aoi"] == aoi]
+        assert pre["start"] >= asm["end"], f"{aoi}: preprocess overlapped its own assembly"
+
+
+def test_different_aois_terminal_stages_overlap(terminal_calls):
+    proj = _pp_project()
+    proj.runtime.assemble_jobs = 4
+    pipeline.run_pipeline(proj, jobs=1, assemble=True, preprocess=True, verify_auth=False)
+
+    a1 = [c for c in terminal_calls if c["aoi"] == "a1"]
+    a2 = [c for c in terminal_calls if c["aoi"] == "a2"]
+    assert any(x["start"] < y["end"] and y["start"] < x["end"] for x in a1 for y in a2), \
+        "the two AoIs' terminal stages ran strictly one after another"
+
+
+def test_preprocess_is_skipped_when_its_assembly_failed(monkeypatch, terminal_calls):
+    """Preprocessing a cube that was never written is not a smaller result -- it is a
+    different failure wearing the wrong name."""
+    def boom(project, *, aois=None, **kw):
+        raise RuntimeError(f"assembly died for {aois}")
+    monkeypatch.setattr(pipeline.datacube, "assemble", boom)
+
+    proj = _pp_project()
+    proj.runtime.assemble_jobs = 2
+    outcomes = pipeline.run_pipeline(proj, jobs=1, assemble=True, preprocess=True,
+                                     verify_auth=False)
+
+    assert [c for c in terminal_calls if c["stage"] == "preprocess"] == []
+    assert "failed" in outcomes["datacube"]
+    assert "skipped" in outcomes["preprocess"]
+
+
+def test_assemble_jobs_1_keeps_the_single_batched_call(terminal_calls):
+    proj = _pp_project()
+    proj.runtime.assemble_jobs = 1
+    pipeline.run_pipeline(proj, jobs=1, assemble=True, preprocess=True, verify_auth=False)
+
+    assembles = [c for c in terminal_calls if c["stage"] == "assemble"]
+    assert len(assembles) == 1
+    assert assembles[0]["aoi"] is None          # the whole-project call, as before
+    assert assembles[0]["budget"] is None       # and no budget override

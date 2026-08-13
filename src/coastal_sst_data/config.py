@@ -539,6 +539,68 @@ class AuthConfig(BaseModel):
     max_refreshes: int = 20       # per backend per run; exceeded -> a real failure, not a retry
 
 
+class RuntimeSpec(BaseModel):
+    """How much of the run happens at once.
+
+    Nothing here changes WHAT a run produces -- only how many pieces of it are in flight.
+    The defaults are the serial pipeline exactly as it has always behaved, so parallelism is
+    opt-in and `jobs: 1` remains a true escape hatch.
+
+    TWO LIMITS, because one number cannot express the constraint. `jobs` bounds the worker
+    pool. `gates` bounds each SERVICE, and services differ by an order of magnitude in what
+    they tolerate: Earthdata is content with several granule reads at once, while CMEMS hands
+    out a dataset handle that is not safe to share at all and the NOAA metadata endpoints sit
+    behind a module-global `requests.Session`. Which gate a product belongs to is declared on
+    its ProductSpec (`products.ProductSpec.gate`); this sizes the buckets.
+
+    The caps are config rather than constants because they move when the run moves: in-region
+    on AWS, Earthdata tolerates far more than it does over a home link.
+    """
+    model_config = {"extra": "forbid"}
+
+    # Concurrent ACQUISITION tasks, where a task is one (product, AoI). 1 == today's serial
+    # path, taken verbatim rather than emulated.
+    jobs: int = Field(1, ge=1)
+    # Concurrent AoIs in the assemble/preprocess stages. Separate from `jobs`, and much
+    # smaller by default, because these are bounded by MEMORY rather than by the network --
+    # and the memory budget is DIVIDED between them (see datacube.budget_bytes). A run that
+    # OOMs here has already done all the downloading, which is the expensive part to lose.
+    assemble_jobs: int = Field(1, ge=1)
+    # Per-service caps, overriding DEFAULT_GATES. Keys are `ProductSpec.gate` names.
+    gates: dict[str, int] = Field(default_factory=dict)
+
+
+# Starting caps per service. Tuned to what each endpoint tolerates, NOT to the machine:
+#
+#   earthdata   several granule reads at once are normal; `earthaccess.open()` already
+#               threads internally, so the real connection count is a multiple of this.
+#               CMR *search* is the throttled part, and there is one search per (product, AoI).
+#   pc          anonymous -- there is no account and no per-account limit. Throttling is
+#               per-IP, and the STAC search endpoint is the sensitive half.
+#   copernicus  the lazy dataset handle carries its own client and is not safe to share; the
+#               toolbox parallelises internally already.
+#   herbie      hardened in this cycle (retry + a requests deadline); before that a stalled
+#               mirror could hang a worker forever, which on a pool is unrecoverable.
+#   noaa_small  small public metadata APIs, behind a module-global `requests.Session`.
+#   erddap      same -- raise once `insitu_ioos` uses a thread-local session.
+#   dem         the CUDEM tile index is one cache file shared by every AoI, refreshed with a
+#               non-atomic expire-then-write.
+DEFAULT_GATES: dict[str, int] = {
+    "earthdata": 6,
+    "pc": 4,
+    "herbie": 4,
+    "copernicus": 1,
+    "noaa_small": 1,
+    "erddap": 1,
+    "dem": 1,
+}
+
+
+def gate_caps(project: "Project") -> dict[str, int]:
+    """The effective per-service caps for a run: defaults, overridden by the config."""
+    return {**DEFAULT_GATES, **{k: int(v) for k, v in project.runtime.gates.items()}}
+
+
 # ---------------------------------------------------------------------------
 # Auth requirements: which backend each product needs. DERIVED from the registry.
 #
@@ -621,6 +683,8 @@ class Project(BaseModel):
     preprocess: PreprocessSpec = Field(default_factory=PreprocessSpec)
     # Non-secret auth settings; required per selected product (see validator).
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    # How much runs at once. Defaults are the serial pipeline, so the block is optional.
+    runtime: RuntimeSpec = Field(default_factory=RuntimeSpec)
 
 
     @field_validator("output_dir")

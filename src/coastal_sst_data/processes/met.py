@@ -40,6 +40,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -51,7 +52,7 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, naming, provenance, report, store
+from .. import entry, naming, net, provenance, report, store
 
 log = logging.getLogger(__name__)
 
@@ -125,7 +126,21 @@ def _snap_to_cycle(dt: datetime, model: str) -> datetime:
 
 
 def _hrrr_fetch_cycle(model, dt, fxx, product, var_keys):
-    """Fetch one HRRR cycle -> ({outname: 2D array}, lon2d, lat2d) or None."""
+    """Fetch one HRRR cycle -> ({outname: 2D array}, lon2d, lat2d) or None.
+
+    NOT retried here -- `_fetch_hrrr` wraps the WHOLE call in `net.retry`, including the
+    `Herbie(...)` construction, because that constructor is itself a network step (it walks the
+    AWS/Google/NOMADS mirrors to find the cycle) and a Herbie bound to a mirror that has since
+    stopped answering cannot be healed by re-reading it. Same reasoning as `mur.py`, where the
+    `earthaccess.open` sits inside the retry with the read rather than outside it.
+
+    THE DEADLINE COMES FROM `net.setup_requests_timeout`, installed in `acquire()`. Herbie
+    exposes no timeout parameter and fetches over plain `requests` with none of its own, so
+    without that patch a stalled mirror hangs this call forever -- and `net.setup_gdal_env` does
+    not help, because those knobs are GDAL's and no GDAL is involved in a GRIB fetch. The hang is
+    what makes this urgent rather than untidy: on a thread pool a hung read holds a worker that
+    nothing can cancel.
+    """
     from herbie import Herbie
     H = Herbie(dt.strftime("%Y-%m-%d %H:00"), model=model, product=product, fxx=fxx)
     fields, lon2d, lat2d = {}, None, None
@@ -171,7 +186,9 @@ def _fetch_hrrr(g: AoiGrid, dt: datetime, cfg: dict) -> dict | None:
     if model is None:
         return None                                  # AoI outside HRRR coverage
     cyc = _snap_to_cycle(dt, model)
-    got = _hrrr_fetch_cycle(model, cyc, cfg["fxx"], cfg["product"], cfg["variables"])
+    got = net.retry(
+        lambda: _hrrr_fetch_cycle(model, cyc, cfg["fxx"], cfg["product"], cfg["variables"]),
+        what=f"HRRR {model} {cyc:%Y-%m-%dT%H}")
     if got is None:
         return None
     fields, lon2d, lat2d = got
@@ -182,14 +199,26 @@ def _fetch_hrrr(g: AoiGrid, dt: datetime, cfg: dict) -> dict | None:
 # ERA5 source (ARCO Zarr on GCS -> rioxarray bilinear reproject)
 # --------------------------------------------------------------------------- #
 _ERA5_CACHE: dict[str, xr.Dataset] = {}
+# The cache holds a LIVE gcsfs/dask-backed handle, and the check-then-open below is not atomic.
+# Under one thread that is invisible; under a pool, two workers would both miss, both open the
+# store, and one would silently discard the other's handle -- doubling the metadata fetch and
+# leaving an orphaned fsspec client behind. Held across the open, not just the dict write, so
+# the store is opened exactly once per URI.
+_ERA5_LOCK = threading.Lock()
 
 
 def _era5_store(uri: str) -> xr.Dataset:
     """Lazily open (and cache) the ARCO-ERA5 Zarr store; metadata only."""
-    if uri not in _ERA5_CACHE:
-        _ERA5_CACHE[uri] = xr.open_zarr(uri, chunks="auto",
-                                        storage_options={"token": "anon"})
-    return _ERA5_CACHE[uri]
+    with _ERA5_LOCK:
+        if uri not in _ERA5_CACHE:
+            _ERA5_CACHE[uri] = net.retry(
+                lambda: xr.open_zarr(
+                    uri, chunks="auto",
+                    # gcsfs reads neither the GDAL knobs nor `requests` -- it is aiohttp -- so
+                    # its deadline has to be passed here or the store open can hang forever.
+                    storage_options={"token": "anon", "timeout": net.HTTP_TIMEOUT_S}),
+                what=f"ARCO-ERA5 store {uri}")
+        return _ERA5_CACHE[uri]
 
 
 def _era5_normalize(fields: dict) -> dict:
@@ -229,8 +258,11 @@ def _fetch_era5(g: AoiGrid, dt: datetime, cfg: dict) -> dict | None:
     w, s, e, n = g.search_bbox
     pad = cfg["pad_deg"]
     lon0, lon1 = (w - pad) % 360.0, (e + pad) % 360.0
-    sub = snap.sel(latitude=slice(n + pad, s - pad),
-                   longitude=slice(lon0, lon1)).load()
+    # `.load()` is where the network actually happens -- everything above it is lazy, so a
+    # transient GCS 503 surfaces HERE and nowhere else. Retried; a genuinely empty window is a
+    # fact about the AoI and is checked after.
+    win = snap.sel(latitude=slice(n + pad, s - pad), longitude=slice(lon0, lon1))
+    sub = net.retry(win.load, what=f"ARCO-ERA5 window {t:%Y-%m-%dT%H}")
     if sub.longitude.size == 0 or sub.latitude.size == 0:
         return None
 
@@ -257,12 +289,23 @@ def _fetch_one(src: str, g: AoiGrid, dt: datetime, cfg: dict) -> dict | None:
     no data here (HRRR off-continent, no ERA5 cell) simply contributes NaN to ITS channel --
     it is never silently substituted by another (HRRR and ERA5 are not interchangeable:
     different resolution, and `swrad` is instantaneous under HRRR but an hourly mean in ERA5).
+
+    TWO OUTCOMES, AND THEY ARE NOT THE SAME THING:
+
+      * ``None`` -- there is no data here. HRRR is North America only; ERA5's window can be
+        empty; the timestamp may fall outside the archive. A fact about the DATA, and the
+        caller records it as such.
+      * ``raise`` -- the read FAILED, after `net.retry` has already spent its budget.
+
+    This used to be one outcome. Every exception was caught here, logged at warning level and
+    turned into ``None``, and the caller then tallied it as ``f"{src}: no data"`` -- so a lost
+    download and a genuine coverage gap went into the run report with the SAME WORDS, and the
+    message that distinguished them was already gone. That is precisely the failure `net.py`
+    was written to remove: "one blip becomes a permanent hole in the cube", made invisible by
+    being reported as an absence of data rather than a loss of it. `cmems.py` draws the same
+    line for the same reason.
     """
-    try:
-        return _SOURCES[src](g, dt, cfg)
-    except Exception as exc:
-        log.warning("    met: %s failed @ %s (%s)", src, dt, exc)
-        return None
+    return _SOURCES[src](g, dt, cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -364,7 +407,15 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                         aoi_out / f"{ref_stem}.nc", store.REQUIRED_VARS["MET"],
                         shape=(g.height, g.width), overwrite=overwrite):
                     rt = reference_time_utc(day, lon, ref_hours, ref_basis)
-                    got = _fetch_one(src, g, rt.to_pydatetime(), ds_cfg)
+                    got, why = None, f"{src}: no data"
+                    try:
+                        got = _fetch_one(src, g, rt.to_pydatetime(), ds_cfg)
+                    except Exception as exc:
+                        # A LOSS, not an absence -- and it must not be tallied as one. Nothing
+                        # is written, so the next run retries this day rather than finding an
+                        # output on disk and skipping it forever.
+                        log.warning("  %s reference [%s] FAILED (%s)", dstr, src, exc)
+                        why = f"{src}: {exc}"
                     if got:
                         ds = to_dataset(got, g, rt, to_celsius)
                         ds.attrs.update(aoi_id=name, source=src, met_source=src,
@@ -376,22 +427,35 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                                  store.write_output(ds, aoi_out, ref_stem, fmt))
                         rep.wrote(source=src)
                     else:
-                        rep.fail(f"{name} {src} ref {dstr}", f"{src}: no data")
+                        rep.fail(f"{name} {src} ref {dstr}", why)
 
                 # ---- daily mean over mean_hours (skipped when daily_mean_hours: []) ----
                 if mean_hours and not store.done(
                         aoi_out / f"{mean_stem}.nc", store.REQUIRED_VARS["MET"],
                         shape=(g.height, g.width), overwrite=overwrite):
-                    stack, used_hours = {}, []
+                    stack, used_hours, lost = {}, [], None
                     for hh in mean_hours:
                         dt = day.to_pydatetime().replace(hour=int(hh))
-                        got = _fetch_one(src, g, dt, ds_cfg)
+                        try:
+                            got = _fetch_one(src, g, dt, ds_cfg)
+                        except Exception as exc:
+                            # A LOST hour is not a missing one. Writing a mean over the hours
+                            # that happened to survive would bake a transient blip into the
+                            # cube permanently -- the file would exist, so the skip guard would
+                            # take the day for done on every later run and the lost hours would
+                            # never be re-fetched. Abandon the day instead; it costs one day of
+                            # daily mean now and retries cleanly next run.
+                            log.warning("  %s daily [%s] %02dh FAILED (%s)", dstr, src, int(hh), exc)
+                            lost = f"{src}: {exc} @ {int(hh):02d}h"
+                            break
                         if not got:
                             continue
                         used_hours.append(int(hh))
                         for k, v in got.items():
                             stack.setdefault(k, []).append(v)
-                    if stack:
+                    if lost:
+                        rep.fail(f"{name} {src} daily {dstr}", lost)
+                    elif stack:
                         mean_grids = {k: np.nanmean(np.stack(v), axis=0) for k, v in stack.items()}
                         ds = to_dataset(mean_grids, g, day, to_celsius)
                         # The hours that ACTUALLY contributed, not the ones we asked for -- a
@@ -476,6 +540,10 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     `source` (from the pipeline, or unset on a direct CLI run) narrows to one. No sensor
     dependency any more -- overpass documentation is the separate `met_overpass` product.
     """
+    # Herbie fetches over plain `requests` with no timeout of its own, so without this a
+    # stalled mirror hangs the stage forever. `acquire()` is the one entry point every
+    # invocation path goes through, which is where the other network policy is applied too.
+    net.setup_requests_timeout()
     eff = _build_eff(project)
     if overwrite:
         eff["overwrite"] = True

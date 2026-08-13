@@ -362,3 +362,57 @@ def test_setup_gdal_env_does_not_override_an_operator(monkeypatch):
     monkeypatch.setenv("GDAL_HTTP_TIMEOUT", "999")
     net.setup_gdal_env()
     assert os.environ["GDAL_HTTP_TIMEOUT"] == "999"
+
+
+# --------------------------------------------------------------------------- #
+# requests deadline
+#
+# `setup_gdal_env` reaches only GDAL. Herbie (the HRRR backend) fetches its index and its
+# GRIB byte-ranges with plain `requests` and passes no timeout on all but one call, so
+# without this patch a stalled mirror hangs the stage forever -- and on a thread pool it
+# holds a worker nothing can cancel.
+# --------------------------------------------------------------------------- #
+def _reset_requests_patch(monkeypatch):
+    """Undo the module-level install so each test observes a fresh one."""
+    import requests
+    monkeypatch.setattr(requests.Session, "request", requests.Session.request)
+    monkeypatch.setattr(net, "_requests_patched", False)
+
+
+def test_setup_requests_timeout_fills_in_a_missing_deadline(monkeypatch):
+    import requests
+    _reset_requests_patch(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(requests.Session, "request",
+                        lambda self, method, url, **kw: seen.update(kw) or "resp")
+
+    net.setup_requests_timeout()
+    requests.Session().request("GET", "http://example.invalid/")
+
+    assert seen["timeout"] == (net.CONNECT_TIMEOUT_S, net.HTTP_TIMEOUT_S)
+
+
+def test_setup_requests_timeout_keeps_an_explicit_one(monkeypatch):
+    """`insitu_ioos._get`, `tides._get_json` and `datum._http_json` all pass their own
+    timeout, chosen for their own endpoint. Clobbering those would be a regression."""
+    import requests
+    _reset_requests_patch(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(requests.Session, "request",
+                        lambda self, method, url, **kw: seen.update(kw) or "resp")
+
+    net.setup_requests_timeout()
+    requests.Session().request("GET", "http://example.invalid/", timeout=7)
+
+    assert seen["timeout"] == 7
+
+
+def test_setup_requests_timeout_is_idempotent(monkeypatch):
+    """Called from every met/met_overpass acquire(); stacking wrappers per call would
+    rebuild the chain on every stage and make the deadline harder to reason about."""
+    import requests
+    _reset_requests_patch(monkeypatch)
+    net.setup_requests_timeout()
+    once = requests.Session.request
+    net.setup_requests_timeout()
+    assert requests.Session.request is once

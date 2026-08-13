@@ -118,6 +118,45 @@ def setup_gdal_env() -> None:
     os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif")
 
 
+_requests_patched = False
+
+
+def setup_requests_timeout() -> None:
+    """Give every `requests` call that sets no deadline of its own a finite one.
+
+    `setup_gdal_env` bounds the /vsicurl COG reads, but it reaches only GDAL. Herbie -- the HRRR
+    backend -- fetches its index and its GRIB byte-ranges with plain `requests.get(...)` and
+    `requests.head(...)`, and passes NO timeout on all but one of them. A `requests` call with no
+    timeout waits forever, which is the exact hang this module exists to remove.
+
+    A GLOBAL SOCKET TIMEOUT DOES NOT FIX THIS, tempting though it looks: urllib3 passes its own
+    timeout object down to `socket.create_connection` rather than the sentinel that would let
+    `socket.setdefaulttimeout()` apply, so setting one changes nothing and the wait falls back to
+    the OS connect timeout (measured: 75s on macOS, and unbounded once connected). The deadline
+    has to be installed where `requests` actually reads it.
+
+    Only fills in a MISSING timeout -- a caller that passed its own keeps it exactly
+    (`insitu_ioos._get`, `tides._get_json` and `datum._http_json` all set theirs, and are
+    untouched). Idempotent, and installed once at `acquire()` time rather than wrapped around
+    individual calls: an install/uninstall pair around a call site would be a race the moment two
+    stages run on one thread pool.
+    """
+    global _requests_patched
+    if _requests_patched:
+        return
+    import requests
+
+    original = requests.Session.request
+
+    def request(self, method, url, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = (CONNECT_TIMEOUT_S, HTTP_TIMEOUT_S)
+        return original(self, method, url, **kwargs)
+
+    requests.Session.request = request
+    _requests_patched = True
+
+
 def _status_of(exc: BaseException) -> int | None:
     """The HTTP status behind an exception, if it carries one."""
     resp = getattr(exc, "response", None)

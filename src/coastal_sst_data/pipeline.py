@@ -33,8 +33,9 @@ import argparse
 import importlib
 import logging
 
-from . import auth, products, report
-from .config import (DataProduct, DEFAULT_SOURCE, Project, load_config, opt, resolve_opts)
+from . import auth, logctx, net, products, report, scheduler
+from .config import (DataProduct, DEFAULT_SOURCE, Project, gate_caps, load_config, opt,
+                     resolve_opts)
 from .grid import AoiGrid, compute_aoi_grid
 from .processes import datacube, preprocess as preprocess_stage
 
@@ -153,6 +154,135 @@ def _modules_for(project: Project, product: DataProduct, aoi_names):
     return list(groups.items())
 
 
+def _preresolve(project: Project, ordered, grids) -> None:
+    """Import every module this run will dispatch, on the calling thread.
+
+    `_module_for` imports lazily, so without this the first import of a stage happens on
+    whichever worker reaches it first -- concurrently with other first imports, and
+    concurrently with code relying on their side effects (`processes.tides` patches
+    `collections` and `numpy` at import time to make `pytides2` importable).
+
+    Best-effort: a product whose module cannot be imported is left for dispatch to report in
+    context, exactly as it does today. The point is to have done the importing, not to add a
+    new failure mode.
+    """
+    for product in ordered:
+        for name in grids:
+            try:
+                _module_for(project, product, name)
+            except Exception as exc:      # noqa: BLE001 -- dispatch reports it properly
+                log.debug("  pre-import of %s for %s deferred to dispatch (%s)",
+                          product.value, name, exc)
+
+
+def _acquire_parallel(project: Project, ordered, grids, run_aois, *, dry_run, overwrite,
+                      jobs, outcomes, run_report) -> None:
+    """Acquire every (product, AoI) concurrently, honouring the declared dependencies.
+
+    THE UNIT OF WORK IS (product, AoI), and that falls out of two things the package already
+    had: every module takes an AoI LIST, so one call over N AoIs splits into N calls over one
+    AoI each with no module change at all; and `_modules_for` already groups AoIs by the
+    module that will serve them, so the split is a loop over a grouping that exists.
+
+    THE DEPENDENCY EDGES ARE PER-AoI, which is the part worth being precise about. The three
+    edges in the registry all describe one product READING ANOTHER'S ALIGNED FILES -- MODIS's
+    coincidence filter reads Landsat's, MUR's `overpass_sensors` and `met_overpass` read the
+    sensors' -- and every one of those reads is scoped to an AoI (`overpass.days_with_scenes`
+    and `match_landsat` both filter by AoI name). So `mur(hobart)` waits for
+    `landsat(hobart)`, NOT for `landsat(tamar)`. Modelling it that way rather than as global
+    per-product waves is what removes the barriers: Hobart can be on MUR while Tamar is still
+    downloading Landsat.
+
+    A product whose module raises for one AoI still runs for the others; the AoIs whose
+    dependencies failed are SKIPPED and say so, rather than running against a directory that
+    was never written.
+    """
+    caps = gate_caps(project)
+    tasks: list[scheduler.Task] = []
+    planned: dict[DataProduct, set[str]] = {}
+    unimplemented: dict[DataProduct, list[str]] = {}
+
+    def _work(module, aoi):
+        return lambda: module.acquire(project, grids=grids, aois=[aoi],
+                                      dry_run=dry_run, overwrite=overwrite)
+
+    for product in ordered:
+        spec = products.spec(product)
+        for module, module_aois in _modules_for(project, product, run_aois):
+            if module is None:
+                srcs = sorted({_source_for(project, product, a) or "?" for a in module_aois})
+                unimplemented.setdefault(product, []).append(
+                    f"{', '.join(module_aois)} (source={'/'.join(srcs)})")
+                continue
+            for aoi in module_aois:
+                planned.setdefault(product, set()).add(aoi)
+                # Depend only on dependencies that are actually RUNNING for THIS AoI. A
+                # dependency that is unselected, or that has no implementation here, produced
+                # no task -- and waiting on a task that will never exist would deadlock.
+                # `ordered` is topologically sorted, so `planned` already holds every
+                # dependency by the time we reach the product that needs it.
+                deps = tuple(("acquire", d.value, aoi) for d in spec.depends_on
+                             if aoi in planned.get(d, ()))
+                tasks.append(scheduler.Task(
+                    key=("acquire", product.value, aoi),
+                    run=_work(module, aoi),
+                    deps=deps,
+                    gates=(spec.gate,),
+                    label=f"{aoi}/{product.value}"))
+
+    for product, notes in unimplemented.items():
+        log.warning("=== %s: no implementation for %s; those AoI(s) are SKIPPED ===",
+                    product.value, "; ".join(notes))
+
+    log.info("Running %d task(s) on %d worker(s); service caps: %s",
+             len(tasks), jobs,
+             ", ".join(f"{g}={caps.get(g, 'unlimited')}"
+                       for g in sorted({t.gates[0] for t in tasks})) or "none")
+
+    results = scheduler.run_graph(tasks, jobs=jobs, gates=caps)
+
+    # Fold the per-AoI reports back into ONE row per product, which is what the reader wants:
+    # `mur` is one product whether it ran once or once per AoI.
+    for product in ordered:
+        merged: report.ProductReport | None = None
+        ran = False
+        failures, skipped = [], []
+        for aoi in sorted(planned.get(product, ())):
+            got = results[("acquire", product.value, aoi)]
+            if got.skipped:
+                skipped.append(aoi)
+                continue
+            if got.error is not None:
+                failures.append(f"{aoi}: {got.error}")
+                continue
+            ran = True
+            if got.value is not None:
+                merged = got.value if merged is None else merged.merge(got.value)
+
+        notes = unimplemented.get(product, [])
+        if failures:
+            outcomes[product] = f"failed: {'; '.join(failures)}"
+            run_report.add(product.value, merged, outcome=f"stage raised: {'; '.join(failures)}")
+        elif skipped and not ran:
+            why = f"dependency failed for {', '.join(skipped)}"
+            outcomes[product] = f"skipped ({why})"
+            run_report.add(product.value, None, outcome=why)
+        elif not ran:
+            outcomes[product] = "skipped (not implemented)"
+            run_report.add(product.value, None,
+                           outcome=f"not implemented: {'; '.join(notes)}")
+        else:
+            outcomes[product] = merged.outcome if merged is not None else "ok"
+            extra = []
+            if notes:
+                extra.append(f"no implementation for {'; '.join(notes)}")
+            if skipped:
+                extra.append(f"dependency failed for {', '.join(skipped)}")
+            if extra and merged is not None:
+                merged.note = "; ".join(n for n in ([merged.note] + extra) if n)
+            run_report.add(product.value, merged)
+
+
 def compute_grids(project: Project) -> dict[str, AoiGrid]:
     """Shared grid for every AoI, skipping any that fail (antimeridian/pole).
 
@@ -171,7 +301,7 @@ def compute_grids(project: Project) -> dict[str, AoiGrid]:
 
 def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
                  overwrite=False, verify_auth=None, assemble=False,
-                 preprocess=False) -> dict:
+                 preprocess=False, jobs=None) -> dict:
     """Run selected products for a project. Returns {product: outcome} summary.
 
     Products default to everything selected in the config; `products` restricts
@@ -191,9 +321,15 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     cube. Runs AFTER assemble (so it sees a freshly-written cube) and is a
     no-op unless the config's `preprocess.enabled` is set. Records its outcome
     under the "preprocess" summary key.
+
+    jobs: how many (product, AoI) acquisitions run at once; None takes `runtime.jobs` from
+    the config (default 1). `jobs=1` runs the ORIGINAL serial loop verbatim -- not a
+    one-worker emulation of the parallel path -- so the escape hatch is a different code
+    path, not a differently-tuned one.
     """
     if verify_auth is None:
         verify_auth = not dry_run
+    jobs = max(1, int(project.runtime.jobs if jobs is None else jobs))
 
     if aois:
         valid = {a.name for a in project.all_areas}
@@ -214,6 +350,23 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
 
     ordered = [p for p in PROCESS_ORDER if p in selected]
 
+    # Network policy, applied ONCE for the whole run rather than from inside each stage's
+    # acquire(). Both are idempotent `setdefault`-style installs, so this is not a behaviour
+    # change today -- it is the point at which "several stages racing to install the same
+    # global" stops being a thing that can happen at all.
+    net.setup_gdal_env()
+    net.setup_requests_timeout()
+
+    # Resolve every module NOW, on the main thread, before any work is dispatched. Dispatch
+    # resolves dotted module paths lazily (`_resolve` -> importlib), and some of those imports
+    # have process-global side effects -- `processes.tides` monkey-patches `collections` and
+    # `numpy` at import time so `pytides2` will import at all. An import racing another
+    # import, or racing the code that depends on its side effect, is a class of bug that is
+    # very hard to reproduce and trivial to avoid: do them all up front, single-threaded.
+    # A resolution FAILURE here is also a much better error than the same failure surfacing
+    # halfway through a run, after an hour of downloads.
+    _preresolve(project, ordered, grids)
+
     # Preflight: connect to every credentialed backend the run needs, up front.
     if verify_auth:
         log.info("Preflight: verifying credentials for %s ...", [p.value for p in ordered])
@@ -230,6 +383,14 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
 
     # The AoIs this run touches (a valid --aoi subset, or everything with a usable grid).
     run_aois = [n for n in grids if not aois or n in set(aois)]
+
+    if jobs > 1:
+        _acquire_parallel(project, ordered, grids, run_aois, dry_run=dry_run,
+                          overwrite=overwrite, jobs=jobs, outcomes=outcomes,
+                          run_report=run_report)
+        return _finish(project, grids, aois, dry_run=dry_run, overwrite=overwrite,
+                       assemble=assemble, preprocess=preprocess,
+                       outcomes=outcomes, run_report=run_report)
 
     for product in ordered:
         log.info("=== %s ===", product.value)
@@ -279,9 +440,29 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
                     if n)
             run_report.add(product.value, merged)
 
+    return _finish(project, grids, aois, dry_run=dry_run, overwrite=overwrite,
+                   assemble=assemble, preprocess=preprocess,
+                   outcomes=outcomes, run_report=run_report)
+
+
+def _finish(project: Project, grids, aois, *, dry_run, overwrite, assemble, preprocess,
+            outcomes, run_report):
+    """The terminal stages and the run report -- shared by the serial and parallel paths.
+
+    Extracted rather than duplicated: these are the two stages whose failure handling and
+    reporting a reader is most likely to compare against the acquisition loop's, and two
+    copies would be two things to keep in step.
+    """
     # (The DEM->MSL datum offset is no longer a separate stage: bathymetry resolves it INLINE
     # per DEM source and stamps it onto that source's output, so it always follows the DEM it
     # belongs to. The datacube assembler surfaces it as per-source cube attributes.)
+
+    do_preprocess = preprocess and project.preprocess.enabled
+    if (assemble or do_preprocess) and project.runtime.assemble_jobs > 1 and not dry_run:
+        _terminal_parallel(project, grids, aois, overwrite=overwrite, assemble=assemble,
+                           preprocess=do_preprocess, outcomes=outcomes,
+                           run_report=run_report)
+        return _report(run_report, outcomes)
 
     # Terminal stage: knit the aligned outputs into per-AoI datacubes.
     if assemble:
@@ -317,8 +498,12 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     elif preprocess and not project.preprocess.enabled:
         log.info("=== preprocess: skipped (set `preprocess.enabled: true` in the config) ===")
 
-    # The run report: what was loaded, from which source, how long it took, and -- the part
-    # that did not exist before -- what was ATTEMPTED AND LOST.
+    return _report(run_report, outcomes)
+
+
+def _report(run_report, outcomes) -> dict:
+    """The run report: what was loaded, from which source, how long it took, and -- the part
+    that did not exist before -- what was ATTEMPTED AND LOST."""
     log.info("")
     run_report.log()
     if run_report.any_failures:
@@ -327,6 +512,82 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
                     "should be. Re-run to retry them (completed outputs are skipped), or "
                     "`coastal-sst-data check --repair` first if a run died mid-write.")
     return outcomes
+
+
+def _terminal_parallel(project: Project, grids, aois, *, overwrite, assemble, preprocess,
+                       outcomes, run_report) -> None:
+    """Assemble (and preprocess) several AoIs at once, on a DIVIDED memory budget.
+
+    Two facts make this safe, and both are properties the tree already had:
+
+      * Each AoI owns its own `<aoi>.zarr`, so concurrent AoIs never touch the same store.
+      * `assemble(aoi)` and `preprocess(aoi)` DO touch the same store -- preprocess reads and
+        rewrites the cube assemble just wrote -- so they are chained as a dependency edge
+        rather than run as two phases. That is also the win: AoI A preprocesses while AoI B
+        is still assembling, instead of every AoI waiting at a barrier between the stages.
+
+    THE MEMORY BUDGET IS DIVIDED, and this is the part that turns a working run into an OOM
+    if it is skipped. `datacube.budget_bytes` detects what the machine has and halves it, on
+    the assumption that it is the only thing running -- true when one AoI assembles at a
+    time, false the moment two do. Four AoIs each claiming half of a 200 GB machine is a
+    400 GB working set. `resolve_block_days` then does the rest by itself: a smaller budget
+    yields smaller (still chunk-aligned) blocks.
+    """
+    jobs = int(project.runtime.assemble_jobs)
+    names = [a.name for a in project.all_areas
+             if a.name in grids and (not aois or a.name in set(aois))]
+    if not names:
+        return
+
+    budget, src = datacube.budget_bytes(datacube._build_eff(project))
+    share_gb = (budget / jobs) / 1024**3
+    log.info("=== terminal stages: %d AoI(s), %d at a time; memory budget %.1f GiB (%s) "
+             "-> %.1f GiB each ===", len(names), jobs, budget / 1024**3, src, share_gb)
+
+    tasks: list[scheduler.Task] = []
+    for name in names:
+        if assemble:
+            tasks.append(scheduler.Task(
+                key=("assemble", name), label=f"{name}/assemble",
+                run=lambda n=name: datacube.assemble(
+                    project, grids=grids, aois=[n], overwrite=overwrite,
+                    memory_budget_gb=share_gb)))
+        if preprocess:
+            tasks.append(scheduler.Task(
+                key=("preprocess", name), label=f"{name}/preprocess",
+                # Reads and rewrites the very store `assemble` produced, so this edge is a
+                # correctness requirement, not an optimisation.
+                deps=(("assemble", name),) if assemble else (),
+                run=lambda n=name: preprocess_stage.preprocess(
+                    project, grids=grids, aois=[n], overwrite=overwrite,
+                    memory_budget_gb=share_gb)))
+
+    results = scheduler.run_graph(tasks, jobs=jobs)
+
+    for stage, enabled in (("assemble", assemble), ("preprocess", preprocess)):
+        if not enabled:
+            continue
+        merged, failures, skipped = None, [], []
+        for name in names:
+            got = results[(stage, name)]
+            if got.skipped:
+                skipped.append(name)
+            elif got.error is not None:
+                failures.append(f"{name}: {got.error}")
+            elif got.value is not None:
+                merged = got.value if merged is None else merged.merge(got.value)
+        key = "datacube" if stage == "assemble" else "preprocess"
+        if failures:
+            outcomes[key] = f"failed: {'; '.join(failures)}"
+            run_report.add(key, merged, outcome=f"stage raised: {'; '.join(failures)}")
+        elif skipped:
+            # Only reachable for preprocess, and only when the assembly it needed failed.
+            why = f"assembly failed for {', '.join(skipped)}"
+            outcomes[key] = f"skipped ({why})"
+            run_report.add(key, merged, outcome=why)
+        else:
+            outcomes[key] = merged.outcome if merged is not None else "ok"
+            run_report.add(key, merged)
 
 
 def main():
@@ -347,12 +608,13 @@ def main():
                     help="after assembly, run the post-assembly preprocessing steps into a "
                          "derived channels into the assembled cube (needs "
                          "`preprocess.enabled` in the config)")
+    ap.add_argument("--jobs", type=int, default=None, metavar="N",
+                    help="acquire N (product, AoI) pairs at once (default: runtime.jobs, "
+                         "or 1); per-service caps still apply (runtime.gates)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    logctx.configure(verbose=args.verbose)
 
     project = load_config(args.config)
 
@@ -375,7 +637,7 @@ def main():
     run_pipeline(project, aois=args.aois, products=products,
                  dry_run=args.dry_run, overwrite=args.overwrite,
                  verify_auth=None if not args.no_verify else False,
-                 assemble=args.assemble, preprocess=args.preprocess)
+                 assemble=args.assemble, preprocess=args.preprocess, jobs=args.jobs)
 
 
 if __name__ == "__main__":

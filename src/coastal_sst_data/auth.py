@@ -51,6 +51,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from . import logctx
 from .config import Project, load_config, required_backend
 
 log = logging.getLogger(__name__)
@@ -306,20 +307,53 @@ def configure(auth_cfg) -> None:
     MAX_REFRESHES = int(getattr(auth_cfg, "max_refreshes", _DEFAULT_MAX_REFRESHES))
 
 
-def login(backend: str, settings) -> None:
+def login(backend: str, settings, *, force: bool = False) -> bool:
     """Authenticate to `backend` and RECORD WHEN, so its age is knowable later.
 
     Every stage should reach a backend through here rather than calling the client library
     directly -- not because the login differs, but because a login nobody timestamped cannot
     be proactively replaced, and that is the difference between a run that finishes and one
     that stops partway with no explanation.
+
+    A LOGIN THAT ALREADY HAPPENED IS NOT REPEATED. Returns True if this call actually
+    authenticated, False if it reused a credential younger than `MAX_AGE_S` -- which is the
+    same freshness `ensure_fresh` enforces, so reusing one is never a weaker guarantee than
+    minting one.
+
+    That matters because a stage's `run()` calls this unconditionally at its top, and the
+    number of times `run()` is entered is an ORCHESTRATION detail, not a property of the
+    credential. The preflight (`verify`) already logs in once before any stage starts; every
+    stage login after it was a second round-trip to EDL for a token we were already holding.
+    Dispatching one AoI at a time -- which is what makes AoIs parallelisable at all, since
+    `acquire()` already takes an AoI list -- turns that waste into a login storm: N AoIs times
+    M products against one account, all inside a few seconds, which is exactly what a service
+    is entitled to treat as abuse.
+
+    `force=True` skips the freshness check. `refresh()` does NOT route through here (it has
+    its own budget, rate limit and forced-relogin handlers); this is for a caller that knows
+    the credential is stale for a reason the clock cannot see.
+
+    THE LOCK IS HELD ACROSS THE LOGIN ITSELF, not just the bookkeeping. Checking freshness
+    and then authenticating as two steps leaves the window this method exists to close: on a
+    cold start several workers all read "no session", all decide to log in, and the account
+    sees the storm anyway. Serialising them means the first authenticates while the rest
+    wait, and each then finds a credential seconds old and reuses it -- one round-trip, N
+    callers. The wait is real but it is once per backend per run, and it is strictly less
+    than the N logins it replaces.
     """
-    log.info("Authenticating with %s (strategy=%s)", backend,
-             _attr(settings, "auth_strategy", "n/a"))
-    authenticate(backend, settings)
     with _LOCK:
+        if not force:
+            a = age(backend)
+            if a is not None and a < MAX_AGE_S:
+                log.debug("  %s: reusing the credential minted %.1f min ago",
+                          backend, a / 60.0)
+                return False
+        log.info("Authenticating with %s (strategy=%s)", backend,
+                 _attr(settings, "auth_strategy", "n/a"))
+        authenticate(backend, settings)
         _SESSIONS[backend] = _Session(backend=backend, at=_clock(),
                                       strategy=_attr(settings, "auth_strategy"))
+    return True
 
 
 def age(backend: str) -> float | None:
@@ -461,7 +495,12 @@ def verify(project: Project, products=None) -> dict[str, str]:
     failed backends (so the user can fix everything at once), not just the first.
 
     Also SEEDS the session registry, so a credential's age is counted from the preflight that
-    actually minted it rather than from whenever a stage first happened to ask.
+    actually minted it rather than from whenever a stage first happened to ask -- and every
+    stage login afterwards reuses what this minted (see `login`).
+
+    Logs in with `force=True`: the whole promise of a preflight is that it CONNECTS. Reusing a
+    recorded session here would turn "your credentials work" into "your credentials worked at
+    some point earlier in this process", which is not the question the user asked.
     """
     backends = required_backends(project, products)
     if not backends:
@@ -472,7 +511,7 @@ def verify(project: Project, products=None) -> dict[str, str]:
     for backend, settings in backends.items():
         log.info("Verifying %s credentials...", backend)
         try:
-            login(backend, settings)
+            login(backend, settings, force=True)
             results[backend] = "ok"
             log.info("  %s: OK", backend)
         except Exception as exc:
@@ -494,9 +533,7 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    logctx.configure(verbose=args.verbose)
 
     project = load_config(args.config)
     try:

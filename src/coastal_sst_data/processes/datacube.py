@@ -1991,15 +1991,24 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
 
 def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
-             overwrite=False) -> None:
+             overwrite=False, memory_budget_gb=None) -> None:
     """Assemble datacubes for a validated Project. Terminal pipeline stage.
 
     Same signature as every product's acquire(); reads only the aligned files the
     acquisition stages wrote, so it must run AFTER them.
+
+    `memory_budget_gb` overrides the config's (and the detection chain's) answer for THIS
+    call. It exists for one caller: an orchestrator assembling several AoIs at once, which
+    must DIVIDE the budget between them. `budget_bytes` otherwise assumes it owns the
+    machine, so N concurrent AoIs would each claim the same allowance and their sum would be
+    N times what is actually there -- and this stage is precisely the one that gets
+    OOM-killed when that arithmetic is wrong.
     """
     eff = _build_eff(project)
     if overwrite:
         eff["overwrite"] = True
+    if memory_budget_gb is not None:
+        eff["memory_budget_gb"] = float(memory_budget_gb)
     if grids is None:
         grids = project_grids(project)
     return run(eff, grids, aois, dry_run)

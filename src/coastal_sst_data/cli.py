@@ -24,7 +24,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from . import auth, store
+from . import auth, logctx, store
 from .config import DataProduct, load_config, required_backend
 from .pipeline import _module_for, compute_grids, run_pipeline
 
@@ -56,6 +56,7 @@ def _cmd_run(args):
         verify_auth=False if args.no_verify else None,
         assemble=args.assemble,
         preprocess=args.preprocess,
+        jobs=args.jobs,
     )
 
 
@@ -63,14 +64,16 @@ def _cmd_assemble(args):
     from .processes import datacube
     project = load_config(args.config)
     datacube.assemble(project, aois=args.aois, dry_run=args.dry_run,
-                      overwrite=args.overwrite)
+                      overwrite=args.overwrite,
+                      memory_budget_gb=args.memory_budget_gb)
 
 
 def _cmd_preprocess(args):
     from .processes import preprocess
     project = load_config(args.config)
     preprocess.preprocess(project, aois=args.aois, dry_run=args.dry_run,
-                          overwrite=args.overwrite)
+                          overwrite=args.overwrite,
+                          memory_budget_gb=args.memory_budget_gb)
 
 
 def _cmd_provenance(args):
@@ -222,6 +225,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--dry-run", action="store_true", help="Search only; no download.")
     p_run.add_argument("--overwrite", action="store_true", help="Reprocess existing outputs.")
     p_run.add_argument("--no-verify", action="store_true", help="Skip the credential preflight.")
+    p_run.add_argument("--jobs", type=int, default=None, metavar="N",
+                       help="Acquire N (product, AoI) pairs at once (default: runtime.jobs "
+                            "in the config, or 1). Per-service caps still apply -- see "
+                            "runtime.gates. 1 runs the original serial path.")
     p_run.add_argument("--assemble", action="store_true",
                        help="After acquisition, assemble the aligned outputs into datacubes.")
     p_run.add_argument("--preprocess", action="store_true",
@@ -256,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_asm.add_argument("--aoi", nargs="+", dest="aois", help="Only these AoI name(s).")
     p_asm.add_argument("--overwrite", action="store_true", help="Rebuild existing .zarr cubes.")
     p_asm.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
+    p_asm.add_argument("--memory-budget-gb", type=float, default=None,
+                       dest="memory_budget_gb", metavar="GB",
+                       help="Override the memory budget for this run (default: detected, halved).")
     p_asm.set_defaults(func=_cmd_assemble)
 
     p_pre = sub.add_parser(
@@ -268,6 +278,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument("--overwrite", action="store_true",
                        help="Rebuild existing derived .zarr cubes.")
     p_pre.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
+    p_pre.add_argument("--memory-budget-gb", type=float, default=None,
+                       dest="memory_budget_gb", metavar="GB",
+                       help="Override the memory budget for this run (default: detected, halved).")
     p_pre.set_defaults(func=_cmd_preprocess)
 
     # The DEM->MSL datum offset is resolved INLINE by the bathymetry stage (per DEM source)
@@ -303,9 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    logctx.configure(verbose=args.verbose)
     args.func(args)
 
 

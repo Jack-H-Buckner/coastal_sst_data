@@ -183,6 +183,19 @@ class ProductSpec:
     # product whose auth depends on which source is chosen.
     auth: "str | None | dict[str, str | None]" = None
 
+    # --- concurrency ----------------------------------------------------- #
+    # The SERVICE this product loads from, which is what a concurrency cap has to be applied
+    # to. Deliberately NOT derived from `auth`: Landsat and land-cover authenticate to
+    # nothing (Planetary Computer is anonymous) yet share one rate-limited endpoint, while
+    # `mur`/`modis`/`ecostress` are three products behind one Earthdata account. "How many of
+    # these may be in flight at once" is a question about the SERVER, so products that share
+    # a server must share a gate -- and only the product itself knows which server that is.
+    #
+    # The CAP is not here: it is deployment policy (`runtime.gates` in the config), and it
+    # moves when the run moves -- in-region on AWS, Earthdata tolerates far more than it does
+    # over a home link. This names the bucket; the config sizes it.
+    gate: str = ""
+
     # --- durability ------------------------------------------------------ #
     # The variables a FINISHED file of this product must carry. A file missing one is not
     # "a file with a gap" -- it is a write, or a set of source layers, that did not
@@ -258,6 +271,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.bathymetry,
+        gate="dem",
         dir="BATHYMETRY",
         kind=Kind.STATIC_RASTER,
         # DISTINCT-DATA sources, STACKED one channel per source (D10). Both DEMs are served
@@ -280,6 +294,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.mur,
+        gate="earthdata",
         dir="MUR",
         kind=Kind.DAILY_RASTER,
         module="coastal_sst_data.processes.mur",
@@ -301,6 +316,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.cmems,
+        gate="copernicus",
         dir="CMEMS",
         kind=Kind.DAILY_RASTER,
         # DISTINCT-DATA sources, STACKED one channel per source (D10). Each source is a TAG
@@ -327,6 +343,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.ecostress,
+        gate="earthdata",
         dir="ECOSTRESS",
         kind=Kind.OVERPASS_SENSOR,
         # DISTINCT-DATA collection VERSIONS, STACKED one channel-set per version (D10) -- the
@@ -354,6 +371,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.landsat,
+        gate="pc",
         dir="LANDSAT",
         kind=Kind.OVERPASS_SENSOR,
         # Source-selectable. Only the free/anonymous Planetary Computer path is implemented;
@@ -379,6 +397,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.modis,
+        gate="earthdata",
         dir="MODIS",
         kind=Kind.OVERPASS_SENSOR,
         module="coastal_sst_data.processes.modis",
@@ -402,6 +421,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.met,
+        gate="herbie",
         dir="MET",
         kind=Kind.DAILY_RASTER,
         # FORCING only now (D14): daily reference-time / daily-mean fields, NO sensor
@@ -425,6 +445,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.met_overpass,
+        gate="herbie",
         dir="MET_OVERPASS",
         # Timestamped snapshots read at each thermal sensor's overpass instant -- NOT a
         # sensor itself, so a distinct Kind (see Kind.OVERPASS_ALIGNED). DISTINCT-DATA sources
@@ -449,6 +470,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.tides,
+        gate="noaa_small",
         dir="TIDE",                # NOT "TIDES" -- the one name that used to need two aliases
         kind=Kind.SERIES_1D,
         # DISTINCT-DATA sources, STACKED one channel per source (D10): CO-OPS gauge synthesis
@@ -473,6 +495,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.landcover,
+        gate="pc",
         dir="LANDCOVER",
         kind=Kind.STATIC_RASTER,
         sources={
@@ -490,6 +513,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
 
     ProductSpec(
         product=DataProduct.insitu,
+        gate="erddap",
         dir="INSITU",
         kind=Kind.STATION_TABLE,
         # DISTINCT DATA, STACKED (D10): a public network and the user's own thermometers are
@@ -635,6 +659,17 @@ def _check_registry() -> None:
         for dep in s.depends_on:
             if dep not in BY_PRODUCT:
                 raise RuntimeError(f"{s.product.value}: depends_on unknown product {dep!r}.")
+        # Every product must name the SERVICE it loads from. Defaulting an unset gate to the
+        # product's own name would be the worst possible failure mode: it silently gives that
+        # product a private cap, so a fourth Earthdata product would quietly run at full
+        # concurrency ALONGSIDE the three that are sharing one -- and the account sees the
+        # sum. Nothing raises, nothing logs, and the only symptom is a service deciding it is
+        # being abused. So it is required, and only the author knows the answer.
+        if not s.gate:
+            raise RuntimeError(
+                f"{s.product.value}: set `gate` to the service this product loads from "
+                "(products sharing a server MUST share a gate name, so their concurrency "
+                "cap applies to the server rather than to each product separately).")
     # Directory names must be unique, or two products would read each other's outputs.
     dirs = [s.dir for s in REGISTRY]
     if len(dirs) != len(set(dirs)):

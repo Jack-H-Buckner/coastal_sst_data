@@ -31,6 +31,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 
+from . import logctx
 from .config import load_config
 
 
@@ -66,9 +67,7 @@ def build_parser(description: str, extra=()) -> argparse.ArgumentParser:
 
 
 def setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    logctx.configure(verbose=verbose)
 
 
 def process_main(acquire, description: str, extra=(), argv=None) -> None:

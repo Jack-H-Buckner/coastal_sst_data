@@ -1140,7 +1140,7 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
 
 def preprocess(project: Project, *, grids=None, aois=None, dry_run=False,
-               overwrite=False) -> report.ProductReport | None:
+               overwrite=False, memory_budget_gb=None) -> report.ProductReport | None:
     """Preprocess assembled cubes for a validated Project. Terminal stage, runs after assembly.
 
     Same signature as every product's acquire() and datacube.assemble(); reads only the
@@ -1148,10 +1148,16 @@ def preprocess(project: Project, *, grids=None, aois=None, dry_run=False,
     place, so it must run AFTER the assembler. A no-op unless `project.preprocess.enabled`
     (checked by the callers). Safe to re-run: it is a no-op when the cube already carries this
     step selection's output, and rebuilds the derived channels from the raw ones otherwise.
+
+    `memory_budget_gb` overrides the resolved budget for THIS call, so an orchestrator
+    running several AoIs at once can divide it between them -- see `datacube.assemble`, which
+    documents why that division is not optional.
     """
     eff = _build_eff(project)
     if overwrite:
         eff["overwrite"] = True
+    if memory_budget_gb is not None:
+        eff["memory_budget_gb"] = float(memory_budget_gb)
     if grids is None:
         grids = project_grids(project)
     return run(eff, grids, aois, dry_run)

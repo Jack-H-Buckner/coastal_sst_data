@@ -133,14 +133,29 @@ def test_grids_prints_each_aoi(config_file, capsys):
 
 def test_assemble_subcommand_dispatches(config_file, monkeypatch):
     seen = {}
-    def stub(project, *, aois=None, dry_run=False, overwrite=False):
-        seen.update(aois=aois, dry_run=dry_run, overwrite=overwrite)
+    def stub(project, *, aois=None, dry_run=False, overwrite=False, memory_budget_gb=None):
+        seen.update(aois=aois, dry_run=dry_run, overwrite=overwrite,
+                    memory_budget_gb=memory_budget_gb)
     monkeypatch.setattr("coastal_sst_data.processes.datacube.assemble", stub)
 
     cli.main(["assemble", "--config", config_file, "--aoi", "a1", "--overwrite"])
 
     assert seen["aois"] == ["a1"]
     assert seen["overwrite"] is True and seen["dry_run"] is False
+    assert seen["memory_budget_gb"] is None      # unset -> detect, exactly as before
+
+
+def test_assemble_forwards_an_explicit_memory_budget(config_file, monkeypatch):
+    """The knob an orchestrator uses to DIVIDE the budget between concurrent AoIs -- and a
+    user needs by hand when the machine is shared."""
+    seen = {}
+    def stub(project, *, aois=None, dry_run=False, overwrite=False, memory_budget_gb=None):
+        seen.update(memory_budget_gb=memory_budget_gb)
+    monkeypatch.setattr("coastal_sst_data.processes.datacube.assemble", stub)
+
+    cli.main(["assemble", "--config", config_file, "--memory-budget-gb", "12.5"])
+
+    assert seen["memory_budget_gb"] == 12.5
 
 
 def test_run_forwards_assemble_flag(config_file, monkeypatch):

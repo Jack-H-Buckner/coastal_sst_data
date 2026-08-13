@@ -39,6 +39,7 @@ import contextlib
 import logging
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -71,9 +72,16 @@ REQUIRED_VARS: dict[str, tuple[str, ...]] = {s.dir: s.required_vars for s in REG
 
 
 def _tag() -> str:
-    """A scratch-name suffix unique to this process and moment, so two runs writing the
-    same output cannot land on each other's scratch."""
-    return f"{os.getpid()}-{int(time.time() * 1000)}"
+    """A scratch-name suffix unique to this process, THREAD and moment, so two runs writing
+    the same output cannot land on each other's scratch.
+
+    The thread id is not redundant with the millisecond: once stages run on a pool, two
+    workers can enter `atomic()` inside the same millisecond, and pid+ms alone would hand
+    them the same scratch path -- one would then swap a file the other was still writing.
+    Cheap insurance behind the real guarantee, which is that the work partition gives every
+    task a distinct DESTINATION (see `sweep_scratch`).
+    """
+    return f"{os.getpid()}-{threading.get_ident()}-{int(time.time() * 1000)}"
 
 
 def _rm(path: Path) -> None:

@@ -25,7 +25,37 @@ auth:
   max_age_s: 1800            # 30 min
   max_refreshes: 20          # per backend per run; exceeded -> a real failure, not a retry
 
-# Grid  
+# How much of the run happens at once. Every default here is the ORIGINAL serial pipeline,
+# so parallelism is opt-in and `jobs: 1` stays a true escape hatch (it takes the old code
+# path, not a one-worker emulation of the new one). Nothing here changes what a run
+# PRODUCES -- only how many pieces of it are in flight.
+runtime:
+  # Concurrent ACQUISITION tasks, where one task is a (product, AoI) pair. The dependency
+  # edges are per-AoI -- MODIS reads Landsat's aligned files FOR ITS OWN AoI -- so Hobart can
+  # be downloading MUR while Tamar is still on Landsat. Overridable with `--jobs`.
+  jobs: 1
+  # Concurrent AoIs in the assemble/preprocess stages. Deliberately separate from `jobs` and
+  # much smaller: these are bounded by MEMORY, not by the network, and the memory budget is
+  # DIVIDED between them (4 AoIs on a 200 GB box get ~25 GB each, not 100 GB each). An OOM
+  # here throws away all the downloading, which is the expensive part.
+  assemble_jobs: 1
+  # Per-SERVICE concurrency caps. These are the answer to "how many calls may I make to one
+  # API on one account", and it differs per service -- which is why one `jobs` number cannot
+  # express it. Products sharing a server share a gate (mur/modis/ecostress are three
+  # products behind ONE Earthdata account), declared on each ProductSpec.
+  #
+  # Omit the block for the defaults below. Raise them when the run moves closer to the data:
+  # in-region on AWS, Earthdata tolerates far more than it does over a home link.
+  gates:
+    earthdata: 6             # mur, modis, ecostress -- `earthaccess` also threads internally
+    pc: 4                    # landsat, landcover -- anonymous, so the limit is per-IP
+    herbie: 4                # met, met_overpass
+    copernicus: 1            # cmems -- the dataset handle is not safe to share
+    noaa_small: 1            # tides -- small metadata API behind a shared requests.Session
+    erddap: 1                # insitu -- ditto
+    dem: 1                   # bathymetry -- one shared CUDEM tile-index cache file
+
+# Grid
 grid:
   resolution_m: 100          # target posting in metres
   target_crs: auto           # "auto" -> local UTM per AOI, or e.g. "EPSG:32610"
