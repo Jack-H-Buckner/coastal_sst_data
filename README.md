@@ -282,7 +282,7 @@ See [Command line interface](#command-line-interface) below for every subcommand
 
 Installing the package provides the `coastal-sst-data` command (equivalently, `python -m coastal_sst_data.cli`). Every command is driven by a project config file passed with `--config`; add `-v` for debug logging.
 
-There are five subcommands:
+There are eight subcommands:
 
 | Command | What it does | Network |
 | --- | --- | --- |
@@ -293,6 +293,7 @@ There are five subcommands:
 | `assemble` | Knit the aligned per-product outputs into one analysis-ready datacube (`.zarr`) per AOI | no |
 | `preprocess` | Post-assembly: add the derived channels (waterline, gap-filled level-4, screened SST) to the assembled cube | no |
 | `provenance` | Print a built cube's provenance: the config that made it, each field's sources, access dates | no |
+| `check` | Scan the output tree for truncated or incomplete files (reads each payload, not just its header); `--repair` deletes them so the next run re-fetches | no |
 
 **A typical workflow** builds up from cheap, offline checks to the full run:
 
@@ -311,7 +312,12 @@ coastal-sst-data run --config config.yaml --dry-run
 
 # 5. Run it for real, then knit the outputs into per-AOI datacubes
 coastal-sst-data run --config config.yaml --assemble
+
+# 5b. …or the same thing with several products/AOIs downloading at once
+coastal-sst-data run --config config.yaml --assemble --jobs 8
 ```
+
+Steps 4 and 5 are the slow ones, and both can be overlapped — see [Running in parallel](#running-in-parallel).
 
 ### `run`
 
@@ -322,6 +328,7 @@ Computes the shared grid once and dispatches each selected product to its acquis
 - `--dry-run` — search each source but download/write nothing (also skips the preflight).
 - `--overwrite` — reprocess and overwrite outputs that already exist.
 - `--no-verify` — skip the credential preflight (not recommended for a real run).
+- `--jobs <N>` — acquire N `(product, AOI)` pairs at once (default: `runtime.jobs`, or 1). See [Running in parallel](#running-in-parallel).
 
 ### `verify`
 
@@ -338,6 +345,7 @@ MODIS additionally ships `modis_footprint_id` (`int32`, `-1` = no observation): 
 - `--aoi <name> …` — assemble only specific AOIs (default: all).
 - `--overwrite` — rebuild cubes that already exist.
 - `--dry-run` — report what would be assembled; write nothing.
+- `--memory-budget-gb <GB>` — override the memory budget for this run (default: detected, halved). Also what `runtime.assemble_jobs` divides between concurrent AOIs — see [Running in parallel](#running-in-parallel).
 
 Storage is tuned by the optional `datacube:` config block — `chunks` (the `(time, y, x)` chunking), `met_time`, `block_days` / `memory_budget_gb` (see below), and a `compression` block (Blosc codec, level, shuffle). Compression is **lossless**: values are kept as float32 / uint8 and only entropy-coded, so smooth and interpolated fields still shrink substantially (byte-shuffle on continuous channels, bit-shuffle on the integer masks) without discarding any precision. (Met-at-overpass is configured on the `met_overpass` product, not here — see below.)
 
@@ -638,6 +646,120 @@ This writes an **overview map** of every AOI, coloured by region, plus **one zoo
 - `--show` — also open the figures interactively.
 
 Plotting is an **optional** capability: it needs `matplotlib` (install with `conda install matplotlib`). If `cartopy` is also installed the maps gain coastlines and land/ocean shading; without it they fall back to plain longitude/latitude axes.
+
+## Running in parallel
+
+A full run spends most of its wall clock **waiting on other people's servers** — a catalogue search here, a granule download there, one product at a time, one AOI at a time. Most of that waiting is independent, and the pipeline can overlap it.
+
+Parallelism is **opt-in and off by default**. Nothing about it changes what a run produces: the same files land in the same places, and `--jobs 1` takes the original serial code path rather than a one-worker emulation of the new one.
+
+```bash
+# Acquire 8 (product, AOI) pairs at once
+coastal-sst-data run --config config.yaml --jobs 8 --assemble
+```
+
+or set it once in the config:
+
+```yaml
+runtime:
+  jobs: 8
+  assemble_jobs: 2
+```
+
+### What runs at the same time
+
+The unit of work is a **`(product, AOI)` pair**. Two things decide what may overlap:
+
+**The product dependency graph.** Only three ordering constraints exist, and each is a case of one product reading another's aligned files: MODIS's coincidence filter reads Landsat's, and both MUR's `overpass_sensors` filter and `met_overpass` read the thermal sensors'. The other eight products — bathymetry, CMEMS, ECOSTRESS, Landsat, met, tides, landcover, in-situ — depend on nothing and all start immediately.
+
+**Those edges are per-AOI.** Every one of those reads is scoped to an AOI, so `mur(hobart)` waits for `landsat(hobart)` but **not** for `landsat(tamar)`. There is no barrier between AOIs: Hobart can be downloading MUR while Tamar is still working through Landsat.
+
+If a stage fails for one AOI, the other AOIs carry on, and the products that depended on it **for that AOI** are reported as skipped rather than run against a directory that was never written — an important distinction, because a product that ran against missing inputs looks exactly like one that found no data.
+
+### Per-service limits — how many calls one account may make
+
+> *"Can I send multiple requests to the same API on one account?"*
+
+Mostly yes, but the answer differs enough per service that a single worker count cannot express it. So there are **two** limits: `jobs` bounds the worker pool, and **gates** bound each service. Products that share a *server* share a gate — `mur`, `modis` and `ecostress` are three products behind one Earthdata account, so a cap on "Earthdata" is what actually protects the account.
+
+| Gate | Products | Default | Why this number |
+| --- | --- | --- | --- |
+| `earthdata` | mur, modis, ecostress | 6 | Several granule reads at once are normal, and `earthaccess` already threads internally — so the real connection count is a multiple of this. CMR *search* is the throttled part. |
+| `pc` | landsat, landcover | 4 | Planetary Computer is **anonymous** — there is no account and no per-account limit. Throttling is per-IP, and the STAC search endpoint is the sensitive half. |
+| `herbie` | met, met_overpass | 4 | HRRR via Herbie. |
+| `copernicus` | cmems | 1 | The lazy dataset handle carries its own client and is not safe to share; the toolbox parallelises internally already. |
+| `noaa_small` | tides | 1 | Small public metadata API behind a shared HTTP session. |
+| `erddap` | insitu | 1 | Same. |
+| `dem` | bathymetry | 1 | One CUDEM tile-index cache file, shared by every AOI. |
+
+Override any of them in the config:
+
+```yaml
+runtime:
+  gates:
+    earthdata: 8
+```
+
+Raise them when the run moves closer to the data — in-region on AWS (`us-west-2` for Earthdata Cloud), the sensible Earthdata number is far higher than it is over a home link.
+
+**Credentials are shared, not multiplied.** All workers run in one process, so they share one login per backend, one refresh budget and one rate-limit window. Eight workers acquiring three Earthdata products across two AOIs produce **exactly one** login — the same as `--jobs 1`. This is the main reason the pipeline uses threads rather than separate processes: separate processes would each hold their own credential state, so eight workers would become eight independent login storms against one account.
+
+### Assembly and preprocessing: bounded by memory, not by the network
+
+`assemble` and `preprocess` get their own, much smaller knob:
+
+```yaml
+runtime:
+  assemble_jobs: 2
+```
+
+Each AOI owns its own `<aoi>.zarr`, so AOIs are independent — but `assemble(aoi)` and `preprocess(aoi)` read and rewrite the *same* store, so those two are chained rather than overlapped. That chaining is also the win: one AOI preprocesses while the next is still assembling, instead of every AOI waiting at a barrier between the stages.
+
+**The memory budget is divided between them.** The assembler normally detects the machine's memory and halves it, on the assumption that it is the only thing running — true for one AOI at a time, false the moment two run. With `assemble_jobs: 4` on a 200 GB machine each AOI gets roughly 25 GB rather than 100 GB, and `block_days: auto` simply produces smaller (still chunk-aligned) blocks. The division is logged:
+
+```
+=== terminal stages: 6 AoI(s), 2 at a time; memory budget 100.0 GiB (half of physical RAM) -> 50.0 GiB each ===
+```
+
+Keep `assemble_jobs` low. Acquisition failures cost a retry; an OOM here throws away all the downloading, which is the expensive part.
+
+### Reading the output
+
+Eight workers interleaving into one log would otherwise be unreadable, so in a parallel run every line is stamped with the task that produced it — including output from the underlying libraries:
+
+```
+16:05:02 INFO [tillamook_bay/landsat] === AOI: tillamook_bay (CRS=EPSG:32610 grid=308x505 @ 100m) ===
+16:05:02 INFO [padilla_bay/ecostress] You're now authenticated with NASA Earthdata Login
+16:05:02 INFO [tillamook_bay/tides]   [dry-run] would build tides (coops) for tillamook_bay
+```
+
+A serial run adds no prefix and prints exactly what it always did.
+
+### Suggested rollout
+
+```bash
+# 1. Serial baseline — the reference run report
+coastal-sst-data run --config config.yaml --jobs 1 --dry-run
+
+# 2. Same thing in parallel: proves the graph and the gates, downloads nothing
+coastal-sst-data run --config config.yaml --jobs 8 --dry-run
+
+# 3. One AOI, for real. The written/skipped/failed tallies should match the serial run
+coastal-sst-data run --config config.yaml --aoi <one> --jobs 8 --assemble --preprocess
+
+# 4. Confirm nothing was half-written (reads each file's payload, not just its header)
+coastal-sst-data check --config config.yaml
+```
+
+Step 4 is the one worth not skipping: it is what would catch a concurrent-write problem, and it reports a clean tree when there is none.
+
+### What is *not* parallelised
+
+- **Within a product's download loop.** Granules and scenes inside one `(product, AOI)` task are still fetched one at a time.
+- **Across time.** One run covers one date range; splitting a long window into shards is a possible future addition, and would only be safe for the per-day/per-scene products (tides and in-situ each write a single file spanning the whole range).
+- **Blocks within one cube.** The assembler's time blocks are order-dependent appends into one store.
+
+For coarser parallelism than this, `--aoi` already shards cleanly, so a scheduler (Slurm array jobs, separate containers) can run whole AOIs as independent jobs. Note that separate *processes* do not share credential state, so give each one a smaller share of the gate budgets.
 
 ## Authenticating to data services
 
