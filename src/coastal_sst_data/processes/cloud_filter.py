@@ -522,6 +522,13 @@ def _step_filter_cloud_cover(ctx: "PreprocessContext", *, key: str = "filter_clo
     `<sensor>_cloud_cover_<src>`, falls back to the daily forcing `cloud_cover_<src>`; `source`
     (default auto: overpass over forcing, hrrr over era5) picks. Emits an
     `<sensor>_scene_cloud_pct_<src>` (time,) diagnostic. Composes with filter_clouds.
+
+    KNOWN LIMIT ON A MOSAICKED DAY. "The overpass" is one instant: the base granule's. But a
+    sensor with `SensorSpec.mosaic_same_day` (eco -- this step's own default -- and lst) merges
+    a day's granules, so the slice can hold pixels from another overpass whose cloud cover was
+    never consulted. The scene-level gate then drops, or spares, those pixels on evidence about
+    a different time of day. Correcting it needs a per-cell granule identity, which the cube
+    does not carry; until then the `mosaic_time` attribute on `<sensor>_sst` is the disclosure.
     """
     opts = _resolve_opts(ctx, key, base_key)
     sensors = _as_list(opts.get("sensors")) or ["eco"]
