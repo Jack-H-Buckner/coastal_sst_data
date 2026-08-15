@@ -380,6 +380,14 @@ def _step_flag_georef(ctx: "PreprocessContext") -> None:
     scene quality (skip -> `insufficient_signal`), search whole-cell shifts, sweep windows for
     stability, and classify. Emits per-sensor 1-D `("time",)` channels only. Never raises: a missing
     sensor / reference coastline degrades to emitting nothing for that sensor.
+
+    KNOWN LIMIT ON A MOSAICKED DAY. "Per-scene" reads one time slice as one granule, which a
+    sensor with `SensorSpec.mosaic_same_day` (eco -- this step's own default -- and lst) breaks:
+    a merged slice can hold two granules whose georeferencing errors differ in size and even in
+    sign. The fit is then a compromise between them, and `correct_georef` applies that one
+    whole-cell shift to every pixel, including the ones it does not describe. Doing better needs
+    a per-cell granule identity the cube does not carry; a day built from ONE granule -- still
+    the overwhelmingly common case -- is unaffected.
     """
     opts = _opts(ctx, "flag_georef")
     water = _ref_water_mask(ctx)

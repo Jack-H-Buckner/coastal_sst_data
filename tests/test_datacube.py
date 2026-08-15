@@ -262,6 +262,296 @@ def test_clearest_overpass_is_kept(project, grids, days):
 
 
 # --------------------------------------------------------------------------- #
+# MOSAICKING a day's granules (SensorSpec.mosaic_same_day).
+#
+# A Landsat/ECOSTRESS scene footprint can be SMALLER than an AoI: an AoI straddling two
+# path/rows gets one granule per row, same day, NOT overlapping. Keeping only the clearest
+# left half the AoI NaN and said nothing about it -- `coverage_hits` counts a day as covered
+# if ANY pixel is finite, so a half-covered day read exactly like a whole one.
+# --------------------------------------------------------------------------- #
+def write_landsat_rows(project, g, day, hour, *, rows, temp=288.0, cloud=0.0):
+    """One Landsat granule covering only `rows`; everything outside is NaN.
+
+    The shape a path/row footprint clipped to an AoI actually has -- valid over its own strip,
+    absent elsewhere, rather than the whole-grid scenes the other writers produce.
+    """
+    H, W, xs, ys = _grid_hw(g)
+    sst = np.full((H, W), np.nan, "float32")
+    sst[rows] = temp
+    water = np.zeros((H, W), "float32")
+    water[rows] = 1.0                                  # lst polarity: 1 == water
+    ds = xr.Dataset({
+        "sst": (("time", "y", "x"), sst[None]),
+        "cloud": (("time", "y", "x"), np.full((1, H, W), cloud, "float32")),
+        "water": (("time", "y", "x"), water[None]),
+    }, coords={"time": [day], "y": ys, "x": xs})
+    _write(project, "LANDSAT", f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc", ds)
+
+
+def test_two_granules_on_a_day_are_mosaicked_not_discarded(project, grids, days):
+    """The bug this feature exists for: two non-overlapping path/rows over one AoI.
+
+    Under the old winner-take-all rule the day's coverage was the LARGER granule alone and the
+    other half of the AoI was NaN -- data that was sitting on disk, unread.
+    """
+    g = grids[AOI]
+    H, W = g.height, g.width
+    cut = 2 * H // 3
+    # Deliberately unequal, so there is a definite base: A covers 2/3, B the bottom half.
+    write_landsat_rows(project, g, days[0], 18, rows=slice(0, cut), temp=288.0)
+    write_landsat_rows(project, g, days[0], 20, rows=slice(H // 2, H), temp=291.0)
+
+    ds = _bare_cube(project, g, days)
+
+    sst = ds["lst_sst"].isel(time=0).values
+    assert int(ds["lst_valid"].isel(time=0).values.sum()) == H * W, (
+        "the day should cover the UNION of its granules; the loser's rows were dropped")
+    assert not np.isnan(sst).any()
+    # A is the base (more valid pixels), so it keeps every row it saw -- including the overlap.
+    assert np.allclose(sst[:cut], 288.0)
+    # ...and B fills only what A never had.
+    assert np.allclose(sst[cut:], 291.0)
+
+
+def test_the_mosaic_keeps_the_dominant_granules_overpass_identity(project, grids, days):
+    """A merged day still reports ONE overpass -- the base granule's -- so every forcing
+    matchup keeps keying off a single instant. `lst_hour` is what preprocess and the tide
+    interpolation read, so a mosaic that blurred it would silently move them."""
+    g = grids[AOI]
+    H = g.height
+    write_landsat_rows(project, g, days[0], 18, rows=slice(0, 2 * H // 3))   # base
+    write_landsat_rows(project, g, days[0], 20, rows=slice(H // 2, H))
+    write_met_snapshot(project, g, days[0], 18, temp=281.0)
+    write_met_snapshot(project, g, days[0], 20, temp=295.0)
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+
+    ds = datacube.assemble_aoi(g, _eff_with_overpass(project), days)
+
+    assert ds["lst_hour"].isel(time=0).item() == pytest.approx(18.0)
+    assert np.nanmean(ds["lst_airtemp_hrrr"].isel(time=0).values) == pytest.approx(281.0), (
+        "the overpass forcing followed a granule the cube does not report as the overpass")
+
+
+def test_a_filled_pixel_takes_its_cloud_and_valid_from_the_granule_that_gave_its_sst(
+        project, grids, days):
+    """sst/cloud/valid at a cell must describe ONE overpass. Merging them from different
+    granules would pair one scene's temperature with another's cloud flag -- a wrong pixel
+    that looks entirely well-formed."""
+    g = grids[AOI]
+    H = g.height
+    cut = 2 * H // 3
+    write_landsat_rows(project, g, days[0], 18, rows=slice(0, cut), temp=288.0, cloud=0.0)
+    write_landsat_rows(project, g, days[0], 20, rows=slice(H // 2, H), temp=291.0, cloud=0.0)
+
+    ds = _bare_cube(project, g, days)
+    sst = ds["lst_sst"].isel(time=0).values
+    cloud = ds["lst_cloud"].isel(time=0).values
+    valid = ds["lst_valid"].isel(time=0).values
+
+    from_a, from_b = sst == 288.0, sst == 291.0
+    assert from_a.any() and from_b.any()
+    assert (cloud[from_a] == 0.0).all() and (cloud[from_b] == 0.0).all()
+    assert (valid[from_a] == 1).all(), "a base cell was left invalid"
+    assert (valid[from_b] == 1).all(), "a filled cell got sst but not the validity behind it"
+
+
+def test_the_earliest_granule_still_wins_a_tie_under_mosaicking(project, grids, days):
+    """The contest is a strict `>` over `scene_index`'s (time, name) order, so equal-count
+    granules resolve to the earliest. That was a determinism fix; under mosaicking it also
+    decides the day's REPORTED overpass, so it is worth pinning separately."""
+    g = grids[AOI]
+    H = g.height
+    write_landsat_rows(project, g, days[0], 18, rows=slice(0, H // 2), temp=288.0)
+    write_landsat_rows(project, g, days[0], 20, rows=slice(H // 2, H), temp=291.0)
+
+    ds = _bare_cube(project, g, days)
+
+    assert ds["lst_hour"].isel(time=0).item() == pytest.approx(18.0)
+    assert int(ds["lst_valid"].isel(time=0).values.sum()) == H * g.width   # still the union
+
+
+def test_modis_is_not_mosaicked(project, grids, days):
+    """MODIS opts out: its `footprint_id` ids restart at 0 per granule, so a merged day would
+    hold two granules' unrelated native-pixel indices in one channel. Its granules are whole
+    overpasses hours apart, not adjoining halves of one, so a day loses no coverage."""
+    g = grids[AOI]
+    H, W, xs, ys = _grid_hw(g)
+    _modis_base(project, g, days)
+    for hh, rows in [(19, slice(0, H // 2)), (21, slice(H // 2, H))]:
+        valid = np.zeros((H, W), "uint8")
+        valid[rows] = 1
+        sst = np.full((H, W), np.nan, "float32")
+        sst[rows] = 287.0
+        ds = xr.Dataset({
+            "sst": (("time", "y", "x"), sst[None]),
+            "valid": (("time", "y", "x"), valid[None]),
+        }, coords={"time": [days[1]], "y": ys, "x": xs})
+        _write(project, "MODIS", f"{AOI}_{days[1].strftime('%Y%m%d')}T{hh:02d}0000.nc", ds)
+
+    ds = _bare_cube(project, g, days)
+
+    got = int(ds["modis_valid"].isel(time=1).values.sum())
+    assert got == (H // 2) * W, f"MODIS was mosaicked to {got}; it must keep the winner alone"
+
+
+def test_ecostress_mosaics_within_a_version_not_across_them(tmp_path, days):
+    """ECOSTRESS is stacked AND mosaicking: each version tag merges its own day's granules,
+    and the versions stay separate channel-sets. Merging across them would collapse the very
+    distinction the per-version channels exist to preserve."""
+    project = _eco_versions_project(tmp_path, ["v002", "v003"])
+    g = grid.project_grids(project)[AOI]
+    H, W, xs, ys = _grid_hw(g)
+
+    def eco_rows(day, hour, rows, tag, sst_val):
+        sst = np.full((H, W), np.nan, "float32")
+        sst[rows] = sst_val
+        water = np.ones((H, W), "float32")             # eco polarity: >=0.5 is LAND
+        water[rows] = 0.0
+        ds = xr.Dataset({
+            "sst": (("time", "y", "x"), sst[None]),
+            "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+            "water": (("time", "y", "x"), water[None]),
+            "quality": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+        }, coords={"time": [day], "y": ys, "x": xs})
+        _write_eco(project, f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc", ds, tag=tag)
+
+    cut = 2 * H // 3
+    eco_rows(days[0], 18, slice(0, cut), "v002", 286.0)          # base of v002
+    eco_rows(days[0], 20, slice(H // 2, H), "v002", 289.0)       # fills v002's gap
+    eco_rows(days[0], 21, slice(0, H // 4), "v003", 293.0)       # v003: one granule, untouched
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert int(ds["eco_valid_v002"].isel(time=0).values.sum()) == H * W
+    assert int(ds["eco_valid_v003"].isel(time=0).values.sum()) == (H // 4) * W, (
+        "v003 absorbed granules from v002")
+    assert ds["eco_hour_v002"].isel(time=0).item() == pytest.approx(18.0)
+    assert ds["eco_hour_v003"].isel(time=0).item() == pytest.approx(21.0)
+
+
+def test_a_mosaicked_day_opens_each_granule_exactly_once(project, grids, days, monkeypatch):
+    """The merge is ONE arrival-ordered pass, not rank-then-fill.
+
+    A ranked fill looks like it needs the ranking before it can start -- which would mean
+    either a second read of every granule or holding them all. It needs neither, and this is
+    the guard on that: the per-cell `score` array carries the ranking as it arrives.
+    """
+    g = grids[AOI]
+    H = g.height
+    write_landsat_rows(project, g, days[0], 18, rows=slice(0, 2 * H // 3))
+    write_landsat_rows(project, g, days[0], 20, rows=slice(H // 2, H))
+
+    opened = []
+    real_open = datacube.xr.open_dataset
+
+    def spy(f, *a, **kw):
+        opened.append(Path(f).name)
+        return real_open(f, *a, **kw)
+
+    monkeypatch.setattr(datacube.xr, "open_dataset", spy)
+    d = project.output_dir / "LANDSAT" / "aligned" / AOI
+    datacube.load_clearest_overpass(d, AOI, days, g.height, g.width, use_cloud=True,
+                                    mosaic=True)
+
+    assert len(opened) == 2, f"read the day's granules {len(opened)}x, expected once each"
+    assert len(set(opened)) == 2
+
+
+def test_mosaicking_a_day_allocates_one_scratch_not_one_per_granule(project, grids, days,
+                                                                    monkeypatch):
+    """Memory discipline: the merge costs ONE (H, W) int32 for the whole call, reused across
+    days -- not a per-granule buffer, and nothing 3-D. `load_clearest_overpass` is written to
+    hold only the contender and the incumbent, and mosaicking must not quietly relax that."""
+    g = grids[AOI]
+    H = g.height
+    for day in days[:2]:
+        write_landsat_rows(project, g, day, 18, rows=slice(0, 2 * H // 3))
+        write_landsat_rows(project, g, day, 20, rows=slice(H // 2, H))
+
+    made = []
+    real_empty = np.empty
+
+    def spy(shape, *a, **kw):
+        out = real_empty(shape, *a, **kw)
+        if out.dtype == np.dtype("int32"):
+            made.append(out.shape)
+        return out
+
+    monkeypatch.setattr(datacube.np, "empty", spy)
+    d = project.output_dir / "LANDSAT" / "aligned" / AOI
+    datacube.load_clearest_overpass(d, AOI, days, g.height, g.width, use_cloud=True,
+                                    mosaic=True)
+
+    assert made == [(g.height, g.width)], (
+        f"expected one 2-D int32 scratch reused across both days, got {made}")
+
+
+def test_the_one_pass_merge_equals_a_brute_force_ranked_fill(project, grids, days):
+    """The merge applies a ranking that has not finished arriving, in one pass, using only a
+    per-cell `score`. That is the subtle part of this feature, so it is checked against the
+    obvious-but-expensive implementation: read every granule, sort by valid count, fill.
+
+    Randomised over many granules with overlapping, ragged footprints -- the cases where an
+    order-dependent shortcut would diverge from a true ranking.
+    """
+    g = grids[AOI]
+    H, W = g.height, g.width
+    rng = np.random.default_rng(20260815)
+
+    for trial in range(12):
+        day = days[0]
+        d = project.output_dir / "LANDSAT" / "aligned" / AOI
+        if d.exists():
+            for f in d.glob("*.nc"):
+                f.unlink()
+        # Ragged, overlapping strips at distinct temperatures, deliberately including granules
+        # whose valid counts tie and whose footprints nest.
+        spec = []
+        for k in range(rng.integers(2, 6)):
+            lo, hi = sorted(rng.integers(0, H + 1, size=2))
+            if lo == hi:
+                hi = min(H, lo + 1)
+            spec.append((17 + k, slice(int(lo), int(hi)), 280.0 + trial + k))
+        for hour, rows, temp in spec:
+            write_landsat_rows(project, g, day, hour, rows=rows, temp=temp)
+
+        got_sst, got_cloud, got_valid, got_hour, got_times, _ = (
+            datacube.load_clearest_overpass(d, AOI, days, H, W, use_cloud=True, mosaic=True))
+
+        # --- brute force: read all, rank by valid count, fill what the base left invalid ---
+        read = []
+        for hour, rows, temp in sorted(spec):                 # (time, name) order, as on disk
+            sst = np.full((H, W), np.nan, "float32"); sst[rows] = temp
+            v = np.zeros((H, W), bool); v[rows] = True
+            read.append((int(v.sum()), hour, sst, v))
+        # Stable sort on the NEGATED count: ties keep arrival order, i.e. earliest wins.
+        ranked = sorted(range(len(read)), key=lambda j: -read[j][0])
+        base = ranked[0]
+        exp_sst = read[base][2].copy()
+        exp_valid = read[base][3].copy()
+        for j in ranked[1:]:
+            fill = read[j][3] & ~exp_valid
+            exp_sst[fill] = read[j][2][fill]
+            exp_valid |= fill
+
+        assert np.array_equal(np.isnan(got_sst[0]), np.isnan(exp_sst)), f"trial {trial}"
+        assert np.allclose(got_sst[0], exp_sst, equal_nan=True), f"trial {trial}"
+        assert np.array_equal(got_valid[0].astype(bool), exp_valid), f"trial {trial}"
+        assert got_hour[0] == pytest.approx(float(read[base][1])), f"trial {trial}"
+
+
+def test_mosaic_and_footprints_together_are_refused(project, grids, days):
+    """Unreachable through the registry (`_check_registry` forbids the pairing), so this pins
+    the loader's own guard for a direct caller."""
+    g = grids[AOI]
+    d = project.output_dir / "MODIS" / "aligned" / AOI
+    with pytest.raises(ValueError, match="footprint"):
+        datacube.load_clearest_overpass(d, AOI, days, g.height, g.width,
+                                        mosaic=True, read_footprint=True)
+
+
+# --------------------------------------------------------------------------- #
 # STACKED-DATA sensor: ECOSTRESS collection versions (D10) get one channel-set PER version,
 # but the matchups (met/tide/in-situ) key off ONE merged overpass identity (D5).
 # --------------------------------------------------------------------------- #
@@ -1164,6 +1454,36 @@ def test_blocked_and_single_block_cubes_are_identical(tmp_path):
         + "\n  ".join(_diff_snapshots(one, many)))
 
 
+def test_a_mosaicked_cube_is_identical_blocked_and_unblocked(tmp_path):
+    """Mosaicking must stay a PER-DAY decision, invisible to the block boundaries.
+
+    `_write_full_fixture` has no day with two granules of unequal coverage, so the test above
+    never exercises a real merge. The risk is specific: if a day's merge could see the other
+    days in its block, blocking would splice a different cube -- and neither guard would catch
+    it, because `_check_channel_set` compares the channel SET and `_merge_block_attrs` the
+    global attrs. Nothing checks values, so this does.
+    """
+    p_one = _long_project(tmp_path / "one", n_days=8)
+    p_many = _long_project(tmp_path / "many", n_days=8)
+    for p in (p_one, p_many):
+        g = grid.project_grids(p)[AOI]
+        days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+        _write_full_fixture(p, g, days)
+        H = g.height
+        # Real merges, and a DIFFERENT shape on each day, so a merge that leaked across days
+        # would land differently once the block boundaries moved.
+        for i, day in enumerate(days):
+            write_landsat_rows(p, g, day, 17, rows=slice(0, H - i - 1), temp=288.0 + i)
+            write_landsat_rows(p, g, day, 19, rows=slice(H // 3, H), temp=294.0 + i)
+
+    one = _assemble_to_zarr(p_one, block_days=8)       # a single pass
+    many = _assemble_to_zarr(p_many, block_days=3)     # 3 + 3 + 2
+
+    assert _diff_snapshots(one, many) == [], (
+        "a blocked mosaicked cube differs from a single-pass one:\n  "
+        + "\n  ".join(_diff_snapshots(one, many)))
+
+
 def test_channel_census_matches_the_assembled_cube(project, grids, days):
     """The census predicts memory and freezes the channel set, so it must equal reality.
 
@@ -1352,6 +1672,36 @@ def test_a_warning_about_the_tree_is_logged_once_not_once_per_block(tmp_path, ca
 
     backfill = [r for r in caplog.records if "no footprint_id layer" in r.getMessage()]
     assert len(backfill) == 1, f"logged {len(backfill)}x across 4 blocks, expected once"
+
+
+def test_the_mosaic_summary_is_logged_once_not_once_per_block(tmp_path, caplog):
+    """The same trap as above, and easier to fall into.
+
+    `_LogOnce` keys on the record's ARGS, so a summary counting what THIS block merged has
+    different args in every block and is emitted once per block. The counts therefore come
+    from `multi_granule_days` over `ctx.all_days` -- the whole window, from filenames -- which
+    is the same reason `footprint_available` is asked that way.
+    """
+    p = _long_project(tmp_path, n_days=8)
+    g = grid.project_grids(p)[AOI]
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    H = g.height
+    write_mur(p, g, days, water_hole_cols=slice(0, 0))
+    # Merged days on only SOME days, so a per-block count would genuinely differ per block.
+    for i, day in enumerate(days):
+        write_landsat_rows(p, g, day, 17, rows=slice(0, 2 * H // 3), temp=288.0)
+        if i % 2 == 0:
+            write_landsat_rows(p, g, day, 19, rows=slice(H // 2, H), temp=291.0)
+
+    eff = datacube._build_eff(p)
+    eff["block_days"] = 2                                   # 4 blocks
+    with caplog.at_level("INFO", logger="coastal_sst_data.processes.datacube"):
+        datacube.run(eff, grid.project_grids(p), None, False)
+
+    merged = [r for r in caplog.records if "MOSAICKED" in r.getMessage()]
+    assert len(merged) == 1, f"logged {len(merged)}x across 4 blocks, expected once"
+    assert "4 of 8" in merged[0].getMessage(), (
+        f"the summary counted one block's days, not the window's: {merged[0].getMessage()}")
 
 
 def test_a_whole_window_attr_that_changes_between_blocks_is_a_hard_error():

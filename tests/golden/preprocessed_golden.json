@@ -360,7 +360,10 @@
       }
     },
     "eco_cloud_v002": {
-      "attrs": {},
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
       "dims": [
         "time",
         "y",
@@ -440,7 +443,10 @@
       }
     },
     "eco_sst_v002": {
-      "attrs": {},
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
       "dims": [
         "time",
         "y",
@@ -514,7 +520,10 @@
       }
     },
     "eco_valid_v002": {
-      "attrs": {},
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
       "dims": [
         "time",
         "y",
@@ -748,7 +757,10 @@
       }
     },
     "lst_cloud": {
-      "attrs": {},
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
       "dims": [
         "time",
         "y",
@@ -828,7 +840,10 @@
       }
     },
     "lst_sst": {
-      "attrs": {},
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
       "dims": [
         "time",
         "y",
@@ -849,7 +864,10 @@
       }
     },
     "lst_valid": {
-      "attrs": {},
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
       "dims": [
         "time",
         "y",

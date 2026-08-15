@@ -136,6 +136,24 @@ class SensorSpec:
     # permission, not a promise: the layer is optional at acquisition time, so the assembler
     # emits `<prefix>_footprint_id` only when a granule on disk actually carried one.
     has_footprint: bool = False
+    # Whether MULTIPLE aligned granules on the same day are MOSAICKED -- the clearest is the
+    # base, the rest fill ONLY the cells it left invalid -- rather than the clearest being kept
+    # and the others DISCARDED. True for a sensor whose scene footprint can be SMALLER than an
+    # AoI: two Landsat path/rows covering different halves of an AoI used to leave half of it
+    # NaN for that day, because the loser's exclusive coverage was thrown away wholesale.
+    # MODIS opts out -- see its spec.
+    #
+    # Mutually exclusive with `has_footprint` (enforced in `_check_registry`): footprint ids
+    # restart at 0 in EVERY granule, so a mosaicked day would put two granules' unrelated
+    # native-pixel indices in one channel.
+    #
+    # The day's overpass IDENTITY is unaffected -- `<prefix>_hour` and the scene time every
+    # forcing matchup keys off stay the BASE granule's. So a mosaicked slice can hold pixels
+    # acquired at a time the cube does not report, and its overpass met / tide / in-situ values
+    # describe the base granule alone. That is why `cloud_filter`'s whole-slice cloud drop and
+    # `georef`'s per-slice shift -- both defaulting to `eco`, which mosaics -- judge a
+    # mosaicked day on evidence from one of its granules. Documented, not yet handled.
+    mosaic_same_day: bool = False
 
 
 @dataclass(frozen=True)
@@ -365,7 +383,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
         # ECOSTRESS's water layer has inverted polarity, and its cloud mask over-masks cold
         # water -- so validity is gated on the QC mandatory-QA bits instead.
         sensor=SensorSpec(prefix="eco", water_is_land=True, use_cloud=False,
-                          qc_levels=(0, 1)),
+                          qc_levels=(0, 1), mosaic_same_day=True),
         provenance_inputs=("ecostress",),
     ),
 
@@ -390,8 +408,11 @@ REGISTRY: tuple[ProductSpec, ...] = (
             "source", "collection", "stac_url", "platforms", "cloud_cover_max", "masking"},
         region_options=frozenset({"source", "collection", "stac_url"}),
         required_vars=("sst", "water", "cloud", "valid"),
-        # Landsat's QA_PIXEL-based cloud mask is reliable, so validity gates on it.
-        sensor=SensorSpec(prefix="lst", water_is_land=False, use_cloud=True),
+        # Landsat's QA_PIXEL-based cloud mask is reliable, so validity gates on it. A 185 km
+        # scene is wider than most AoIs, but an AoI straddling two path/rows gets one granule
+        # per row -- non-overlapping, same day -- so the day is mosaicked rather than halved.
+        sensor=SensorSpec(prefix="lst", water_is_land=False, use_cloud=True,
+                          mosaic_same_day=True),
         provenance_inputs=("landsat",),
     ),
 
@@ -413,7 +434,11 @@ REGISTRY: tuple[ProductSpec, ...] = (
         # Already quality-filtered upstream -> trust the file's own `valid` layer; it has no
         # water or cloud layer to recompute from, and so publishes no `modis_cloud` channel.
         # It is the one sensor gridded from a COARSER swath, so it alone can say which native
-        # ~1 km observation each grid cell came from -- `modis_footprint_id`.
+        # ~1 km observation each grid cell came from -- `modis_footprint_id`. That is also why
+        # it is the one sensor NOT mosaicked: those ids restart at 0 per granule, so merging
+        # two granules into a day would make the channel mean two different things at once.
+        # Its granules are whole overpasses hours apart, not adjoining halves of one, so a day
+        # loses no coverage by keeping the clearest.
         sensor=SensorSpec(prefix="modis", trust_valid=True, has_cloud=False,
                           has_footprint=True),
         provenance_inputs=("modis",),
@@ -655,6 +680,15 @@ def _check_registry() -> None:
                     f"sensor prefix {s.sensor.prefix!r} is claimed by both {clash} and "
                     f"{s.product.value}; every cube channel it names would collide.")
             seen_prefix[s.sensor.prefix] = s.product.value
+            # Unreachable today (only MODIS carries footprints, and it does not mosaic) --
+            # this is here for the FOURTH sensor, because the two features are silently
+            # incompatible rather than obviously so.
+            if s.sensor.mosaic_same_day and s.sensor.has_footprint:
+                raise RuntimeError(
+                    f"{s.product.value}: mosaic_same_day and has_footprint are mutually "
+                    "exclusive. footprint_id restarts at 0 in EVERY granule, so a mosaicked "
+                    "day would hold two granules' unrelated native-pixel indices in one "
+                    "channel, and grouping by it would average unrelated observations.")
         # A dependency must be a real product.
         for dep in s.depends_on:
             if dep not in BY_PRODUCT:

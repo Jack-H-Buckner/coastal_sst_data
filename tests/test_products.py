@@ -177,6 +177,26 @@ def test_sensor_specs_carry_the_validity_rules_the_assembler_needs():
     assert by_prefix["lst"].water_is_land is False
     # MODIS: quality-filtered upstream -> trust its own `valid` layer.
     assert by_prefix["modis"].trust_valid is True
+    # Which sensors MOSAIC a day's granules rather than keeping only the clearest. Landsat and
+    # ECOSTRESS can put two non-overlapping granules over one AoI on one day; MODIS opts out
+    # because its `footprint_id` ids restart per granule.
+    assert by_prefix["lst"].mosaic_same_day is True
+    assert by_prefix["eco"].mosaic_same_day is True
+    assert by_prefix["modis"].mosaic_same_day is False
+
+
+def test_a_mosaicking_sensor_may_not_also_carry_footprint_ids(monkeypatch):
+    """footprint_id restarts at 0 in every granule, so a mosaicked day would hold two granules'
+    unrelated native-pixel indices in one channel -- and grouping by it would then average
+    unrelated observations together, silently. Unreachable today; this is for sensor four."""
+    import dataclasses
+    modis = BY_PRODUCT[DataProduct.modis]
+    both = dataclasses.replace(
+        modis, sensor=dataclasses.replace(modis.sensor, mosaic_same_day=True))
+    monkeypatch.setattr(products, "REGISTRY",
+                        tuple(both if s is modis else s for s in products.REGISTRY))
+    with pytest.raises(RuntimeError, match="footprint"):
+        products._check_registry()
 
 
 def test_ecostress_is_a_stacked_data_sensor_keyed_on_versions():

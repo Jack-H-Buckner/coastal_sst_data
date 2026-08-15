@@ -295,10 +295,76 @@ def footprint_available(d: Path, aoi_id, days, H, W, *, cache=None) -> bool:
     return _cached(cache, ("footprint", str(d)), build)
 
 
+def _read_granule(f: Path, H, W, *, water_is_land, use_cloud, qset, trust_valid, read_fp):
+    """One granule -> (sst, cloud, valid, footprint|None), or None if it is not on this grid.
+
+    The validity rules `load_clearest_overpass` documents, applied to a single file. Split out
+    because that function now has two ways to combine a day's granules (keep the clearest, or
+    mosaic them) and only one way to READ one -- the guards and the mask algebra are identical
+    either way, and duplicating them is how the two regimes would drift apart.
+    """
+    with xr.open_dataset(f) as raw:
+        ds = raw.isel(time=0) if "time" in raw.dims else raw
+        if "sst" not in ds or ds["sst"].shape != (H, W):
+            return None
+        s = ds["sst"].values.astype("float32")
+        c = (ds["cloud"].values.astype("float32")
+             if "cloud" in ds and ds["cloud"].shape == (H, W) else np.zeros((H, W), "float32"))
+        fp = None
+        if read_fp and "footprint_id" in ds and ds["footprint_id"].shape == (H, W):
+            fp = ds["footprint_id"].values.astype("int32")
+        if trust_valid and "valid" in ds and ds["valid"].shape == (H, W):
+            v = (ds["valid"].values > 0) & np.isfinite(s)
+        else:
+            if "water" in ds and ds["water"].shape == (H, W):
+                w = ds["water"].values.astype("float32")
+                wp = np.isfinite(w) & ((w < 0.5) if water_is_land else (w > 0.5))
+            else:
+                wp = np.zeros((H, W), dtype=bool)      # no water layer -> claim NOTHING
+            q = (ds["quality"].values if "quality" in ds and ds["quality"].shape == (H, W)
+                 else None)
+            v = np.isfinite(s) & wp
+            if use_cloud:
+                v &= ~(np.nan_to_num(c, nan=1.0) > 0)
+            if qset is not None and q is not None:
+                mqa = np.full((H, W), -1, dtype="int64")
+                fin = np.isfinite(q)
+                mqa[fin] = q[fin].astype("int64") & 0b11   # mandatory-QA bits 0-1
+                v &= np.isin(mqa, qset)
+    return s, c, v, fp
+
+
+def multi_granule_days(d: Path, aoi_id, days, *, cache=None) -> tuple[int, int]:
+    """(scene-days holding MORE than one granule, scene-days at all) over the window.
+
+    FILENAMES only -- `scene_index` is already built and cached, so this opens nothing.
+
+    WHOLE-WINDOW, like `footprint_available`, and for a related reason: the caller logs these
+    counts, and a count taken from one BLOCK's days differs between blocks. `_LogOnce` keys on
+    the record's args, so a per-block count produces a different key each time and the summary
+    is emitted once per block -- the very thing that filter exists to stop. Pass `ctx.all_days`.
+    """
+    def build() -> tuple[int, int]:
+        want = {naming.day_stamp(dd) for dd in days}
+        seen = [len(g) for day, g in scene_index(d, aoi_id, cache=cache).items() if day in want]
+        return sum(1 for n in seen if n > 1), len(seen)
+
+    return _cached(cache, ("multiday", str(d)), build)
+
+
 def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                            use_cloud=True, qc_levels=None, trust_valid=False,
-                           read_footprint=False, footprint_present=None, cache=None):
-    """Per-overpass sensors (ECOSTRESS/Landsat/MODIS): keep the clearest scene/day.
+                           read_footprint=False, footprint_present=None, mosaic=False,
+                           cache=None):
+    """Per-overpass sensors (ECOSTRESS/Landsat/MODIS): one scene-set per day, clearest first.
+
+    Two regimes for a day holding MORE than one granule, chosen per sensor by
+    `SensorSpec.mosaic_same_day`:
+      * mosaic=False -- keep the clearest granule (most valid pixels) and DISCARD the rest.
+      * mosaic=True  -- the clearest is the BASE, and lower-ranked granules fill ONLY the
+        cells it left invalid. Two non-overlapping Landsat path/rows over one AoI used to
+        leave half of it NaN under the first rule; the day's coverage is now their union.
+    Either way a day with ONE granule takes the same path it always did.
 
     Validity per sensor:
       * trust_valid=True (MODIS -- already quality-filtered): use the file's
@@ -309,14 +375,38 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
           - qc_levels (e.g. {0,1}) gates on QC mandatory-QA bits 0-1 instead of
             cloud (ECOSTRESS: cloud over-masks cold water, so gate on QC).
     Returns (sst, cloud, valid, hour, times, footprint).
-    `times` is the CHOSEN scene's datetime per day (None where the sensor had no scene), so
+    `times` is the BASE scene's datetime per day (None where the sensor had no scene), so
     the tide and the met snapshot can be matched to that exact scene rather than to the day.
+    MOSAICKING DOES NOT CHANGE IT: a merged day still reports the base granule's instant, and
+    `hour` with it, so every downstream matchup keys off one overpass identity exactly as
+    before. The cost is that a merged slice can hold pixels acquired at a time the cube does
+    not report, and its overpass forcing describes the base granule alone -- said out loud on
+    the channels themselves via `_MOSAIC_ATTRS`.
 
-    ONE DAY AT A TIME. The scenes are walked per day (via `scene_index`) and the day's winner
+    Two consequences of filling only what the base left INVALID, both deliberate:
+      * a lower-ranked granule wins a cell where the base is finite but cloudy/QC-rejected,
+        so `<prefix>_sst` is no longer one granule's raw scene there; and
+      * a cell NO granule validly observed keeps the base's raw value -- possibly NaN -- even
+        where a lower-ranked granule held a masked reading. Filling it would put unvalidated
+        pixels into the sst channel, which is a stronger claim than the files make.
+
+    Ties go to the earliest granule, in both regimes: the contest is a strict `>` over
+    `scene_index`'s (time, name) ordering. That is load-bearing under mosaicking, because the
+    winner's datetime IS the day's reported overpass.
+
+    ONE DAY AT A TIME. The scenes are walked per day (via `scene_index`) and the day's result
     is written into the output before the next day is read, so the only scene arrays alive at
     once are the contender and the incumbent. Accumulating every day's winner first and
     copying afterwards -- which is what this did -- held a WHOLE WINDOW of scenes alongside
     the outputs that were already allocated, roughly doubling the peak for no benefit.
+    Mosaicking keeps that bound: it needs no ranking pass and no second read, because `score`
+    (below) records what each cell already came from, which is enough to apply a ranking that
+    has not finished arriving. It costs ONE (H, W) int32, not one per granule.
+
+    BLOCK-INVARIANT. The merge reads only `scene_index[day]` -- built from FILENAMES, cached
+    per directory, identical in every block -- and that day's granule contents. A day lives in
+    exactly one block, so it merges once per run, the same way, whatever the block boundaries.
+    Nothing here consults the other days in `days`.
 
     `footprint` is the native sensor-pixel index per grid cell, read only when
     `read_footprint` and returned as None when NO granule on disk carried the layer -- it is
@@ -329,11 +419,23 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
     SST channel, and eagerly filling one with -1 for a sensor that never carried the layer
     cost a large AoI many GB to build something the caller then threw away.
     """
+    if mosaic and read_footprint:
+        raise ValueError(
+            "mosaic and read_footprint are mutually exclusive: footprint ids restart at 0 in "
+            "every granule, so a merged day would mix two granules' unrelated native-pixel "
+            "indices in one channel (see SensorSpec.mosaic_same_day).")
     sst, cloud = _empty3d(days, H, W), _empty3d(days, H, W)
     valid = np.zeros((len(days), H, W), dtype="uint8")
     hour = np.full(len(days), np.nan, dtype="float32")
     times: list = [None] * len(days)
     footprint = None
+    # Per-cell provenance for the mosaic: the valid-pixel count of the granule each cell's
+    # values came from, or -1 for a cell no granule has validly claimed yet. This is what lets
+    # a ranked fill run in ONE arrival-ordered pass -- see the merge below. Allocated lazily,
+    # on the first day that actually has granules to merge, and reused across days; a sensor
+    # with no multi-granule day never pays for it. `np.empty(...).fill()` rather than
+    # `np.full`, because a test spies on `np.full` to prove no stray int32 is allocated.
+    score = None
     # `footprint_present` is `footprint_available`'s whole-window answer, so that every time
     # block emits the same channel set (see that function). None keeps the self-contained
     # behaviour -- decide from the granules actually read -- for a caller holding one window.
@@ -347,49 +449,50 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
         i = didx.get(day)
         if i is None:
             continue
+        # A day with one granule cannot be mosaicked, so it keeps the contest path exactly --
+        # which is what makes this change a no-op for every tree that has no merged day.
+        mosaic_day = mosaic and len(granules) > 1
+        if mosaic_day:
+            if score is None:
+                score = np.empty((H, W), dtype="int32")
+            score.fill(-1)
         best = None  # (valid_count, sst, cloud, valid, footprint|None, datetime)
         for dt, f in granules:
-            ds = xr.open_dataset(f)
-            if "time" in ds.dims:
-                ds = ds.isel(time=0)
-            if "sst" not in ds or ds["sst"].shape != (H, W):
-                ds.close(); continue
-            s = ds["sst"].values.astype("float32")
-            c = (ds["cloud"].values.astype("float32")
-                 if "cloud" in ds and ds["cloud"].shape == (H, W) else np.zeros((H, W), "float32"))
-            fp = None
-            if read_fp and "footprint_id" in ds and ds["footprint_id"].shape == (H, W):
-                fp = ds["footprint_id"].values.astype("int32")
+            got = _read_granule(f, H, W, water_is_land=water_is_land, use_cloud=use_cloud,
+                                qset=qset, trust_valid=trust_valid, read_fp=read_fp)
+            if got is None:
+                continue
+            s, c, v, fp = got
+            if fp is not None:
                 saw_footprint = True
-            if trust_valid and "valid" in ds and ds["valid"].shape == (H, W):
-                v = (ds["valid"].values > 0) & np.isfinite(s)
-            else:
-                if "water" in ds and ds["water"].shape == (H, W):
-                    w = ds["water"].values.astype("float32")
-                    wp = np.isfinite(w) & ((w < 0.5) if water_is_land else (w > 0.5))
-                else:
-                    wp = np.zeros((H, W), dtype=bool)      # no water layer -> claim NOTHING
-                q = (ds["quality"].values if "quality" in ds and ds["quality"].shape == (H, W)
-                     else None)
-                v = np.isfinite(s) & wp
-                if use_cloud:
-                    v &= ~(np.nan_to_num(c, nan=1.0) > 0)
-                if qset is not None and q is not None:
-                    mqa = np.full((H, W), -1, dtype="int64")
-                    fin = np.isfinite(q)
-                    mqa[fin] = q[fin].astype("int64") & 0b11   # mandatory-QA bits 0-1
-                    v &= np.isin(mqa, qset)
-            ds.close()
 
             vc = int(v.sum())
-            if best is None or vc > best[0]:
+            new_base = best is None or vc > best[0]
+            if mosaic_day:
+                # THE MERGE, in one pass. A new base claims every cell it validly observes plus
+                # every cell still unclaimed (score < 0) -- NOT every cell, or it would wipe the
+                # valid fill an earlier, lower-ranked granule contributed where this one is
+                # blind. A non-base granule may only claim cells whose current source ranked
+                # BELOW it. Together those give exactly the ranked fill: each cell ends with
+                # the highest-count granule that validly saw it, and a cell none of them saw
+                # ends with the last new base -- which, since `new_base` fires only on running
+                # maxima, is the clearest granule of the day.
+                take = (v | (score < 0)) if new_base else (v & (score < vc))
+                # sst/cloud/valid are written under ONE mask from ONE granule, so a filled
+                # cell's temperature, cloud flag and validity all describe the same overpass.
+                np.copyto(sst[i], s, where=take)
+                np.copyto(cloud[i], np.nan_to_num(c, nan=0.0), where=take)
+                np.copyto(valid[i], v, where=take)
+                np.copyto(score, np.int32(vc), where=take & v)   # unclaimed cells stay at -1
+            if new_base:
                 best = (vc, s, c, v, fp, dt)
         if best is None:
             continue                                       # every granule failed the shape check
         _, s, c, v, fp, dt = best
-        sst[i] = s
-        cloud[i] = np.nan_to_num(c, nan=0.0)
-        valid[i] = v.astype("uint8")
+        if not mosaic_day:
+            sst[i] = s
+            cloud[i] = np.nan_to_num(c, nan=0.0)
+            valid[i] = v.astype("uint8")
         hour[i] = dt.hour + dt.minute / 60.0
         times[i] = dt
         scene_days += 1
@@ -864,6 +967,25 @@ def _contribute_bathymetry(ctx: AssemblyContext) -> None:
 def _load_sensor(ctx: AssemblyContext, sp, adir):
     """Read one sensor scene-stream from one aligned dir, applying the sensor's validity
     rules. Factored out so a flat sensor and one per-version tree share exactly one path."""
+    # `ctx.days` is empty only in the CENSUS pass, which runs the real contributors over a
+    # zero-length axis purely to learn the channel set. `_quiet` covers it, but only while the
+    # module logger defers to the package one -- set a level on the module logger (as a test
+    # reasonably might) and the census starts narrating. Every other loader here is silent then
+    # by accident, because no day matches and the message sits behind a per-day counter; this
+    # one reads the whole window, so it has to say so itself.
+    if sp.mosaic_same_day and len(ctx.days):
+        # Asked over the WHOLE cube axis, like footprint_available and for a related reason:
+        # a count taken from THIS block's days differs between blocks, which makes each block's
+        # message a different log record and defeats `_LogOnce` -- one identical summary per
+        # block is exactly what that filter exists to prevent.
+        n_multi, n_days = multi_granule_days(adir, ctx.aid, ctx.all_days, cache=ctx.cache)
+        if n_multi:
+            # The tree path, not adir.name: that is the AoI id for BOTH ECOSTRESS/v002/... and
+            # /v003/..., so identical args would make _LogOnce swallow the second version.
+            log.info("  %s: %d of %d scene-days have more than one granule; those days are "
+                     "MOSAICKED -- the clearest granule is the base and the rest fill only the "
+                     "cells it left invalid, while %s_hour stays the base granule's time",
+                     adir.relative_to(ctx.eff["aligned_root"]), n_multi, n_days, sp.prefix)
     return load_clearest_overpass(
         adir, ctx.aid, ctx.days, ctx.H, ctx.W,
         water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
@@ -873,7 +995,7 @@ def _load_sensor(ctx: AssemblyContext, sp, adir):
         footprint_present=(footprint_available(adir, ctx.aid, ctx.all_days, ctx.H, ctx.W,
                                                cache=ctx.cache)
                            if sp.has_footprint else False),
-        cache=ctx.cache)
+        mosaic=sp.mosaic_same_day, cache=ctx.cache)
 
 
 # The footprint index is a per-day identity, and saying so on the variable is the only place a
@@ -885,6 +1007,17 @@ _FOOTPRINT_ATTRS = dict(
             "for every scene and are NOT comparable across days")
 
 
+# Said on the channels themselves, because it is the only place a user reading the cube would
+# ever learn it: a mosaicked slice can hold pixels from more than one overpass, while
+# `<prefix>_hour` -- and every forcing matched to it -- reports only the base granule's.
+_MOSAIC_ATTRS = dict(
+    mosaic="days with more than one granule are merged: the granule with the most valid "
+           "pixels is the base, and the rest fill ONLY the cells it left invalid",
+    mosaic_time="the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), "
+                "describe the BASE granule alone -- filled cells may come from another "
+                "overpass of the same day")
+
+
 def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None:
     """A single-collection sensor (Landsat, MODIS): one flat `<DIR>/aligned/<aoi>` tree, one
     channel-set under the bare prefix, one entry in `sensor_times`."""
@@ -892,10 +1025,11 @@ def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None
     sst, cloud, valid, hour, times, footprint = _load_sensor(
         ctx, sp, ctx.adir(s.product.value))
     pre = sp.prefix
-    ctx.emit(f"{pre}_sst", T3, sst)
+    mos = _MOSAIC_ATTRS if sp.mosaic_same_day else {}
+    ctx.emit(f"{pre}_sst", T3, sst, **mos)
     if sp.has_cloud:          # MODIS arrives pre-filtered with no cloud layer; an all-zero
-        ctx.emit(f"{pre}_cloud", T3, cloud)   # channel would falsely read "never cloudy"
-    ctx.emit(f"{pre}_valid", T3, valid)
+        ctx.emit(f"{pre}_cloud", T3, cloud, **mos)   # channel would falsely read "never cloudy"
+    ctx.emit(f"{pre}_valid", T3, valid, **mos)
     ctx.emit(f"{pre}_hour", ("time",), hour)
     # Only when a granule actually carried the layer (it is optional at acquisition): an
     # all -1 channel would read as "nothing was ever in swath" rather than "never recorded".
@@ -932,10 +1066,11 @@ def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> N
         sst, cloud, valid, hour, times, footprint = _load_sensor(
             ctx, sp, ctx.adir(s.product.value, tag))
         pre = sp.prefix
-        ctx.emit(f"{pre}_sst_{tag}", T3, sst)
+        mos = _MOSAIC_ATTRS if sp.mosaic_same_day else {}
+        ctx.emit(f"{pre}_sst_{tag}", T3, sst, **mos)
         if sp.has_cloud:
-            ctx.emit(f"{pre}_cloud_{tag}", T3, cloud)
-        ctx.emit(f"{pre}_valid_{tag}", T3, valid)
+            ctx.emit(f"{pre}_cloud_{tag}", T3, cloud, **mos)
+        ctx.emit(f"{pre}_valid_{tag}", T3, valid, **mos)
         ctx.emit(f"{pre}_hour_{tag}", ("time",), hour)
         if footprint is not None:
             ctx.emit(f"{pre}_footprint_id_{tag}", T3, footprint, **_FOOTPRINT_ATTRS)
