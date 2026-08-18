@@ -31,14 +31,36 @@ set before `to_netcdf` is called and HDF5 writes them early, so a truncated file
 carries a perfectly good stamp. The stamp proves the write STARTED. Only the data proves
 it finished -- which is why the deep check (`--validate`) reads the payload rather than
 trusting the header.
+
+WHOSE SCRATCH IS IT. Atomicity assumed one writer per destination, and cleaning up after a
+dead run was therefore "delete every `<dest>.part-*` you find". That is wrong the moment two
+runs share an output tree -- a Slurm array with overlapping `--aoi` lists, two shells, a job
+relaunched before the old one died -- because the sweep cannot tell a dead run's leftovers
+from a live run's open file. It deleted the live one, and the writer (whose HDF5 handle is
+reopened BY PATH for each dask chunk) failed mid-day with `errno = 2` on a file it had every
+reason to think it owned.
+
+So scratch now says WHO made it (`<host>-<pid>-<tid>-<ms>`) and the sweep asks whether that
+writer is still around, using the strongest evidence available:
+
+    this host, this pid   -> the in-process registry: is it open right now?
+    this host, other pid  -> os.kill(pid, 0): is that process still running?
+    another host, or a
+    tag we cannot read    -> the clock: has anything under it been touched recently?
+
+Only the first two are PROOF. The clock is a guess, so it is deliberately generous
+(`STALE_SCRATCH_S`) and it errs toward keeping: a stranded file costs a line in `check`,
+a wrongly-deleted one costs another run the work it was in the middle of.
 """
 
 from __future__ import annotations
 
 import contextlib
+import glob as globlib
 import logging
 import os
 import shutil
+import socket
 import threading
 import time
 from pathlib import Path
@@ -52,6 +74,20 @@ log = logging.getLogger(__name__)
 
 PART_SUFFIX = ".part-"     # a write in progress; junk if the run dies
 OLD_SUFFIX = ".old-"       # the previous output, kept only until the swap succeeds
+SCRATCH_SUFFIXES = (PART_SUFFIX, OLD_SUFFIX)
+
+# How long scratch owned by a run we CANNOT interrogate -- another host, or a tag written by
+# an older version -- must sit untouched before we call it dead. Generous on purpose: this
+# tier is a guess, and the two tiers above it (the registry, and os.kill) already clear the
+# common cases the moment the owning process is gone, so nothing waits on this clock unless
+# the writer was on another machine.
+STALE_SCRATCH_S = 6 * 3600
+
+# The host half of a scratch file's owner token. Hyphens are NOT sanitised out: `-` is the
+# field separator, and the tag is parsed from the RIGHT so a hyphenated hostname survives
+# intact. Collapsing `node-1` and `node_1` onto one name would make two machines look like
+# one, which is the false-"that's mine" that deletes a live writer's file.
+_HOST = socket.gethostname().split(".")[0] or "unknown"
 
 # The variables a finished file of each product MUST carry, keyed by its ALLCAPS output
 # directory. A file missing one of these is not "a file with a gap" -- it is a file whose
@@ -71,17 +107,145 @@ OLD_SUFFIX = ".old-"       # the previous output, kept only until the swap succe
 REQUIRED_VARS: dict[str, tuple[str, ...]] = {s.dir: s.required_vars for s in REGISTRY}
 
 
+# The scratch this process has OPEN right now: {scratch path -> its destination}. The only
+# tier of `is_live_scratch` that is certain in both directions -- it is what lets us reclaim
+# scratch THIS pid abandoned (a swap that raised, an `_rm` that failed on NFS) without
+# waiting out a clock, and what stops one thread sweeping another thread's open file.
+_ACTIVE: dict[Path, Path] = {}
+_ACTIVE_LOCK = threading.Lock()
+
+
 def _tag() -> str:
-    """A scratch-name suffix unique to this process, THREAD and moment, so two runs writing
-    the same output cannot land on each other's scratch.
+    """A scratch-name suffix unique to this HOST, process, THREAD and moment.
+
+    Unique, and -- the part that matters -- ATTRIBUTABLE: `sweep_scratch` reads the host and
+    pid back out to ask whether the writer still exists, instead of assuming that anything
+    it finds is junk.
 
     The thread id is not redundant with the millisecond: once stages run on a pool, two
     workers can enter `atomic()` inside the same millisecond, and pid+ms alone would hand
     them the same scratch path -- one would then swap a file the other was still writing.
-    Cheap insurance behind the real guarantee, which is that the work partition gives every
-    task a distinct DESTINATION (see `sweep_scratch`).
     """
-    return f"{os.getpid()}-{threading.get_ident()}-{int(time.time() * 1000)}"
+    return f"{_HOST}-{os.getpid()}-{threading.get_ident()}-{int(time.time() * 1000)}"
+
+
+def _owner_of(path: Path) -> tuple[str, int] | None:
+    """The (host, pid) that made this scratch, or None if the tag cannot be read.
+
+    Parsed from the RIGHT, because a hostname may contain the separator. None means "written
+    by a version that did not stamp a host, or not a scratch name at all" -- and an unknown
+    owner is never treated as ours.
+    """
+    for suffix in SCRATCH_SUFFIXES:
+        _, sep, tail = path.name.partition(suffix)
+        if not sep:
+            continue
+        parts = tail.rsplit("-", 3)
+        if len(parts) != 4 or not parts[0] or not all(p.isdigit() for p in parts[1:]):
+            return None
+        return parts[0], int(parts[1])
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is `pid` a live process on THIS host? Every uncertain answer is 'yes'."""
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:            # another user's process: alive, just not ours to signal
+        return True
+    except OSError:                    # no signals here (non-POSIX): assume the worst
+        return True
+    return True
+
+
+def _newest_mtime(path: Path, *, at_least: float = float("inf")) -> float:
+    """The most recent mtime anywhere under `path`, stopping once it reaches `at_least`.
+
+    A DIRECTORY's own mtime is not a liveness signal: a staged Zarr's top level stops moving
+    once its first block lands, while the assembler spends hours writing chunks underneath
+    it. Ask the chunk files. `at_least` keeps that from being a full walk of a large store --
+    the caller only needs to know which side of its cutoff the answer falls on.
+    """
+    try:
+        newest = path.stat().st_mtime
+    except OSError:
+        return 0.0
+    if newest >= at_least or not path.is_dir():
+        return newest
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for name in (dirpath, *(os.path.join(dirpath, f) for f in filenames)):
+            try:
+                newest = max(newest, os.stat(name).st_mtime)
+            except OSError:            # vanished under us; something else is clearly busy here
+                continue
+            if newest >= at_least:
+                return newest
+    return newest
+
+
+def _register(tmp: Path, dest: Path) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE[Path(tmp)] = Path(dest)
+
+
+def _unregister(tmp: Path) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE.pop(Path(tmp), None)
+
+
+def _is_scratch_name(name: str) -> bool:
+    return any(s in name for s in SCRATCH_SUFFIXES)
+
+
+def scratch_owner(path: Path) -> str:
+    """'host:pid' that made this scratch, for a human-readable report."""
+    owner = _owner_of(Path(path))
+    return f"{owner[0]}:{owner[1]}" if owner else "an unidentified run"
+
+
+def is_live_scratch(path: Path, *, max_age_s: float | None = None) -> bool:
+    """Might something still be WRITING this scratch? Errs toward yes.
+
+    The three tiers, strongest evidence first (see the module docstring). Only the first two
+    are proof; the third is a clock, and a clock cannot distinguish a dead run from a writer
+    stalled on a slow download -- which is exactly what a lazy CMEMS or ARCO read looks like
+    from outside, the scratch file created and its mtime frozen while chunks trickle in.
+    """
+    path = Path(path)
+    with _ACTIVE_LOCK:
+        if path in _ACTIVE:
+            return True                    # a thread here has it open right now
+    owner = _owner_of(path)
+    if owner is not None and owner[0] == _HOST:
+        if owner[1] == os.getpid():
+            return False                   # ours, and not open -> we abandoned it
+        if not _pid_alive(owner[1]):
+            return False                   # the writer is gone
+    cutoff = time.time() - (STALE_SCRATCH_S if max_age_s is None else max_age_s)
+    return _newest_mtime(path, at_least=cutoff) > cutoff
+
+
+def unique_suffix() -> str:
+    """A host/process/thread/moment-unique name fragment, for scratch that is NOT an
+    `atomic()` destination -- a per-granule download directory, say.
+
+    Such a directory is torn down with `shutil.rmtree` when its item finishes, so a name
+    built only from what the item IS (its AoI and timestamp) is the same name in every
+    concurrent run: two runs over overlapping dates download into one directory and each
+    deletes the other's half-fetched granule. The identity has to be in the name.
+    """
+    return _tag()
+
+
+def scratch_beside(dest: Path) -> list[Path]:
+    """Every scratch path sharing this destination, whoever wrote it."""
+    dest = Path(dest)
+    pattern = globlib.escape(dest.name)
+    return sorted(p for s in SCRATCH_SUFFIXES for p in dest.parent.glob(f"{pattern}{s}*"))
 
 
 def _rm(path: Path) -> None:
@@ -98,19 +262,40 @@ def _rm(path: Path) -> None:
         log.warning("  could not remove %s (%s); delete it by hand", path.name, exc)
 
 
-def sweep_scratch(dest: Path) -> None:
-    """Discard scratch left beside `dest` by a run that died mid-write.
+def sweep_scratch(dest: Path, *, max_age_s: float | None = None) -> list[Path]:
+    """Discard scratch beside `dest` left by a run that DIED -- and only that.
 
-    This warns, and it is the ONLY trace the user gets that an earlier run failed partway
-    through a write -- the output itself looks untouched, because that is the whole point.
+    Returns the scratch it LEFT ALONE, because someone may still be filling it. A caller
+    that gets a non-empty list has learned that another run is writing this destination.
+
+    The warning on a discard is the ONLY trace the user gets that an earlier run failed
+    partway through a write -- the output itself looks untouched, because that is the whole
+    point. The warning on a KEEP matters just as much: it is the only sign that two runs are
+    writing one file, which is safe (unique scratch names, an atomic swap, last writer wins)
+    but is almost always an unintended overlap in `--aoi` lists or date ranges.
     """
-    for stale in sorted(dest.parent.glob(f"{dest.name}{PART_SUFFIX}*")):
+    live: list[Path] = []
+    for stale in scratch_beside(dest):
+        if is_live_scratch(stale, max_age_s=max_age_s):
+            live.append(stale)
+            log.warning("  leaving %s alone -- %s may still be writing it",
+                        stale.name, scratch_owner(stale))
+            continue
         log.warning("  discarding %s left by an unfinished run", stale.name)
         _rm(stale)
+    return live
 
 
 def _swap(tmp: Path, dest: Path) -> None:
-    """Move a COMPLETED scratch write onto the final path."""
+    """Move a COMPLETED scratch write onto the final path.
+
+    A DIRECTORY destination is the interesting case, and it is not fully serialisable: two
+    processes swapping one store can interleave so that the second finds `dest` already
+    moved aside, takes the no-stash branch, and then fails ENOTEMPTY against the first's
+    freshly-installed directory. Nothing is corrupted -- the first swap is complete and
+    intact -- but the second loses its work to a spurious error, which is why `atomic` warns
+    as soon as it sees another run writing the same destination.
+    """
     if not tmp.is_dir():
         os.replace(tmp, dest)      # atomic, and overwrites an existing file in one step
         return
@@ -121,12 +306,20 @@ def _swap(tmp: Path, dest: Path) -> None:
     if dest.exists():
         stash = dest.with_name(f"{dest.name}{OLD_SUFFIX}{_tag()}")
         dest.rename(stash)
+        # REGISTERED, because the stash is the only copy of the previous output until the
+        # replace lands. It carries our own tag, so without this a concurrent sweep in this
+        # same process would read it as "ours and not open" -- provably dead -- and delete
+        # the rollback out from under us.
+        _register(stash, dest)
     try:
         os.replace(tmp, dest)
     except OSError:
         if stash is not None:      # put the old output back: leaving NOTHING is worse
             stash.rename(dest)
         raise
+    finally:
+        if stash is not None:
+            _unregister(stash)
     if stash is not None:
         _rm(stash)
 
@@ -143,8 +336,16 @@ def atomic(dest: Path):
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    sweep_scratch(dest)
+    live = sweep_scratch(dest)
+    if live:
+        log.warning("  %s is being written by more than one run at once (%s); both writes "
+                    "complete and whichever finishes LAST wins -- check for overlapping "
+                    "--aoi lists or date ranges", dest.name,
+                    ", ".join(sorted({scratch_owner(p) for p in live})))
     tmp = dest.with_name(f"{dest.name}{PART_SUFFIX}{_tag()}")
+    # Claimed BEFORE the yield, not once the writer has created something: a sweep that ran
+    # in the gap would find no file to glob, so registering first leaves no window at all.
+    _register(tmp, dest)
     try:
         yield tmp
         if not tmp.exists():
@@ -155,6 +356,8 @@ def atomic(dest: Path):
         # leave a half-file behind either.
         _rm(tmp)
         raise
+    finally:
+        _unregister(tmp)
 
 
 # --------------------------------------------------------------------------- #
@@ -312,8 +515,10 @@ def scan(root: Path, aois=None, *, deep: bool = True):
     one is currently being skipped as done on every run. It reads the payload of every file
     (`deep`), because a truncated chunk is invisible to a metadata check.
 
-    Returns (n_checked, bad, leftovers): the files that failed, and any scratch stranded by
-    a run that died mid-write.
+    Returns (n_checked, bad, leftovers, in_use). `leftovers` is scratch whose writer is gone
+    -- safe to delete. `in_use` is scratch something appears to be filling RIGHT NOW: it is
+    reported and never repaired, because deleting it is how a concurrent run loses a file it
+    was in the middle of writing.
     """
     root = Path(root)
     bad: list[tuple[str, Path]] = []
@@ -337,8 +542,35 @@ def scan(root: Path, aois=None, *, deep: bool = True):
                     n += 1
                     if not is_complete(f, s.required_vars, deep=deep):
                         bad.append((s.dir, f))
-    leftovers = sorted(p for p in root.rglob(f"*{PART_SUFFIX}*"))
-    return n, bad, leftovers
+    leftovers: list[Path] = []
+    in_use: list[Path] = []
+    for p in _find_scratch(root):
+        (in_use if is_live_scratch(p) else leftovers).append(p)
+    return n, bad, leftovers, in_use
+
+
+def _find_scratch(root: Path) -> list[Path]:
+    """Every scratch path under `root`, without descending INTO one.
+
+    `rglob("*.part-*")` walks the inside of an abandoned scratch Zarr and reports each of its
+    chunk files as a separate leftover -- thousands of paths naming one dead write. The
+    scratch directory itself is the unit; what is inside it goes with it.
+
+    `.old-` counts too. A process killed between the rename and the replace in `_swap` leaves
+    a full copy of the previous output that nothing has ever looked for, which for a cube is
+    tens of gigabytes of silent leak.
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        keep = []
+        for d in dirnames:
+            if _is_scratch_name(d):
+                found.append(Path(dirpath) / d)
+            else:
+                keep.append(d)
+        dirnames[:] = keep                 # in place: this is what prunes the walk
+        found.extend(Path(dirpath) / f for f in filenames if _is_scratch_name(f))
+    return sorted(found)
 
 
 def repair(bad, leftovers) -> int:
@@ -348,9 +580,21 @@ def repair(bad, leftovers) -> int:
     bad file is enough -- the next run sees no output and fetches it again. We delete rather
     than leave it in place so that a tree can be made trustworthy without a full --overwrite
     re-download of everything that was already fine.
+
+    Scratch that looks live is refused even when it is handed to us. `scan` already filters
+    it out; this is the second lock on the same door, because deleting a running job's
+    in-flight write is the one mistake this pass must never make.
+
+    -> how many paths were actually removed.
     """
+    removed = 0
     for _, f in bad:
         _rm(f)
+        removed += 1
     for p in leftovers:
+        if is_live_scratch(p):
+            log.warning("  %s is in use by %s; NOT deleting it", p.name, scratch_owner(p))
+            continue
         _rm(p)
-    return len(bad) + len(leftovers)
+        removed += 1
+    return removed

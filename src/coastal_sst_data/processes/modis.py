@@ -406,7 +406,10 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                     continue
                 # One scratch dir per granule, removed in `finally`. A partial download can
                 # therefore never survive to be mistaken for a complete one by the next run.
-                gran_tmp = tmp_root / f"g_{name}_{tstr}"
+                # The name carries WHO is downloading as well as WHAT: keyed on the granule
+                # alone, two runs over overlapping dates share the directory, and each one's
+                # `finally` deletes the other's half-fetched granule.
+                gran_tmp = tmp_root / f"g_{name}_{tstr}_{store.unique_suffix()}"
                 try:
                     path = fetch(gr, g.search_bbox, gran_tmp, variables=want_vars)
                     sst, lat, lon = read_swath(path, variable, quality_min, to_celsius)
@@ -426,7 +429,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                                     solar_h=solar_hour(t, lon_c),
                                     day_night=_day_night(gr))
                 ds.attrs.update(**provenance.stamp(eff))
-                log.info("  [%s] wrote %s", tag, store.write_output(ds, aoi_out, stem, fmt))
+                try:
+                    out = store.write_output(ds, aoi_out, stem, fmt)
+                except (OSError, RuntimeError) as exc:   # this scene only -- see cmems.run
+                    log.warning("  [%s] WRITE FAILED %s (%s)", tag, stem, exc)
+                    rep.fail(f"{name} {tag} {stem}", f"write failed: {exc}")
+                    continue
+                log.info("  [%s] wrote %s", tag, out)
                 rep.wrote(source=f"GHRSST {short_name}")
     rep.log_summary()
     return rep

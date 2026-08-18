@@ -342,7 +342,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers,
                     rep.fail(f"{name} {tag} {tstr}", "granule dropped (missing core layer)")
                     continue
                 ds.attrs.update(**provenance.stamp(eff))
-                log.info("      wrote %s", store.write_output(ds, aoi_out, stem, fmt))
+                try:
+                    out = store.write_output(ds, aoi_out, stem, fmt)
+                except (OSError, RuntimeError) as exc:   # this granule only -- see cmems.run
+                    log.warning("      WRITE FAILED %s (%s)", stem, exc)
+                    rep.fail(f"{name} {tag} {tstr}", f"write failed: {exc}")
+                    continue
+                log.info("      wrote %s", out)
                 rep.wrote(source=ds.attrs.get("source"))
 
     rep.log_summary()

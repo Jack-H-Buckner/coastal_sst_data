@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coastal_sst_data"
-version = "0.4.0"
+version = "0.4.1"
 description = "Acquire and grid coastal SST and covariate data products into analysis-ready datacubes."
 readme = "README.md"
 requires-python = ">=3.10"

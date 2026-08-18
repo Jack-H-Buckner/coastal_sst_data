@@ -172,7 +172,8 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 continue
             # One scratch dir per granule, removed in `finally`. A partial download can
             # therefore never survive to be mistaken for a complete one by the next run.
-            gran_tmp = tmp_dir / f"g_{name}_{tstr}"
+            # The name carries WHO is downloading as well as WHAT -- see modis.acquire.
+            gran_tmp = tmp_dir / f"g_{name}_{tstr}_{store.unique_suffix()}"
             try:
                 path = fetch(gr, g.search_bbox, gran_tmp, variables=want_vars)
                 sst, lat, lon = read_swath(path, variable, quality_min, to_celsius)
@@ -191,7 +192,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                                 short_name=short_name, solar_h=solar_hour(t, lon_c),
                                 day_night=_day_night(gr))
             ds.attrs.update(**provenance.stamp(eff))
-            log.info("  wrote %s", store.write_output(ds, aoi_out, stem, fmt))
+            try:
+                out = store.write_output(ds, aoi_out, stem, fmt)
+            except (OSError, RuntimeError) as exc:       # this scene only -- see cmems.run
+                log.warning("  WRITE FAILED %s (%s)", stem, exc)
+                rep.fail(f"{name} {stem}", f"write failed: {exc}")
+                continue
+            log.info("  wrote %s", out)
             rep.wrote(source=f"GHRSST {short_name}")
     rep.log_summary()
     return rep

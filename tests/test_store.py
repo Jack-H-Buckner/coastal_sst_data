@@ -4,7 +4,15 @@ The failure these exist to prevent: a run killed mid-write leaves a file that EX
 OPENS but is missing its data; the old `.exists()` skip guard took that for a finished
 download and never repaired it, so a dropped connection became a permanent NaN day in
 every cube built afterwards.
+
+And the failure the OWNERSHIP half prevents: the cleanup that removes a dead run's scratch
+could not tell it from a live run's open file, so two runs over one tree deleted each other's
+writes mid-flight.
 """
+
+import os
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -18,6 +26,26 @@ def _ds(h=4, w=4):
         {"sst": (("y", "x"), np.ones((h, w), "float32")),
          "valid": (("y", "x"), np.ones((h, w), "uint8"))},
         coords={"y": range(h), "x": range(w)})
+
+
+def _scratch(dest, owner, *, age_h=0.0, body=b"junk"):
+    """Scratch beside `dest` attributed to `owner` ('<host>-<pid>') and last touched
+    `age_h` hours ago. BOTH halves decide whether the sweep may delete it, so both are
+    spelled out at every call site rather than left to a default.
+    """
+    p = dest.with_name(f"{dest.name}{store.PART_SUFFIX}{owner}-1-1")
+    p.write_bytes(body)
+    if age_h:
+        stamp = time.time() - age_h * 3600
+        os.utime(p, (stamp, stamp))
+    return p
+
+
+# A run we cannot interrogate -- on another machine, so `os.kill` cannot answer for it -- and
+# untouched for two days. Only the clock can condemn this one.
+DEAD = "oldnode-999"
+# This host, but a pid that cannot exist: above every platform's pid_max.
+DEAD_PID_HERE = f"{store._HOST}-4000000"
 
 
 # --------------------------------------------------------------------------- #
@@ -80,13 +108,141 @@ def test_overwrite_replaces_and_leaves_no_scratch(tmp_path):
 
 def test_scratch_from_an_earlier_crash_is_swept_and_reported(tmp_path, caplog):
     dest = tmp_path / "a.nc"
-    (tmp_path / "a.nc.part-999-1").write_bytes(b"junk")
+    _scratch(dest, DEAD, age_h=48)
 
     with caplog.at_level("WARNING"):
         store.write_netcdf(_ds(), dest)
 
     assert not list(tmp_path.glob("*.part-*"))
     assert "unfinished run" in caplog.text      # the only trace an earlier run died
+
+
+# --------------------------------------------------------------------------- #
+# sweep_scratch() -- whose scratch is it?
+#
+# The sweep runs at the top of EVERY atomic() call, so getting this wrong does not strand a
+# file, it deletes one out from under an open HDF5 handle. Each test below pins one tier of
+# the evidence, and every one of them errs the same way: when we cannot prove the writer is
+# gone, the file stays.
+# --------------------------------------------------------------------------- #
+def test_scratch_a_live_writer_in_this_process_holds_is_not_swept(tmp_path):
+    """The reported production failure, in miniature.
+
+    Two runs over one output tree both reach `Macquarie_Harbour_20040327.nc`. The second
+    swept the first's scratch, and the first -- whose netCDF4 handle is reopened BY PATH for
+    each dask chunk -- died with `errno = 2` on a day it had already downloaded.
+    """
+    dest = tmp_path / "a.nc"
+    entered, release, seen = threading.Event(), threading.Event(), {}
+
+    def writer():
+        with store.atomic(dest) as tmp:
+            tmp.write_bytes(b"half a file")      # the write is under way...
+            seen["tmp"] = tmp
+            entered.set()
+            release.wait(5)                      # ...and stalled here, as a slow fetch stalls
+            tmp.write_bytes(b"whole file")
+
+    t = threading.Thread(target=writer)
+    t.start()
+    assert entered.wait(5)
+
+    store.sweep_scratch(dest)                    # what the second run does on arrival
+    assert seen["tmp"].exists()                  # ...and must not have done
+
+    release.set()
+    t.join(5)
+    assert dest.read_bytes() == b"whole file"    # the first writer still landed its file
+
+
+def test_scratch_owned_by_another_live_process_on_this_host_is_left_alone(tmp_path, caplog):
+    """Our parent: deterministically alive, and deterministically not us."""
+    dest = tmp_path / "a.nc"
+    p = _scratch(dest, f"{store._HOST}-{os.getppid()}")
+
+    with caplog.at_level("WARNING"):
+        assert store.sweep_scratch(dest) == [p]
+    assert p.exists()
+    assert "may still be writing it" in caplog.text
+
+
+def test_scratch_owned_by_a_dead_process_on_this_host_is_swept_immediately(tmp_path):
+    """No waiting out the clock: `os.kill(pid, 0)` PROVES the writer is gone, so a killed
+    job's leftovers clear on the next run rather than in six hours."""
+    dest = tmp_path / "a.nc"
+    p = _scratch(dest, DEAD_PID_HERE)            # fresh mtime, and still condemned
+    assert store.sweep_scratch(dest) == []
+    assert not p.exists()
+
+
+def test_our_own_abandoned_scratch_is_swept_even_though_our_pid_is_alive(tmp_path):
+    """`os.kill` cannot answer for our own pid -- it is trivially alive -- so without the
+    registry this process could never reclaim scratch it abandoned itself."""
+    dest = tmp_path / "a.nc"
+    p = _scratch(dest, f"{store._HOST}-{os.getpid()}")
+    assert store.sweep_scratch(dest) == []
+    assert not p.exists()
+
+
+def test_recent_scratch_from_another_host_is_left_alone_until_it_goes_stale(tmp_path):
+    """The only tier that is a guess, so it is the only one that waits."""
+    dest = tmp_path / "a.nc"
+    p = _scratch(dest, DEAD)
+    assert store.sweep_scratch(dest) == [p] and p.exists()
+
+    assert store.sweep_scratch(dest, max_age_s=0) == []
+    assert not p.exists()
+
+
+def test_a_staged_zarr_directory_is_judged_live_by_its_chunk_files_not_its_own_mtime(tmp_path):
+    """A cube assembly writes into `sst/c/0/0` for hours; the store's OWN mtime stops moving
+    after the first block. Trusting it would declare a running assembly dead."""
+    dest = tmp_path / "cube.zarr"
+    staged = dest.with_name(f"{dest.name}{store.PART_SUFFIX}{DEAD}-1-1")
+    (staged / "sst" / "c" / "0").mkdir(parents=True)
+    (staged / "sst" / "c" / "0" / "0").write_bytes(b"a fresh chunk")
+    old = time.time() - 48 * 3600
+    for d in (staged, staged / "sst", staged / "sst" / "c"):
+        os.utime(d, (old, old))
+
+    assert store.sweep_scratch(dest) == [staged]
+    assert staged.exists()
+
+
+def test_a_stash_from_a_live_swap_is_never_swept(tmp_path):
+    """`_swap` moves the previous output to `<dest>.old-<our own tag>` while it installs the
+    new one. That tag is OURS, which reads as provably dead -- so the swap has to claim it,
+    or a concurrent sweep deletes the only copy of the old output mid-rename."""
+    dest = tmp_path / "layers"
+    dest.mkdir()
+    (dest / "sst.tif").write_bytes(b"the previous output")
+    swept, entered, release = {}, threading.Event(), threading.Event()
+
+    real_replace = os.replace
+
+    def slow_replace(src, dst):                  # pause INSIDE _swap, stash on disk
+        entered.set()
+        release.wait(5)
+        return real_replace(src, dst)
+
+    def writer():
+        with store.atomic(dest) as tmp:
+            tmp.mkdir()
+            (tmp / "sst.tif").write_bytes(b"the new output")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "replace", slow_replace)
+        t = threading.Thread(target=writer)
+        t.start()
+        assert entered.wait(5)
+        stash = next(p for p in tmp_path.glob("*.old-*"))
+        swept["live"] = store.sweep_scratch(dest)
+        swept["survived"] = stash.exists()       # asked NOW: the swap deletes it on success
+        release.set()
+        t.join(5)
+
+    assert stash in swept["live"] and swept["survived"]
+    assert (dest / "sst.tif").read_bytes() == b"the new output"
 
 
 def test_rasters_swap_the_whole_directory(tmp_path):
@@ -222,13 +378,52 @@ def test_scan_finds_truncated_and_degraded_files(tmp_path):
     store.write_netcdf(_ds(), d / "aoi1_20230101.nc")        # good
     (d / "aoi1_20230102.nc").touch()                          # truncated
     store.write_netcdf(_ds()[["sst"]], d / "aoi1_20230103.nc")  # missing `valid`
-    (d / "aoi1_20230104.nc.part-1-1").write_bytes(b"junk")    # scratch from a crash
+    dead = _scratch(d / "aoi1_20230104.nc", DEAD, age_h=48)    # scratch from a crash
 
-    n, bad, leftovers = store.scan(tmp_path)
+    n, bad, leftovers, in_use = store.scan(tmp_path)
 
     assert n == 3
     assert {f.name for _, f in bad} == {"aoi1_20230102.nc", "aoi1_20230103.nc"}
-    assert [p.name for p in leftovers] == ["aoi1_20230104.nc.part-1-1"]
+    assert leftovers == [dead] and in_use == []
+
+
+def test_scan_separates_scratch_in_use_from_scratch_to_repair(tmp_path):
+    """The distinction `check --repair` turns on: one of these is junk, the other is a file
+    another job is in the middle of writing."""
+    d = _aligned(tmp_path, "MUR", "aoi1")
+    dead = _scratch(d / "aoi1_20230101.nc", DEAD, age_h=48)
+    live = _scratch(d / "aoi1_20230102.nc", f"{store._HOST}-{os.getppid()}")
+
+    _, _, leftovers, in_use = store.scan(tmp_path)
+    assert leftovers == [dead] and in_use == [live]
+
+
+def test_scan_does_not_descend_into_an_abandoned_scratch_directory(tmp_path):
+    """An abandoned scratch Zarr holds thousands of chunk files. It is ONE dead write, and
+    reporting it as one is the difference between a readable `check` and a wall of paths."""
+    d = _aligned(tmp_path, "MUR", "aoi1")
+    staged = d / f"aoi1.zarr{store.PART_SUFFIX}{DEAD}-1-1"
+    (staged / "sst" / "c").mkdir(parents=True)
+    (staged / "sst" / "c" / "0").write_bytes(b"chunk")
+    old = time.time() - 48 * 3600
+    for p in (*staged.rglob("*"), staged):
+        os.utime(p, (old, old))
+
+    _, _, leftovers, in_use = store.scan(tmp_path)
+    assert leftovers == [staged] and in_use == []
+
+
+def test_a_stash_left_by_a_swap_that_died_is_reported_by_scan(tmp_path):
+    """A process killed between the rename and the replace leaves a full copy of the previous
+    output that nothing ever looked for -- for a cube, tens of gigabytes of silent leak."""
+    d = _aligned(tmp_path, "MUR", "aoi1")
+    stash = d / f"aoi1.zarr{store.OLD_SUFFIX}{DEAD}-1-1"
+    stash.mkdir()
+    old = time.time() - 48 * 3600
+    os.utime(stash, (old, old))
+
+    _, _, leftovers, _ = store.scan(tmp_path)
+    assert leftovers == [stash]
 
 
 def test_repair_deletes_the_bad_and_leaves_the_good(tmp_path):
@@ -236,7 +431,7 @@ def test_repair_deletes_the_bad_and_leaves_the_good(tmp_path):
     good = store.write_netcdf(_ds(), d / "aoi1_20230101.nc")
     (d / "aoi1_20230102.nc").touch()
 
-    n, bad, leftovers = store.scan(tmp_path)
+    n, bad, leftovers, _ = store.scan(tmp_path)
     assert store.repair(bad, leftovers) == 1
 
     assert good.exists()                                      # the good file is untouched
@@ -244,9 +439,21 @@ def test_repair_deletes_the_bad_and_leaves_the_good(tmp_path):
     assert store.scan(tmp_path)[1] == []                      # tree now clean
 
 
+def test_repair_refuses_to_delete_scratch_that_is_in_use(tmp_path, caplog):
+    """`scan` already filters it out; this is the second lock on the same door, for a caller
+    that assembled the list some other way."""
+    d = _aligned(tmp_path, "MUR", "aoi1")
+    live = _scratch(d / "aoi1_20230101.nc", f"{store._HOST}-{os.getppid()}")
+
+    with caplog.at_level("WARNING"):
+        assert store.repair([], [live]) == 0
+    assert live.exists()
+    assert "in use by" in caplog.text
+
+
 def test_scan_can_be_limited_to_one_aoi(tmp_path):
     (_aligned(tmp_path, "MUR", "aoi1") / "aoi1_20230101.nc").touch()
     (_aligned(tmp_path, "MUR", "aoi2") / "aoi2_20230101.nc").touch()
 
-    _, bad, _ = store.scan(tmp_path, aois=["aoi1"])
+    _, bad, _, _ = store.scan(tmp_path, aois=["aoi1"])
     assert [f.name for _, f in bad] == ["aoi1_20230101.nc"]

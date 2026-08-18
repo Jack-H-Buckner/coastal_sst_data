@@ -103,8 +103,15 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                     ds = met.to_dataset(got, g, op, to_celsius)
                     ds.attrs.update(aoi_id=name, source=src, met_source=src,
                                     **provenance.stamp(eff))
-                    log.info("  overpass %s [%s] -> %s", naming.time_stamp(op), src,
-                             store.write_output(ds, aoi_out, op_stem, fmt))
+                    try:                         # this overpass only -- see cmems.run
+                        out = store.write_output(ds, aoi_out, op_stem, fmt)
+                    except (OSError, RuntimeError) as exc:
+                        log.warning("  overpass %s [%s] WRITE FAILED (%s)",
+                                    naming.time_stamp(op), src, exc)
+                        rep.fail(f"{name} {src} {naming.time_stamp(op)}",
+                                 f"write failed: {exc}")
+                        continue
+                    log.info("  overpass %s [%s] -> %s", naming.time_stamp(op), src, out)
                     rep.wrote(source=src)
     rep.log_summary()
     return rep

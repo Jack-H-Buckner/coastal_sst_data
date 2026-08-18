@@ -422,10 +422,15 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                                         reference_time=str(ref_time), reference_basis=ref_basis,
                                         reference_time_utc=rt.isoformat(),
                                         **provenance.stamp(eff))
-                        log.info("  %s reference [%s] (%s %s -> %s UTC) -> %s", dstr, src,
-                                 ref_time, ref_basis, rt.strftime("%H:%M"),
-                                 store.write_output(ds, aoi_out, ref_stem, fmt))
-                        rep.wrote(source=src)
+                        try:                     # this day only -- see cmems.run
+                            out = store.write_output(ds, aoi_out, ref_stem, fmt)
+                        except (OSError, RuntimeError) as exc:
+                            log.warning("  %s reference [%s] WRITE FAILED (%s)", dstr, src, exc)
+                            rep.fail(f"{name} {src} ref {dstr}", f"write failed: {exc}")
+                        else:
+                            log.info("  %s reference [%s] (%s %s -> %s UTC) -> %s", dstr, src,
+                                     ref_time, ref_basis, rt.strftime("%H:%M"), out)
+                            rep.wrote(source=src)
                     else:
                         rep.fail(f"{name} {src} ref {dstr}", why)
 
@@ -470,9 +475,14 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                                         daily_mean_hours=str(used_hours),
                                         daily_mean_hours_requested=str([int(h) for h in mean_hours]),
                                         **provenance.stamp(eff))
-                        log.info("  %s daily [%s, %dh] -> %s", dstr, src, len(used_hours),
-                                 store.write_output(ds, aoi_out, mean_stem, fmt))
-                        rep.wrote(source=src)
+                        try:                     # this day only -- see cmems.run
+                            out = store.write_output(ds, aoi_out, mean_stem, fmt)
+                        except (OSError, RuntimeError) as exc:
+                            log.warning("  %s daily [%s] WRITE FAILED (%s)", dstr, src, exc)
+                            rep.fail(f"{name} {src} daily {dstr}", f"write failed: {exc}")
+                        else:
+                            log.info("  %s daily [%s, %dh] -> %s", dstr, src, len(used_hours), out)
+                            rep.wrote(source=src)
                     else:
                         rep.fail(f"{name} {src} daily {dstr}", f"{src}: no data at any hour")
     rep.log_summary()

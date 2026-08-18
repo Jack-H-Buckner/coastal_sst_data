@@ -438,8 +438,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             ds.attrs.update(aoi_id=name, source=src,
                             processing="subset + bilinear upsample to AOI grid",
                             **provenance.stamp(eff))
-            log.info("  [%d/%d] wrote %s", gi, len(kept),
-                     store.write_output(ds, aoi_out, stem, fmt))
+            try:
+                out = store.write_output(ds, aoi_out, stem, fmt)
+            except (OSError, RuntimeError) as exc:   # this day only -- see cmems.run
+                log.warning("  [%d/%d] WRITE FAILED %s (%s)", gi, len(kept), stem, exc)
+                rep.fail(f"{name} {stem}", f"write failed: {exc}")
+                continue
+            log.info("  [%d/%d] wrote %s", gi, len(kept), out)
             rep.wrote(source=src)
 
     rep.log_summary()

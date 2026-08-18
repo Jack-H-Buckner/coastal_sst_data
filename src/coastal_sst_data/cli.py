@@ -182,6 +182,11 @@ def _cmd_check(args):
     just its header, which survives a truncation intact -- and reports what it cannot read.
     With --repair it deletes them, which IS the repair: the next run finds no output there
     and re-fetches it, without a full --overwrite of everything that was already fine.
+
+    --repair REFUSES to run while another job is writing this tree. Its verdicts are a
+    snapshot: a file a concurrent run replaces during the scan can be condemned as bad and
+    then deleted after it has become perfectly good, and its in-flight scratch is not junk at
+    all. Neither is worth guessing at, so the answer is to wait for the other run to finish.
     """
     project = load_config(args.config)
     root = Path(project.output_dir)
@@ -189,17 +194,28 @@ def _cmd_check(args):
         raise SystemExit(f"output_dir does not exist: {root}")
 
     print(f"Scanning {root} ({'metadata only' if args.quick else 'deep read'}) ...")
-    n, bad, leftovers = store.scan(root, aois=args.aois, deep=not args.quick)
+    n, bad, leftovers, in_use = store.scan(root, aois=args.aois, deep=not args.quick)
 
     for product, f in bad:
         print(f"  BAD      {product:<11} {f.relative_to(root)}")
     for p in leftovers:
         print(f"  SCRATCH  {'':<11} {p.relative_to(root)}   (a run died mid-write)")
+    for p in in_use:
+        print(f"  IN USE   {'':<11} {p.relative_to(root)}   "
+              f"({store.scratch_owner(p)} is still writing it)")
 
     print(f"\n{n} file(s) checked, {len(bad)} unreadable/incomplete, "
-          f"{len(leftovers)} scratch leftover(s).")
+          f"{len(leftovers)} scratch leftover(s), {len(in_use)} in use.")
+    if in_use and args.repair:
+        raise SystemExit(
+            f"Refusing to repair: another run is writing this tree ({len(in_use)} file(s) in "
+            f"use). Deleting its in-flight scratch is exactly the failure this pass exists "
+            f"to prevent, and its verdicts on the rest are a moving target. Wait for that "
+            f"run to finish, then re-run.")
+    if in_use:
+        print("Another run is writing this tree; --repair will refuse until it finishes.")
     if not bad and not leftovers:
-        print("Tree is clean.")
+        print("Tree is clean." if not in_use else "Nothing to repair.")
         return
     if not args.repair:
         print("Re-run with --repair to delete these; the next run will then re-fetch them.")

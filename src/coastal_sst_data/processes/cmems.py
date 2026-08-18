@@ -324,8 +324,17 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                 ds.attrs.update(aoi_id=name, source=dsid, cmems_source=src,
                                 processing="subset + bilinear reproject to AOI grid",
                                 **provenance.stamp(eff))
-                log.info("  [%s] %s -> %s", src, naming.day_stamp(day),
-                         store.write_output(ds, aoi_out, naming.day_stem(name, day), fmt).name)
+                # The write is the cheapest part of this loop to lose and the likeliest to
+                # fail transiently -- a full quota, an NFS hiccup, another run sweeping our
+                # scratch. Letting it escape abandons every day we have not reached yet,
+                # including days already fetched, so it costs THIS day and no more.
+                try:
+                    out = store.write_output(ds, aoi_out, naming.day_stem(name, day), fmt)
+                except (OSError, RuntimeError) as exc:
+                    log.warning("    %s: WRITE FAILED (%s)", naming.day_stamp(day), exc)
+                    rep.fail(f"{name} {src} {naming.day_stamp(day)}", f"write failed: {exc}")
+                    continue
+                log.info("  [%s] %s -> %s", src, naming.day_stamp(day), out.name)
                 rep.wrote(source=dsid)
             holder[0].close()
     rep.log_summary()
