@@ -6,6 +6,7 @@ was written with the expected chunking/compressor. No network, no real data."""
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -1064,9 +1065,15 @@ def test_write_zarr_safe_overwrites_and_cleans_up(tmp_path):
 
 def test_write_zarr_safe_sweeps_scratch_left_by_an_earlier_crash(tmp_path, caplog):
     zpath = tmp_path / "aoi.zarr"
-    stale = tmp_path / "aoi.zarr.part-999-1"
+    # Attributed to a host we cannot interrogate and untouched for two days -- both halves
+    # matter: recent scratch, or scratch whose owning pid is still alive, is presumed to
+    # belong to a RUNNING job and is deliberately left where it is.
+    stale = tmp_path / "aoi.zarr.part-oldnode-999-1-1"
     stale.mkdir()
     (stale / "junk").write_text("half a chunk")
+    old = time.time() - 48 * 3600
+    for p in (stale / "junk", stale):
+        os.utime(p, (old, old))
 
     with caplog.at_level("WARNING"):
         _write_cube(_cube(), zpath)

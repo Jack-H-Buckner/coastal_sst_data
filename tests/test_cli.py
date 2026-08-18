@@ -185,6 +185,47 @@ def test_grids_plot_flag_wires_to_plotting(config_file, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# check / --repair
+# ---------------------------------------------------------------------------
+def _tree_with_live_scratch(tmp_path):
+    """An output tree holding one file another RUNNING job is in the middle of writing.
+
+    Attributed to our parent process: on this host, so `os.kill` can answer for it, and
+    alive, so the answer is the one that matters.
+    """
+    import os
+    from coastal_sst_data import store
+
+    root = tmp_path / "out"
+    d = root / "MUR" / "aligned" / "a1"
+    d.mkdir(parents=True)
+    scratch = d / f"a1_20230801.nc{store.PART_SUFFIX}{store._HOST}-{os.getppid()}-1-1"
+    scratch.write_bytes(b"half a day")
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(CONFIG_YAML.replace("output_dir: out", f"output_dir: {root}"))
+    return str(cfg), scratch
+
+
+def test_check_reports_scratch_another_run_is_still_writing(tmp_path, capsys):
+    config, scratch = _tree_with_live_scratch(tmp_path)
+    cli.main(["check", "--config", config, "--quick"])
+
+    out = capsys.readouterr().out
+    assert "IN USE" in out and "still writing it" in out
+    assert scratch.exists()
+
+
+def test_check_refuses_to_repair_a_tree_with_a_live_write_in_it(tmp_path):
+    """Deleting a running job's in-flight scratch is the exact failure this pass exists to
+    prevent, so `--repair` declines rather than guessing."""
+    config, scratch = _tree_with_live_scratch(tmp_path)
+    with pytest.raises(SystemExit, match="Refusing to repair"):
+        cli.main(["check", "--config", config, "--quick", "--repair"])
+    assert scratch.exists()
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing errors.
 # ---------------------------------------------------------------------------
 def test_missing_subcommand_errors():

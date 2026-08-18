@@ -762,6 +762,23 @@ Step 4 is the one worth not skipping: it is what would catch a concurrent-write 
 
 For coarser parallelism than this, `--aoi` already shards cleanly, so a scheduler (Slurm array jobs, separate containers) can run whole AOIs as independent jobs. Note that separate *processes* do not share credential state, so give each one a smaller share of the gate budgets.
 
+**Sharing one `output_dir` between concurrent runs is safe**, including when their AOI lists or date ranges overlap. Every write goes to scratch named for the host and process that made it and is renamed into place only when finished, so two runs writing one file both complete and the later one wins — each file on disk is always a whole file. A run will say so when it notices:
+
+```
+WARNING   leaving MH_20040327.nc.part-node07-41233-... alone -- node07:41233 may still be writing it
+WARNING   MH_20040327.nc is being written by more than one run at once (node07:41233); both writes
+          complete and whichever finishes LAST wins -- check for overlapping --aoi lists or date ranges
+```
+
+That is a report, not an error — but it usually means two jobs are doing the same work twice, which is worth fixing in the sharding.
+
+Two consequences worth knowing:
+
+- **`check --repair` refuses to run while another job is writing the tree.** It reports that job's in-flight scratch as `IN USE` and stops, because deleting it is precisely the failure atomic writes exist to prevent — and its verdict on everything else is a moving target while another run is still producing output. Wait for the run to finish, then repair.
+- **Scratch from a run that died clears on the next run**, immediately if the run was on this machine (its pid is gone, which is proof), and after six hours (`store.STALE_SCRATCH_S`) if it was on another node, where the clock is the only evidence available.
+
+What this does *not* make safe is two runs **assembling the same cube**: `preprocess` reads and rewrites `<aoi>.zarr` in place, so one run replacing the store under another's open reader is a hazard the write path cannot address. Shard cubes by AOI.
+
 ## Authenticating to data services
 
 Most data products stream from **open archives that need no login** — Landsat and landcover from Microsoft Planetary Computer, bathymetry from NOAA CUDEM/GMRT, met from HRRR and Google's public ERA5, and tides from NOAA CO-OPS. Only a few products need credentials, and the package is built so that adding a new authenticated service later is a small, contained change.

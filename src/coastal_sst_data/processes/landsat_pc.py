@@ -300,7 +300,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             if ds is None:
                 continue
             ds.attrs.update(**provenance.stamp(eff))
-            log.info("      wrote %s", store.write_output(ds, aoi_out, stem, fmt))
+            try:
+                out = store.write_output(ds, aoi_out, stem, fmt)
+            except (OSError, RuntimeError) as exc:       # this scene only -- see cmems.run
+                log.warning("      WRITE FAILED %s (%s)", stem, exc)
+                rep.fail(f"{name} {it.id}", f"write failed: {exc}")
+                continue
+            log.info("      wrote %s", out)
             rep.wrote(source="Landsat C2 L2 (Planetary Computer)")
     rep.log_summary()
     return rep
