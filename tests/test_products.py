@@ -125,7 +125,7 @@ def test_process_order_honours_the_real_constraints():
 def test_process_order_is_stable_and_matches_the_previous_hand_kept_list():
     """The topological sort must not have quietly reshuffled a working pipeline."""
     assert [p.value for p in pipeline.process_order()] == [
-        "bathymetry", "cmems", "ecostress", "landsat", "modis", "mur",
+        "bathymetry", "cmems", "ecostress", "landsat", "modis", "mur", "modis_ref",
         "met", "met_overpass", "tides", "landcover", "insitu",
     ]
 
@@ -167,7 +167,7 @@ def test_unimplemented_sources_resolve_to_none_not_an_error():
 
 def test_sensor_specs_carry_the_validity_rules_the_assembler_needs():
     by_prefix = {s.sensor.prefix: s.sensor for s in products.sensors()}
-    assert set(by_prefix) == {"eco", "lst", "modis"}
+    assert set(by_prefix) == {"eco", "lst", "modis", "modisref"}
     # ECOSTRESS: inverted water polarity, and cloud over-masks cold water -> gate on QC.
     assert by_prefix["eco"].water_is_land is True
     assert by_prefix["eco"].use_cloud is False
@@ -175,26 +175,35 @@ def test_sensor_specs_carry_the_validity_rules_the_assembler_needs():
     # Landsat: QA_PIXEL cloud is reliable.
     assert by_prefix["lst"].use_cloud is True
     assert by_prefix["lst"].water_is_land is False
-    # MODIS: quality-filtered upstream -> trust its own `valid` layer.
+    # MODIS: quality-filtered upstream -> trust its own `valid` layer. Both MODIS products
+    # read the same L2P files, so both say so.
     assert by_prefix["modis"].trust_valid is True
+    assert by_prefix["modisref"].trust_valid is True
     # Which sensors MOSAIC a day's granules rather than keeping only the clearest. Landsat and
-    # ECOSTRESS can put two non-overlapping granules over one AoI on one day; MODIS opts out
-    # because its `footprint_id` ids restart per granule.
+    # ECOSTRESS can put two non-overlapping granules over one AoI on one day, and so can MODIS
+    # -- above ~32 deg latitude consecutive orbits overlap, so a platform sees an AoI twice a
+    # night. `modis_ref` opts out because its `footprint_id` ids restart per granule.
     assert by_prefix["lst"].mosaic_same_day is True
     assert by_prefix["eco"].mosaic_same_day is True
-    assert by_prefix["modis"].mosaic_same_day is False
+    assert by_prefix["modis"].mosaic_same_day is True
+    assert by_prefix["modis"].has_footprint is False
+    assert by_prefix["modisref"].mosaic_same_day is False
+    assert by_prefix["modisref"].has_footprint is True
 
 
 def test_a_mosaicking_sensor_may_not_also_carry_footprint_ids(monkeypatch):
     """footprint_id restarts at 0 in every granule, so a mosaicked day would hold two granules'
     unrelated native-pixel indices in one channel -- and grouping by it would then average
-    unrelated observations together, silently. Unreachable today; this is for sensor four."""
+    unrelated observations together, silently.
+
+    `modis_ref` is the live case: it is the one sensor carrying footprints, and it is the one
+    sensor that does not mosaic. Turning mosaicking on for it must be refused at import."""
     import dataclasses
-    modis = BY_PRODUCT[DataProduct.modis]
+    ref = BY_PRODUCT[DataProduct.modis_ref]
     both = dataclasses.replace(
-        modis, sensor=dataclasses.replace(modis.sensor, mosaic_same_day=True))
+        ref, sensor=dataclasses.replace(ref.sensor, mosaic_same_day=True))
     monkeypatch.setattr(products, "REGISTRY",
-                        tuple(both if s is modis else s for s in products.REGISTRY))
+                        tuple(both if s is ref else s for s in products.REGISTRY))
     with pytest.raises(RuntimeError, match="footprint"):
         products._check_registry()
 

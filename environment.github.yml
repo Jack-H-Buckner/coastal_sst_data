@@ -45,6 +45,8 @@ dependencies:
   - planetary-computer
   # MODIS swath -> grid resampling (modis.py) and HRRR regridding (met.py).
   - pyresample>=1.28,<2
+  # MODIS server-side subsetting (modis.py, access: harmony) -- see environment.yml.
+  - harmony-py
   # datacube.py assembler: nearest-neighbour water fill of the MUR + CMEMS channels.
   - scipy>=1.13,<2
   # met.py forcing: HRRR via Herbie; ERA5 fallback streamed from the public

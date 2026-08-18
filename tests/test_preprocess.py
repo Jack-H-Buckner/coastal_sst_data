@@ -909,7 +909,12 @@ def test_preprocessed_golden_is_unchanged(project, grids, days):
     INTENDED change, then review the golden's git diff."""
     g = grids[AOI]
     _write_full_fixture(project, g, days)
-    ds_raw = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    eff = datacube._build_eff(project)
+    # Pin the stacked sensor's source preference, as a real `platforms: [terra, aqua]` config
+    # would: without it the merged overpass identity falls back to on-disk ALPHABETICAL order,
+    # so `aqua` silently becomes what every matchup keys off. (Same note in test_datacube.)
+    eff["sensor_version_pref"]["modis"] = ["terra", "aqua"]
+    ds_raw = datacube.assemble_aoi(g, eff, days)
     ds = preprocess.preprocess_aoi(ds_raw, g, preprocess._build_eff(project))
     actual = _snapshot(ds)
 

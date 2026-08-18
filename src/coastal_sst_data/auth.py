@@ -469,6 +469,38 @@ def ensure_fresh(backend: str, settings, *, max_age_s: float | None = None) -> b
         return False
 
 
+def earthdata_client_auth() -> dict:
+    """Credentials for a NON-earthaccess client that must talk to an Earthdata service.
+
+    Returned as kwargs for a client accepting `token=` or `auth=(user, password)` -- which is
+    harmony-py's `Client` signature, and the shape any other EDL-backed SDK takes.
+
+    THIS EXISTS BECAUSE THE FALLBACKS DO NOT LINE UP. harmony-py finds credentials by trying,
+    in order: an explicit argument, the `EDL_USERNAME`/`EDL_PASSWORD` environment variables,
+    then ~/.netrc. earthaccess's `environment` strategy reads `EARTHDATA_USERNAME`/`PASSWORD`
+    and writes no .netrc -- so a project configured that way authenticates perfectly for every
+    earthaccess product and then hands Harmony nothing at all. The failure surfaces as a 401
+    on the first subset, hours into a run, and looks like an expired token.
+
+    Prefers the EDL bearer token earthaccess already minted, so the password is not copied
+    around. An empty dict means "we have nothing to add" -- the client then falls back to its
+    own .netrc lookup, which is correct for the `netrc` strategy and is why this never raises.
+    """
+    import earthaccess
+
+    a = getattr(earthaccess, "__auth__", None)
+    if a is None or not getattr(a, "authenticated", False):
+        return {}
+    token = getattr(a, "token", None)
+    access = token.get("access_token") if isinstance(token, Mapping) else None
+    if access:
+        return {"token": access}
+    user, password = getattr(a, "username", None), getattr(a, "password", None)
+    if user and password:
+        return {"auth": (user, password)}
+    return {}
+
+
 def required_backends(project: Project, products=None) -> dict[str, object]:
     """{backend: settings} for the backends the selected products require.
 

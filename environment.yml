@@ -41,6 +41,10 @@ dependencies:
   - planetary-computer
   # MODIS swath -> grid resampling (modis.py) and HRRR regridding (met.py).
   - pyresample>=1.28,<2
+  # MODIS server-side subsetting (modis.py, access: harmony). A full L2P granule is
+  # ~15-25 MB of a global swath; a night-time Terra+Aqua series is tens of thousands of
+  # them, so `access: download` is only practical for short ranges.
+  - harmony-py
   # datacube.py assembler: nearest-neighbour water fill of the MUR + CMEMS channels.
   - scipy>=1.13,<2
   # met.py forcing: HRRR via Herbie; ERA5 fallback streamed from the public

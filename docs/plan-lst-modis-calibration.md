@@ -2,10 +2,15 @@
 
 ## Context
 
+> **Updated for the MODIS split.** MODIS is now two products: `modis` (a standalone
+> thermal sensor, stacked per platform) and `modis_ref` (the Landsat-coincident
+> reference this plan uses). The channels below are therefore `modisref_*`, and the
+> step's `reference:` option names `modis_ref`.
+
 Issue #61. The cube already carries everything a Landsat-to-MODIS calibration needs —
-`lst_sst`, `modis_sst`, and `modis_footprint_id` (added in #52 specifically so a downstream
+`lst_sst`, `modisref_sst`, and `modisref_footprint_id` (added in #52 specifically so a downstream
 calibration could group the fine-grid cells covered by one ~1 km MODIS observation). The
-calibration itself has never been written; `processes/modis.py:8-11` says so explicitly
+calibration itself has never been written; `processes/modis_ref.py` says so explicitly
 ("Calibration itself is out of scope here").
 
 MODIS is the well-calibrated coarse reference; Landsat is the high-resolution field whose
@@ -29,10 +34,10 @@ Branch `61-...` currently has **zero commits** and is one commit behind `main` (
 | Diagnostics | QA dir beside the cube: `<output_dir>/<datacube.output_subdir>/qa/<aoi>_lst_calibration.{csv,png}` |
 | Intercept | `median` by default; `intercept: per_date` option, falling back to the median for dates without a fit |
 | Source / target | Fit and apply on `lst_sst_clean`; emit `lst_sst_clean_calibrated`. Raw `lst_sst` untouched |
-| Fit orientation | `lst ~ modis` (x = `modis_sst`, y = Landsat footprint median), inverted to apply |
+| Fit orientation | `lst ~ modis` (x = `modisref_sst`, y = Landsat footprint median), inverted to apply |
 | Table format | **CSV** — `pyarrow` is not a dependency and adding one for a diagnostic sidecar inverts the package's rule that heavy backends live behind extras |
 | Step shape | **One step**, `calibrate_sst`. A `apply: false` option gives diagnose-without-applying without a second registry entry |
-| Scope | Generic: `sensors: [lst]`, `reference: modis` — ECOSTRESS can be calibrated later with no code change |
+| Scope | Generic: `sensors: [lst]`, `reference: modis_ref` — ECOSTRESS can be calibrated later with no code change |
 
 ## Departures from the prototype scripts (read this before porting)
 
@@ -55,7 +60,7 @@ These are not stylistic — each is a place the script would misbehave against *
    are generic over prefix but `examples/config.test.yaml` lists `sensors: [eco]`. The step
    resolves its source as `lst_sst_clean` (emitted *this run*) → raw `lst_sst`, and records
    which in `calibration_source`. The config block below turns the filter on for `lst`.
-6. **`modis_footprint_id` restarts at 0 in every scene.** Group within a timestep, never across
+6. **`modisref_footprint_id` restarts at 0 in every scene.** Group within a timestep, never across
    the time axis — already what the script does, but it must stay that way and gets its own test.
 7. **`sigma == 0` is an exact fit, not a failure.** The script aborts; that makes a perfect
    synthetic fixture untestable. Only a *non-finite* sigma aborts.
@@ -83,12 +88,12 @@ then one `_step_calibrate_sst(ctx)` entry point. Imports **numpy, pandas, `.chan
   a zero-length group silently reads the next group's first element, and empty groups (a fully
   clouded footprint) are the normal case here.
 - `group_first_finite(inv, x, G)` → `(first, ptp)`. Every cell of a footprint carries the *same*
-  `modis_sst`; taking the mean would paper over a violated assumption, so take the first finite
+  `modisref_sst`; taking the mean would paper over a violated assumption, so take the first finite
   value and **report the peak-to-peak spread** so the violation is visible in the QA table.
 
 **Stage 1 — `footprint_matchups(...) -> pd.DataFrame`.** Per date: `n_total` (geometric cell
 count — the `clear_frac` denominator), `n_raw`, `n_clear`, `clear_frac`, mean/median/std/p25/p75
-of the working LST, `modis_sst`, `modis_ptp`. Invalid where
+of the working LST, `modisref_sst`, `modis_ptp`. Invalid where
 `n_clear < min_count | clear_frac < min_clear_frac | ~isfinite(modis_sst)`; **rows are kept**
 with LST stats NaN'd and a `reject_reason`, because the table's job is to show what was rejected
 and why. Key is `(t_index, footprint_id)`.
@@ -145,7 +150,7 @@ LST product, and declaration order is the topo tie-break):
 ```python
 PreprocessStep(
     key="calibrate_sst",
-    reads=("lst_sst", "modis_sst", "modis_footprint_id", "_clean"),
+    reads=("lst_sst", "modisref_sst", "modisref_footprint_id", "_clean"),
     writes=("_cal_", "_calibrated"),
     fn=_step_calibrate_sst,
     # the fit must read the CLOUD-FILTERED LST -- a cloudy pixel inside a footprint drags its
@@ -261,7 +266,7 @@ preprocess:
 
     calibrate_sst:
       sensors: [lst]           # sensors to calibrate (channel prefixes)
-      reference: modis         # target scale; needs <ref>_sst and <ref>_footprint_id
+      reference: modis_ref         # target scale; needs <ref>_sst and <ref>_footprint_id
       source: auto             # auto | clean | raw -- which field to fit and apply on
       apply: true              # false = fit and write diagnostics only, move no pixels
       intercept: median        # median (default) | per_date (falls back to median per date)
@@ -311,8 +316,8 @@ metadata slot, a `#`-comment header would break bare `pd.read_csv`, and
 
 | condition | behaviour |
 |---|---|
-| no `modis_footprint_id` | WARNING naming `footprint_id: true`; emit nothing |
-| no `modis_sst` | WARNING; emit nothing |
+| no `modisref_footprint_id` | WARNING naming `footprint_id: true`; emit nothing |
+| no `modisref_sst` | WARNING; emit nothing |
 | no `lst_sst` (Landsat not acquired) | INFO, `continue` — mirrors `sensor_hours() is None` |
 | no cloud filter ran | fit + apply on raw `lst_sst` → `lst_sst_calibrated`; INFO. Not an error |
 | stale `lst_sst_clean` on disk, filter deselected | never used — `_clean` resolves only through this run's `ctx.channels` |
@@ -323,7 +328,7 @@ metadata slot, a `#`-comment header would break bare `pd.read_csv`, and
 | `sigma == 0` (exact fit) | **converged, `reason="ok"`, calibration applies** |
 | slope outside `(0.05, 20.0)` | abort `degenerate_slope`; no `_calibrated`; WARNING quoting the slope |
 | common slope outside the free-slope 90 % band | WARNING pointing at the figure; `common_slope_ok=false`; **still applies** |
-| `modis_ptp > 0` on >1 % of footprints | one aggregated WARNING: footprint ids may not be aligned with the `modis_sst` beside them |
+| `modis_ptp > 0` on >1 % of footprints | one aggregated WARNING: footprint ids may not be aligned with the `modisref_sst` beside them |
 | matplotlib absent / QA dir unwritable | WARNING, CSV still written, run still reports `wrote()` |
 
 ## Tests — `tests/test_calibration.py`
@@ -376,7 +381,7 @@ select the new step. Assert that explicitly in the PR.
 - **`docs/DEVELOPMENT.md` §5b** — the step in the worked YAML block, plus a short paragraph on
   the **QA-artifact protocol**, which is the one new thing a future step author must know.
 - **`README.md`** preprocess section — a bullet, the config lines, and a note that
-  `calibrate_sst` needs `modis_sst` + `modis_footprint_id` (acquire MODIS with
+  `calibrate_sst` needs `modisref_sst` + `modisref_footprint_id` (acquire MODIS with
   `footprint_id: true`) and a Landsat SST channel.
 - **`examples/config.test.yaml`** — the step commented out, as the corrected-pass filters are.
 - `preprocess.py` module docstring "Steps shipped today" list; `config.PreprocessSpec` docstring.

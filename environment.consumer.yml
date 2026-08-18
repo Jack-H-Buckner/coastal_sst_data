@@ -53,6 +53,7 @@ dependencies:
   - planetary-computer       # landsat / landcover
   - pyresample               # modis + met resampling
   - netcdf4                  # modis (reads MODIS L2P swaths, modis.py)
+  - harmony-py               # modis (server-side AoI subsetting, access: harmony)
   - herbie-data              # met (HRRR)
   - gcsfs                    # met (ERA5 fallback)
   - copernicusmarine>=2,<3   # cmems coastal_sst_data v0.0.1 needs the v2 login()

@@ -875,44 +875,37 @@
         "n_finite": 1764
       }
     },
-    "modis_footprint_id": {
-      "attrs": {
-        "comment": "ids identify a pixel WITHIN one day's chosen scene only -- they restart at 0 for every scene and are NOT comparable across days",
-        "long_name": "native sensor pixel index this grid cell was resampled from; -1 = none"
-      },
-      "dims": [
-        "time",
-        "y",
-        "x"
-      ],
-      "dtype": "int32",
-      "fingerprint": "c97fd5d9892013bd5c1604d154bed3884f10b7cabe41d88f77cfb70ab4761149",
-      "shape": [
-        3,
-        42,
-        42
-      ],
-      "stats": {
-        "max": 195.0,
-        "mean": 31.833333,
-        "min": -1.0,
-        "n_finite": 5292
-      }
-    },
-    "modis_hour": {
+    "modis_hour_aqua": {
       "attrs": {},
       "dims": [
         "time"
       ],
       "dtype": "float32",
-      "fingerprint": "7a6cdceefa0a8012668a5155acf50b5473bba617bd64a5881c3bb86f6c5fe403",
+      "fingerprint": "7557cb52042c2337ae54f8f7d72afb71647cd9bcd674e293490855b756f21d0a",
       "shape": [
         3
       ],
       "stats": {
-        "max": 21.0,
-        "mean": 21.0,
-        "min": 21.0,
+        "max": 9.0,
+        "mean": 9.0,
+        "min": 9.0,
+        "n_finite": 1
+      }
+    },
+    "modis_hour_terra": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "d22f56832e2bdd61e068f52cb3e838469d1e62ecdeb6dc83983334668e5bfdef",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 6.0,
+        "mean": 6.0,
+        "min": 6.0,
         "n_finite": 1
       }
     },
@@ -945,6 +938,185 @@
         "x"
       ],
       "dtype": "float32",
+      "fingerprint": "d346428cb435493922138dae86086bdebbeb9a4b0f35445d19e70f7a003530e1",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 13.5,
+        "mean": 13.5,
+        "min": 13.5,
+        "n_finite": 1
+      }
+    },
+    "modis_sst_aqua": {
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "317c2a718da84489651190508f3122dd8fba94e779479bc7bdf1d90f7bce1b0f",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 286.5,
+        "mean": 286.5,
+        "min": 286.5,
+        "n_finite": 1764
+      }
+    },
+    "modis_sst_terra": {
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "5b1a9d0fd2d0ec5d21a3a05628616a1fdab531a3dee8d4f1b504fe7a2eb83942",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 287.0,
+        "mean": 287.0,
+        "min": 287.0,
+        "n_finite": 1764
+      }
+    },
+    "modis_valid_aqua": {
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "55c7b65c24c285be5c67d994f1669dd6645c98b93bdda67d19f28bdfe481b285",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.333333,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "modis_valid_terra": {
+      "attrs": {
+        "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "uint8",
+      "fingerprint": "55c7b65c24c285be5c67d994f1669dd6645c98b93bdda67d19f28bdfe481b285",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 1.0,
+        "mean": 0.333333,
+        "min": 0.0,
+        "n_finite": 5292
+      }
+    },
+    "modisref_footprint_id": {
+      "attrs": {
+        "comment": "ids identify a pixel WITHIN one day's chosen scene only -- they restart at 0 for every scene and are NOT comparable across days",
+        "long_name": "native sensor pixel index this grid cell was resampled from; -1 = none"
+      },
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "int32",
+      "fingerprint": "c97fd5d9892013bd5c1604d154bed3884f10b7cabe41d88f77cfb70ab4761149",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 195.0,
+        "mean": 31.833333,
+        "min": -1.0,
+        "n_finite": 5292
+      }
+    },
+    "modisref_hour": {
+      "attrs": {},
+      "dims": [
+        "time"
+      ],
+      "dtype": "float32",
+      "fingerprint": "7a6cdceefa0a8012668a5155acf50b5473bba617bd64a5881c3bb86f6c5fe403",
+      "shape": [
+        3
+      ],
+      "stats": {
+        "max": 21.0,
+        "mean": 21.0,
+        "min": 21.0,
+        "n_finite": 1
+      }
+    },
+    "modisref_insitu_dt_min": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
+      "fingerprint": "c4b08f7411bda18dd468ecc889d8d59e99790bc06da795338a4e5cbddcf16aef",
+      "shape": [
+        3,
+        42,
+        42
+      ],
+      "stats": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "n_finite": 1
+      }
+    },
+    "modisref_insitu_sst": {
+      "attrs": {},
+      "dims": [
+        "time",
+        "y",
+        "x"
+      ],
+      "dtype": "float32",
       "fingerprint": "639ff0ebcb42b5466ea0fdb0ce831876d39c5cf42c051cbfbcafdba44f93bd0d",
       "shape": [
         3,
@@ -958,7 +1130,7 @@
         "n_finite": 1
       }
     },
-    "modis_sst": {
+    "modisref_sst": {
       "attrs": {},
       "dims": [
         "time",
@@ -979,7 +1151,7 @@
         "n_finite": 1764
       }
     },
-    "modis_valid": {
+    "modisref_valid": {
       "attrs": {},
       "dims": [
         "time",

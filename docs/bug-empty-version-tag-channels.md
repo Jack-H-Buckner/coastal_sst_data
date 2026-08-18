@@ -1,8 +1,19 @@
 # Empty version-tag channels silently disable the georeferencing correction
 
 Status: diagnosed against the `test_coastal_sst_data` project on 2026-07-27; worked around there by
-moving the offending directory. **No package code has been changed.** This note records the defects
-so the fixes can be applied to `coastal_sst_data` itself.
+moving the offending directory. This note records the defects so the fixes can be applied to
+`coastal_sst_data` itself.
+
+**Defect A is FIXED in 0.4.0** (`_contribute_stacked_sensor`, `processes/datacube.py`), and the
+regression test is `test_datacube.py::test_a_stray_directory_is_not_loaded_as_a_platform`. Making
+MODIS a stacked-per-platform sensor turned it from a latent trap into a certainty: an existing
+`MODIS/aligned/` tree AND the stage's own `MODIS/_tmp` scratch dir would both have been loaded as
+platform tags. The applied fix differs from the one proposed below in one respect — the test is
+**structural** (does `<DIR>/<tag>/aligned/` exist) rather than per-AoI (does this AoI have granules
+under it), so a real tag whose coverage misses one AoI still emits that AoI's empty channel set
+and two AoIs in a project keep comparable channel sets. Dropped directories are named in an
+`INFO` line. The stage's scratch dir also moved to `MODIS/<tag>/_tmp`, so it is never a sibling of
+a tag in the first place. **Defect B below is unchanged.**
 
 ## Symptom
 

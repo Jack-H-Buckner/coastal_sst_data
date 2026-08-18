@@ -69,6 +69,7 @@ class DataProduct(str, Enum):
     cmems = "cmems"
     landsat = "landsat"
     modis = "modis"
+    modis_ref = "modis_ref"
     met = "met"
     met_overpass = "met_overpass"
     tides = "tides"
@@ -421,27 +422,69 @@ REGISTRY: tuple[ProductSpec, ...] = (
         gate="earthdata",
         dir="MODIS",
         kind=Kind.OVERPASS_SENSOR,
-        module="coastal_sst_data.processes.modis",
+        # DISTINCT-DATA PLATFORMS, STACKED one channel-set per platform (D10). Terra and Aqua
+        # are two instruments on two spacecraft in two different orbits -- they never observe
+        # the same overpass, so they are stacked (`modis_sst_terra` / `modis_sst_aqua`) rather
+        # than one falling back to the other. That separation is not cosmetic: since NASA
+        # stopped maintaining the orbits (Terra Feb 2020, Aqua Mar 2021) the two equator
+        # crossings have drifted in OPPOSITE directions -- Terra earlier, Aqua later -- so one
+        # merged channel would blend two diverging times of day into a single number.
+        sources={
+            "terra": "coastal_sst_data.processes.modis",
+            "aqua": "coastal_sst_data.processes.modis",
+        },
+        source_kind=SourceKind.DATA,
+        sources_option="platforms",
+        auth="earthdata",
+        options=_COMMON | {
+            "platforms", "short_name", "variable", "quality_min", "regrid_radius_m",
+            "access", "time_of_day", "night_solar_hours", "daytime_only"},
+        required_vars=("sst", "valid"),
+        # STANDALONE: no Landsat edge. The Landsat-coincident behaviour that used to live on
+        # this spec is now its own product (`modis_ref`), so a project can load MODIS as a
+        # thermal sensor in its own right without acquiring Landsat at all.
+        depends_on=(),
+        # Already quality-filtered upstream -> trust the file's own `valid` layer; it has no
+        # water or cloud layer to recompute from, and so publishes no `modis_cloud` channel.
+        # No `footprint_id` here -- that is `modis_ref`'s job, and its ABSENCE is what lets
+        # this product MOSAIC. Above ~32 deg latitude consecutive same-night orbits overlap,
+        # so a platform sees an AoI about twice a night: once near nadir, once near the swath
+        # edge, each covering a different part of it. Keeping only the clearest threw the
+        # other's exclusive coverage away wholesale -- the case mosaicking was added for.
+        sensor=SensorSpec(prefix="modis", trust_valid=True, has_cloud=False,
+                          has_footprint=False, mosaic_same_day=True),
+        provenance_inputs=("modis",),
+    ),
+
+    ProductSpec(
+        product=DataProduct.modis_ref,
+        gate="earthdata",
+        dir="MODIS_REF",
+        kind=Kind.OVERPASS_SENSOR,
+        module="coastal_sst_data.processes.modis_ref",
         auth="earthdata",
         options=_COMMON | {
             "short_name", "variable", "quality_min", "regrid_radius_m", "access",
-            "match_landsat", "max_time_diff_minutes", "daytime_only", "footprint_id"},
+            "match_landsat", "max_time_diff_minutes", "time_of_day", "daytime_only",
+            "footprint_id"},
         required_vars=("sst", "valid"),
         # MODIS coincidence (match_landsat) reads the Landsat aligned files, so Landsat must
         # have run first. This is WHY the old PROCESS_ORDER put landsat before modis; here
         # it is a constraint the sort enforces rather than a comment on a hand-kept list.
         depends_on=(DataProduct.landsat,),
-        # Already quality-filtered upstream -> trust the file's own `valid` layer; it has no
-        # water or cloud layer to recompute from, and so publishes no `modis_cloud` channel.
-        # It is the one sensor gridded from a COARSER swath, so it alone can say which native
-        # ~1 km observation each grid cell came from -- `modis_footprint_id`. That is also why
-        # it is the one sensor NOT mosaicked: those ids restart at 0 per granule, so merging
-        # two granules into a day would make the channel mean two different things at once.
-        # Its granules are whole overpasses hours apart, not adjoining halves of one, so a day
-        # loses no coverage by keeping the clearest.
-        sensor=SensorSpec(prefix="modis", trust_valid=True, has_cloud=False,
+        # The CALIBRATION REFERENCE: coarse, well-calibrated MODIS observations matched to
+        # Landsat overpasses so a downstream step can regress the drifting high-resolution
+        # field onto them. Same validity rules as `modis` (quality-filtered upstream, no
+        # water/cloud layer), but it is the one sensor gridded from a COARSER swath, so it
+        # alone can say which native ~1 km observation each grid cell came from --
+        # `modisref_footprint_id`. That is also why it is the one sensor NOT mosaicked: those
+        # ids restart at 0 in every granule, so merging two granules into a day would make the
+        # channel mean two different things at once. Its granules are whole overpasses hours
+        # apart, not adjoining halves of one, so a day loses no coverage by keeping the
+        # clearest.
+        sensor=SensorSpec(prefix="modisref", trust_valid=True, has_cloud=False,
                           has_footprint=True),
-        provenance_inputs=("modis",),
+        provenance_inputs=("modis_ref",),
     ),
 
     ProductSpec(

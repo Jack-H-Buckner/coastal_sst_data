@@ -21,6 +21,7 @@ def test_load_config():
     # products is a mapping: keys = selection, values = global options.
     assert list(cfg.products) == [DataProduct.bathymetry, DataProduct.ecostress,
                                   DataProduct.mur, DataProduct.cmems, DataProduct.landsat,
+                                  DataProduct.modis,
                                   DataProduct.met, DataProduct.met_overpass, DataProduct.tides,
                                   DataProduct.insitu, DataProduct.landcover]
     # a bare `bathymetry:` -> default (empty) global options

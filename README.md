@@ -85,7 +85,7 @@ pip install .                 # from a clone (copy)
 | Extra | Enables |
 | --- | --- |
 | `landsat`, `landcover` | Planetary Computer sources (`planetary-computer`, `pystac-client`) |
-| `modis` | swath→grid resampling (`pyresample`) |
+| `modis` | swath→grid resampling (`pyresample`) + server-side subsetting (`harmony-py`) |
 | `met` | HRRR + ERA5 forcing (`herbie-data`, `gcsfs`, `pyresample`) |
 | `tides` | NOAA CO-OPS backend (`pytides2`) |
 | `cmems` | Copernicus Marine global physics (`copernicusmarine`) |
@@ -144,6 +144,7 @@ dependencies:
   - h5netcdf
   - earthaccess
   - pyresample        # modis / met
+  - harmony-py        # modis (server-side AoI subsetting)
   - herbie-data       # met (HRRR)
   - gcsfs             # met (ERA5 fallback)
   - copernicusmarine  # cmems (Copernicus Marine global physics)
@@ -321,7 +322,7 @@ Steps 4 and 5 are the slow ones, and both can be overlapped — see [Running in 
 
 ### `run`
 
-Computes the shared grid once and dispatches each selected product to its acquisition module in a fixed order — static covariates and the MUR backbone first, then Landsat *before* MODIS (MODIS coincidence reads the Landsat outputs). Before downloading anything it runs the credential preflight automatically, so a bad or missing credential fails in seconds rather than mid-run. A product whose module isn't implemented yet is skipped with a warning; a product that errors is logged and the run continues to the next, with a per-product outcome summary at the end.
+Computes the shared grid once and dispatches each selected product to its acquisition module in a fixed order — static covariates and the MUR backbone first, then Landsat *before* `modis_ref` (its coincidence filter reads the Landsat outputs). Before downloading anything it runs the credential preflight automatically, so a bad or missing credential fails in seconds rather than mid-run. A product whose module isn't implemented yet is skipped with a warning; a product that errors is logged and the run continues to the next, with a per-product outcome summary at the end.
 
 - `--aoi <name> …` — restrict to specific areas of interest (default: all).
 - `--products <name> …` — run only these products, e.g. `--products mur landsat modis` (each must be selected in the config).
@@ -338,9 +339,9 @@ Runs the credential preflight on its own — handy before a long unattended run,
 
 The terminal stage: once the products are acquired, it knits their per-AOI aligned files into one analysis-ready **Zarr datacube per AOI** (`<output_dir>/datacube/<aoi>.zarr`), on a common **daily** time axis and the same shared grid every product was regridded onto. It reads only files already on disk, so it needs no network — run it after a `run`, or fold it into one with `run --assemble`.
 
-Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst`, `lst_sst`, `modis_sst`) so a downstream model can learn per-source offsets; each high-res sensor carries its own `valid` mask and overpass hour. When a sensor has several granules on one day, the **clearest** (most valid pixels) is the base; for Landsat and ECOSTRESS the others then fill only the cells it left invalid, so an AoI straddling two Landsat path/rows keeps both halves instead of losing one. MODIS keeps the clearest granule alone, because its `footprint_id` indices restart per granule. Either way the day reports **one** overpass — the base granule's — and `<sensor>_hour` with it. The cube ships **raw ingredients** on a common grid and daily axis — MUR ships its observed values with honest NaN gaps (no fill), and the raw land-cover water layer ships as `landcover_water` rather than an opinionated derived land mask.
+Each cube keeps SST **separate per sensor** (`mur_sst`, `eco_sst_<version>`, `lst_sst`, `modis_sst_<platform>`, `modisref_sst`) so a downstream model can learn per-source offsets; each high-res sensor carries its own `valid` mask and overpass hour. When a sensor has several granules on one day, the **clearest** (most valid pixels) is the base; for Landsat, ECOSTRESS and MODIS the others then fill only the cells it left invalid, so an AoI straddling two Landsat path/rows — or seen twice a night by two overlapping MODIS orbits — keeps both parts instead of losing one. `modis_ref` keeps the clearest granule alone, because its `footprint_id` indices restart per granule. Either way the day reports **one** overpass — the base granule's — and `<sensor>_hour` with it. The cube ships **raw ingredients** on a common grid and daily axis — MUR ships its observed values with honest NaN gaps (no fill), and the raw land-cover water layer ships as `landcover_water` rather than an opinionated derived land mask.
 
-MODIS additionally ships `modis_footprint_id` (`int32`, `-1` = no observation): the index of the native ~1 km swath pixel each grid cell was resampled from, so grouping by it gives exactly the fine-grid cells one MODIS reading covers — the grouping a Landsat-to-MODIS calibration needs. **The ids identify a pixel within one day's chosen scene only**: they restart at 0 in every granule, so group within a timestep, never across the time axis. The channel appears only when the aligned granules actually carried the layer (it is optional at acquisition via `products.modis.footprint_id`); granules acquired before it, or with it off, are not re-fetched automatically — use `modis --overwrite` to backfill.
+`modis_ref` additionally ships `modisref_footprint_id` (`int32`, `-1` = no observation): the index of the native ~1 km swath pixel each grid cell was resampled from, so grouping by it gives exactly the fine-grid cells one MODIS reading covers — the grouping a Landsat-to-MODIS calibration needs. **The ids identify a pixel within one day's chosen scene only**: they restart at 0 in every granule, so group within a timestep, never across the time axis. The channel appears only when the aligned granules actually carried the layer (it is optional at acquisition via `products.modis_ref.footprint_id`); granules acquired before it, or with it off, are not re-fetched automatically — use `modis_ref --overwrite` to backfill.
 
 - `--aoi <name> …` — assemble only specific AOIs (default: all).
 - `--overwrite` — rebuild cubes that already exist.
@@ -670,7 +671,7 @@ runtime:
 
 The unit of work is a **`(product, AOI)` pair**. Two things decide what may overlap:
 
-**The product dependency graph.** Only three ordering constraints exist, and each is a case of one product reading another's aligned files: MODIS's coincidence filter reads Landsat's, and both MUR's `overpass_sensors` filter and `met_overpass` read the thermal sensors'. The other eight products — bathymetry, CMEMS, ECOSTRESS, Landsat, met, tides, landcover, in-situ — depend on nothing and all start immediately.
+**The product dependency graph.** Only three ordering constraints exist, and each is a case of one product reading another's aligned files: `modis_ref`'s coincidence filter reads Landsat's, and both MUR's `overpass_sensors` filter and `met_overpass` read the thermal sensors'. The other nine products — bathymetry, CMEMS, ECOSTRESS, Landsat, MODIS, met, tides, landcover, in-situ — depend on nothing and all start immediately.
 
 **Those edges are per-AOI.** Every one of those reads is scoped to an AOI, so `mur(hobart)` waits for `landsat(hobart)` but **not** for `landsat(tamar)`. There is no barrier between AOIs: Hobart can be downloading MUR while Tamar is still working through Landsat.
 
@@ -680,11 +681,11 @@ If a stage fails for one AOI, the other AOIs carry on, and the products that dep
 
 > *"Can I send multiple requests to the same API on one account?"*
 
-Mostly yes, but the answer differs enough per service that a single worker count cannot express it. So there are **two** limits: `jobs` bounds the worker pool, and **gates** bound each service. Products that share a *server* share a gate — `mur`, `modis` and `ecostress` are three products behind one Earthdata account, so a cap on "Earthdata" is what actually protects the account.
+Mostly yes, but the answer differs enough per service that a single worker count cannot express it. So there are **two** limits: `jobs` bounds the worker pool, and **gates** bound each service. Products that share a *server* share a gate — `mur`, `modis`, `modis_ref` and `ecostress` are four products behind one Earthdata account, so a cap on "Earthdata" is what actually protects the account.
 
 | Gate | Products | Default | Why this number |
 | --- | --- | --- | --- |
-| `earthdata` | mur, modis, ecostress | 6 | Several granule reads at once are normal, and `earthaccess` already threads internally — so the real connection count is a multiple of this. CMR *search* is the throttled part. |
+| `earthdata` | mur, modis, modis_ref, ecostress | 6 | Several granule reads at once are normal, and `earthaccess` already threads internally — so the real connection count is a multiple of this. CMR *search* is the throttled part. |
 | `pc` | landsat, landcover | 4 | Planetary Computer is **anonymous** — there is no account and no per-account limit. Throttling is per-IP, and the STAC search endpoint is the sensitive half. |
 | `herbie` | met, met_overpass | 4 | HRRR via Herbie. |
 | `copernicus` | cmems | 1 | The lazy dataset handle carries its own client and is not safe to share; the toolbox parallelises internally already. |
@@ -773,7 +774,7 @@ Auth requirements are declared **per product — and per source** where a produc
 
 | Backend | Required by | Credentials |
 | --- | --- | --- |
-| `earthdata` | ECOSTRESS, MODIS, MUR | free NASA Earthdata account |
+| `earthdata` | ECOSTRESS, MODIS, MODIS_REF, MUR | free NASA Earthdata account |
 | `copernicus` | CMEMS | free [Copernicus Marine](https://data.marine.copernicus.eu) account |
 | `gee` | Landsat / landcover with `source: gee` | Google Earth Engine |
 | *(none)* | Landsat (`pc`), landcover (`esa`), bathymetry, met, tides | — |
@@ -915,24 +916,72 @@ Landsat contributes additional high-resolution thermal scenes and the water/clou
 **Region-level options**: none.
 
 ### MODIS
-MODIS provides a coarser, well-calibrated SST reference that downstream calibration can match Landsat/ECOSTRESS against, optionally restricted to overpasses coincident with a Landsat scene.
+MODIS is a ~1 km thermal sensor in its own right, alongside ECOSTRESS and Landsat. It is far coarser than either, but it is well calibrated, it images an AoI several times a day, and its record runs from 2000 — an order of magnitude more observations than the high-resolution sensors over the same window.
 
-- **Where it comes from**: the `MODIS_T-JPL-L2P-v2019.0` GHRSST MODIS Terra L2P skin-SST product from NASA OB.DAAC via `earthaccess`. It is a swath (2D curvilinear) product, so it is regridded with nearest-neighbour resampling (`pyresample`) to preserve the observed values rather than smoothing them.
-- **What it measures**: skin sea-surface temperature (`sst`, K or °C), quality-filtered on the GHRSST `quality_level` band, plus a derived `valid` layer. Optionally emits `footprint_id`, the MODIS swath pixel index each grid cell was drawn from — a ~1 km observation covers many grid cells, so grouping by it recovers exactly the pixels one MODIS reading saw. The assembler carries it into the cube as `modis_footprint_id` (see [`assemble`](#assemble)), so footprint-level matchups need no per-granule file handling.
+There are **two MODIS products**, because there are two different questions:
 
-**Project-level options** (`products.modis`):
+| | question | shape |
+|---|---|---|
+| `modis` | what was the SST over this AoI, per overpass | a thermal **sensor** — stacked per platform, no dependencies |
+| `modis_ref` | what did MODIS see **at the moment Landsat did** | a calibration **reference** — Landsat-coincident, carries footprint ids |
 
-- `short_name`: Earthdata short name (default `MODIS_T-JPL-L2P-v2019.0`).
+- **Where it comes from**: the GHRSST MODIS L2P skin-SST products from NASA OB.DAAC via `earthaccess` — `MODIS_T-JPL-L2P-v2019.0` (Terra) and `MODIS_A-JPL-L2P-v2019.0` (Aqua). They are swath (2D curvilinear) products, so they are regridded with nearest-neighbour resampling (`pyresample`) to preserve the observed values rather than smoothing them.
+- **What it measures**: skin sea-surface temperature (`sst`, K or °C), quality-filtered on the GHRSST `quality_level` band, plus a derived `valid` layer. MODIS arrives already quality-filtered with no water or cloud layer, so it publishes **no** `modis_cloud` channel — an all-zero one would read as "this scene was never cloudy", which is a claim the files do not make.
+
+#### Overpasses, and why the time of day is a decision
+
+MODIS flies on **two** spacecraft, both sun-synchronous at ~705 km with a 2330 km swath (1 km at nadir, ~5 × 2 km at the swath edge):
+
+| Platform | Node | Nominal day | Nominal night |
+|---|---|---|---|
+| Terra | descending AM | 10:30 local | 22:30 local |
+| Aqua | ascending PM | 13:30 local | 01:30 local |
+
+Consecutive same-day orbits are spaced `40075·cos(φ)/14.56` km apart — about 2752 km at the equator (leaving gaps), but **overlapping above ~32° latitude**. So at mid-latitudes each platform sees an AoI roughly **twice per day and twice per night**: once near nadir and once near the swath edge, each pass covering a different part of it. Terra + Aqua therefore deliver on the order of **4–8 granules a day**, which is why this product mosaics a platform's same-day granules rather than keeping only the clearest.
+
+**Two things about the record you have to plan around:**
+
+1. **The overpass times drift.** NASA stopped maintaining both orbits — Terra's last inclination maneuver was Feb 2020, Aqua's Mar 2021. Terra's morning crossing has since moved 10:30 → 10:15 (2022) → ~09:00 (2025); Aqua's afternoon crossing 13:30 → ~15:50 (2026). The night crossings moved with them. **A 2000–2026 series therefore has hours of local-time drift baked into it**, so anything that assumes a fixed local hour (a diurnal correction, say) is wrong at the ends. This is why `time_of_day` is decided on **computed local mean solar time**, not on a fixed clock and not on the granule's `-D-`/`-N-` filename token alone — see `night_solar_hours`. Every aligned granule records its own `solar_hour` attribute so the drift stays auditable.
+2. **The missions are over.** Terra MODIS ended production Dec 2025 and Aqua MODIS Aug 2026. MODIS is a **closed 2000–2026 archive**, not a forward-processing source. VIIRS is its successor; it is not implemented here.
+
+**Which time of day to pick.** Night (`time_of_day: night`, the default for the standalone product) gives the higher-quality SST retrieval — no solar contamination and no diurnal skin warming — and roughly doubles the observation count relative to daytime-only. Day matches the illumination state of daytime Landsat and ECOSTRESS scenes, which is what a cross-sensor matchup wants. `modis_ref` therefore defaults to `day`, and `modis` to `night`.
+
+**A note on day binning.** Like every other sensor, granules are binned by **UTC** day. At Puget Sound (UTC−8) Terra's ~22:30 and Aqua's ~01:30 local passes of the *same night* both land on the same UTC day (06:30 and 09:30 UTC), so the binning is coherent. Near UTC+0 one local night splits across two cube days.
+
+#### `products.modis` — the standalone sensor
+
+- `platforms`: which spacecraft to stack, e.g. `[terra, aqua]` (default: both). **Distinct data, stacked** — each writes its own `MODIS/<platform>/aligned/` tree and its own `modis_sst_<platform>` channel set, because Terra and Aqua never observe the same overpass. **Order matters**: the first listed wins the single overpass identity that the in-situ / met / tide matchups key off. With no list configured the preference falls back to alphabetical, i.e. `aqua`.
+- `time_of_day`: `night` (default), `day`, or `both`. Judged on local mean solar time at the AoI.
+- `night_solar_hours`: the local-solar window that means "night", wrapping midnight (default `[19, 5]`). Wide enough to hold both platforms' night crossings across the whole record including the drift.
+- `short_name`: pin every platform to one Earthdata collection. Unset (default) means each platform uses its own.
 - `variable`: SST variable to read (default `sea_surface_temperature`).
 - `quality_min`: minimum GHRSST quality level to keep, 0–5 (default `4`; 5 is best).
 - `regrid_radius_m`: nearest-neighbour search radius in metres (default `1500`).
-- `access`: fetch backend, `download` (default) or `harmony` (not yet implemented).
-- `match_landsat`: only load granules within `max_time_diff_minutes` of an already-acquired Landsat scene (default `true`; requires Landsat to have run first).
-- `max_time_diff_minutes`: coincidence window for `match_landsat` (default `360`, i.e. ±6 h).
-- `daytime_only`: drop night granules (default `true`).
-- `footprint_id`: emit the swath-pixel-index layer (default `true`).
+- `access`: fetch backend, `harmony` (default) or `download`. **This matters at scale.** A full L2P granule is ~15–25 MB holding a global swath and ~15 variables, of which this module reads four; a night-time Terra+Aqua series over the full archive is tens of thousands of granules. `harmony` asks PO.DAAC's subsetter for the AoI bounding box and only the needed variables, so a few hundred KB crosses the wire instead of tens of GB, and the reader never materialises a full swath. `download` fetches whole granules and crops in memory — no extra dependency, and fine for short ranges. Harmony needs `harmony-py` (in the `modis` extra).
+- `daytime_only`: **deprecated** — `true` maps to `time_of_day: day`, `false` to `both`.
 
-**Region-level options**: none.
+#### `products.modis_ref` — the Landsat calibration reference
+
+Same instrument and the same swath machinery, restricted to overpasses coincident with an acquired Landsat scene. Writes a flat `MODIS_REF/aligned/` tree and contributes `modisref_*` channels.
+
+- `match_landsat`: only load granules within `max_time_diff_minutes` of an already-acquired Landsat scene (default `true`; requires Landsat to have run first — the pipeline enforces the ordering).
+- `max_time_diff_minutes`: coincidence window (default `360`, i.e. ±6 h).
+- `time_of_day`: default `day`, since Landsat flies in the morning.
+- `short_name`: default `MODIS_T-JPL-L2P-v2019.0` — Terra, whose 10:30 crossing sits within minutes of Landsat's. Aqua's 13:30 is three hours off and would fold the diurnal warming cycle into the calibration.
+- `footprint_id`: emit the swath-pixel-index layer (default `true`). A ~1 km observation covers many grid cells, so grouping by it recovers exactly the fine-grid cells one MODIS reading saw — the grouping a Landsat-to-MODIS calibration needs. The assembler carries it into the cube as `modisref_footprint_id` (see [`assemble`](#assemble)).
+- `access`: `download` (default) or `harmony`. **`harmony` is refused while `footprint_id` is on**, and this is not a limitation to work around: the ids are indices into the *native* swath, and a server-side subset trims the swath and renumbers them, so the same id would mean different observations in different AoIs. Set `footprint_id: false` if you only need the SST.
+- `variable`, `quality_min`, `regrid_radius_m`: as above.
+
+**Region-level options**: none, for either product.
+
+#### Migrating from the single `modis` product (≤ 0.3.2)
+
+Before 0.4.0 there was one `modis` product: Terra only, daytime only, Landsat-coincident by default, writing a flat `MODIS/aligned/` tree and contributing `modis_sst` / `modis_footprint_id`. That product is now `modis_ref`, and `modis` is the standalone sensor.
+
+- **Config**: rename your `products.modis` block to `products.modis_ref` to keep the old behaviour. Add a `products.modis` block only if you want the standalone sensor.
+- **Channels**: `modis_sst` → `modisref_sst`, `modis_footprint_id` → `modisref_footprint_id`, and so on. The standalone sensor's channels are suffixed by platform: `modis_sst_terra`, `modis_sst_aqua`.
+- **Sensor prefixes** in `met_overpass.combinations`, `tides.overpass_combinations`, `mur.overpass_sensors` and the `cloud_filter` / `georef` step `sensors` lists: `modis` now means the standalone sensor. Use `modisref` for the reference. An unknown prefix is rejected at config load with a suggestion, so a stale name fails loudly rather than silently producing no matchups.
+- **Existing data**: an old `MODIS/aligned/` tree is orphaned. Move it to `MODIS_REF/aligned/` to keep it, or delete it. Left in place it is now *ignored with a log line* rather than loaded as a phantom platform tag — see `docs/bug-empty-version-tag-channels.md`.
 
 ### MUR
 MUR is the always-present, gap-free SST backbone the high-resolution products add detail onto.
@@ -995,7 +1044,7 @@ products:
     overpass_sensors: [eco]        # ...or [eco, lst, modis]
 ```
 
-Name sensors by their **channel prefix** (`eco`, `lst`, `modis`), not the product name — a wrong
+Name sensors by their **channel prefix** (`eco`, `lst`, `modis`, `modisref`), not the product name — a wrong
 name is rejected at config load. It is region-overridable, because which sensors are worth
 restricting to genuinely varies (an AOI may be ECOSTRESS-only). Because the filter reads what the
 sensors wrote, MUR now runs **after** them in the process order; running `--products mur` alone
@@ -1124,8 +1173,8 @@ A region may override `sources`, `path`, `stations`, `exclude_stations` and `var
 | Channel | Dims | Meaning |
 | --- | --- | --- |
 | `insitu_sst` | (time,y,x) | the observation nearest the **reference time** (10:30 local solar), so it is contemporaneous with the met channels |
-| `{eco,lst,modis}_insitu_sst` | (time,y,x) | the observation nearest **that sensor's overpass** — the satellite-vs-buoy matchup |
-| `{eco,lst,modis}_insitu_dt_min` | (time,y,x) | signed minutes between the observation and the overpass, so matchup quality is auditable |
+| `{eco,lst,modis,modisref}_insitu_sst` | (time,y,x) | the observation nearest **that sensor's overpass** — the satellite-vs-buoy matchup |
+| `{eco,lst,modis,modisref}_insitu_dt_min` | (time,y,x) | signed minutes between the observation and the overpass, so matchup quality is auditable |
 | `insitu_n` | (time,y,x) | stations contributing to the cell — N stations sharing a cell are **averaged**, from any mix of sources |
 | `insitu_station` | (y,x) | `0` = none, `k` = station #k, indexing the `insitu_stations` cube attribute (which records each station's `source`) |
 
