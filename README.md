@@ -937,7 +937,7 @@ MODIS provides a coarser, well-calibrated SST reference that downstream calibrat
 ### MUR
 MUR is the always-present, gap-free SST backbone the high-resolution products add detail onto.
 
-- **Where it comes from**: the `MUR-JPL-L4-GLOB-v4.1` GHRSST MUR L4 analysis (daily, ~1 km, global) from PO.DAAC via `earthaccess`. For each day the global granule is opened lazily and subset to the AOI window (HDF5 range reads — the global file is never fully downloaded), then bilinearly upsampled onto the AOI grid.
+- **Where it comes from**: the `MUR-JPL-L4-GLOB-v4.1` GHRSST MUR L4 analysis (daily, ~1 km, global) from PO.DAAC via `earthaccess`. For each day the AOI window is subset out of the global granule — either client-side over HDF5 range reads or server-side via OPeNDAP (see `access` below) — then bilinearly upsampled onto the AOI grid. The global file is never fully downloaded either way.
 - **What it measures**: `analysed_sst`, a gap-free (cloud-free) foundation SST analysis (`sst`, K or °C). Because it is an L4 analysis there is no cloud mask; `valid` is simply finite SST (i.e. water).
 
 **Project-level options** (`products.mur`):
@@ -945,9 +945,42 @@ MUR is the always-present, gap-free SST backbone the high-resolution products ad
 - `short_name`: Earthdata short name (default `MUR-JPL-L4-GLOB-v4.1`).
 - `variable`: variable to read (default `analysed_sst`).
 - `pad_deg`: degrees of padding added around the AOI lat/lon window before subsetting (default `0.05`).
+- `access`: fetch backend, `download` (default) or `opendap`. See below.
 - `overpass_sensors`: fetch only the days these sensors flew (default: unset — every day). See below.
 
 **Region-level options**: `overpass_sensors`.
+
+#### `access: opendap` — server-side subsetting
+
+`download` (the default) streams the granule over HTTPS and subsets client-side. That works, but
+the granule is remote HDF5 read through fsspec in **8 MB blocks with background prefetch**, so the
+scattered header reads needed to locate one AOI window drag far more over the wire than the window
+contains. `opendap` instead asks PO.DAAC's Hyrax server for a DAP4 hyperslab — the window itself.
+
+```yaml
+products:
+  mur:
+    access: opendap
+```
+
+Measured live on one granule over a 50 km AOI (Washington coast, 100 m grid):
+
+| `access` | bytes on the wire | wall time |
+|---|---|---|
+| `download` | 26.83 MB | 9–14 s |
+| `opendap` | 0.03 MB (+ a one-off 0.14 MB axis read per process) | ~4 s |
+
+The gridded output is **bit-identical** — the backend selects exactly the index range
+`.sel(lat=slice(...))` selects, so both paths reproject from the same source window.
+
+Same credentials: Hyrax sits behind Earthdata Login and reuses the session `earthaccess` already
+holds — there is nothing extra to configure. One caveat: if OPeNDAP returns 401/403 and a
+credential refresh does not clear it, the Earthdata profile has probably never authorized the
+OPeNDAP application. Approve it once under *Applications → Authorized Apps* at
+`urs.earthdata.nasa.gov`; a fresh token cannot fix an unapproved application. The error says so.
+
+`download` remains the default because it is the path with years of runs behind it. Switch per
+config once `opendap` has proved itself on your own AOIs and date range.
 
 #### MUR on overpass days only
 

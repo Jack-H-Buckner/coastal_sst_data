@@ -4,10 +4,23 @@ OCEANSR -- MUR L4 SST backbone acquisition.
 
 Reads the common project config (configs/config.yaml): AOIs, grid, dates and
 paths are shared; MUR settings come from `sources.mur`. For each AOI and each
-day it streams the daily GHRSST MUR L4 granule from PODAAC (earthaccess.open),
-subsets `analysed_sst` to the AOI lat/lon window (HDF5 range reads -- the global
-1 km file is never fully downloaded), upsamples onto the AOI grid (identical to
-the ECOSTRESS/Landsat grid), and writes one aligned NetCDF per day.
+day it subsets `analysed_sst` from the daily GHRSST MUR L4 granule at PODAAC to
+the AOI lat/lon window, upsamples onto the AOI grid (identical to the
+ECOSTRESS/Landsat grid), and writes one aligned NetCDF per day. The global 1 km
+file is never fully downloaded.
+
+WHERE the subsetting happens is the `access` option:
+
+  * download (default) -- stream the granule (earthaccess.open) and subset in
+    this process, over HDF5 range reads.
+  * opendap            -- ask PO.DAAC's Hyrax for a DAP4 hyperslab: the server
+    sends the window and nothing else.
+
+They produce bit-identical grids. `download` moves far more than the window
+contains, because the remote HDF5 is read through fsspec in 8 MB blocks with
+background prefetch and the header reads that locate the window are scattered:
+measured live on one granule over a 50 km AOI, 26.83 MB against 0.03 MB.
+`download` stays the default only because it is the long-proven path.
 
 MUR is a gap-free L4 analysis, so it has no cloud mask; `valid` = finite SST
 (i.e. water). It is the always-present backbone the model fills high-res detail
@@ -27,9 +40,12 @@ Usage (run from the OCEANSR project root, Earthdata auth via ~/.netrc):
 
 from __future__ import annotations
 
+import io
 import logging
 import re
+import threading
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -52,6 +68,11 @@ SOURCE = "mur"
 SHORT_NAME = "MUR-JPL-L4-GLOB-v4.1"
 DEFAULT_VARIABLE = "analysed_sst"
 DEFAULT_PAD_DEG = 0.05
+# `download` streams the granule and subsets client-side; `opendap` asks Hyrax for the window.
+# Measured live on one granule over a 50 km AOI: 26.83 MB / 13.8 s vs 0.03 MB / 4.1 s, for a
+# bit-identical gridded result. `download` stays the default because it is the path with years
+# of runs behind it -- switch per config once opendap has proved itself on your own AOIs.
+DEFAULT_ACCESS = "download"
 
 
 # The nominal stamp that opens a MUR granule id: 20230715090000-JPL-L4_GHRSST-...
@@ -128,16 +149,12 @@ def _select_granules(granules, day_stamps: set[str] | None) -> list:
 # --------------------------------------------------------------------------- #
 # MUR per-granule processing
 # --------------------------------------------------------------------------- #
-def subset_and_reproject(fobj, variable, bbox_ll, pad, target_crs, transform,
-                         width, height, geom_proj, grid_cfg) -> tuple[xr.DataArray, pd.Timestamp]:
-    """Open one daily MUR granule lazily, subset to the AOI, upsample to grid."""
-    w, s, e, n = bbox_ll
-    ds = xr.open_dataset(fobj, engine="h5netcdf", mask_and_scale=True)
-    da = ds[variable].isel(time=0)
-    da = da.sel(lat=slice(s - pad, n + pad), lon=slice(w - pad, e + pad)).load()
+def _to_grid(da, target_crs, transform, width, height, geom_proj, grid_cfg) -> xr.DataArray:
+    """A lat/lon-indexed MUR window -> the AOI grid. Shared by every access backend.
 
-    t = pd.Timestamp(ds["time"].values[0]).tz_localize(None)
-
+    Split out of `subset_and_reproject` so the OPeNDAP backend, which never holds a file
+    object, reaches the identical reprojection rather than a second copy of it.
+    """
     if grid_cfg.get("to_celsius", False):
         da = da - 273.15
 
@@ -147,8 +164,141 @@ def subset_and_reproject(fobj, variable, bbox_ll, pad, target_crs, transform,
     rs = Resampling[grid_cfg.get("resampling_continuous", "bilinear")]
     out = da.rio.reproject(dst_crs=target_crs, shape=(height, width),
                            transform=transform, resampling=rs, nodata=np.nan)
-    out = out.rio.clip([geom_proj], target_crs, drop=False)
-    return out, t
+    return out.rio.clip([geom_proj], target_crs, drop=False)
+
+
+def subset_and_reproject(fobj, variable, bbox_ll, pad, target_crs, transform,
+                         width, height, geom_proj, grid_cfg) -> tuple[xr.DataArray, pd.Timestamp]:
+    """Open one daily MUR granule lazily, subset to the AOI, upsample to grid."""
+    w, s, e, n = bbox_ll
+    ds = xr.open_dataset(fobj, engine="h5netcdf", mask_and_scale=True)
+    da = ds[variable].isel(time=0)
+    da = da.sel(lat=slice(s - pad, n + pad), lon=slice(w - pad, e + pad)).load()
+
+    t = pd.Timestamp(ds["time"].values[0]).tz_localize(None)
+    return _to_grid(da, target_crs, transform, width, height, geom_proj, grid_cfg), t
+
+
+# --------------------------------------------------------------------------- #
+# Access backends: granule -> (gridded DataArray, time). Swappable via `access`.
+# --------------------------------------------------------------------------- #
+def _fetch_download(granule, variable, g: AoiGrid, pad, grid_cfg):
+    """Stream the granule over HTTPS and subset client-side (the original path).
+
+    The OPEN is here, inside the caller's `net.retry`, not outside it: `earthaccess.open`
+    returns a handle bound to the fsspec session it was created with, so re-authenticating
+    cannot heal a handle we already hold -- only re-opening can.
+    """
+    fobj = earthaccess.open([granule])[0]
+    return subset_and_reproject(fobj, variable, g.search_bbox, pad, g.target_crs,
+                                g.transform, g.width, g.height, g.geom_proj, grid_cfg)
+
+
+# The coordinate axes are a property of the COLLECTION, not of a granule, so they are read
+# once (~216 KB) and shared. Read rather than computed: hard-coding MUR's -89.99/0.01 origin
+# would silently mis-index the day the collection is re-gridded, and a wrong window is a wrong
+# answer that still looks like data.
+_DAP_AXES: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+_DAP_LOCK = threading.Lock()
+
+
+def _dap_base(granule) -> str:
+    """The granule's own OPeNDAP endpoint, from its catalogue metadata.
+
+    Read from the granule rather than built from a template: the Hyrax path embeds the full
+    collection title, and a hand-assembled URL would break on any collection but this one.
+    """
+    for r in (granule.get("umm", {}) or {}).get("RelatedUrls", []) or []:
+        url = str(r.get("URL", ""))
+        if r.get("Type") == "USE SERVICE API" and "opendap" in url.lower():
+            return url.rstrip("/")
+    raise RuntimeError(
+        "this granule publishes no OPeNDAP service URL; use mur access='download'")
+
+
+def _dap_get(url: str, what: str) -> bytes:
+    """One authenticated DAP request -> raw bytes.
+
+    Earthdata Login, the same credential everything else here uses: Hyrax 302s to URS and
+    `earthaccess`'s session already carries the cookie jar.
+    """
+    resp = earthaccess.get_requests_https_session().get(
+        url, timeout=(net.CONNECT_TIMEOUT_S, net.HTTP_TIMEOUT_S))
+    if resp.status_code in (401, 403):
+        # Deliberately a bare status number in the text: net.err_text strips path-like tokens,
+        # and net.is_auth_error reads the number -- so this still costs exactly one credential
+        # refresh before failing permanently, with the hint attached. The hint matters because
+        # an un-approved EDL application and an expired token are the SAME status, and only one
+        # of them is fixable by re-authenticating (net.retry says so on the second rejection).
+        raise RuntimeError(
+            f"OPeNDAP rejected {what} with status {resp.status_code}. If a credential refresh "
+            "does not clear this, the Earthdata profile has most likely not authorized the "
+            "OPeNDAP application yet -- approve it once under Applications -> Authorized Apps "
+            "at urs.earthdata.nasa.gov. A fresh token cannot fix an unapproved application.")
+    resp.raise_for_status()
+    return resp.content
+
+
+def _dap_axes(base: str, short_name: str) -> tuple[np.ndarray, np.ndarray]:
+    """The collection's (lat, lon) axes, fetched once per process."""
+    with _DAP_LOCK:
+        if short_name not in _DAP_AXES:
+            raw = _dap_get(f"{base}.dap.nc4?dap4.ce={quote('/lat;/lon', safe='')}",
+                           f"{short_name} coordinate axes")
+            with xr.open_dataset(io.BytesIO(raw), engine="h5netcdf") as d:
+                _DAP_AXES[short_name] = (np.asarray(d["lat"].values).copy(),
+                                         np.asarray(d["lon"].values).copy())
+            log.info("  OPeNDAP: read %s axes (%d lat x %d lon)", short_name,
+                     *(a.size for a in _DAP_AXES[short_name]))
+        return _DAP_AXES[short_name]
+
+
+def _fetch_opendap(granule, variable, g: AoiGrid, pad, grid_cfg):
+    """Ask Hyrax for ONLY the AOI window (a DAP4 hyperslab).
+
+    MUR is a regular 0.01 deg grid, so the AOI's array indices are a lookup on the coordinate
+    axes -- no geolocation search. The server returns the window itself rather than the ~27 MB
+    of 8 MB-aligned HDF5 blocks a client-side subset drags over the wire for the same pixels.
+    """
+    base = _dap_base(granule)
+    lats, lons = _dap_axes(base, str(granule["umm"].get("CollectionReference", {})
+                                     .get("ShortName") or SHORT_NAME))
+    w, s, e, n = g.search_bbox
+
+    def span(axis, lo, hi):
+        # EXACTLY the index range `.sel(slice(lo, hi))` selects on an ascending axis -- first
+        # index >= lo, last index <= hi -- so the two backends reproject from the identical
+        # source window. Widening this by a cell "for interpolation slack" is what it looks
+        # like it should do, and it silently breaks equivalence: `analysed_sst` is NaN over
+        # land, so one extra ring can pull a land NaN into an edge cell's bilinear
+        # neighbourhood and drop it from `valid`. The slack is `pad` (0.05 deg = 5 cells),
+        # applied by the caller to BOTH paths. Clamped, so an AOI running off the edge of the
+        # grid shrinks to the edge rather than wrapping to the far side of the world.
+        i0 = int(np.searchsorted(axis, lo, "left"))
+        i1 = int(np.searchsorted(axis, hi, "right")) - 1
+        return max(i0, 0), min(i1, axis.size - 1)
+
+    i0, i1 = span(lats, s - pad, n + pad)
+    j0, j1 = span(lons, w - pad, e + pad)
+    if i1 < i0 or j1 < j0:
+        raise RuntimeError(f"AOI window is empty in the {variable} grid "
+                           f"(lat {i0}:{i1}, lon {j0}:{j1})")
+
+    ce = (f"/{variable}[0][{i0}:{i1}][{j0}:{j1}];"
+          f"/lat[{i0}:{i1}];/lon[{j0}:{j1}];/time[0]")
+    raw = _dap_get(f"{base}.dap.nc4?dap4.ce={quote(ce, safe='')}",
+                   f"{variable} window {i0}:{i1},{j0}:{j1}")
+
+    # mask_and_scale on the RESPONSE: Hyrax preserves the packing and the CF attributes, so
+    # the int16 -> Kelvin conversion is the same arithmetic the streamed path applies.
+    with xr.open_dataset(io.BytesIO(raw), engine="h5netcdf", mask_and_scale=True) as ds:
+        da = ds[variable].isel(time=0).load()
+        t = pd.Timestamp(ds["time"].values[0]).tz_localize(None)
+    return _to_grid(da, g.target_crs, g.transform, g.width, g.height,
+                    g.geom_proj, grid_cfg), t
+
+
+_ACCESS = {"download": _fetch_download, "opendap": _fetch_opendap}
 
 
 # --------------------------------------------------------------------------- #
@@ -196,8 +346,9 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         ds_cfg = eff["ds"][name]
         variable = ds_cfg["variable"]
         pad = float(ds_cfg["pad_deg"])
-        log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
-                 name, g.target_crs, g.width, g.height, g.resolution_m)
+        fetch = _ACCESS[ds_cfg["access"]]
+        log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) | access=%s ===",
+                 name, g.target_crs, g.width, g.height, g.resolution_m, ds_cfg["access"])
         auth.ensure_fresh("earthdata", eff["earthdata"])
 
         want = ds_cfg["overpass_sensors"]
@@ -245,16 +396,13 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             if gi % auth.CHECK_EVERY == 0:
                 auth.ensure_fresh("earthdata", eff["earthdata"])
             try:
-                # The OPEN is inside the retry with the read, not outside it. `earthaccess.open`
-                # returns a handle bound to the fsspec session it was created with, so
-                # re-authenticating cannot heal a handle we already hold -- only re-opening can.
-                # Retrying just `subset_and_reproject` would read through the same dead session
+                # The WHOLE fetch sits inside the retry -- open included, for `download`. An
+                # `earthaccess.open` handle is bound to the fsspec session it was created with,
+                # so re-authenticating cannot heal a handle we already hold; only re-opening
+                # can, and retrying the read alone would go through the same dead session
                 # forever. `granule=granule` pins the loop variable (the CUDEM idiom).
                 def _fetch(granule=granule):
-                    fobj = earthaccess.open([granule])[0]
-                    return subset_and_reproject(fobj, variable, g.search_bbox, pad,
-                                                g.target_crs, g.transform, g.width,
-                                                g.height, g.geom_proj, grid_cfg)
+                    return fetch(granule, variable, g, pad, grid_cfg)
 
                 da, t = net.retry(_fetch, what=f"MUR granule {gi}", refresh=ed)
             except Exception as exc:
@@ -313,6 +461,20 @@ def _overpass_sensors(raw) -> tuple[str, ...] | None:
     return tuple(str(n) for n in names) or None
 
 
+def _access(raw) -> str:
+    """The fetch backend for this AoI. Fails at CONFIG time, not on granule 400.
+
+    `config._option_keys_are_known` validates option NAMES; nothing validates a value, so an
+    unknown backend would otherwise surface as a KeyError deep inside the granule loop after
+    the search has already run.
+    """
+    name = str(raw)
+    if name not in _ACCESS:
+        raise ValueError(f"mur access={name!r} is not a known backend; "
+                         f"choose from {sorted(_ACCESS)}.")
+    return name
+
+
 def _ds_cfg(opts) -> dict:
     """One AoI's MUR settings. MUR is a global product, so nothing about the DATA varies by
     region -- but `overpass_sensors` does (which sensors are worth restricting days to here),
@@ -321,6 +483,7 @@ def _ds_cfg(opts) -> dict:
         "short_name": _opt(opts, "short_name", SHORT_NAME),
         "variable": _opt(opts, "variable", DEFAULT_VARIABLE),
         "pad_deg": float(_opt(opts, "pad_deg", DEFAULT_PAD_DEG)),
+        "access": _access(_opt(opts, "access", DEFAULT_ACCESS)),
         "overpass_sensors": _overpass_sensors(_opt(opts, "overpass_sensors", None)),
     }
 
