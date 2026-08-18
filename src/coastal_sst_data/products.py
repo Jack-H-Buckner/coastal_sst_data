@@ -317,7 +317,7 @@ REGISTRY: tuple[ProductSpec, ...] = (
         kind=Kind.DAILY_RASTER,
         module="coastal_sst_data.processes.mur",
         auth="earthdata",
-        options=_COMMON | {"short_name", "variable", "pad_deg", "overpass_sensors"},
+        options=_COMMON | {"short_name", "variable", "pad_deg", "access", "overpass_sensors"},
         # MUR is a GLOBAL product, so nothing about the DATA varies by region -- but which
         # sensors are worth restricting its days to does (an AoI may be ECOSTRESS-only).
         region_options=frozenset({"overpass_sensors"}),

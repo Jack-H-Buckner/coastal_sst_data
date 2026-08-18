@@ -1,9 +1,11 @@
 
+import re
 import pytest
 import numpy as np
 import xarray as xr
 import pandas as pd
 from pathlib import Path
+from urllib.parse import unquote
 from coastal_sst_data.config import load_config, parse_config, AreaOfInterest, GridSpec
 from coastal_sst_data.processes import mur
 from coastal_sst_data import auth, grid
@@ -170,7 +172,8 @@ DAYS = ["2026-06-01", "2026-06-02", "2026-06-03"]
 
 def _mur_eff(tmp_path, g, **over):
     cfg = {"short_name": "MUR-JPL-L4-GLOB-v4.1", "variable": "analysed_sst",
-           "pad_deg": 0.05, "overpass_sensors": None} | over.pop("ds", {})
+           "pad_deg": 0.05, "access": "download",
+           "overpass_sensors": None} | over.pop("ds", {})
     return {
         "config_sha256": "x",
         "ds": {g.name: cfg},
@@ -396,6 +399,187 @@ def test_subset_and_reproject_to_celsius(tmp_path, aoi_grid):
         {"resampling_continuous": "bilinear", "to_celsius": True})
     finite = out.values[np.isfinite(out.values)]
     assert finite.min() == pytest.approx(290.0 - 273.15, abs=1e-3)   # 16.85
+
+# --------------------------------------------------------------------------- #
+# access="opendap" -- the server-side hyperslab backend
+# --------------------------------------------------------------------------- #
+_TERM = re.compile(r"/(\w+)((?:\[\d+(?::\d+)?\])*)")
+_SLICE = re.compile(r"\[(\d+)(?::(\d+))?\]")
+
+DAP_URL = ("https://opendap.earthdata.nasa.gov/providers/POCLOUD/collections/"
+           "GHRSST%20Level%204%20MUR/granules/20260615090000-JPL-L4_GHRSST")
+
+
+def _dap_granule():
+    """A CMR record carrying the OPeNDAP service URL the backend reads."""
+    return {"umm": {"GranuleUR": "20260615090000-JPL-L4_GHRSST-SSTfnd-MUR-GLOB-v02.0-fv04.1",
+                    "CollectionReference": {"ShortName": "MUR-JPL-L4-GLOB-v4.1"},
+                    "RelatedUrls": [{"Type": "GET DATA", "URL": "https://example/x.nc"},
+                                    {"Type": "USE SERVICE API", "URL": DAP_URL}]},
+            "meta": {}}
+
+
+def _fake_hyrax(src_path, tmp_path, calls):
+    """A stand-in Hyrax that actually honours the DAP4 constraint expression.
+
+    Parses the CE and serves exactly that hyperslab, so the test exercises the real index
+    arithmetic and CE construction rather than asserting on a string the backend also wrote.
+    """
+    def _get(url, what):
+        calls.append(url)
+        ce = unquote(url.split("dap4.ce=")[1])
+        src = xr.open_dataset(src_path)
+        out = {}
+        for name, slices in _TERM.findall(ce):
+            var = src[name]
+            sel = {}
+            for dim, (a, b) in zip(var.dims, _SLICE.findall(slices)):
+                sel[dim] = slice(int(a), int(b) + 1 if b else int(a) + 1)
+            out[name] = var.isel(sel)
+        dest = tmp_path / f"resp_{len(calls)}.nc"
+        xr.Dataset(out).to_netcdf(dest)
+        return dest.read_bytes()
+    return _get
+
+
+@pytest.fixture(autouse=True)
+def _clear_dap_axes():
+    """The axis cache is a module global; a stale one would let a test pass on another's read."""
+    mur._DAP_AXES.clear()
+    yield
+    mur._DAP_AXES.clear()
+
+
+def _gradient_granule(path, g, when="2026-06-15"):
+    """Like make_mur_granule but with a lat/lon RAMP, so an off-by-one window is visible.
+
+    A constant field makes every windowing bug look correct.
+    """
+    w, s, e, n = g.search_bbox
+    lat = np.arange(s - 0.3, n + 0.3, 0.01, dtype="float64")
+    lon = np.arange(w - 0.3, e + 0.3, 0.01, dtype="float64")
+    sst = (285.0 + 10.0 * (lat[:, None] - lat[0]) / (lat[-1] - lat[0])
+           + 5.0 * (lon[None, :] - lon[0]) / (lon[-1] - lon[0])).astype("float32")
+    ds = xr.Dataset({"analysed_sst": (("time", "lat", "lon"), sst[None])},
+                    coords={"time": [np.datetime64(when)], "lat": lat, "lon": lon})
+    ds.to_netcdf(path)
+    return path
+
+
+def test_opendap_matches_the_streamed_path(tmp_path, aoi_grid, monkeypatch):
+    """THE acceptance gate: the two backends must land the same numbers on the same grid.
+
+    A different access path is only worth having if it is not also a different answer -- so
+    this compares the gridded output, not the request that produced it.
+    """
+    g = aoi_grid
+    src = _gradient_granule(tmp_path / "mur.nc", g)
+    grid_cfg = {"resampling_continuous": "bilinear", "to_celsius": False}
+
+    monkeypatch.setattr(mur, "_dap_get", _fake_hyrax(src, tmp_path, []))
+    dap, t_dap = mur._fetch_opendap(_dap_granule(), "analysed_sst", g, 0.05, grid_cfg)
+
+    monkeypatch.setattr(mur.earthaccess, "open", lambda gs: [str(src)])
+    stream, t_stream = mur._fetch_download(_dap_granule(), "analysed_sst", g, 0.05, grid_cfg)
+
+    assert dap.shape == stream.shape == (g.height, g.width)
+    assert t_dap == t_stream == pd.Timestamp("2026-06-15")
+    both = np.isfinite(dap.values) & np.isfinite(stream.values)
+    assert both.any()
+    assert np.allclose(dap.values[both], stream.values[both], atol=1e-3)
+
+
+def test_opendap_asks_for_only_the_aoi_window(tmp_path, aoi_grid, monkeypatch):
+    """The whole point: the constraint expression must bound the request to the AoI."""
+    g = aoi_grid
+    src = _gradient_granule(tmp_path / "mur.nc", g)
+    calls = []
+    monkeypatch.setattr(mur, "_dap_get", _fake_hyrax(src, tmp_path, calls))
+    mur._fetch_opendap(_dap_granule(), "analysed_sst", g, 0.05,
+                       {"resampling_continuous": "bilinear"})
+
+    axes, window = unquote(calls[0]), unquote(calls[-1])
+    assert axes.endswith("/lat;/lon")                    # axes read first, unconstrained
+    assert "/analysed_sst[0][" in window
+    full = xr.open_dataset(src)
+    i0, i1 = (int(v) for v in re.findall(r"analysed_sst\[0\]\[(\d+):(\d+)\]", window)[0])
+    # the requested rows are a small fraction of the granule, and cover the AoI
+    assert (i1 - i0 + 1) < full.sizes["lat"] / 2
+    assert full["lat"].values[i0] <= g.search_bbox[1] and full["lat"].values[i1] >= g.search_bbox[3]
+
+
+def test_opendap_window_is_exactly_the_slice_the_streamed_path_takes(tmp_path, aoi_grid,
+                                                                    monkeypatch):
+    """Regression: the hyperslab must select the SAME cells as `.sel(lat=slice(lo, hi))`.
+
+    A live run caught this. The index span was widened by a cell each way for "interpolation
+    slack", which reads as harmless and is not: `analysed_sst` is NaN over land, so the extra
+    ring pulls a land NaN into an edge cell's bilinear neighbourhood and drops it from `valid`.
+    Three cells of a 511x513 grid disagreed -- invisible in a gradient field with no NaNs,
+    which is why this asserts on the INDICES rather than on the values.
+    """
+    g = aoi_grid
+    src = _gradient_granule(tmp_path / "mur.nc", g)
+    calls = []
+    monkeypatch.setattr(mur, "_dap_get", _fake_hyrax(src, tmp_path, calls))
+    mur._fetch_opendap(_dap_granule(), "analysed_sst", g, 0.05,
+                       {"resampling_continuous": "bilinear"})
+
+    ce = unquote(calls[-1])
+    (i0, i1), (j0, j1) = (tuple(int(v) for v in m) for m in
+                          re.findall(r"\[(\d+):(\d+)\]", ce.split(";")[0])[:2])
+    w, s, e, n = g.search_bbox
+    full = xr.open_dataset(src)
+    want = full["analysed_sst"].isel(time=0).sel(lat=slice(s - 0.05, n + 0.05),
+                                                 lon=slice(w - 0.05, e + 0.05))
+    assert (i1 - i0 + 1, j1 - j0 + 1) == want.shape
+    np.testing.assert_array_equal(full["lat"].values[i0:i1 + 1], want["lat"].values)
+    np.testing.assert_array_equal(full["lon"].values[j0:j1 + 1], want["lon"].values)
+
+
+def test_opendap_reads_the_coordinate_axes_only_once(tmp_path, aoi_grid, monkeypatch):
+    """Axes are a property of the COLLECTION; re-reading them per granule would undo the win."""
+    g = aoi_grid
+    src = _gradient_granule(tmp_path / "mur.nc", g)
+    calls = []
+    monkeypatch.setattr(mur, "_dap_get", _fake_hyrax(src, tmp_path, calls))
+    for _ in range(3):
+        mur._fetch_opendap(_dap_granule(), "analysed_sst", g, 0.05,
+                           {"resampling_continuous": "bilinear"})
+    assert sum(1 for c in calls if unquote(c).endswith("/lat;/lon")) == 1
+    assert len(calls) == 4                                # 1 axes + 3 windows
+
+
+def test_opendap_401_points_at_application_authorization(monkeypatch):
+    """An un-approved EDL application and an expired token are the SAME status, and only one
+    is fixable by re-authenticating -- so the message has to name the other one."""
+    class _Resp:
+        status_code = 401
+        content = b""
+    monkeypatch.setattr(mur.earthaccess, "get_requests_https_session",
+                        lambda: type("S", (), {"get": lambda self, *a, **k: _Resp()})())
+    with pytest.raises(RuntimeError, match="Authorized Apps"):
+        mur._dap_get("https://x/y.dap.nc4?dap4.ce=%2Flat", "axes")
+
+
+def test_opendap_without_a_service_url_says_which_backend_to_use():
+    g = {"umm": {"RelatedUrls": [{"Type": "GET DATA", "URL": "https://example/x.nc"}]}}
+    with pytest.raises(RuntimeError, match="access='download'"):
+        mur._dap_base(g)
+
+
+def test_an_unknown_access_backend_fails_at_config_time(base_project):
+    """Not on granule 400, after the search has already run."""
+    base_project["products"]["mur"] = {"access": "harmony"}
+    with pytest.raises(ValueError, match="not a known backend"):
+        mur._build_eff(parse_config(base_project))
+
+
+def test_access_defaults_to_download(base_project):
+    """The default-unchanged guard: the measured path is opt-in, not a surprise switch."""
+    base_project["products"]["mur"] = None
+    assert _ds(mur._build_eff(parse_config(base_project)))["access"] == "download"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
