@@ -1058,7 +1058,28 @@ def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> N
     # on disk (sorted), so a version acquired but dropped from the config still contributes a
     # channel and merges last rather than vanishing.
     pref = ctx.eff["sensor_version_pref"].get(s.product.value, [])
-    on_disk = {d.name for d in base.iterdir() if d.is_dir()}
+    # A SOURCE TAG IS A DIRECTORY THAT ACTUALLY HOLDS GRANULES, not merely a subdirectory.
+    # Every subdir used to become a tag, so a flat pre-stacking leftover (`MODIS/aligned`,
+    # `ECOSTRESS/aligned`) or a scratch dir (`MODIS/_tmp`) was loaded as a version: the loader
+    # then resolved its granules at `<DIR>/<tag>/aligned/<aoi>`, which does not exist, and
+    # `_load_sensor` returned empty arrays that were emitted anyway. The result was a COMPLETE
+    # but entirely-NaN channel set (`eco_sst_aligned`, `eco_valid_aligned`, ...) which every
+    # prefix-fanning preprocess step then forked again -- and an all-NaN `_georef_corrected`
+    # channel reads as "the correction ran and moved nothing", not as "this tag is a phantom".
+    # See docs/bug-empty-version-tag-channels.md, Defect A.
+    #
+    # The test is STRUCTURAL -- does `<DIR>/<tag>/aligned/` exist -- rather than "does this
+    # AoI have granules under it". A real tag whose coverage misses ONE AoI must still emit
+    # that AoI's (empty) channel set, or two AoIs in the same project would end up with
+    # different channel sets and stop being comparable; a phantom has no `aligned` level at
+    # all, which is exactly what distinguishes it.
+    all_dirs = {d.name for d in base.iterdir() if d.is_dir()}
+    on_disk = {t for t in all_dirs if ctx.adir(s.product.value, t).parent.is_dir()}
+    # Silently ignoring a directory the user put on disk is its own failure mode.
+    for t in sorted(all_dirs - on_disk):
+        log.info("  %s: ignoring %s/%s -- no %s level, so it is not a source tag",
+                 sp.prefix, PRODUCT_DIRS[s.product.value], t,
+                 ctx.adir(s.product.value, t).parent.name)
     ordered = [t for t in pref if t in on_disk] + sorted(on_disk - set(pref))
 
     per_tag_times: dict[str, list] = {}

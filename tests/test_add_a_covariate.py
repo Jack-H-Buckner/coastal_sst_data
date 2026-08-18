@@ -147,10 +147,10 @@ def test_an_assembled_cube_gains_the_covariate_channel(with_chl_contributor, pro
     import json
     assert json.loads(ds.attrs["coverage"])["chl"]["fraction"] == 1.0
 
-    # And the existing flat sensors are untouched by its arrival. (ECOSTRESS is a stacked-data
-    # sensor now -- its per-version channels appear only where a version tree exists, so it is
-    # exercised in test_datacube, not here where no eco scene is written.)
-    for pre in ("lst", "modis"):
+    # And the existing flat sensors are untouched by its arrival. (ECOSTRESS and MODIS are
+    # stacked-data sensors -- their per-source channels appear only where a source tree exists,
+    # so they are exercised in test_datacube, not here where no such scene is written.)
+    for pre in ("lst", "modisref"):
         assert f"{pre}_sst" in ds.data_vars
 
 

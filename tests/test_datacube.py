@@ -109,8 +109,10 @@ def write_landsat(project, g, day, hour, temp=288.0):
     _write(project, "LANDSAT", f"{AOI}_{stamp}.nc", ds)
 
 
-def write_modis(project, g, day, temp=287.0, *, footprint=True, block=3, temp_step=0.0):
-    """One MODIS scene, with the `footprint_id` layer MODIS writes by default.
+def write_modis_ref(project, g, day, temp=287.0, *, footprint=True, block=3, temp_step=0.0,
+                    hour=21):
+    """One MODIS_REF scene -- the Landsat-coincident calibration reference, with the
+    `footprint_id` layer it writes by default.
 
     The ids are laid out as `block` x `block` tiles, which is the shape a real nearest-neighbour
     resample from a ~1 km swath onto a fine grid produces: many grid cells per native pixel.
@@ -118,6 +120,9 @@ def write_modis(project, g, day, temp=287.0, *, footprint=True, block=3, temp_st
     footprint-grouped average has something to average; the 0.0 default keeps SST constant for
     the tests that predate the layer. `footprint=False` writes the pre-feature file (sst+valid),
     which is what a granule acquired with `footprint_id: false` looks like.
+
+    This is the FLAT MODIS product. The standalone `modis` sensor is STACKED per platform --
+    see `write_modis` below.
     """
     H, W, xs, ys = _grid_hw(g)
     rows, cols = np.arange(H)[:, None], np.arange(W)[None, :]
@@ -128,7 +133,31 @@ def write_modis(project, g, day, temp=287.0, *, footprint=True, block=3, temp_st
     if footprint:
         data["footprint_id"] = (("time", "y", "x"), fp[None])
     ds = xr.Dataset(data, coords={"time": [day], "y": ys, "x": xs})
-    _write(project, "MODIS", f"{AOI}_{day.strftime('%Y%m%d')}T210000.nc", ds)
+    _write(project, "MODIS_REF", f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc", ds)
+
+
+def write_modis(project, g, day, temp=287.0, *, tag="terra", hour=6, rows=None):
+    """One standalone-MODIS scene, into its PLATFORM tree (MODIS/<tag>/aligned/<aoi>).
+
+    Terra and Aqua are stacked sources (D10), so each writes its own tree and the cube ships
+    one channel-set per platform (`modis_sst_terra`, `modis_sst_aqua`). No `footprint_id`:
+    that layer belongs to MODIS_REF, and its absence is what lets this product mosaic.
+
+    `rows` restricts the valid region, which is how a same-night pair of overlapping orbits is
+    simulated -- each granule covering a different part of the AoI.
+    """
+    H, W, xs, ys = _grid_hw(g)
+    valid = np.zeros((H, W), "uint8")
+    sst = np.full((H, W), np.nan, "float32")
+    sl = slice(None) if rows is None else rows
+    valid[sl] = 1
+    sst[sl] = temp
+    ds = xr.Dataset({"sst": (("time", "y", "x"), sst[None]),
+                     "valid": (("time", "y", "x"), valid[None])},
+                    coords={"time": [day], "y": ys, "x": xs})
+    d = project.output_dir / "MODIS" / tag / "aligned" / AOI
+    d.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(d / f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc")
 
 
 def write_cmems(project, g, days, *, land_cols, src="my_global"):
@@ -188,7 +217,7 @@ def test_channel_layout_and_dims(project, grids, days):
     ds = datacube.assemble_aoi(g, eff, days)
 
     assert ds.sizes == {"time": len(days), "y": g.height, "x": g.width}
-    for v in ["mur_sst", "eco_sst_v002", "lst_sst", "modis_sst", "airtemp_hrrr",
+    for v in ["mur_sst", "eco_sst_v002", "lst_sst", "modisref_sst", "airtemp_hrrr",
               "elevation_cudem", "depth_cudem", "landcover_water", "tide_coops", "doy_sin"]:
         assert v in ds.data_vars
     # A stacked-data sensor emits per-version channels, not a bare `eco_sst`.
@@ -371,10 +400,71 @@ def test_the_earliest_granule_still_wins_a_tie_under_mosaicking(project, grids, 
     assert int(ds["lst_valid"].isel(time=0).values.sum()) == H * g.width   # still the union
 
 
+def test_modis_platforms_are_stacked_not_merged(project, grids, days):
+    """Terra and Aqua are two spacecraft in two orbits and never observe the same overpass.
+    Merging them into one `modis_sst` would blend two times of day -- and since NASA stopped
+    maintaining the orbits those two times drift APART, so the blend gets worse over the
+    record. Each platform gets its own channel set, and a bare `modis_sst` must not exist."""
+    g = grids[AOI]
+    _modis_base(project, g, days)
+    write_modis(project, g, days[1], temp=287.0, tag="terra", hour=6)
+    write_modis(project, g, days[1], temp=283.0, tag="aqua", hour=9)
+
+    ds = _bare_cube(project, g, days)
+
+    assert "modis_sst" not in ds.data_vars
+    assert np.nanmean(ds["modis_sst_terra"].isel(time=1).values) == pytest.approx(287.0)
+    assert np.nanmean(ds["modis_sst_aqua"].isel(time=1).values) == pytest.approx(283.0)
+    assert ds["modis_hour_terra"].values[1] == pytest.approx(6.0)
+    assert ds["modis_hour_aqua"].values[1] == pytest.approx(9.0)
+    # MODIS arrives quality-filtered with no cloud LAYER, so it publishes no cloud channel --
+    # an all-zero one would read as "this scene was never cloudy".
+    assert not [c for c in ds.data_vars if c.startswith("modis_cloud")]
+
+
+def test_modis_mosaics_a_platforms_two_night_orbits(project, grids, days):
+    """Above ~32 deg latitude consecutive same-night orbits OVERLAP, so one platform sees an
+    AoI about twice a night, each pass covering a different part of it. Keeping only the
+    clearest threw the other's exclusive coverage away -- which for a coastal AoI is half the
+    scene. `modis` can mosaic precisely because it carries no footprint ids."""
+    g = grids[AOI]
+    H, W, _, _ = _grid_hw(g)
+    _modis_base(project, g, days)
+    write_modis(project, g, days[1], tag="terra", hour=6, rows=slice(0, H // 2))
+    write_modis(project, g, days[1], tag="terra", hour=7, rows=slice(H // 2, H))
+
+    ds = _bare_cube(project, g, days)
+
+    got = int(ds["modis_valid_terra"].isel(time=1).values.sum())
+    assert got == H * W, f"the two orbits were not merged: {got} of {H * W} cells valid"
+    # The day's reported hour is still the BASE granule's -- filled cells came from the other.
+    assert ds["modis_hour_terra"].values[1] == pytest.approx(6.0)
+
+
+def test_a_stray_directory_is_not_loaded_as_a_platform(project, grids, days):
+    """docs/bug-empty-version-tag-channels.md, Defect A. Every subdirectory of a stacked
+    product's dir used to become a source tag, so a flat pre-stacking leftover (MODIS/aligned)
+    or a scratch dir (MODIS/_tmp) produced a COMPLETE all-NaN channel set that every
+    prefix-fanning preprocess step then forked again."""
+    g = grids[AOI]
+    _modis_base(project, g, days)
+    write_modis(project, g, days[1], tag="terra", hour=6)
+    # A leftover flat tree and a scratch dir, both direct children of MODIS/.
+    (project.output_dir / "MODIS" / "aligned" / AOI).mkdir(parents=True)
+    (project.output_dir / "MODIS" / "_tmp").mkdir(parents=True)
+
+    ds = _bare_cube(project, g, days)
+
+    assert "modis_sst_terra" in ds.data_vars
+    for phantom in ("modis_sst_aligned", "modis_sst__tmp",
+                    "modis_valid_aligned", "modis_hour__tmp"):
+        assert phantom not in ds.data_vars, f"{phantom} is a phantom channel"
+
+
 def test_modis_is_not_mosaicked(project, grids, days):
-    """MODIS opts out: its `footprint_id` ids restart at 0 per granule, so a merged day would
-    hold two granules' unrelated native-pixel indices in one channel. Its granules are whole
-    overpasses hours apart, not adjoining halves of one, so a day loses no coverage."""
+    """MODIS_REF opts out: its `footprint_id` ids restart at 0 per granule, so a merged day
+    would hold two granules' unrelated native-pixel indices in one channel. Its granules are
+    whole overpasses hours apart, not adjoining halves of one, so a day loses no coverage."""
     g = grids[AOI]
     H, W, xs, ys = _grid_hw(g)
     _modis_base(project, g, days)
@@ -387,12 +477,12 @@ def test_modis_is_not_mosaicked(project, grids, days):
             "sst": (("time", "y", "x"), sst[None]),
             "valid": (("time", "y", "x"), valid[None]),
         }, coords={"time": [days[1]], "y": ys, "x": xs})
-        _write(project, "MODIS", f"{AOI}_{days[1].strftime('%Y%m%d')}T{hh:02d}0000.nc", ds)
+        _write(project, "MODIS_REF", f"{AOI}_{days[1].strftime('%Y%m%d')}T{hh:02d}0000.nc", ds)
 
     ds = _bare_cube(project, g, days)
 
-    got = int(ds["modis_valid"].isel(time=1).values.sum())
-    assert got == (H // 2) * W, f"MODIS was mosaicked to {got}; it must keep the winner alone"
+    got = int(ds["modisref_valid"].isel(time=1).values.sum())
+    assert got == (H // 2) * W, f"MODIS_REF was mosaicked to {got}; it must keep the winner alone"
 
 
 def test_ecostress_mosaics_within_a_version_not_across_them(tmp_path, days):
@@ -545,7 +635,7 @@ def test_mosaic_and_footprints_together_are_refused(project, grids, days):
     """Unreachable through the registry (`_check_registry` forbids the pairing), so this pins
     the loader's own guard for a direct caller."""
     g = grids[AOI]
-    d = project.output_dir / "MODIS" / "aligned" / AOI
+    d = project.output_dir / "MODIS_REF" / "aligned" / AOI
     with pytest.raises(ValueError, match="footprint"):
         datacube.load_clearest_overpass(d, AOI, days, g.height, g.width,
                                         mosaic=True, read_footprint=True)
@@ -615,12 +705,12 @@ def test_modis_trusts_valid_layer(project, grids, days):
     write_mur(project, g, days, water_hole_cols=slice(0, 0))
     write_bathymetry(project, g)
     write_landcover(project, g, land_cols=slice(0, 0))
-    write_modis(project, g, days[1], temp=290.0)
+    write_modis_ref(project, g, days[1], temp=290.0)
     eff = datacube._build_eff(project)
     ds = datacube.assemble_aoi(g, eff, days)
-    assert np.nanmean(ds["modis_sst"].isel(time=1).values) == pytest.approx(290.0)
-    assert int(ds["modis_valid"].isel(time=1).values.sum()) == g.height * g.width
-    assert np.isnan(ds["modis_sst"].isel(time=0).values).all()   # no granule that day
+    assert np.nanmean(ds["modisref_sst"].isel(time=1).values) == pytest.approx(290.0)
+    assert int(ds["modisref_valid"].isel(time=1).values.sum()) == g.height * g.width
+    assert np.isnan(ds["modisref_sst"].isel(time=0).values).all()   # no granule that day
 
 
 # --------------------------------------------------------------------------- #
@@ -642,20 +732,20 @@ def _modis_base(project, g, days):
 def test_modis_footprint_id_reaches_the_cube(project, grids, days):
     g = grids[AOI]
     _modis_base(project, g, days)
-    write_modis(project, g, days[1], temp=290.0, block=3)
+    write_modis_ref(project, g, days[1], temp=290.0, block=3)
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
-    assert "modis_footprint_id" in ds.data_vars
+    assert "modisref_footprint_id" in ds.data_vars
     # An INDEX, not a measurement: int32 with a -1 sentinel, never a float with NaN.
-    assert ds["modis_footprint_id"].dtype == np.int32
-    fp = ds["modis_footprint_id"].isel(time=1).values
+    assert ds["modisref_footprint_id"].dtype == np.int32
+    fp = ds["modisref_footprint_id"].isel(time=1).values
     assert (fp >= 0).all()                               # the whole AoI was in swath
     # Days with no granule are -1 throughout -- distinguishable from any real id.
-    assert (ds["modis_footprint_id"].isel(time=0).values == -1).all()
+    assert (ds["modisref_footprint_id"].isel(time=0).values == -1).all()
     # A footprint spans many grid cells; that is the entire point of the channel.
     _, counts = np.unique(fp, return_counts=True)
     assert counts.max() == 9                              # 3x3 blocks
-    assert "NOT comparable across days" in ds["modis_footprint_id"].attrs["comment"]
+    assert "NOT comparable across days" in ds["modisref_footprint_id"].attrs["comment"]
 
 
 def test_footprint_ids_group_cells_that_share_one_modis_observation(project, grids, days):
@@ -663,11 +753,11 @@ def test_footprint_ids_group_cells_that_share_one_modis_observation(project, gri
     so averaging another sensor within an id is averaging over one MODIS observation."""
     g = grids[AOI]
     _modis_base(project, g, days)
-    write_modis(project, g, days[1], temp=290.0, block=3, temp_step=0.5)
+    write_modis_ref(project, g, days[1], temp=290.0, block=3, temp_step=0.5)
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
-    fp = ds["modis_footprint_id"].isel(time=1).values
-    sst = ds["modis_sst"].isel(time=1).values
+    fp = ds["modisref_footprint_id"].isel(time=1).values
+    sst = ds["modisref_sst"].isel(time=1).values
     for fid in np.unique(fp):
         block = sst[fp == fid]
         assert np.ptp(block) == 0.0, f"footprint {fid} spans >1 MODIS value"
@@ -681,11 +771,11 @@ def test_no_footprint_channel_when_the_granules_never_carried_one(project, grids
     ABSENT rather than all -1 -- which would read as 'nothing was ever in swath'."""
     g = grids[AOI]
     _modis_base(project, g, days)
-    write_modis(project, g, days[1], temp=290.0, footprint=False)
+    write_modis_ref(project, g, days[1], temp=290.0, footprint=False)
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
-    assert "modis_footprint_id" not in ds.data_vars
-    assert "modis_sst" in ds.data_vars                    # the rest of MODIS is unaffected
+    assert "modisref_footprint_id" not in ds.data_vars
+    assert "modisref_sst" in ds.data_vars                 # the rest of MODIS_REF is unaffected
 
 
 def test_no_int32_footprint_is_allocated_when_no_granule_carried_the_layer(
@@ -699,7 +789,7 @@ def test_no_int32_footprint_is_allocated_when_no_granule_carried_the_layer(
     """
     g = grids[AOI]
     _modis_base(project, g, days)
-    write_modis(project, g, days[1], temp=290.0, footprint=False)
+    write_modis_ref(project, g, days[1], temp=290.0, footprint=False)
 
     big = []
     real_full = np.full
@@ -711,7 +801,7 @@ def test_no_int32_footprint_is_allocated_when_no_granule_carried_the_layer(
         return out
 
     monkeypatch.setattr(datacube.np, "full", spy)
-    d = project.output_dir / "MODIS" / "aligned" / AOI
+    d = project.output_dir / "MODIS_REF" / "aligned" / AOI
     *_, footprint = datacube.load_clearest_overpass(
         d, AOI, days, g.height, g.width, trust_valid=True, read_footprint=True)
 
@@ -738,11 +828,11 @@ def test_footprint_comes_from_the_same_scene_as_the_sst(project, grids, days):
              "valid": (("time", "y", "x"), valid[None]),
              "footprint_id": (("time", "y", "x"), fp[None])},
             coords={"time": [days[1]], "y": ys, "x": xs})
-        _write(project, "MODIS", f"{AOI}_{days[1].strftime('%Y%m%d')}T{hh:02d}0000.nc", ds_in)
+        _write(project, "MODIS_REF", f"{AOI}_{days[1].strftime('%Y%m%d')}T{hh:02d}0000.nc", ds_in)
 
     ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
-    assert ds["modis_hour"].values[1] == pytest.approx(21.0)      # the clearer scene won
-    _, counts = np.unique(ds["modis_footprint_id"].isel(time=1).values, return_counts=True)
+    assert ds["modisref_hour"].values[1] == pytest.approx(21.0)   # the clearer scene won
+    _, counts = np.unique(ds["modisref_footprint_id"].isel(time=1).values, return_counts=True)
     assert counts.max() == 9        # the 21:00 scene's 3x3 blocks, not the 19:00 scene's 2x2
 
 
@@ -1264,16 +1354,25 @@ def _write_full_fixture(project, g, days):
     write_landcover(project, g, land_cols=slice(0, 5))
     write_ecostress_two_scenes(project, g, days[0])      # clearest scene 20:00
     write_landsat(project, g, days[0], hour=18)
-    write_modis(project, g, days[1], temp=287.0)         # overpass 21:00
+    # The standalone sensor, STACKED per platform: two night overpasses of the same AoI.
+    write_modis(project, g, days[1], temp=287.0, tag="terra", hour=6)
+    write_modis(project, g, days[1], temp=286.5, tag="aqua", hour=9)
+    # ...and the Landsat-coincident reference, which is flat and carries footprint ids.
+    write_modis_ref(project, g, days[1], temp=287.0, hour=21)
     write_cmems(project, g, days, land_cols=slice(0, 4), src="my_global")
     write_cmems(project, g, days, land_cols=slice(0, 4), src="anfc_global")  # stacked (D10)
     write_met_daily(project, g, days, temp=280.0)                 # daily mean
     write_met_daily(project, g, days, temp=291.0, prefix="ref_")  # reference snapshot
     write_met_snapshot(project, g, days[0], 20, temp=286.0)       # eco overpass
     write_met_snapshot(project, g, days[0], 18, temp=299.0)       # lst overpass
-    write_met_snapshot(project, g, days[1], 21, temp=285.0)       # modis overpass
-    write_insitu(project, g, ["2026-06-01T18:00", "2026-06-01T20:00", "2026-06-02T21:00"],
-                 [12.5, 13.0, 14.0])
+    write_met_snapshot(project, g, days[1], 21, temp=285.0)       # modis_ref overpass
+    write_met_snapshot(project, g, days[1], 6, temp=283.0)        # modis terra night overpass
+    # 06:00 is the terra NIGHT overpass, so the standalone sensor's in-situ matchup carries a
+    # real value rather than being an all-NaN channel nothing would notice breaking.
+    write_insitu(project, g,
+                 ["2026-06-01T18:00", "2026-06-01T20:00", "2026-06-02T06:00",
+                  "2026-06-02T21:00"],
+                 [12.5, 13.0, 13.5, 14.0])
     write_tides(project, g, days)
 
 
@@ -1398,6 +1497,12 @@ def test_golden_cube_is_unchanged(project, grids, days):
     eff = datacube._build_eff(project)
     eff["met_overpass_combos"] = [("eco", "hrrr"), ("lst", "hrrr")]
     eff["tide_overpass_combos"] = [("eco", "coops"), ("lst", "coops")]
+    # A stacked sensor keeps ONE overpass identity for the matchups, preferring the
+    # config-listed source order per day. The minimal project fixture selects no modis block,
+    # so without this the preference falls back to on-disk ALPHABETICAL order and `aqua`
+    # silently becomes the identity every in-situ/met/tide matchup keys off. Pin it, as a
+    # real `platforms: [terra, aqua]` config would.
+    eff["sensor_version_pref"]["modis"] = ["terra", "aqua"]
     ds = datacube.assemble_aoi(g, eff, days)
     actual = _snapshot(ds)
 
@@ -1426,6 +1531,12 @@ def _assemble_to_zarr(project, block_days=None):
     eff = datacube._build_eff(project)
     eff["met_overpass_combos"] = [("eco", "hrrr"), ("lst", "hrrr")]
     eff["tide_overpass_combos"] = [("eco", "coops"), ("lst", "coops")]
+    # A stacked sensor keeps ONE overpass identity for the matchups, preferring the
+    # config-listed source order per day. The minimal project fixture selects no modis block,
+    # so without this the preference falls back to on-disk ALPHABETICAL order and `aqua`
+    # silently becomes the identity every in-situ/met/tide matchup keys off. Pin it, as a
+    # real `platforms: [terra, aqua]` config would.
+    eff["sensor_version_pref"]["modis"] = ["terra", "aqua"]
     if block_days is not None:
         eff["block_days"] = block_days
     datacube.run(eff, grid.project_grids(project), None, False)
@@ -1516,12 +1627,12 @@ def test_footprint_channel_survives_blocking_when_one_block_lacks_the_layer(tmp_
         days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
         write_mur(p, g, days, water_hole_cols=slice(0, 0))
         for i in range(6):
-            write_modis(p, g, days[i], temp=287.0, footprint=(i == only_day))
+            write_modis_ref(p, g, days[i], temp=287.0, footprint=(i == only_day))
 
         snap = _assemble_to_zarr(p, block_days=2)        # 3 blocks; only one has the layer
 
         assert snap["dims"]["time"] == 6
-        fp = snap["data_vars"]["modis_footprint_id"]
+        fp = snap["data_vars"]["modisref_footprint_id"]
         assert fp["shape"][0] == 6, "the footprint channel is shorter than the time axis"
         assert fp["stats"]["min"] == -1               # the days without the layer
         assert fp["stats"]["max"] > 0                 # the day with it
@@ -1663,7 +1774,7 @@ def test_a_warning_about_the_tree_is_logged_once_not_once_per_block(tmp_path, ca
     # A partly backfilled MODIS tree: every block then holds one scene-day with the footprint
     # layer and one without, so the "partly backfilled" warning is reached in every block.
     for i in range(8):
-        write_modis(p, g, days[i], temp=287.0, footprint=(i % 2 == 0))
+        write_modis_ref(p, g, days[i], temp=287.0, footprint=(i % 2 == 0))
 
     eff = datacube._build_eff(p)
     eff["block_days"] = 2                                   # 4 blocks

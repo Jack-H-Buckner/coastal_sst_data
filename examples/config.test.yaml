@@ -130,6 +130,29 @@ products:
     depths: [0, 10]      # metres; each SNAPPED to the nearest model level
   landsat:
     source: "pc"        # pc (default) | aws | gee
+  modis:                # the standalone ~1 km thermal sensor (GHRSST MODIS L2P skin SST)
+    # DISTINCT-DATA PLATFORMS are STACKED (one modis_sst_<platform> channel-set each), not
+    # picked-one: Terra and Aqua are two spacecraft in two orbits and never observe the same
+    # overpass. ORDER MATTERS -- the first listed wins the single overpass identity that the
+    # in-situ / met / tide matchups key off. Absent -> both, terra first.
+    platforms: [terra, aqua]
+    # night | day | both. Decided on LOCAL MEAN SOLAR time at the AoI, not on a fixed clock:
+    # NASA stopped maintaining both orbits (Terra 2020, Aqua 2021) and the crossings have
+    # since drifted hours -- Terra's morning 10:30 -> ~09:00, Aqua's afternoon 13:30 -> ~15:50
+    # -- so a fixed UTC window silently loses the ends of a long record.
+    time_of_day: night
+    # night_solar_hours: [19, 5]   # the window that means "night"; wraps midnight
+    quality_min: 4      # GHRSST quality_level: >=4 acceptable, 5 best
+    # download -> whole granules (~15-25 MB each, ~15 variables, global swath).
+    # harmony  -> server-side bbox + variable subset, so only the AoI crosses the wire.
+    # A night Terra+Aqua series is tens of thousands of granules, hence the default.
+    access: harmony
+  # modis_ref:          # OPTIONAL: the same instrument as a LANDSAT-COINCIDENT reference,
+  #                     #   for calibrating Landsat's absolute scale against MODIS.
+  #   match_landsat: true          # keep only granules near an acquired Landsat scene
+  #   max_time_diff_minutes: 360
+  #   time_of_day: day             # Landsat flies in the morning
+  #   access: download             # its footprint ids index the NATIVE swath -- do not subset
   met:                        # daily FORCING (no sensor dependency)
     # DISTINCT-DATA sources STACKED (one <var>_<src> channel each): hrrr (N. America), era5
     # (global). No fallback -- a region outside HRRR stacks only era5.

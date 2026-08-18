@@ -1,42 +1,56 @@
 #!/usr/bin/env python3
 """
-coastal_sst_data -- MODIS Terra L2P Sea-Surface Temperature acquisition.
+coastal_sst_data -- MODIS L2P Sea-Surface Temperature acquisition (Terra + Aqua).
 
-Loads GHRSST MODIS Terra L2P skin SST (NASA OB.DAAC via earthaccess) and grids it
-onto the shared AoiGrid. MODIS L2P is a SWATH product (2D curvilinear lat/lon),
-so it is regridded with pyresample nearest-neighbour (`resample_nearest`) -- NOT
-rioxarray reproject. Nearest is deliberate: it preserves the actual observed
-MODIS values (block-constant on the fine grid) so a DOWNSTREAM calibration module
-can match Landsat to MODIS faithfully. Calibration itself is out of scope here --
-this module only LOADS and grids the data.
+Loads GHRSST MODIS L2P skin SST (NASA OB.DAAC via earthaccess) and grids it onto the shared
+AoiGrid. MODIS L2P is a SWATH product (2D curvilinear lat/lon), so it is regridded with
+pyresample nearest-neighbour (`resample_nearest`) -- NOT rioxarray reproject. Nearest is
+deliberate: it preserves the actual observed MODIS values (block-constant on the fine grid)
+rather than inventing intermediate ones a 1 km sensor never measured.
 
-Coincidence with Landsat (configurable):
-  * match_landsat: true (default) -- only load MODIS granules within
-    `max_time_diff_minutes` of an already-acquired Landsat scene (read from
-    <output_dir>/LANDSAT/aligned/<aoi>/). Requires Landsat to have run first.
-  * match_landsat: false -- load the full MODIS time series over the date range.
+STACKED PLATFORMS (D10). Terra and Aqua are two instruments on two spacecraft in two orbits;
+they never observe the same overpass, so each is acquired into its own tree and contributes
+its own cube channel set (`modis_sst_terra`, `modis_sst_aqua`) rather than one falling back
+to the other:
+
+    <output_dir>/MODIS/<platform>/aligned/<aoi>/<aoi>_<YYYYMMDDTHHMMSS>.nc
+
+Keeping them apart is not cosmetic. NASA stopped maintaining both orbits (Terra's last
+inclination maneuver Feb 2020, Aqua's Mar 2021) and the two equator crossings have since
+drifted in OPPOSITE directions -- Terra earlier, Aqua later -- so a single merged channel
+would blend two diverging times of day into one number.
+
+TIME OF DAY. Nominal local crossings are Terra 10:30 / 22:30 and Aqua 13:30 / 01:30, but the
+drift above means those are the START of the record, not a property of it: by end of mission
+Terra's morning crossing had reached ~09:00 and Aqua's afternoon ~15:50. So the day/night
+selection is made on COMPUTED LOCAL MEAN SOLAR TIME (`solar_hour`), not on a fixed clock and
+not on the granule filename's `-D-`/`-N-` token alone -- see `select_by_time_of_day`.
+
+Above ~32 deg latitude consecutive same-night orbits overlap, so a platform typically sees an
+AoI twice a night -- once near nadir, once near the swath edge, each covering a different part
+of it. Both are kept; the assembler mosaics them (`mosaic_same_day=True` on the spec).
 
 Access backends (configurable via `access`):
-  * download (default) -- earthaccess.download the full granule, crop in memory.
-  * harmony  -- server-side AOI subsetting (NOT yet implemented; documented next step).
+  * harmony (default) -- server-side bbox + variable subsetting, so only the AoI crosses the
+    wire. A full L2P granule is ~15-25 MB of a ~2030x1354 swath with ~15 variables, of which
+    this module reads four; a multi-year night-time series over both platforms is tens of
+    thousands of granules, which is the whole reason this backend exists.
+  * download -- earthaccess.download the full granule, crop in memory. No extra dependency,
+    and the only option for a caller that needs NATIVE swath indices (see processes.modis_ref).
 
-Output: one aligned NetCDF per granule at
-    <output_dir>/MODIS/aligned/<aoi>/<aoi>_<YYYYMMDDTHHMMSS>.nc
-Variables: sst (K|degC), valid (uint8), and (optional) footprint_id -- the MODIS
-swath pixel index each grid cell was drawn from, for exact footprint-median
-matchups downstream.
+Output variables: sst (K|degC) and valid (uint8). MODIS L2P arrives quality-filtered, with no
+water or cloud layer to recompute from, so this product publishes no `modis_cloud` channel.
 
 Usage:
     python -m coastal_sst_data.processes.modis --config config.yaml
     python -m coastal_sst_data.processes.modis --config config.yaml --dry-run
-    python -m coastal_sst_data.processes.modis --config config.yaml --full-series
 """
 
 from __future__ import annotations
 
 import logging
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -48,35 +62,57 @@ import rioxarray  # noqa: F401  (registers the .rio accessor)
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import auth, entry, naming, net, provenance, report, store
+from .. import auth, entry, naming, net, products, provenance, report, store
 
 log = logging.getLogger(__name__)
 
 # --- MODIS L2P product constants (overridable via the modis product options) - #
 SOURCE = "modis"
-SHORT_NAME = "MODIS_T-JPL-L2P-v2019.0"       # MODIS Terra L2P skin SST (GHRSST)
+
+# Platform TAG -> GHRSST collection short name. The tag is the provenance identity: it names
+# the output tree (`MODIS/<tag>/aligned`) and the cube channel suffix (`modis_sst_<tag>`).
+PLATFORMS = {
+    "terra": "MODIS_T-JPL-L2P-v2019.0",
+    "aqua": "MODIS_A-JPL-L2P-v2019.0",
+}
+DEFAULT_PLATFORMS = ("terra", "aqua")
+
 DEFAULT_VARIABLE = "sea_surface_temperature"  # Kelvin (xarray auto-unscales)
 QUALITY_VAR = "quality_level"                 # GHRSST: >=4 acceptable, 5 best
+GEO_VARS = ("lat", "lon")                     # the 2D swath geolocation
 DEFAULT_QUALITY_MIN = 4
-DEFAULT_RADIUS_M = 1500.0                      # pyresample search radius (~1 km px)
-DEFAULT_MAX_TIME_DIFF_MIN = 360               # +/- 6 h Landsat<->MODIS overpass
+DEFAULT_RADIUS_M = 1500.0                     # pyresample search radius (~1 km px)
+
+# Day/night selection. `night_solar_hours` is a LOCAL MEAN SOLAR time window and it WRAPS
+# through midnight, which is the only shape that can describe a night. The default spans both
+# platforms' night crossings across the whole 2000-2026 record including the orbit drift
+# (Terra 22:30 -> ~21:00, Aqua 01:30 -> ~03:50); `day` is its complement.
+DEFAULT_TIME_OF_DAY = "night"
+DEFAULT_NIGHT_SOLAR_HOURS = (19.0, 5.0)
+TIMES_OF_DAY = ("night", "day", "both")
 
 
 # --------------------------------------------------------------------------- #
-# Coincidence helpers
+# Time of day: local solar hour, and selecting granules by it
 # --------------------------------------------------------------------------- #
-def _landsat_times(landsat_dir: Path, aoi: str) -> list[datetime]:
-    """Acquisition times of the Landsat aligned files already written for an AoI.
+def solar_hour(t: datetime, lon: float) -> float:
+    """Local MEAN SOLAR hour at longitude `lon` for a UTC instant, in [0, 24).
 
-    Reads the stamp Landsat WROTE via the shared convention (coastal_sst_data.naming), so
-    the two cannot drift: this coincidence filter is the one place where one product's
-    filenames are parsed by another product's code.
+    The inverse of the conversion `processes.met.reference_time_utc` already applies to turn
+    a solar reference time into UTC (`utc = solar - lon/15`), so the two stages agree on what
+    "local time" means by construction rather than by coincidence.
+
+    Mean solar, not apparent: no equation-of-time term. That is worth up to ~16 minutes, which
+    is an order of magnitude below the multi-hour windows this feeds and two orders below the
+    orbit drift it exists to absorb.
     """
-    d = landsat_dir / aoi
-    if not d.exists():
-        return []
-    return [t for f in d.glob(f"{aoi}_*T*.nc")
-            if (t := naming.parse_time(f.name)) is not None]
+    utc_h = t.hour + t.minute / 60.0 + t.second / 3600.0
+    return (utc_h + lon / 15.0) % 24.0
+
+
+def _in_window(h: float, lo: float, hi: float) -> bool:
+    """Is hour `h` inside [lo, hi), where lo > hi means the window WRAPS through midnight."""
+    return (lo <= h < hi) if lo <= hi else (h >= lo or h < hi)
 
 
 def _granule_time(granule) -> datetime:
@@ -84,15 +120,59 @@ def _granule_time(granule) -> datetime:
     return datetime.strptime(t, "%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def _is_night(granule) -> bool:
-    return "-N-" in granule["meta"].get("native-id", "")
+def _day_night(granule) -> str | None:
+    """'day' | 'night' from the GHRSST filename token, or None when it is absent.
+
+    The `-D-`/`-N-` token in a GHRSST native-id is OBPG's own classification of which side of
+    the orbit the granule is on, so it is authoritative about the granule. It is NOT
+    authoritative about the local hour, which is what drifts -- hence it is used to CONFIRM the
+    solar-time decision rather than to make it.
+    """
+    nid = granule["meta"].get("native-id", "")
+    if "-N-" in nid:
+        return "night"
+    if "-D-" in nid:
+        return "day"
+    return None
+
+
+def select_by_time_of_day(granules, *, time_of_day: str, night_hours, lon: float):
+    """Filter granules to a time of day. Returns [(granule, acq_time), ...] sorted by time.
+
+    The decision is made on LOCAL MEAN SOLAR HOUR at the AoI, because the thing being selected
+    for -- "this is a night-time observation" -- is a fact about the sun, and MODIS's UTC
+    overpass time for a fixed place moved by hours over the mission as the orbits drifted. A
+    fixed UTC window, or a hard-coded 22:30/01:30, silently loses granules at the ends of the
+    record.
+
+    The filename token is then required to AGREE where it exists. It almost always does; a
+    disagreement means the granule straddles the terminator (or the window has been set to cut
+    through one), and dropping it keeps the channel honest about what "night" meant.
+    """
+    kept = []
+    for gr in granules:
+        t = _granule_time(gr)
+        if time_of_day != "both":
+            want_night = time_of_day == "night"
+            if _in_window(solar_hour(t, lon), *night_hours) != want_night:
+                continue
+            token = _day_night(gr)
+            if token is not None and token != time_of_day:
+                log.debug("  %s: solar hour says %s but the granule is tagged %s; dropping",
+                          gr["meta"].get("native-id", "?"), time_of_day, token)
+                continue
+        kept.append((gr, t))
+    return sorted(kept, key=lambda x: x[1])
 
 
 # --------------------------------------------------------------------------- #
 # Fetch backends: granule -> local NetCDF path. Swappable via `access`.
 # --------------------------------------------------------------------------- #
-def _fetch_download(granule, bbox, tmp_dir: Path) -> Path:
-    """Download the full granule into a SCRATCH dir the caller will delete.
+def _fetch_download(granule, bbox, tmp_dir: Path, *, variables=None) -> Path:
+    """Download the FULL granule into a SCRATCH dir the caller will delete.
+
+    `variables` is accepted and ignored: this backend has no way to ask for less than the whole
+    file. That is the trade -- no extra dependency, no service round-trip, every byte.
 
     `earthaccess.download` skips a file that already exists BY NAME. That is a caching
     feature and, combined with the old lifecycle (unlink inside the try, so a killed run
@@ -114,13 +194,71 @@ def _fetch_download(granule, bbox, tmp_dir: Path) -> Path:
     return Path(paths[0])
 
 
-def _fetch_harmony(granule, bbox, tmp_dir: Path) -> Path:
-    """Server-side AOI subset via Harmony (documented next step)."""
-    raise NotImplementedError(
-        "modis access='harmony' is not implemented yet; use access='download'.")
+def _fetch_harmony(granule, bbox, tmp_dir: Path, *, variables=None) -> Path:
+    """Server-side subset via Harmony (PO.DAAC's l2ss-py), so only the AoI crosses the wire.
+
+    Two multipliers, and both matter at this product's scale: the BBOX trims the swath to the
+    AoI, and `variables` drops the ~11 L2P layers this module never reads (`sses_bias`,
+    `l2p_flags`, `sst_dtime`, `wind_speed`, ...). The variable list is derived from what
+    `read_swath` actually opens, so the request and the reader cannot drift apart.
+
+    Both CMR concept-ids come off the granule `earthaccess.search_data` already returned --
+    there is no second catalogue round-trip to address the granule to Harmony.
+
+    A single-granule request often completes without Harmony creating a job at all, in which
+    case `submit` returns the result JSON instead of a job id; `download_all` accepts either,
+    so the two paths do not need distinguishing here.
+    """
+    from harmony import BBox, Client, Collection, Request
+
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    meta = granule["meta"]
+    collection_id = meta.get("collection-concept-id")
+    granule_id = meta.get("concept-id")
+    if not collection_id or not granule_id:
+        raise RuntimeError(
+            "granule metadata carries no CMR concept-ids, so Harmony cannot address it; "
+            "use access='download' for this collection")
+
+    def _subset() -> list[str]:
+        # The client is built INSIDE the retry, like ECOSTRESS's `earthaccess.open`: its
+        # requests session carries the credential it was created with, so re-authenticating
+        # cannot heal a client already held -- only rebuilding it can.
+        #
+        # should_validate_auth=False because auth.login already verified this credential
+        # against EDL; leaving it on would add a round-trip per granule to re-ask a question
+        # the preflight answered.
+        client = Client(should_validate_auth=False, **auth.earthdata_client_auth())
+        req = Request(collection=Collection(id=collection_id),
+                      granule_id=[granule_id],
+                      spatial=BBox(*bbox),
+                      **({"variables": list(variables)} if variables else {}))
+        if not req.is_valid():
+            raise RuntimeError("invalid Harmony request: "
+                               + ", ".join(req.error_messages()))
+        job = client.submit(req)
+        # `download_all` is a GENERATOR and it SWALLOWS a failed job -- it prints to stderr and
+        # yields nothing. Materialising it here is what turns "the job failed" into an
+        # exception the retry and the ProductReport can both see, rather than a granule that
+        # silently produced no file.
+        futures = list(client.download_all(job, directory=str(tmp_dir), overwrite=True))
+        return [f.result() for f in futures]
+
+    paths = net.retry(_subset, what="MODIS Harmony subset",
+                      refresh=auth.refresher("earthdata"))
+    if not paths:
+        raise RuntimeError(
+            "Harmony returned no file for this granule (the job failed, or the subset was "
+            "empty); re-run with access='download' to see the unsubsetted granule")
+    return Path(paths[0])
 
 
 _ACCESS = {"download": _fetch_download, "harmony": _fetch_harmony}
+
+
+def harmony_variables(variable: str) -> tuple[str, ...]:
+    """The L2P variables a Harmony subset must carry -- exactly what `read_swath` opens."""
+    return (variable, QUALITY_VAR) + GEO_VARS
 
 
 # --------------------------------------------------------------------------- #
@@ -158,7 +296,8 @@ def resample_to_grid(sst, lat, lon, g: AoiGrid, radius_m, footprint=None):
 
 
 def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius,
-                   short_name=SHORT_NAME) -> xr.Dataset:
+                   short_name=None, platform=None, solar_h=None,
+                   day_night=None) -> xr.Dataset:
     xs, ys = g.xy_centers()
     data = {
         "sst": (("y", "x"), sst_g.astype("float32")),
@@ -178,37 +317,24 @@ def _scene_dataset(sst_g, fp_g, g: AoiGrid, acq_time, aoi_id, to_celsius,
     # old constant still stamped every file "Terra", so the cube misnamed its own sensor.
     ds.attrs.update(aoi_id=aoi_id, source=f"GHRSST {short_name}",
                     processing="swath -> nearest resample onto AoI grid")
+    # The overpass's LOCAL time, recorded per scene. The cube only carries the UTC hour, and
+    # the whole point of a multi-decade MODIS series is that the local hour behind that UTC
+    # hour MOVED -- so the drift has to be auditable from the granules themselves.
+    if platform is not None:
+        ds.attrs["platform"] = platform
+    if solar_h is not None:
+        ds.attrs["solar_hour"] = round(float(solar_h), 4)
+    if day_night is not None:
+        ds.attrs["day_night"] = day_night
     return ds
-
-
-# --------------------------------------------------------------------------- #
-# Coincidence filter (day/time + Landsat matchup)
-# --------------------------------------------------------------------------- #
-def _select_granules(granules, ls_times, match_landsat, max_dt, daytime_only):
-    """Filter granules to daytime and (optionally) within max_dt of a Landsat scene.
-
-    Returns [(granule, acq_time), ...] sorted by time.
-    """
-    kept = []
-    for gr in granules:
-        if daytime_only and _is_night(gr):
-            continue
-        t = _granule_time(gr)
-        if match_landsat:
-            nearest = min((abs(t - lt) for lt in ls_times), default=None)
-            if nearest is None or nearest > max_dt:
-                continue
-        kept.append((gr, t))
-    return sorted(kept, key=lambda x: x[1])
 
 
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
-def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
+def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=None):
     grid_cfg = eff["grid"]
-    out_root, tmp_dir, fmt, overwrite = eff["out_dir"], eff["tmp_dir"], eff["fmt"], eff["overwrite"]
-    landsat_dir = eff["landsat_dir"]
+    modis_root, fmt, overwrite = eff["modis_root"], eff["fmt"], eff["overwrite"]
     to_celsius = grid_cfg.get("to_celsius", False)
     start, end = eff["time"]["start_date"], eff["time"]["end_date"]
 
@@ -225,69 +351,83 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
         ds_cfg = eff["ds"][name]
         variable, quality_min = ds_cfg["variable"], ds_cfg["quality_min"]
         radius, access = ds_cfg["regrid_radius_m"], ds_cfg["access"]
-        match_landsat = ds_cfg["match_landsat"]
-        max_dt = timedelta(minutes=ds_cfg["max_time_diff_minutes"])
-        daytime_only, do_footprint = ds_cfg["daytime_only"], ds_cfg["footprint_id"]
+        time_of_day, night_hours = ds_cfg["time_of_day"], ds_cfg["night_solar_hours"]
         fetch = _ACCESS[access]
+        want_vars = harmony_variables(variable)
+        # The AoI's centre longitude drives the solar-time conversion. `search_bbox` is
+        # (W, S, E, N) in EPSG:4326, which is the one longitude on the grid that is already
+        # in degrees -- the projected grid's own x is metres.
+        lon_c = 0.5 * (g.search_bbox[0] + g.search_bbox[2])
 
-        log.info("=== AOI: %s (CRS=%s grid=%dx%d) | match_landsat=%s access=%s ===",
-                 name, g.target_crs, g.width, g.height, match_landsat, access)
+        platforms = [p for p in ds_cfg["platforms"]
+                     if only_source is None or p == only_source]
+        log.info("=== AOI: %s (CRS=%s grid=%dx%d) | platforms=%s time_of_day=%s access=%s ===",
+                 name, g.target_crs, g.width, g.height, platforms, time_of_day, access)
+        auth.ensure_fresh("earthdata", eff["earthdata"])
 
-        ls_times = _landsat_times(landsat_dir, name) if match_landsat else []
-        if match_landsat and not ls_times:
-            log.warning("  %s: match_landsat on but no Landsat aligned files in %s; "
-                        "run Landsat first (or set match_landsat: false)", name, landsat_dir / name)
-            continue
+        for tag in platforms:
+            short_name = ds_cfg["short_name"] or PLATFORMS[tag]
 
-        granules = net.retry(
-            lambda: earthaccess.search_data(
-                short_name=ds_cfg["short_name"], temporal=(start, end),
-                bounding_box=tuple(g.search_bbox)),
-            what=f"MODIS search {name}",
-            refresh=auth.refresher("earthdata", eff["earthdata"]))
-        kept = _select_granules(granules, ls_times, match_landsat, max_dt, daytime_only)
-        log.info("  %d granule(s) over AOI -> %d after daytime/coincidence filter",
-                 len(granules), len(kept))
-        if not kept:
-            continue
-        if dry_run:
-            log.info("  [dry-run] would process %d MODIS granule(s)", len(kept))
-            continue
-
-        aoi_out = out_root / name
-        for gi, (gr, t) in enumerate(kept, 1):
-            # Proactive: top the credential up between granules rather than discovering it
-            # died four hours in.
-            if gi % auth.CHECK_EVERY == 0:
-                auth.ensure_fresh("earthdata", eff["earthdata"])
-            tstr = naming.time_stamp(t)
-            stem = naming.time_stem(name, t)
-            if store.done(aoi_out / f"{stem}.nc", store.REQUIRED_VARS["MODIS"],
-                          shape=(g.height, g.width), overwrite=overwrite):
-                log.info("  %s already processed, skipping", tstr)
+            granules = net.retry(
+                lambda sn=short_name: earthaccess.search_data(
+                    short_name=sn, temporal=(start, end),
+                    bounding_box=tuple(g.search_bbox)),
+                what=f"MODIS search {name} {tag}",
+                refresh=auth.refresher("earthdata", eff["earthdata"]))
+            kept = select_by_time_of_day(granules, time_of_day=time_of_day,
+                                         night_hours=night_hours, lon=lon_c)
+            log.info("  [%s] %d granule(s) over AOI -> %d after the %s filter",
+                     tag, len(granules), len(kept), time_of_day)
+            if not kept:
                 continue
-            # One scratch dir per granule, removed in `finally`. A partial download can
-            # therefore never survive to be mistaken for a complete one by the next run.
-            gran_tmp = tmp_dir / f"g_{name}_{tstr}"
-            try:
-                path = fetch(gr, g.search_bbox, gran_tmp)
-                sst, lat, lon = read_swath(path, variable, quality_min, to_celsius)
-                fp = np.arange(sst.size, dtype="int32").reshape(sst.shape) if do_footprint else None
-                sst_g, fp_g = resample_to_grid(sst, lat, lon, g, radius, fp)
-            except Exception as exc:
-                log.warning("  FAILED %s (%s)", tstr, exc)
-                rep.fail(f"{name} {tstr}", exc)
+            if dry_run:
+                for gr, t in kept[:5]:
+                    log.info("    [dry-run] %s solar_hour=%.2f (%s)", naming.time_stamp(t),
+                             solar_hour(t, lon_c), _day_night(gr) or "untagged")
+                log.info("  [%s] [dry-run] would process %d MODIS granule(s)", tag, len(kept))
                 continue
-            finally:
-                shutil.rmtree(gran_tmp, ignore_errors=True)
-            if not np.isfinite(sst_g).any():
-                log.info("  %s: no valid MODIS pixels over AOI, skipping", tstr)
-                continue
-            ds = _scene_dataset(sst_g, fp_g, g, t, name, to_celsius,
-                                short_name=ds_cfg["short_name"])
-            ds.attrs.update(**provenance.stamp(eff))
-            log.info("  wrote %s", store.write_output(ds, aoi_out, stem, fmt))
-            rep.wrote(source=f"GHRSST {ds_cfg['short_name']}")
+
+            aoi_out = modis_root / tag / "aligned" / name
+            # Scratch lives UNDER the platform tag, never beside it: a directory that is a
+            # direct child of MODIS/ is a candidate source tag to the assembler.
+            tmp_root = modis_root / tag / "_tmp"
+
+            for gi, (gr, t) in enumerate(kept, 1):
+                # Proactive: top the credential up between granules rather than discovering it
+                # died four hours in.
+                if gi % auth.CHECK_EVERY == 0:
+                    auth.ensure_fresh("earthdata", eff["earthdata"])
+                tstr = naming.time_stamp(t)
+                stem = naming.time_stem(name, t)
+                if store.done(aoi_out / f"{stem}.nc", store.REQUIRED_VARS["MODIS"],
+                              shape=(g.height, g.width), overwrite=overwrite):
+                    log.info("  [%s] %s already processed, skipping", tag, tstr)
+                    rep.skip()
+                    continue
+                # One scratch dir per granule, removed in `finally`. A partial download can
+                # therefore never survive to be mistaken for a complete one by the next run.
+                gran_tmp = tmp_root / f"g_{name}_{tstr}"
+                try:
+                    path = fetch(gr, g.search_bbox, gran_tmp, variables=want_vars)
+                    sst, lat, lon = read_swath(path, variable, quality_min, to_celsius)
+                    log.debug("  [%s] %s: swath %s", tag, tstr, sst.shape)
+                    sst_g, _ = resample_to_grid(sst, lat, lon, g, radius)
+                except Exception as exc:
+                    log.warning("  [%s] FAILED %s (%s)", tag, tstr, exc)
+                    rep.fail(f"{name} {tag} {tstr}", exc)
+                    continue
+                finally:
+                    shutil.rmtree(gran_tmp, ignore_errors=True)
+                if not np.isfinite(sst_g).any():
+                    log.info("  [%s] %s: no valid MODIS pixels over AOI, skipping", tag, tstr)
+                    continue
+                ds = _scene_dataset(sst_g, None, g, t, name, to_celsius,
+                                    short_name=short_name, platform=tag,
+                                    solar_h=solar_hour(t, lon_c),
+                                    day_night=_day_night(gr))
+                ds.attrs.update(**provenance.stamp(eff))
+                log.info("  [%s] wrote %s", tag, store.write_output(ds, aoi_out, stem, fmt))
+                rep.wrote(source=f"GHRSST {short_name}")
     rep.log_summary()
     return rep
 
@@ -295,22 +435,71 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 # --------------------------------------------------------------------------- #
 # Config adapter + pipeline entry point
 # --------------------------------------------------------------------------- #
-def _ds_cfg(opts) -> dict:
-    """One AoI's MODIS settings. MODIS is global, so nothing here is region-overridable."""
-    access = _opt(opts, "access", "download")
+def resolve_time_of_day(opts, default: str = DEFAULT_TIME_OF_DAY) -> str:
+    """`time_of_day`, honouring the `daytime_only` boolean it replaced.
+
+    The old option could only say "day, or don't filter"; the new one has to be able to say
+    "night", which is what a standalone MODIS series is usually after. Accepting the old key
+    keeps existing configs running rather than silently changing which granules they select --
+    the one failure mode that would look exactly like the archive having changed.
+    """
+    tod = _opt(opts, "time_of_day", None)
+    legacy = _opt(opts, "daytime_only", None)
+    if tod is None and legacy is not None:
+        tod = "day" if bool(legacy) else "both"
+        log.warning("`daytime_only: %s` is deprecated; write `time_of_day: %s`", legacy, tod)
+    tod = default if tod is None else str(tod)
+    if tod not in TIMES_OF_DAY:
+        raise ValueError(f"modis time_of_day {tod!r} not recognized; "
+                         f"choose from {list(TIMES_OF_DAY)}.")
+    return tod
+
+
+def resolve_night_hours(opts) -> tuple[float, float]:
+    """The local-solar-time window that means "night", as (start, end), wrapping midnight."""
+    raw = _opt(opts, "night_solar_hours", None)
+    if raw is None:
+        return DEFAULT_NIGHT_SOLAR_HOURS
+    try:
+        lo, hi = (float(x) for x in raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("modis night_solar_hours must be two numbers, "
+                         f"e.g. [19, 5]; got {raw!r}") from exc
+    if not (0.0 <= lo < 24.0 and 0.0 <= hi < 24.0):
+        raise ValueError(f"modis night_solar_hours must lie in [0, 24); got {raw!r}")
+    if lo == hi:
+        raise ValueError(f"modis night_solar_hours {raw!r} is an empty window")
+    return lo, hi
+
+
+def _access(opts, default: str) -> str:
+    access = _opt(opts, "access", default)
     if access not in _ACCESS:
         raise ValueError(f"modis access {access!r} not recognized; "
                          f"choose from {sorted(_ACCESS)}.")
+    return access
+
+
+def _ds_cfg(opts) -> dict:
+    """One AoI's MODIS settings. MODIS is global, so nothing here is region-overridable."""
+    raw_platforms = _opt(opts, "platforms", None)
+    if raw_platforms is None:
+        platforms = list(DEFAULT_PLATFORMS)
+    elif isinstance(raw_platforms, str):
+        platforms = [raw_platforms]
+    else:
+        platforms = [str(p) for p in raw_platforms]
     return {
-        "short_name": _opt(opts, "short_name", SHORT_NAME),
+        "platforms": platforms,
+        # Unset -> each platform's own collection. Setting it PINS every platform to one
+        # collection, which is only meaningful when a single platform is configured.
+        "short_name": _opt(opts, "short_name", None),
         "variable": _opt(opts, "variable", DEFAULT_VARIABLE),
         "quality_min": int(_opt(opts, "quality_min", DEFAULT_QUALITY_MIN)),
         "regrid_radius_m": float(_opt(opts, "regrid_radius_m", DEFAULT_RADIUS_M)),
-        "access": access,
-        "match_landsat": bool(_opt(opts, "match_landsat", True)),
-        "max_time_diff_minutes": float(_opt(opts, "max_time_diff_minutes", DEFAULT_MAX_TIME_DIFF_MIN)),
-        "daytime_only": bool(_opt(opts, "daytime_only", True)),
-        "footprint_id": bool(_opt(opts, "footprint_id", True)),
+        "access": _access(opts, "harmony"),
+        "time_of_day": resolve_time_of_day(opts),
+        "night_solar_hours": resolve_night_hours(opts),
     }
 
 
@@ -331,9 +520,8 @@ def _build_eff(project: Project) -> dict:
         "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.modis))
                for a in project.all_areas},
         "grid": grid_cfg,
-        "out_dir": root / "MODIS" / "aligned",
-        "landsat_dir": root / "LANDSAT" / "aligned",   # coincidence source
-        "tmp_dir": root / "MODIS" / "_tmp",
+        # Per-platform trees hang under here: MODIS/<tag>/aligned/<aoi> (mirrors eco_root).
+        "modis_root": root / "MODIS",
         "fmt": _opt(opts, "output_format", "netcdf"),
         "overwrite": bool(_opt(opts, "overwrite", False)),
         "earthdata": {"auth_strategy": project.auth.earthdata.auth_strategy},
@@ -345,11 +533,13 @@ def _build_eff(project: Project) -> dict:
 
 
 def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
-            overwrite=False, full_series=False) -> None:
+            overwrite=False, source=None) -> None:
     """Acquire MODIS for a validated Project. Entry point for pipeline.py.
 
-    full_series=True forces match_landsat off (load the whole time series). MODIS
-    with match_landsat should run AFTER Landsat so its aligned files exist.
+    Every configured platform is acquired and STACKED (D10); the pipeline dispatches the
+    shared module once and it fans out over the `platforms` list internally. `source` narrows
+    to one platform tag (unset on a pipeline run; available for a direct CLI/test run) --
+    there is no fallback, a platform with no coverage simply contributes no channel.
     """
     eff = _build_eff(project)
     # Credentials expire and runs are long: apply this project's refresh policy before any
@@ -357,19 +547,21 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     auth.configure(project.auth)
     if overwrite:
         eff["overwrite"] = True
-    if full_series:
-        for ds_cfg in eff["ds"].values():     # `ds` is per-AoI now
-            ds_cfg["match_landsat"] = False
     if grids is None:
         grids = project_grids(project)
-    return run(eff, grids, aois, dry_run)
+    # A platform tag no code recognises would silently drop a satellite -- fail loudly, like
+    # ecostress does for an unknown version (config also checks this at load time).
+    known = set(products.spec(DataProduct.modis).known_sources)
+    bad = sorted(f"{n}:{p}" for n, c in eff["ds"].items() for p in c["platforms"]
+                 if p not in known)
+    if bad:
+        raise ValueError(f"modis platform not recognized ({', '.join(bad)}); "
+                         f"choose from {sorted(known)}.")
+    return run(eff, grids, aois, dry_run, only_source=source)
 
 
 def main():
-    entry.process_main(
-        acquire, "coastal_sst_data MODIS Terra L2P SST acquisition.",
-        extra=[entry.Flag("--full-series",
-                          "ignore Landsat coincidence; load the full MODIS time series")])
+    entry.process_main(acquire, "coastal_sst_data MODIS L2P SST acquisition (Terra + Aqua).")
 
 
 if __name__ == "__main__":

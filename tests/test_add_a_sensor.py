@@ -189,10 +189,10 @@ def test_an_assembled_cube_gains_the_new_sensors_channels(registered, project):
     assert int(ds["viirs_valid"].isel(time=0).values.sum()) == H * W
     assert int(ds["viirs_valid"].isel(time=1).values.sum()) == 0
 
-    # ...and the existing flat sensors are untouched by its arrival. (ECOSTRESS is a stacked-data
-    # sensor now -- per-version channels appear only where a version tree exists, exercised in
-    # test_datacube, not here where no eco scene is written.)
-    for pre in ("lst", "modis"):
+    # ...and the existing flat sensors are untouched by its arrival. (ECOSTRESS and the
+    # standalone MODIS are stacked-data sensors -- per-source channels appear only where a
+    # source tree exists, exercised in test_datacube, not here where no such scene is written.)
+    for pre in ("lst", "modisref"):
         assert f"{pre}_sst" in ds.data_vars
 
 

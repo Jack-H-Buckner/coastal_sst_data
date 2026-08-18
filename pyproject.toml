@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coastal_sst_data"
-version = "0.3.2"
+version = "0.4.0"
 description = "Acquire and grid coastal SST and covariate data products into analysis-ready datacubes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,7 +38,7 @@ dependencies = [
 # Per-product backends -- install only what your config selects.
 landsat = ["planetary-computer", "pystac-client"]        # landsat_pc source
 landcover = ["planetary-computer", "pystac-client"]      # landcover_esa source
-modis = ["pyresample", "netcdf4"]                         # swath -> grid resampling (netcdf4 reads MODIS L2P)
+modis = ["pyresample", "netcdf4", "harmony-py"]           # swath -> grid resampling (netcdf4 reads MODIS L2P); harmony-py = server-side subsetting
 met = ["herbie-data", "gcsfs", "pyresample"]              # HRRR + ARCO-ERA5 forcing
 tides = ["pytides2"]                                      # NOAA CO-OPS harmonic synthesis
 cmems = ["copernicusmarine>=2"]                            # Copernicus Marine global physics
@@ -46,7 +46,7 @@ tides-global = ["eo-tides"]                               # global tide-model ba
 plot = ["matplotlib", "cartopy"]                          # `grids --plot` maps
 # Convenience bundles.
 all = [
-    "planetary-computer", "pystac-client", "pyresample", "netcdf4",
+    "planetary-computer", "pystac-client", "pyresample", "netcdf4", "harmony-py",
     "herbie-data", "gcsfs", "pytides2", "eo-tides", "copernicusmarine>=2",
     "matplotlib", "cartopy",
 ]

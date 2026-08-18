@@ -8,7 +8,7 @@ import pytest
 from coastal_sst_data.config import DataProduct, parse_config
 from coastal_sst_data import pipeline
 from coastal_sst_data.processes import (
-    bathymetry, ecostress, landcover_esa, landsat_pc, met, modis, mur, tides,
+    bathymetry, ecostress, landcover_esa, landsat_pc, met, modis, modis_ref, mur, tides,
 )
 
 EARTHDATA = {"earthdata": {"auth_strategy": "netrc"}}
@@ -45,7 +45,8 @@ def acquire_calls(monkeypatch):
 
     for name, m in [("bathymetry", bathymetry), ("ecostress", ecostress),
                     ("mur", mur), ("landsat_pc", landsat_pc), ("met", met),
-                    ("modis", modis), ("tides", tides), ("landcover_esa", landcover_esa)]:
+                    ("modis", modis), ("modis_ref", modis_ref),
+                    ("tides", tides), ("landcover_esa", landcover_esa)]:
         monkeypatch.setattr(m, "acquire", make(name))
     return calls
 
@@ -61,10 +62,19 @@ def test_products_run_in_process_order(acquire_calls):
     assert [c["name"] for c in acquire_calls] == ["bathymetry", "ecostress", "mur"]
 
 
-def test_landsat_runs_before_modis(acquire_calls):
-    proj = _make_project({"modis": None, "landsat": None}, auth=EARTHDATA)
+def test_landsat_runs_before_modis_ref(acquire_calls):
+    """`modis_ref`'s coincidence filter reads Landsat's aligned filenames, so it declares the
+    edge. The STANDALONE `modis` sensor deliberately does not -- it must be runnable with no
+    Landsat in the project at all."""
+    proj = _make_project({"modis_ref": None, "landsat": None}, auth=EARTHDATA)
     pipeline.run_pipeline(proj, dry_run=True)
-    assert [c["name"] for c in acquire_calls] == ["landsat_pc", "modis"]
+    assert [c["name"] for c in acquire_calls] == ["landsat_pc", "modis_ref"]
+
+
+def test_standalone_modis_needs_no_landsat(acquire_calls):
+    proj = _make_project({"modis": None}, auth=EARTHDATA)
+    pipeline.run_pipeline(proj, dry_run=True)
+    assert [c["name"] for c in acquire_calls] == ["modis"]
 
 
 def test_landsat_dispatched_to_pc_source(acquire_calls):
@@ -332,7 +342,8 @@ def timed_calls(monkeypatch):
 
     for name, m in [("bathymetry", bathymetry), ("ecostress", ecostress),
                     ("mur", mur), ("landsat_pc", landsat_pc), ("met", met),
-                    ("modis", modis), ("tides", tides), ("landcover_esa", landcover_esa)]:
+                    ("modis", modis), ("modis_ref", modis_ref),
+                    ("tides", tides), ("landcover_esa", landcover_esa)]:
         monkeypatch.setattr(m, "acquire", make(name))
     return calls
 
@@ -351,13 +362,13 @@ def test_parallel_dispatches_one_call_per_aoi(timed_calls):
 
 
 def test_parallel_honours_the_dependency_within_each_aoi(timed_calls):
-    proj = _make_project({"modis": None, "landsat": None}, auth=EARTHDATA, extra_area=A2)
+    proj = _make_project({"modis_ref": None, "landsat": None}, auth=EARTHDATA, extra_area=A2)
     pipeline.run_pipeline(proj, dry_run=True, jobs=4)
 
     for aoi in ("a1", "a2"):
         _, landsat_end = _span(timed_calls, "landsat_pc", aoi)
-        modis_start, _ = _span(timed_calls, "modis", aoi)
-        assert modis_start >= landsat_end, f"{aoi}: modis started before landsat finished"
+        modis_start, _ = _span(timed_calls, "modis_ref", aoi)
+        assert modis_start >= landsat_end, f"{aoi}: modis_ref started before landsat finished"
 
 
 def test_parallel_does_not_serialise_across_aois(timed_calls):
@@ -408,22 +419,22 @@ def test_a_failure_in_one_aoi_does_not_stop_another(monkeypatch, acquire_calls):
 
 
 def test_a_dependent_is_skipped_when_its_aois_dependency_fails(monkeypatch, acquire_calls):
-    """MODIS reading a Landsat directory that was never written produces a channel that
+    """MODIS_REF reading a Landsat directory that was never written produces a channel that
     looks like 'no scenes matched' rather than 'the stage it depends on failed'."""
     def boom(project, *, grids=None, aois=None, **kw):
         raise RuntimeError("landsat died")
     monkeypatch.setattr(landsat_pc, "acquire", boom)
 
     ran = []
-    monkeypatch.setattr(modis, "acquire",
+    monkeypatch.setattr(modis_ref, "acquire",
                         lambda project, **kw: ran.append(kw.get("aois")))
 
-    proj = _make_project({"landsat": None, "modis": None}, auth=EARTHDATA)
+    proj = _make_project({"landsat": None, "modis_ref": None}, auth=EARTHDATA)
     outcomes = pipeline.run_pipeline(proj, dry_run=True, jobs=4)
 
     assert ran == []
-    assert "skipped" in outcomes[DataProduct.modis]
-    assert "dependency failed" in outcomes[DataProduct.modis]
+    assert "skipped" in outcomes[DataProduct.modis_ref]
+    assert "dependency failed" in outcomes[DataProduct.modis_ref]
 
 
 def test_jobs_1_takes_the_original_serial_path(acquire_calls):
