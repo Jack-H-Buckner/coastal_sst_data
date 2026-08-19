@@ -281,6 +281,36 @@ preprocess:
     #   ...or gate on the tide-adjusted water line instead of the static landcover mask:
     # filter_land_clouds: { threshold_k: 5.0, land_source: water_line, sensors: [eco] }
 
+# ---------------------------------------------------------------------------
+# Point time series (OPTIONAL, and only used by `coastal-sst-data extract`)
+# ---------------------------------------------------------------------------
+# Pulls the assembled cubes' values at a CSV of lat/lon sites into ONE long-format table:
+#   point_id, lat, lon, aoi, time, variable, stat, radius_m, value
+# Nothing runs this automatically -- `run`/`assemble`/`preprocess` ignore the block
+# entirely. Delete it and nothing about a run changes; most projects have no `extract:`.
+extract:
+  points: examples/sites.csv        # lat/lon (+ an id); or pass --points on the command line
+  format: parquet                   # or csv (csv needs no extra dependency; parquet needs pyarrow)
+  # Channels are EXPLICIT: a channel not listed is not extracted, and a channel listed but
+  # absent from the cube is a hard error. A quietly missing column in a modelling table is
+  # indistinguishable from a channel that was genuinely all-NaN.
+  channels:
+    # A bare key is the nearest pixel -- the value of the cell the point falls in.
+    depth_cudem:
+    tide_coops:
+    # `radius_m` is a DISC in metres on the ground (not degrees, not pixels), centred on the
+    # point. Below the grid posting (default 100 m) it degenerates to the containing pixel,
+    # and the run says so.
+    #
+    # `mean` PROPAGATES NaN (one cloudy pixel in the disc -> NaN); `nanmean` skips it. They
+    # answer different questions, so pick deliberately and ship `count_valid` alongside to
+    # see how many pixels each value actually rests on.
+    eco_sst_clean: { radius_m: 300, stat: [nanmean, nanstd, count_valid] }
+    mur_sst:       { radius_m: 1000, stat: mean }
+    # `mask: water` restricts the disc to the cube's landcover_water cells, so a coastal
+    # point's mean is not contaminated by land. `nearest` ignores it (it is one pixel).
+    # eco_sst_clean: { radius_m: 300, stat: nanmean, mask: water }
+
 regions:
   - name: pnw_estuaries
     # Region-DEPENDENT source options (which source has coverage here, etc.).

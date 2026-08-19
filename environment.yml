@@ -65,6 +65,9 @@ dependencies:
   # is required for the maps; cartopy is optional (adds coastlines/land context).
   - matplotlib
   - cartopy
+  # Optional parquet output: `coastal-sst-data extract` writes point time series as
+  # parquet by default (`--format csv` needs nothing beyond pandas).
+  - pyarrow
   - pip
   - pip:
       # Editable install of the package itself (core deps already provided by conda

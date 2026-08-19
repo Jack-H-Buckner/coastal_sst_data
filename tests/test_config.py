@@ -725,3 +725,56 @@ def test_a_region_may_not_reshape_the_insitu_channel(base_project, key, value):
 def test_the_working_example_config_still_loads():
     """The registry must describe what real configs actually use."""
     load_config(Path(__file__).parents[1] / "examples" / "config.test.yaml")
+
+
+# ---------------------------------------------------------------------------
+# extract: the optional point-extraction block
+# ---------------------------------------------------------------------------
+def test_extract_block_is_optional(base_project):
+    """A config that never extracts must not have to say so."""
+    p = parse_config(base_project)
+    assert p.extract.channels == {} and p.extract.format == "parquet"
+
+
+def test_extract_channel_shorthands(base_project):
+    """Terse spellings must mean what they look like."""
+    base_project["extract"] = {"points": "sites.csv", "channels": {
+        "bare": None,                                    # nearest pixel
+        "one_stat": "nanmean",
+        "several": ["mean", "std"],
+        "full": {"radius_m": 300, "stat": ["nanmean", "count_valid"], "mask": "water"},
+    }}
+    ch = parse_config(base_project).extract.channels
+    assert ch["bare"].stat == ["nearest"] and ch["bare"].radius_m == 0.0
+    assert ch["one_stat"].stat == ["nanmean"]
+    assert ch["several"].stat == ["mean", "std"]
+    assert ch["full"].mask == "water" and ch["full"].radius_m == 300.0
+
+
+@pytest.mark.parametrize("channel,match", [
+    ({"stat": "nanmeen"}, "did you mean"),               # typo, with a suggestion
+    ({"stat": ["mean", "mean"]}, "duplicate stat"),      # would break the table's key
+    ({"stat": []}, "cannot be empty"),
+    ({"stat": "p9O"}, "unknown stat"),                   # letter O, not a percentile
+    ({"radius_m": 300}, "ignores the radius"),           # a radius nothing reduces over
+    ({"radius_m": -1, "stat": "mean"}, "greater than or equal to 0"),
+    ({"radiusm": 300, "stat": "mean"}, "Extra inputs"),  # typo'd key
+])
+def test_extract_channel_rejects(base_project, channel, match):
+    """Every one of these must fail at LOAD time, not after an hour of cube reads."""
+    base_project["extract"] = {"points": "s.csv", "channels": {"eco_sst": channel}}
+    with pytest.raises(ValidationError, match=match):
+        parse_config(base_project)
+
+
+def test_extract_accepts_percentiles(base_project):
+    base_project["extract"] = {"points": "s.csv",
+                               "channels": {"eco_sst": {"radius_m": 300,
+                                                        "stat": ["p10", "p97.5"]}}}
+    assert parse_config(base_project).extract.channels["eco_sst"].stat == ["p10", "p97.5"]
+
+
+def test_extract_rejects_an_unknown_key(base_project):
+    base_project["extract"] = {"points": "s.csv", "channels": {}, "formatt": "csv"}
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        parse_config(base_project)

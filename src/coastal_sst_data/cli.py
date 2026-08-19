@@ -10,6 +10,7 @@ A single entry point over the pieces of the package:
     coastal-sst-data grids    --config config.yaml        # show each AoI's target grid
     coastal-sst-data assemble --config config.yaml        # knit aligned outputs -> datacubes
     coastal-sst-data preprocess --config config.yaml      # post-assembly derived channels
+    coastal-sst-data extract  --config config.yaml        # point time series -> parquet/csv
     coastal-sst-data check    --config config.yaml        # find truncated/incomplete outputs
 
 (Equivalent to `python -m coastal_sst_data.cli <command> ...`.) Each subcommand
@@ -74,6 +75,26 @@ def _cmd_preprocess(args):
     preprocess.preprocess(project, aois=args.aois, dry_run=args.dry_run,
                           overwrite=args.overwrite,
                           memory_budget_gb=args.memory_budget_gb)
+
+
+def _cmd_extract(args):
+    """Pull point time series out of the assembled cubes -> one long-format table.
+
+    `processes.extract` is imported HERE, not at module scope: most projects never extract,
+    and this keeps the stage (and its pandas/table machinery) off every other subcommand's
+    import path.
+    """
+    from .processes import extract
+    project = load_config(args.config)
+    try:
+        extract.extract(project, aois=args.aois, points_file=args.points, out=args.out,
+                        fmt=args.fmt, dry_run=args.dry_run, overwrite=args.overwrite)
+    except ImportError as exc:
+        # store.write_table raises this when the parquet backend is missing. Say what to do
+        # rather than quietly writing a different format than the one asked for.
+        raise SystemExit(
+            f"{exc}. Install it with `pip install 'coastal_sst_data[extract]'` "
+            f"(or `conda install pyarrow`), or pass --format csv.")
 
 
 def _cmd_provenance(args):
@@ -299,6 +320,27 @@ def build_parser() -> argparse.ArgumentParser:
                        dest="memory_budget_gb", metavar="GB",
                        help="Override the memory budget for this run (default: detected, halved).")
     p_pre.set_defaults(func=_cmd_preprocess)
+
+    p_ext = sub.add_parser(
+        "extract",
+        help="Extract long-format time series from the assembled cubes at a CSV of lat/lon "
+             "points. Optional: needs `extract.channels` in the config, and nothing else "
+             "runs it.")
+    add_common(p_ext)
+    p_ext.add_argument("--aoi", nargs="+", dest="aois", help="Only these AoI name(s).")
+    p_ext.add_argument("--points", help="Points CSV (overrides `extract.points`).")
+    p_ext.add_argument("--out", help="Output path (default: "
+                                     "<output_dir>/<extract.output_subdir>/<stem>.<ext>).")
+    # default=None on purpose: `default='parquet'` would silently override a config that
+    # says `format: csv`, on every single invocation.
+    p_ext.add_argument("--format", dest="fmt", choices=["parquet", "csv"], default=None,
+                       help="Output format (default: `extract.format`, i.e. parquet).")
+    p_ext.add_argument("--overwrite", action="store_true",
+                       help="Replace an existing table.")
+    p_ext.add_argument("--dry-run", action="store_true",
+                       help="Report the point-to-AoI assignment, the channel plan and the "
+                            "row count; write nothing.")
+    p_ext.set_defaults(func=_cmd_extract)
 
     # The DEM->MSL datum offset is resolved INLINE by the bathymetry stage (per DEM source)
     # and stamped onto its output, so there is no separate `datum` subcommand -- re-run

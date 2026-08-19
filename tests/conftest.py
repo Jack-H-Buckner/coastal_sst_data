@@ -160,3 +160,88 @@ class UniformDs(dict):
 
     def values(self):                      # e.g. modis.acquire(full_series=True)
         return [self._cfg]
+
+
+# ---------------------------------------------------------------------------
+# Synthetic assembled cube + points file, for the `extract` stage.
+# ---------------------------------------------------------------------------
+# Every channel is an ANISOTROPIC ramp, and the 3-D and 2-D ones vary along
+# DIFFERENT axes on purpose. A y-flip, a row/col transposition, or an off-by-one
+# in the affine inversion then CHANGES THE NUMBER rather than returning something
+# plausible -- which is the only way a point-extraction bug is ever caught.
+CUBE_DAYS = 4
+NAN_ROW, NAN_COL = 20, 20        # the one hole punched into `eco_sst_gappy`
+
+
+def build_cube(g, days=CUBE_DAYS):
+    """The synthetic cube as an xr.Dataset (see the fixture below for the layout)."""
+    import pandas as pd
+    import xarray as xr
+
+    H, W = g.shape
+    xs, ys = g.xy_centers()
+    rows = np.arange(H)[:, None] * np.ones((1, W))
+    cols = np.ones((H, 1)) * np.arange(W)[None, :]
+    t = np.arange(days)[:, None, None]
+
+    sst = (1000 * t + rows[None]).astype("float32")      # varies with ROW and time
+    gappy = sst.copy()
+    gappy[:, NAN_ROW, NAN_COL] = np.nan                  # the point's own pixel
+    return xr.Dataset(
+        {"eco_sst": (("time", "y", "x"), sst),
+         "eco_sst_gappy": (("time", "y", "x"), gappy),
+         "elevation_cudem": (("y", "x"), cols.astype("float32")),   # varies with COL
+         "landcover_water": (("y", "x"), (cols < W // 2).astype("uint8")),  # west = water
+         "tide_coops": (("time",), np.arange(days, dtype="float32"))},
+        coords={"time": pd.date_range("2023-06-01", periods=days, freq="D"),
+                "y": ys, "x": xs},
+        attrs={"crs": g.target_crs, "aoi_id": g.name})
+
+
+@pytest.fixture
+def cube_dir(tmp_path, aoi_grid):
+    """A synthetic assembled cube at <tmp_path>/datacube/test_aoi.zarr.
+
+        eco_sst        (t,y,x) = 1000*t + row   -> a y-flip or row error changes it
+        eco_sst_gappy  (t,y,x) = eco_sst, NaN at (20, 20)
+        elevation_cudem  (y,x) = col            -> a row/col swap changes it
+        landcover_water  (y,x) = 1 over the WEST half
+        tide_coops      (time,) = 0, 1, 2, 3
+    """
+    d = tmp_path / "datacube"
+    d.mkdir(parents=True, exist_ok=True)
+    build_cube(aoi_grid).to_zarr(d / f"{aoi_grid.name}.zarr", mode="w-", consolidated=True)
+    return d
+
+
+def pixel_lonlat(g, row, col):
+    """The lon/lat of the CENTRE of pixel (row, col) on `g`.
+
+    Derived by inverting the grid's own `xy_centers`, so a test asserting "this point is in
+    pixel (20, 20)" is asserting against the grid's definition of a pixel centre rather than
+    against a second, independent piece of arithmetic that could share the same bug.
+    """
+    from pyproj import Transformer
+    xs, ys = g.xy_centers()
+    inv = Transformer.from_crs(g.target_crs, "EPSG:4326", always_xy=True)
+    lon, lat = inv.transform(float(xs[col]), float(ys[row]))
+    return float(lon), float(lat)
+
+
+@pytest.fixture
+def points_csv(tmp_path, aoi_grid):
+    """A points CSV with deliberately NON-canonical column names.
+
+    `station`/`latitude`/`longitude` -- because the alias resolution is part of what has to
+    work, and a fixture that used the canonical names would never exercise it.
+    Sites: `centre` at pixel (20,20) (where the cube's NaN hole is), and `edge` one pixel
+    in from the north-west corner.
+    """
+    import pandas as pd
+    rows = []
+    for name, (r, c) in {"centre": (20, 20), "edge": (1, 1)}.items():
+        lon, lat = pixel_lonlat(aoi_grid, r, c)
+        rows.append({"station": name, "latitude": lat, "longitude": lon})
+    path = tmp_path / "sites.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
