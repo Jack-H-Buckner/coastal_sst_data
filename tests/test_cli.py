@@ -249,3 +249,45 @@ def test_missing_config_errors():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "-o", "log_cli=true"])
+
+# ---------------------------------------------------------------------------
+# extract
+# ---------------------------------------------------------------------------
+def test_extract_subcommand_dispatches(config_file, monkeypatch):
+    seen = {}
+    def stub(project, **kw):
+        seen.update(kw)
+    monkeypatch.setattr("coastal_sst_data.processes.extract.extract", stub)
+
+    cli.main(["extract", "--config", config_file, "--aoi", "a1",
+              "--points", "sites.csv", "--format", "csv", "--overwrite"])
+
+    assert seen["aois"] == ["a1"]
+    assert seen["points_file"] == "sites.csv"
+    assert seen["fmt"] == "csv" and seen["overwrite"] is True
+    assert seen["dry_run"] is False and seen["out"] is None
+
+
+def test_extract_format_flag_defaults_to_none(config_file, monkeypatch):
+    """The config's `extract.format` must win when --format is absent.
+
+    A `default='parquet'` here would silently override a config that says csv, on every
+    invocation, and nothing would report it.
+    """
+    seen = {}
+    monkeypatch.setattr("coastal_sst_data.processes.extract.extract",
+                        lambda project, **kw: seen.update(kw))
+    cli.main(["extract", "--config", config_file])
+    assert seen["fmt"] is None
+
+
+def test_extract_missing_pyarrow_exits_with_advice(config_file, monkeypatch):
+    """The ImportError from store.write_table must become actionable advice, not a traceback."""
+    def boom(project, **kw):
+        raise ImportError("parquet output needs pyarrow, which is optional")
+    monkeypatch.setattr("coastal_sst_data.processes.extract.extract", boom)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["extract", "--config", config_file])
+    msg = str(exc.value)
+    assert "coastal_sst_data[extract]" in msg and "--format csv" in msg

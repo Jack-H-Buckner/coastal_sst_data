@@ -12,6 +12,7 @@ This module does three jobs:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date
 from difflib import get_close_matches
 from pathlib import Path
@@ -465,6 +466,156 @@ class PreprocessSpec(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Point extraction (OPTIONAL, and optional in a load-bearing way)
+# ---------------------------------------------------------------------------
+# Most projects build cubes and stop. A minority need the transpose -- for a handful of
+# lat/lon sites, the time series of every channel, as a table -- and that minority must
+# cost the majority NOTHING: no dependency (pyarrow is an extra, lazy-imported only on the
+# parquet branch of store.write_table), no import (processes.extract is imported inside the
+# CLI handler), no config key (this whole block defaults), and no pipeline stage (nothing
+# runs unless someone types `coastal-sst-data extract`).
+
+# The reductions a neighbourhood may be collapsed with. A CLOSED set, because a typo'd stat
+# must fail at config-load time and not after an hour of cube reads.
+#
+# The nan* variants are the NaN-SKIPPING counterparts of the plain ones, and BOTH are
+# offered on purpose. Over a 300 m neighbourhood of satellite SST, `mean` returning NaN
+# because one pixel was cloudy and `nanmean` returning the mean of the other 28 are
+# different scientific questions, and which one you got must be visible in the output rather
+# than decided for you here. `nearest` is not a reduction at all -- it is the value of the
+# pixel the point falls in.
+STATS: tuple[str, ...] = (
+    "nearest",
+    "mean", "median", "std", "min", "max", "sum",
+    "nanmean", "nanmedian", "nanstd", "nanmin", "nanmax", "nansum",
+    "count", "count_valid",
+)
+
+# p10, p90, p97.5 -- NaN-skipping percentiles. Spelled as a pattern rather than enumerated
+# so the set stays closed (`p9O` with a letter O still fails) without listing 101 names.
+PERCENTILE_RE = re.compile(r"^p(100|\d{1,2})(\.\d+)?$")
+
+# What `mask: water` resolves to. The alias exists because "restrict the mean to water" is
+# the question people actually ask; the channel it needs is an implementation detail of
+# whichever landcover source ran.
+WATER_MASK_CHANNEL = "landcover_water"
+
+
+class ExtractChannel(BaseModel):
+    """One cube channel to pull at each point, and how to reduce it around the point.
+
+    The neighbourhood is a CIRCLE of `radius_m` in the AoI's projected CRS -- metres on the
+    ground, never degrees and never pixels. It is the set of pixels whose CENTRES fall
+    within that radius, plus the pixel the point itself falls in. That last clause is not a
+    nicety: at the package's default 100 m posting a `radius_m: 50` circle contains no pixel
+    centre at all for most point positions, so without it the reduction would run over an
+    empty set and the whole column would be NaN -- which reads exactly like a channel that
+    was cloudy for the entire record.
+
+    `stat` may be one name or a list; each becomes its OWN ROW, tagged in the output's `stat`
+    column, so `[nanmean, nanstd, count_valid]` never has to be decoded back out of a
+    variable name.
+
+    `mask` restricts the neighbourhood before the reduction -- `water` for the cube's water
+    mask, or any 2-D (y,x) channel name. `nearest` ignores it, because `nearest` is one
+    specific pixel by definition.
+    """
+    model_config = {"extra": "forbid"}
+    radius_m: float = Field(0.0, ge=0)          # 0 -> just the pixel the point falls in
+    stat: list[str] = Field(default_factory=lambda: ["nearest"])
+    mask: str | None = None                     # "water", or a 2-D channel name
+
+    @field_validator("stat", mode="before")
+    @classmethod
+    def _listify(cls, v):
+        """`stat: mean` and `stat: [mean]` are the same thing."""
+        return [v] if isinstance(v, str) else v
+
+    @field_validator("stat")
+    @classmethod
+    def _known_stats(cls, v):
+        if not v:
+            raise ValueError("stat cannot be empty; drop it to get the default `nearest`.")
+        bad = [s for s in v if s not in STATS and not PERCENTILE_RE.match(str(s))]
+        if bad:
+            hint = ""
+            near = get_close_matches(str(bad[0]), STATS, n=3, cutoff=0.6)
+            if near:
+                hint = f" (did you mean {', '.join(near)}?)"
+            raise ValueError(
+                f"unknown stat(s) {bad}{hint}; choose from {', '.join(STATS)}, "
+                f"or a percentile like p90.")
+        if len(set(v)) != len(v):
+            # Duplicates would emit two identical rows and break the output table's
+            # (point_id, aoi, time, variable, stat) primary key.
+            raise ValueError(f"duplicate stat(s) in {v}")
+        return list(v)
+
+    @model_validator(mode="after")
+    def _radius_is_used(self):
+        """A radius nothing reduces over is a config that LIES about what was extracted.
+
+        `stat: nearest` reads ONE pixel; asking for it over a 500 m circle states an intent
+        the run ignores, and the output's `radius_m` column would then honestly record 0
+        while the config said 500 -- with nothing anywhere contradicting the other.
+        """
+        if self.radius_m > 0 and set(self.stat) == {"nearest"}:
+            raise ValueError(
+                "radius_m is set but the only stat is `nearest`, which reads the single "
+                "pixel the point falls in and ignores the radius. Add a reducing stat "
+                "(nanmean/mean/median/...) or drop radius_m.")
+        return self
+
+
+class ExtractSpec(BaseModel):
+    """Long-format time series pulled from the assembled cubes at user-supplied points.
+
+    Entirely opt-in: with no `channels` nothing can run, and the whole block may be omitted.
+
+    Channels are declared EXPLICITLY -- a channel not listed is not extracted, and a channel
+    listed but absent from the cube is a hard error naming it. A quietly-missing column in a
+    modelling table is indistinguishable from a channel that was genuinely all-NaN, and the
+    difference is a modelling result.
+    """
+    model_config = {"extra": "forbid"}
+    # CSV of points; at minimum lat/lon, ideally an id. Overridable with `--points`.
+    points: Path | None = None
+    # canonical field -> the column name in YOUR file, for when the aliases in points.py
+    # do not cover it (see points.ALIASES).
+    columns: dict[str, str] = Field(default_factory=dict)
+    channels: dict[str, ExtractChannel] = Field(default_factory=dict)
+    format: Literal["parquet", "csv"] = "parquet"
+    output_subdir: str = "extract"              # <output_dir>/extract/
+    stem: str = "points"                        # -> points.parquet
+    overwrite: bool = False
+    # Falls back to the assembler's budget, exactly as PreprocessSpec does: the stages
+    # usually want the same answer, and one knob is enough until they do not.
+    memory_budget_gb: float | None = Field(None, gt=0)
+
+    @field_validator("channels", mode="before")
+    @classmethod
+    def _fill_channel_defaults(cls, v):
+        """Accept the terse spellings.
+
+        `chan:`               -> extract it, nearest pixel
+        `chan: nanmean`       -> that stat
+        `chan: [mean, std]`   -> those stats
+        `chan: {radius_m: 300, stat: nanmean}` -> the full form
+        """
+        if isinstance(v, dict):
+            out = {}
+            for k, o in v.items():
+                if o is None:
+                    out[k] = {}
+                elif isinstance(o, (str, list)):
+                    out[k] = {"stat": o}
+                else:
+                    out[k] = o
+            return out
+        return v
+
+
+# ---------------------------------------------------------------------------
 # Authentication (NON-SECRET settings only)
 # ---------------------------------------------------------------------------
 # These say *how* to authenticate; the real secrets live OUTSIDE the repo and
@@ -681,6 +832,9 @@ class Project(BaseModel):
     datacube: DataCubeSpec = Field(default_factory=DataCubeSpec)
     # Post-assembly preprocessing (opt-in); all default, so the block is optional.
     preprocess: PreprocessSpec = Field(default_factory=PreprocessSpec)
+    # Point extraction (opt-in via `extract.channels`); all default, so the block is
+    # optional -- a project that never extracts writes nothing here and pays nothing.
+    extract: ExtractSpec = Field(default_factory=ExtractSpec)
     # Non-secret auth settings; required per selected product (see validator).
     auth: AuthConfig = Field(default_factory=AuthConfig)
     # How much runs at once. Defaults are the serial pipeline, so the block is optional.

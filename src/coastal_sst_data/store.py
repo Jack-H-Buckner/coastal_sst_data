@@ -456,6 +456,44 @@ def write_text(path: Path, text: str) -> Path:
     return path
 
 
+def write_table(df: pd.DataFrame, out_dir: Path, stem: str, fmt: str = "parquet") -> Path:
+    """Atomically write one long-format table -> the path written.
+
+    The package's only TABULAR output (the `extract` stage). It lives here, beside the raster
+    writers, for one reason: `atomic`. A writer that opened the destination directly would be
+    the single durable write in this package that can leave a half-file behind for the next
+    run's `exists()` check to take for done.
+
+    Parquet by default. The extraction table is tall and narrow -- one row per point x time x
+    variable x stat -- with four label columns that are almost entirely repetition, so
+    dictionary encoding makes it an order of magnitude smaller AND typed: a CSV round-trip
+    turns the `time` column into strings and every NaT into an empty field that pandas reads
+    back as an object column. CSV stays available because it opens in everything.
+
+    pyarrow is OPTIONAL and lazily imported, like every other heavy backend here (extra:
+    `extract`). Most projects never call this stage, and a base install must not grow a
+    dependency for it. The ImportError is raised rather than downgraded to CSV: silently
+    writing a different format than the one asked for is how you discover, a month later,
+    that half your outputs are text.
+    """
+    out_dir = Path(out_dir)
+    if fmt == "parquet":
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(f"parquet output needs pyarrow, which is optional: {exc}") from exc
+        path = out_dir / f"{stem}.parquet"
+        with atomic(path) as tmp:
+            df.to_parquet(tmp, engine="pyarrow", index=False)
+        return path
+    if fmt == "csv":
+        path = out_dir / f"{stem}.csv"
+        with atomic(path) as tmp:
+            df.to_csv(tmp, index=False)
+        return path
+    raise ValueError(f"unknown table format {fmt!r}; choose 'parquet' or 'csv'.")
+
+
 def write_output(ds: xr.Dataset, out_dir: Path, stem: str, fmt: str = "netcdf",
                  *, encoding: dict | None = None) -> Path:
     """Write one aligned output in the configured format -> the path written.

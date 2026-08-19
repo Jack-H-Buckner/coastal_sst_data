@@ -61,6 +61,7 @@ dependencies:
   - eo-tides                 # global tide-model backup
   - matplotlib               # grids --plot maps
   - cartopy                   # grids --plot coastlines (optional)
+  - pyarrow                   # extract --format parquet (csv needs nothing)
 
   - pip
   - pip:

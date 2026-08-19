@@ -49,11 +49,12 @@ tides = ["pytides2"]                                      # NOAA CO-OPS harmonic
 cmems = ["copernicusmarine>=2"]                            # Copernicus Marine global physics
 tides-global = ["eo-tides"]                               # global tide-model backup
 plot = ["matplotlib", "cartopy"]                          # `grids --plot` maps
+extract = ["pyarrow>=16"]                                 # parquet output for `extract` (csv needs nothing)
 # Convenience bundles.
 all = [
     "planetary-computer", "pystac-client", "pyresample", "harmony-py",
     "herbie-data", "gcsfs", "pytides2", "eo-tides", "copernicusmarine>=2",
-    "matplotlib", "cartopy",
+    "matplotlib", "cartopy", "pyarrow>=16",
 ]
 dev = ["pytest"]
 

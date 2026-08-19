@@ -51,6 +51,12 @@ datum.py (derived)  ── DEM→MSL offset, from the bathymetry that actually r
    ▼
 datacube.py  ── knit every aligned output into ONE Zarr cube per AoI,
                 on a common daily axis, self-describing (embedded provenance)
+   ▼
+preprocess.py (opt-in)   ── derived channels, written back into the same cube
+processes/extract.py     ── OPTIONAL and terminal: read the cubes at a list of
+   (+ points.py)            lat/lon points -> one long-format parquet/CSV table.
+                            Reached only by `coastal-sst-data extract`; no
+                            pipeline stage calls it and no config needs it.
 ```
 
 **The one design decision to internalise before touching anything:** a data product is *declared
@@ -636,7 +642,7 @@ specific silent-failure hole:
 
 | Module | Use it for | The failure it prevents |
 |---|---|---|
-| [`store.py`](../src/coastal_sst_data/store.py) | `store.write_output` (atomic), `store.done` (skip guard) | a mid-write crash leaving a file that exists, opens, and is truncated — taken for "done" forever |
+| [`store.py`](../src/coastal_sst_data/store.py) | `store.write_output` (atomic), `store.write_table` (the one tabular writer), `store.done` (skip guard) | a mid-write crash leaving a file that exists, opens, and is truncated — taken for "done" forever |
 | [`naming.py`](../src/coastal_sst_data/naming.py) | encode/decode the aligned-file timestamp | a write-side and read-side stamp drifting apart → every affected day a silent NaN slice |
 | [`net.py`](../src/coastal_sst_data/net.py) | `net.retry` around every network call; `net.is_auth_error` to tell a dead credential from a dead server | an unbounded hang, a transient failure aborting a long run, or a credential expiring four hours in and reading as a permission error that kills the rest of the range |
 | [`auth.py`](../src/coastal_sst_data/auth.py) | `auth.login` (never the client library directly), `auth.refresher` on credentialed `net.retry` calls, `auth.ensure_fresh` at loop boundaries | a login nobody timestamped — and therefore cannot refresh — leaving a multi-hour run to die on an expired token that looks exactly like the data running out |
@@ -644,6 +650,7 @@ specific silent-failure hole:
 | [`provenance.py`](../src/coastal_sst_data/provenance.py) | `provenance.stamp` on write; `field_inputs` for the cube | a channel shipping with a blank/guessed source record |
 | [`config.py`](../src/coastal_sst_data/config.py) | `resolve_opts` + `opt` for per-AoI options | a region override silently ignored, or an unread option silently accepted |
 | [`grid.py`](../src/coastal_sst_data/grid.py) | the shared `AoiGrid`; `select_aois` | every product must land on the *same* grid — compute once, don't reinvent |
+| [`points.py`](../src/coastal_sst_data/points.py) | reading a user's lat/lon CSV; placing points on an `AoiGrid` (`read_points`, `assign_aois`) | a coordinate column read in the wrong units, or a point silently assigned to the wrong AoI — both produce a plausible table, not an error |
 
 ---
 

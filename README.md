@@ -283,7 +283,7 @@ See [Command line interface](#command-line-interface) below for every subcommand
 
 Installing the package provides the `coastal-sst-data` command (equivalently, `python -m coastal_sst_data.cli`). Every command is driven by a project config file passed with `--config`; add `-v` for debug logging.
 
-There are eight subcommands:
+There are nine subcommands:
 
 | Command | What it does | Network |
 | --- | --- | --- |
@@ -293,6 +293,7 @@ There are eight subcommands:
 | `run` | Run the pipeline: compute the shared grid once, then acquire each selected product in order | yes |
 | `assemble` | Knit the aligned per-product outputs into one analysis-ready datacube (`.zarr`) per AOI | no |
 | `preprocess` | Post-assembly: add the derived channels (waterline, gap-filled level-4, screened SST) to the assembled cube | no |
+| `extract` | Pull point time series out of the assembled cubes at a CSV of lat/lon sites, as one long-format parquet/CSV table (optional; needs an `extract:` block) | no |
 | `provenance` | Print a built cube's provenance: the config that made it, each field's sources, access dates | no |
 | `check` | Scan the output tree for truncated or incomplete files (reads each payload, not just its header); `--repair` deletes them so the next run re-fetches | no |
 
@@ -316,6 +317,9 @@ coastal-sst-data run --config config.yaml --assemble
 
 # 5b. …or the same thing with several products/AOIs downloading at once
 coastal-sst-data run --config config.yaml --assemble --jobs 8
+
+# 6. (optional) pull the cubes' values at a list of lat/lon sites into one table
+coastal-sst-data extract --config config.yaml --points sites.csv
 ```
 
 Steps 4 and 5 are the slow ones, and both can be overlapped — see [Running in parallel](#running-in-parallel).
@@ -629,6 +633,104 @@ coastal-sst-data preprocess --config config.yaml --aoi tillamook_bay # just this
   whose cube hasn't been assembled yet is skipped with a warning (run `assemble` first). There is one
   store either way — open it with `xr.open_zarr("data/datacube/<aoi>.zarr")`. The cube's
   `preprocess_channels` attribute lists exactly which channels this stage owns.
+
+### `extract`
+
+**Optional, and only if you ask for it.** Nothing in `run`/`assemble`/`preprocess` reads
+this; a project with no `extract:` block is completely unaffected, and the parquet backend
+is an extra rather than a dependency.
+
+`extract` is the **transpose** of everything else in the package: the pipeline turns
+scattered granules into a dense `(time, y, x)` cube, and this pulls that cube's values back
+out at a list of sites, as one long-format table.
+
+```bash
+# what would be extracted, and how many rows -- opens no cube, writes nothing
+coastal-sst-data extract --config config.yaml --points sites.csv --dry-run
+
+coastal-sst-data extract --config config.yaml --points sites.csv
+# -> <output_dir>/extract/points.parquet
+```
+
+The **points file** is a CSV with a latitude, a longitude, and (ideally) an id. Column
+names are matched case-insensitively against `lat`/`latitude`/`y`, `lon`/`longitude`/`x`,
+and `id`/`point_id`/`station`/`name`/`site`; a file carrying two candidates for the same
+field is rejected rather than guessed at, and every coordinate is range-checked against
+WGS84 so a file of **projected metres** (which is what an `x`/`y` file usually is) fails
+loudly instead of silently landing in the ocean. Extra columns are ignored — join them back
+on `point_id`.
+
+Each point is assigned to exactly **one AOI**: the one whose grid contains it, and if
+several do, the one whose grid centre is nearest. A point inside no AOI is dropped with a
+warning naming it, and if that leaves nothing the run fails rather than writing an empty
+file. Points are **never** snapped to the nearest water pixel — a site is where you said it
+is.
+
+**The output** is one row per (point, AOI, time, variable, stat):
+
+| column | |
+| --- | --- |
+| `point_id`, `lat`, `lon` | from your points file — the coordinates you gave, not the pixel centre |
+| `aoi` | which cube the value came from |
+| `time` | the cube's date; **empty** for a static `(y,x)` channel, which gets one row rather than a copy per date |
+| `variable` | the cube channel name, unmodified |
+| `stat` | which statistic this row is |
+| `radius_m` | the neighbourhood this row actually **used** (a `nearest` row is always `0`, whatever the channel declares) |
+| `value` | the number |
+
+**Configuration** lives in an `extract:` block, and the channels are **explicit** — a
+channel you do not list is not extracted, and a channel you list that the cube does not
+have is a hard error naming it (with a spelling suggestion). A silently missing column in a
+modelling table is indistinguishable from a channel that was genuinely all-NaN.
+
+```yaml
+extract:
+  points: sites.csv          # or pass --points
+  format: parquet            # or csv
+  channels:
+    depth_cudem:                                          # bare key = nearest pixel
+    tide_coops:
+    eco_sst_clean: { radius_m: 300, stat: [nanmean, nanstd, count_valid] }
+    mur_sst:       { radius_m: 1000, stat: mean }
+    lst_sst:       { radius_m: 300, stat: nanmean, mask: water }
+```
+
+`radius_m` is a **disc in metres on the ground**, in the AOI's projected CRS — never
+degrees, never pixels — measured from the point's exact position to each pixel centre. (A
+box of the same nominal size would reach `radius x 1.41` into its corners.) The pixel the
+point falls in is always included, so a radius below the grid posting degenerates to that
+one pixel; the run says so rather than returning a column of NaN. A disc clipped by the
+grid edge still returns a value, over a partial disc — which is why `count` exists, and why
+it is worth requesting alongside any radius.
+
+The statistics:
+
+| stat | |
+| --- | --- |
+| `nearest` (the default) | the value of the pixel the point falls in. **Not** the nearest *finite* value: if that pixel is cloudy the answer is NaN, because filling from just offshore is how a validation set quietly acquires a warm bias. Ignores `radius_m` and `mask`. |
+| `mean` `median` `std` `min` `max` `sum` | plain NumPy — **NaN propagates**: one cloudy pixel in the disc gives NaN |
+| `nanmean` `nanmedian` `nanstd` `nanmin` `nanmax` `nansum` | the same, **skipping** NaN |
+| `count` | pixels in the disc after masking, finite or not — how edge-clipping and mask shrinkage become visible |
+| `count_valid` | **finite** pixels in the disc — how many observations the value actually rests on |
+| `p10` … `p97.5` | percentiles (NaN-skipping) |
+
+`mean` and `nanmean` are both offered because they are different questions, and which one
+you got should be visible in the output rather than decided for you. Ship `count_valid`
+next to any reducing statistic.
+
+`mask: water` restricts the disc to the cube's `landcover_water` cells (any other value
+names a static `(y,x)` channel to use instead), so a coastal point's mean is not
+contaminated by land. The mask wins over the include-the-containing-pixel rule: a point
+whose own cell is masked out contributes nothing, and an entirely masked-out neighbourhood
+gives NaN with `count == 0` rather than quietly falling back to the unmasked window.
+
+Other flags: `--aoi` restricts which cubes are read (and gives the output its own filename,
+so a one-AOI run cannot overwrite a full one), `--out` sets the path outright, `--format
+parquet|csv` overrides the config, and `--overwrite` replaces an existing table.
+
+**Parquet needs `pyarrow`**, which is *not* a core dependency — install it with
+`pip install 'coastal_sst_data[extract]'` or `conda install pyarrow`. `--format csv` works
+with no extra at all.
 
 ### `validate` and `grids`
 
