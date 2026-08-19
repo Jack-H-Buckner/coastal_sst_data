@@ -7,6 +7,7 @@ product's.
 """
 
 import logging
+import time
 import threading
 
 import pytest
@@ -110,3 +111,51 @@ def test_configure_is_idempotent():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# --------------------------------------------------------------------------- #
+# Diagnosing a wedged run.
+#
+# An acquisition run is hours of blocking reads on a thread pool. When one wedges the log
+# simply stops -- no traceback, no exit, nothing separating a deadlock from a slow granule.
+# Recovering the stack afterwards needs py-spy, which needs ptrace, which on a shared server
+# needs root the person running the job does not have. A handler the process installs on
+# ITSELF needs none of that.
+# --------------------------------------------------------------------------- #
+def test_sigusr1_dumps_every_thread_and_the_process_survives(capfd):
+    """Both halves matter. All threads, because a deadlock is never visible from the main
+    one alone; and survives, because diagnosing a hang must not cost the hours of work the
+    run has already banked."""
+    import os
+    import signal
+
+    logctx.configure()
+    parked = threading.Event()
+    started = threading.Event()
+
+    def worker():
+        started.set()
+        parked.wait(timeout=10)
+
+    t = threading.Thread(target=worker, name="a_parked_worker", daemon=True)
+    t.start()
+    assert started.wait(timeout=5)
+
+    try:
+        os.kill(os.getpid(), signal.SIGUSR1)
+        time.sleep(0.2)                       # the handler runs on the signal, not inline
+        err = capfd.readouterr().err
+    finally:
+        parked.set()
+        t.join(timeout=5)
+
+    assert "Thread" in err, f"no stack dump appeared:\n{err}"
+    assert "worker" in err, "the parked thread's frame is missing -- all_threads did not apply"
+    assert threading.main_thread().is_alive()
+
+
+def test_installing_the_dumper_twice_is_harmless():
+    """`configure` is called from four entry points and a `run` subcommand goes through more
+    than one, so re-registering has to be a no-op rather than an error."""
+    assert logctx._install_stack_dumper() is True
+    assert logctx._install_stack_dumper() is True

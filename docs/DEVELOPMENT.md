@@ -131,10 +131,19 @@ The `Kind` you choose determines the filename stamp and which assembler reader s
 | `Kind` | Filename | Assembler reader |
 |---|---|---|
 | `DAILY_RASTER` | `<aoi>_YYYYMMDD.nc` | `load_daily_sensor` |
-| `OVERPASS_SENSOR` | `<aoi>_YYYYMMDDThhmmss.nc` | `load_clearest_overpass` (registry loop — no wiring) |
+| `OVERPASS_SENSOR` | `<aoi>_YYYYMMDDThhmmss.nc`, or `<aoi>_YYYYMMDDThhmmss_<tile>.nc` if **tiled** | `load_clearest_overpass` (registry loop — no wiring) |
 | `STATIC_RASTER` | `<aoi>.nc` (no time dim) | a product-specific `load_*` (e.g. `load_bathy`, `load_landcover`) |
 | `SERIES_1D` | `<aoi>_tides.nc`, dims `(time,)` | `load_tide_daily` |
 | `STATION_TABLE` | `<aoi>_insitu.nc`, dims `(station, time)` | `load_insitu` + `build_insitu` |
+
+**A TILED overpass sensor must put the tile in the name** (`naming.tile_stem`). ECOSTRESS
+ECO_L2T delivers one overpass as several granules that share an acquisition time *exactly* and
+differ only by MGRS tile, so `time_stem` alone names every one of them identically: the first
+tile written makes `store.done` report the rest as already processed, and an AoI wider than a
+tile silently keeps one tile's footprint. Nothing fails — the file is valid and the run reports
+success. The tile makes them separate files, which is all `load_clearest_overpass` needs: it
+already merges a day's granules for any sensor whose `SensorSpec.mosaic_same_day` is set. Do
+not mosaic at acquisition time.
 
 For chlorophyll:
 

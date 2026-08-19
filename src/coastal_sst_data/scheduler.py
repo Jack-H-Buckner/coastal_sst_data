@@ -36,12 +36,26 @@ from __future__ import annotations
 import concurrent.futures as cf
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import logctx
 
 log = logging.getLogger(__name__)
+
+# How often the wait loop surfaces what is still in flight, and how long a task may run before
+# that report becomes a WARNING.
+#
+# A run's ONLY liveness signal is its stages' own log lines, and those go quiet legitimately --
+# a MUR granule read is minutes of one blocking call. So a stalled run and a slow one look
+# identical from the outside, and one that wedged overnight was indistinguishable from one
+# still working until the next morning. The heartbeat separates them: the run says what it is
+# waiting for and for how long, and says it at WARNING once "slow" stops being a plausible
+# explanation. `cf.wait` without a timeout could not do this -- it parks the main thread with
+# nothing left to notice that nothing is happening.
+HEARTBEAT_S = 300.0
+STALL_S = 1800.0
 
 
 @dataclass(frozen=True)
@@ -141,6 +155,7 @@ def run_graph(tasks: list[Task], *, jobs: int = 1, gates: dict | None = None) ->
     outcomes: dict = {}
     pending = set(order)
     running: dict = {}                 # future -> key
+    started: dict = {}                 # key -> monotonic time it was submitted
     jobs = max(1, int(jobs))
 
     def _blockers(task: Task) -> tuple:
@@ -179,6 +194,7 @@ def run_graph(tasks: list[Task], *, jobs: int = 1, gates: dict | None = None) ->
                         continue          # service is at capacity; try again next round
                     pending.discard(key)
                     running[pool.submit(_invoke, task)] = key
+                    started[key] = time.monotonic()
 
                 if not running:
                     if pending:
@@ -192,9 +208,27 @@ def run_graph(tasks: list[Task], *, jobs: int = 1, gates: dict | None = None) ->
 
                 # 3. Wait for the first result, so the loop reacts as soon as anything frees
                 #    a slot or unblocks a dependent -- rather than at a batch barrier.
-                finished, _ = cf.wait(running, return_when=cf.FIRST_COMPLETED)
+                finished, _ = cf.wait(running, timeout=HEARTBEAT_S,
+                                      return_when=cf.FIRST_COMPLETED)
+                if not finished:
+                    # Nothing completed within the heartbeat. Report rather than react: a slow
+                    # task is not a broken one, and a download cannot be killed mid-read
+                    # anyway, so the useful thing is to make the wait VISIBLE and name what it
+                    # is waiting for. Escalating past STALL_S is what lets `WARNING` in a
+                    # scrollback mean "this is no longer plausibly slow work".
+                    now = time.monotonic()
+                    waits = sorted(((now - started[k], k) for k in running.values()),
+                                   reverse=True)
+                    log.log(logging.WARNING if waits and waits[0][0] >= STALL_S
+                            else logging.INFO,
+                            "  still running %d task(s): %s",
+                            len(waits),
+                            ", ".join(f"{_name(k)} ({secs / 60:.0f}m)" for secs, k in waits))
+                    continue
+
                 for future in finished:
                     key = running.pop(future)
+                    started.pop(key, None)
                     gate_pool.give(by_key[key].gates)
                     try:
                         outcomes[key] = Outcome(key, value=future.result())
@@ -208,6 +242,12 @@ def run_graph(tasks: list[Task], *, jobs: int = 1, gates: dict | None = None) ->
             # -- so the honest thing is to drop the queue, say what we are waiting for, and
             # let the in-flight reads finish. `store.atomic` guarantees none of them can leave
             # a half-written output behind.
+            #
+            # SO CTRL-C IS NOT A WAY TO DIAGNOSE A HANG. `shutdown(wait=False)` returns, but
+            # the `with` block's own exit then calls `shutdown(wait=True)` and blocks on the
+            # stuck worker -- and the traceback only ever covers the main thread regardless.
+            # `kill -USR1 <pid>` dumps every thread and leaves the run alive; see
+            # `logctx._install_stack_dumper`.
             log.warning("Interrupted: cancelling %d queued task(s); waiting for %d in flight "
                         "(a download cannot be killed mid-read).", len(pending), len(running))
             pool.shutdown(wait=False, cancel_futures=True)

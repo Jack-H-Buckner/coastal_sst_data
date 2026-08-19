@@ -12,7 +12,16 @@ starts earlier, v003 reaches the present), so the user stacks the versions neede
 their range, and the datacube ships one channel-set per version (`eco_sst_v002`,
 `eco_sst_v003`). A granule present in both collections lands under each rather than colliding:
 
-    data/ECOSTRESS/<version>/aligned/<aoi>/<aoi>_<YYYYMMDDThhmmss>.nc
+    data/ECOSTRESS/<version>/aligned/<aoi>/<aoi>_<YYYYMMDDThhmmss>_<tile>.nc
+
+ONE FILE PER TILE, not per overpass. ECO_L2T is a TILED product: an AoI wider than a 110 km
+tile is covered by several granules that share an acquisition time EXACTLY and differ only by
+MGRS tile. Naming the output by time alone gave them all one filename, so the first tile
+written made `store.done` report every other tile of that overpass as already processed and
+the AoI kept one tile's footprint with nodata across the rest. The tile is therefore part of
+the name, which also lets the assembler do what it was already configured to do: `scene_index`
+groups a day's files, and `load_clearest_overpass` unions them because ECOSTRESS's SensorSpec
+sets `mosaic_same_day=True`. Nothing is mosaicked here.
 
 For each (AOI, version) it searches ECO_L2T_LSTE by bbox + dates (Earthdata wants the bare
 collection number, so the tag's leading `v` is stripped at the search boundary), then for
@@ -46,6 +55,7 @@ import xarray as xr
 import earthaccess
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
+from shapely.geometry import box as shp_box
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
@@ -152,6 +162,49 @@ def filter_links_for_granule(granule, layers: dict) -> dict:
 def parse_acq_time(filename: str) -> Optional[datetime]:
     """The overpass stamp in a granule id (..._20230715T210043_...), or None."""
     return naming.parse_time(filename)
+
+
+# The MGRS tile, read from its position RELATIVE TO the acquisition stamp rather than by
+# counting underscores from the left: the id's leading fields differ between collection
+# versions, and a positional split that silently returns the orbit number instead would name
+# every tile of an overpass identically again -- the exact failure this parse exists to stop.
+_TILE_RE = re.compile(r"_([0-9]{1,2}[A-Z]{3})_\d{8}T\d{6}_")
+
+
+def tile_id(granule_id: str) -> Optional[str]:
+    """The MGRS tile in an ECO_L2T granule id, or None if it carries none.
+
+    ECO_L2T is a TILED product: one overpass is delivered as several granules sharing an
+    acquisition time exactly and differing only here. Without this field in the output name
+    they all collapse onto one file (see `naming.tile_stem`).
+    """
+    m = _TILE_RE.search(granule_id)
+    return m.group(1) if m else None
+
+
+def granule_bbox(granule) -> Optional[tuple[float, float, float, float]]:
+    """(W, S, E, N) in EPSG:4326 from the granule's own catalogue metadata, or None.
+
+    Read from the search result -- no extra request. None means "the metadata does not say",
+    which every caller must treat as "keep it": dropping a granule because its extent could
+    not be read would lose real data on a metadata quirk.
+    """
+    try:
+        geom = (granule["umm"]["SpatialExtent"]["HorizontalSpatialDomain"]["Geometry"])
+        rects = geom.get("BoundingRectangles") or []
+        if not rects:
+            return None
+        r = rects[0]
+        w, s = float(r["WestBoundingCoordinate"]), float(r["SouthBoundingCoordinate"])
+        e, n = float(r["EastBoundingCoordinate"]), float(r["NorthBoundingCoordinate"])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    if w > e:
+        # Crosses the antimeridian, so this is TWO boxes and `shapely.box` would build the
+        # inside-out one -- which intersects nothing and would drop the granule silently.
+        # Unrepresentable here is "the metadata does not say", i.e. keep it.
+        return None
+    return (w, s, e, n)
 
 
 # --------------------------------------------------------------------------- #
@@ -300,25 +353,50 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers,
                 continue
 
             aoi_out = eco_root / tag / "aligned" / name
+            # Once per (AoI, version), not once per granule: the projection back to lon/lat
+            # is the same answer every time and there are thousands of granules.
+            aoi_lonlat = g.geom_lonlat()
 
             for gi, granule in enumerate(granules, 1):
                 if gi % auth.CHECK_EVERY == 0:
                     auth.ensure_fresh("earthdata", eff["earthdata"])
+                gid = granule_name(granule)
+
+                # Tiles that touch the search BOX but miss the AoI polygon read five COGs to
+                # produce a file that is nodata everywhere. Skipped before anything is opened.
+                bbox = granule_bbox(granule)
+                if bbox is not None and not shp_box(*bbox).intersects(aoi_lonlat):
+                    log.debug("  [%s %d/%d] %s outside the AoI polygon, skipping",
+                              tag, gi, len(granules), gid)
+                    continue
+
                 role_to_url = filter_links_for_granule(granule, layers)
                 if not role_to_url:
                     continue
-                t = parse_acq_time(granule_name(granule))
+                t = parse_acq_time(gid)
                 tstr = naming.time_stamp(t) if t else f"g{gi}"
-                stem = f"{name}_{tstr}"
+                # ECO_L2T is TILED: without the tile, every granule of one overpass names the
+                # same file and `store.done` reports all but the first as already processed,
+                # leaving the AoI covered by whichever tile happened to be reached first. An
+                # id we cannot read the tile from falls back to the untiled stem -- it is one
+                # granule's name, not a reason to drop the overpass.
+                tile = tile_id(gid)
+                if tile is None:
+                    log.warning("    %s: no MGRS tile in the granule id; a second tile of "
+                                "this overpass would collide with it", gid)
+                    stem = f"{name}_{tstr}"
+                else:
+                    stem = naming.tile_stem(name, t, tile) if t else f"{name}_{tstr}_{tile}"
+                label = f"{tstr} {tile}" if tile else tstr
                 if store.done(aoi_out / f"{stem}.nc", expected_vars(vcfg),
                               shape=(g.height, g.width), overwrite=overwrite):
                     log.info("  [%s %d/%d] %s already processed, skipping",
-                             tag, gi, len(granules), tstr)
+                             tag, gi, len(granules), label)
                     rep.skip()
                     continue
 
                 log.info("  [%s %d/%d] streaming %d layer(s) for %s",
-                         tag, gi, len(granules), len(role_to_url), tstr)
+                         tag, gi, len(granules), len(role_to_url), label)
                 try:
                     # The OPEN and the READS go in ONE closure. `earthaccess.open` returns
                     # handles bound to the fsspec session they were created with, so
@@ -326,27 +404,40 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers,
                     # can. Retrying the reads alone would keep reading through a dead session.
                     def _open_and_read(urls=list(role_to_url.values()),
                                        roles=list(role_to_url)):
+                        # CLOSED in a finally: each handle holds an HTTPS connection and a
+                        # one-thread executor for its background block cache, and neither is
+                        # released until the object is collected. Tiling multiplied the
+                        # handles per overpass, so leaking them stopped being survivable.
+                        # `process_granule` reprojects to numpy before returning, so the
+                        # Dataset it hands back does not read through these again.
                         fobjs = earthaccess.open(urls)
-                        return process_granule(dict(zip(roles, fobjs)), vcfg, grid_cfg,
-                                               g, name, t)
+                        try:
+                            return process_granule(dict(zip(roles, fobjs)), vcfg, grid_cfg,
+                                                   g, name, t)
+                        finally:
+                            for fo in fobjs:
+                                try:
+                                    fo.close()
+                                except Exception:   # noqa: BLE001 -- a close that fails must
+                                    pass            # not mask what we are returning/raising
 
-                    ds = net.retry(_open_and_read, what=f"ECOSTRESS {tag} {tstr}",
+                    ds = net.retry(_open_and_read, what=f"ECOSTRESS {tag} {label}",
                                    refresh=auth.refresher("earthdata", eff["earthdata"]))
                 except Exception as exc:
-                    log.warning("    FAILED to open %s %s (%s)", tag, tstr, exc)
-                    rep.fail(f"{name} {tag} {tstr}", exc)
+                    log.warning("    FAILED to open %s %s (%s)", tag, label, exc)
+                    rep.fail(f"{name} {tag} {label}", exc)
                     continue
 
                 if ds is None:
                     # dropped as degraded (a mask layer was missing) -- a LOSS, not a no-op
-                    rep.fail(f"{name} {tag} {tstr}", "granule dropped (missing core layer)")
+                    rep.fail(f"{name} {tag} {label}", "granule dropped (missing core layer)")
                     continue
                 ds.attrs.update(**provenance.stamp(eff))
                 try:
                     out = store.write_output(ds, aoi_out, stem, fmt)
                 except (OSError, RuntimeError) as exc:   # this granule only -- see cmems.run
                     log.warning("      WRITE FAILED %s (%s)", stem, exc)
-                    rep.fail(f"{name} {tag} {tstr}", f"write failed: {exc}")
+                    rep.fail(f"{name} {tag} {label}", f"write failed: {exc}")
                     continue
                 log.info("      wrote %s", out)
                 rep.wrote(source=ds.attrs.get("source"))

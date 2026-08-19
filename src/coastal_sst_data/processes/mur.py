@@ -171,11 +171,13 @@ def subset_and_reproject(fobj, variable, bbox_ll, pad, target_crs, transform,
                          width, height, geom_proj, grid_cfg) -> tuple[xr.DataArray, pd.Timestamp]:
     """Open one daily MUR granule lazily, subset to the AOI, upsample to grid."""
     w, s, e, n = bbox_ll
-    ds = xr.open_dataset(fobj, engine="h5netcdf", mask_and_scale=True)
-    da = ds[variable].isel(time=0)
-    da = da.sel(lat=slice(s - pad, n + pad), lon=slice(w - pad, e + pad)).load()
-
-    t = pd.Timestamp(ds["time"].values[0]).tz_localize(None)
+    # `with`, because the window is `.load()`ed and the time read out before we return: the
+    # Dataset is finished with at that point, and leaving it open pins the HDF5 handle -- and
+    # through it the caller's fsspec object -- for as long as the DataArray is alive.
+    with xr.open_dataset(fobj, engine="h5netcdf", mask_and_scale=True) as ds:
+        da = ds[variable].isel(time=0)
+        da = da.sel(lat=slice(s - pad, n + pad), lon=slice(w - pad, e + pad)).load()
+        t = pd.Timestamp(ds["time"].values[0]).tz_localize(None)
     return _to_grid(da, target_crs, transform, width, height, geom_proj, grid_cfg), t
 
 
@@ -190,8 +192,19 @@ def _fetch_download(granule, variable, g: AoiGrid, pad, grid_cfg):
     cannot heal a handle we already hold -- only re-opening can.
     """
     fobj = earthaccess.open([granule])[0]
-    return subset_and_reproject(fobj, variable, g.search_bbox, pad, g.target_crs,
-                                g.transform, g.width, g.height, g.geom_proj, grid_cfg)
+    try:
+        # CLOSED here: the handle holds an HTTPS connection and a one-thread executor for its
+        # background block cache, and neither is released until the object is collected. A
+        # multi-year AoI is hundreds of granules, and the abandoned sockets were still on the
+        # process as CLOSE-WAIT hours later. `subset_and_reproject` materialises its window,
+        # so nothing reads back through this afterwards.
+        return subset_and_reproject(fobj, variable, g.search_bbox, pad, g.target_crs,
+                                    g.transform, g.width, g.height, g.geom_proj, grid_cfg)
+    finally:
+        try:
+            fobj.close()
+        except Exception:      # noqa: BLE001 -- a close that fails must not mask the result
+            pass
 
 
 # The coordinate axes are a property of the COLLECTION, not of a granule, so they are read

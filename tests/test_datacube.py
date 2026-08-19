@@ -521,6 +521,53 @@ def test_ecostress_mosaics_within_a_version_not_across_them(tmp_path, days):
     assert ds["eco_hour_v003"].isel(time=0).item() == pytest.approx(21.0)
 
 
+def test_ecostress_tiles_of_one_overpass_are_mosaicked(tmp_path, days):
+    """The case `mosaic_same_day` was set for but never actually reached.
+
+    ECO_L2T is TILED: an AoI wider than a 110 km tile is covered by granules that share an
+    acquisition time EXACTLY and differ only by MGRS tile. Every other mosaic test here gives
+    its granules different HOURS, so they were distinct files by construction and this path
+    was never exercised. Named by time alone -- as the acquisition stage did -- the tiles are
+    one filename, all but the first are never written, and the AoI silently keeps one tile's
+    footprint. With the tile in the name they are separate files that `scene_index` groups
+    into the same day, and the day is their union.
+    """
+    project = _eco_versions_project(tmp_path, ["v002"])
+    g = grid.project_grids(project)[AOI]
+    H, W, xs, ys = _grid_hw(g)
+
+    def eco_tile(day, hour, rows, tile, sst_val):
+        sst = np.full((H, W), np.nan, "float32")
+        sst[rows] = sst_val
+        water = np.ones((H, W), "float32")             # eco polarity: >=0.5 is LAND
+        water[rows] = 0.0
+        ds = xr.Dataset({
+            "sst": (("time", "y", "x"), sst[None]),
+            "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+            "water": (("time", "y", "x"), water[None]),
+            "quality": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+        }, coords={"time": [day], "y": ys, "x": xs})
+        stamp = f"{day.strftime('%Y%m%d')}T{hour:02d}0000"
+        _write_eco(project, f"{AOI}_{stamp}_{tile}.nc", ds)
+
+    cut = 2 * H // 3
+    # SAME instant, different tiles -- deliberately unequal, so the base is the larger tile
+    # rather than a tie broken by name.
+    eco_tile(days[0], 18, slice(0, cut), "55GDP", 286.0)
+    eco_tile(days[0], 18, slice(cut, H), "55GDQ", 289.0)
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert int(ds["eco_valid_v002"].isel(time=0).values.sum()) == H * W, (
+        "the overpass should cover the UNION of its tiles; a tile was dropped")
+    sst = ds["eco_sst_v002"].isel(time=0).values
+    assert not np.isnan(sst).any()
+    assert np.allclose(sst[:cut], 286.0)
+    assert np.allclose(sst[cut:], 289.0)
+    # Tiles of one overpass share an instant, so the merged day reports it unambiguously.
+    assert ds["eco_hour_v002"].isel(time=0).item() == pytest.approx(18.0)
+
+
 def test_a_mosaicked_day_opens_each_granule_exactly_once(project, grids, days, monkeypatch):
     """The merge is ONE arrival-ordered pass, not rank-then-fill.
 
