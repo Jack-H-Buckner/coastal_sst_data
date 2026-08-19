@@ -206,21 +206,22 @@ def _cmd_check(args):
 
     print(f"\n{n} file(s) checked, {len(bad)} unreadable/incomplete, "
           f"{len(leftovers)} scratch leftover(s), {len(in_use)} in use.")
-    if in_use and args.repair:
+    if in_use and args.repair and not args.force:
         raise SystemExit(
             f"Refusing to repair: another run is writing this tree ({len(in_use)} file(s) in "
             f"use). Deleting its in-flight scratch is exactly the failure this pass exists "
             f"to prevent, and its verdicts on the rest are a moving target. Wait for that "
-            f"run to finish, then re-run.")
-    if in_use:
+            f"run to finish, then re-run -- or pass --force if you KNOW nothing is running "
+            f"(a reboot can leave scratch whose pid has since been reused).")
+    if in_use and not args.repair:
         print("Another run is writing this tree; --repair will refuse until it finishes.")
-    if not bad and not leftovers:
+    if not bad and not leftovers and not (in_use and args.force):
         print("Tree is clean." if not in_use else "Nothing to repair.")
         return
     if not args.repair:
         print("Re-run with --repair to delete these; the next run will then re-fetch them.")
         return
-    removed = store.repair(bad, leftovers)
+    removed = store.repair(bad, leftovers + (in_use if args.force else []), force=args.force)
     print(f"Removed {removed} path(s). Re-run the pipeline to re-fetch them.")
 
 
@@ -324,6 +325,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "Much faster, but cannot see a truncated chunk.")
     p_chk.add_argument("--repair", action="store_true",
                        help="Delete the bad files (default: report only).")
+    p_chk.add_argument("--force", action="store_true",
+                       help="With --repair: delete scratch that still looks in use. Only "
+                            "when you KNOW nothing is running -- a reboot can leave scratch "
+                            "whose owning pid has since been reused, which nothing else "
+                            "will ever clear.")
     p_chk.set_defaults(func=_cmd_check)
 
     return ap

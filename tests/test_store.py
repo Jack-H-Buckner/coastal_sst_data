@@ -184,6 +184,20 @@ def test_our_own_abandoned_scratch_is_swept_even_though_our_pid_is_alive(tmp_pat
     assert not p.exists()
 
 
+def test_a_live_process_keeps_its_scratch_however_old_the_file_looks(tmp_path):
+    """The clock does not get to overrule `os.kill`.
+
+    This was the first fix's bug with a longer fuse: a live pid fell THROUGH to the age test,
+    so a writer stalled on a slow read -- scratch created, mtime frozen, entirely alive --
+    had its file deleted once it crossed the staleness threshold.
+    """
+    dest = tmp_path / "a.nc"
+    p = _scratch(dest, f"{store._HOST}-{os.getppid()}", age_h=48)   # ancient, and alive
+
+    assert store.sweep_scratch(dest, max_age_s=0) == [p]
+    assert p.exists()
+
+
 def test_recent_scratch_from_another_host_is_left_alone_until_it_goes_stale(tmp_path):
     """The only tier that is a guess, so it is the only one that waits."""
     dest = tmp_path / "a.nc"
@@ -243,6 +257,55 @@ def test_a_stash_from_a_live_swap_is_never_swept(tmp_path):
 
     assert stash in swept["live"] and swept["survived"]
     assert (dest / "sst.tif").read_bytes() == b"the new output"
+
+
+def test_writing_a_netcdf_off_the_main_thread_prints_no_hdf5_error_stacks(tmp_path, capfd):
+    """A `--jobs N` run buried its own log under HDF5 error stacks -- for writes that
+    SUCCEEDED.
+
+    libnetcdf probes the target with `H5Fis_accessible()` before every create, with no
+    existence check, so writing a NEW file emitted a full `HDF5-DIAG` block ending
+    `errno = 2` about a file that was missing only because it was about to be created.
+    Serial runs never saw it and parallel runs drowned in it, from identical code: HDF5's
+    error stack is thread-local, and libnetcdf silences it once on the thread that
+    initialised HDF5 -- the main one -- so every pool worker printed.
+
+    `capfd`, not `caplog`: a C library writes this straight to fd 2, and it never passes
+    through Python's logging at all.
+    """
+    # The main-thread write is LOAD-BEARING, not a warm-up. HDF5 is initialised lazily by
+    # the first netCDF call in the process, and whichever thread does that is the one
+    # libnetcdf silences. Skip this and the worker below initialises HDF5 itself, silences
+    # itself, and the test passes without ever exercising the bug. A real run always
+    # initialises on the main thread first.
+    store.write_netcdf(_ds(), tmp_path / "init.nc")
+
+    err = {}
+
+    def write():
+        capfd.readouterr()                       # discard anything already buffered
+        store.write_netcdf(_ds(), tmp_path / "a.nc")
+        err["text"] = capfd.readouterr().err
+
+    t = threading.Thread(target=write)
+    t.start()
+    t.join(30)
+
+    assert "HDF5-DIAG" not in err["text"], f"HDF5 noise leaked:\n{err['text'][:1500]}"
+    with xr.open_dataset(tmp_path / "a.nc") as ds:       # ...and the file is real
+        assert ds["sst"].shape == (4, 4)
+
+
+def test_a_placeholder_that_is_never_written_to_is_still_an_error(tmp_path):
+    """`placeholder=True` makes the scratch exist before the writer touches it, so the
+    emptiness guard cannot be `exists()` any more. A writer that opens the file and writes
+    nothing must still fail -- silently swapping a 0-byte file onto the destination is
+    exactly the half-output this module exists to prevent."""
+    dest = tmp_path / "a.nc"
+    with pytest.raises(RuntimeError, match="nothing was written"):
+        with store.atomic(dest, placeholder=True) as tmp:
+            assert tmp.exists() and tmp.stat().st_size == 0     # handed to us pre-created
+    assert not dest.exists()
 
 
 def test_rasters_swap_the_whole_directory(tmp_path):
@@ -449,6 +512,17 @@ def test_repair_refuses_to_delete_scratch_that_is_in_use(tmp_path, caplog):
         assert store.repair([], [live]) == 0
     assert live.exists()
     assert "in use by" in caplog.text
+
+
+def test_force_deletes_scratch_that_still_looks_in_use(tmp_path):
+    """The one escape hatch, for the one case the liveness rule cannot get right: a machine
+    rebooted while scratch was open and the owning pid has since been REUSED, so nothing will
+    ever call that file dead on its own."""
+    d = _aligned(tmp_path, "MUR", "aoi1")
+    live = _scratch(d / "aoi1_20230101.nc", f"{store._HOST}-{os.getppid()}")
+
+    assert store.repair([], [live], force=True) == 1
+    assert not live.exists()
 
 
 def test_scan_can_be_limited_to_one_aoi(tmp_path):

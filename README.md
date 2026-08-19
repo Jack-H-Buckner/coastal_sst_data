@@ -774,8 +774,8 @@ That is a report, not an error — but it usually means two jobs are doing the s
 
 Two consequences worth knowing:
 
-- **`check --repair` refuses to run while another job is writing the tree.** It reports that job's in-flight scratch as `IN USE` and stops, because deleting it is precisely the failure atomic writes exist to prevent — and its verdict on everything else is a moving target while another run is still producing output. Wait for the run to finish, then repair.
-- **Scratch from a run that died clears on the next run**, immediately if the run was on this machine (its pid is gone, which is proof), and after six hours (`store.STALE_SCRATCH_S`) if it was on another node, where the clock is the only evidence available.
+- **`check --repair` refuses to run while another job is writing the tree.** It reports that job's in-flight scratch as `IN USE` and stops, because deleting it is precisely the failure atomic writes exist to prevent — and its verdict on everything else is a moving target while another run is still producing output. Wait for the run to finish, then repair. `--force` overrides it, for the one case the liveness check cannot get right on its own: a machine rebooted while scratch was open and the owning pid has since been reused, so nothing will ever call that file dead.
+- **Scratch from a run that died clears on the next run**, immediately if the run was on this machine (`os.kill(pid, 0)` proves the writer is gone), and after six hours (`store.STALE_SCRATCH_S`) if it was on another node, where the clock is the only evidence available. A discard says which of those decided it.
 
 What this does *not* make safe is two runs **assembling the same cube**: `preprocess` reads and rewrites `<aoi>.zarr` in place, so one run replacing the store under another's open reader is a hazard the write path cannot address. Shard cubes by AOI.
 

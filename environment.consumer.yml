@@ -52,7 +52,8 @@ dependencies:
   - pystac-client            # landsat / landcover (Planetary Computer)
   - planetary-computer       # landsat / landcover
   - pyresample               # modis + met resampling
-  - netcdf4                  # modis (reads MODIS L2P swaths, modis.py)
+  - netcdf4                  # CORE: the engine every aligned file is written with
+                             # (store.NETCDF_ENGINE); also reads MODIS L2P swaths
   - harmony-py               # modis (server-side AoI subsetting, access: harmony)
   - herbie-data              # met (HRRR)
   - gcsfs                    # met (ERA5 fallback)

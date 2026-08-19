@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coastal_sst_data"
-version = "0.4.1"
+version = "0.4.2"
 description = "Acquire and grid coastal SST and covariate data products into analysis-ready datacubes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,13 +32,18 @@ dependencies = [
     "numcodecs>=0.13,<1",
     "scipy>=1.13,<2",
     "h5netcdf>=1.4,<2",                # xarray engine for the MUR SST backbone (mur.py)
+    # The engine EVERY aligned file is WRITTEN with (store.NETCDF_ENGINE). Core, not an
+    # extra: left to xarray's default order this slot is filled by whichever engine happens
+    # to be installed, so the same code wrote through netcdf4 in a conda env and h5netcdf in
+    # a bare pip install -- different HDF5 stacks, silently. It also reads MODIS L2P swaths.
+    "netcdf4>=1.7,<2",
 ]
 
 [project.optional-dependencies]
 # Per-product backends -- install only what your config selects.
 landsat = ["planetary-computer", "pystac-client"]        # landsat_pc source
 landcover = ["planetary-computer", "pystac-client"]      # landcover_esa source
-modis = ["pyresample", "netcdf4", "harmony-py"]           # swath -> grid resampling (netcdf4 reads MODIS L2P); harmony-py = server-side subsetting
+modis = ["pyresample", "harmony-py"]                      # swath -> grid resampling; harmony-py = server-side subsetting (netcdf4, which reads MODIS L2P, is core)
 met = ["herbie-data", "gcsfs", "pyresample"]              # HRRR + ARCO-ERA5 forcing
 tides = ["pytides2"]                                      # NOAA CO-OPS harmonic synthesis
 cmems = ["copernicusmarine>=2"]                            # Copernicus Marine global physics
@@ -46,7 +51,7 @@ tides-global = ["eo-tides"]                               # global tide-model ba
 plot = ["matplotlib", "cartopy"]                          # `grids --plot` maps
 # Convenience bundles.
 all = [
-    "planetary-computer", "pystac-client", "pyresample", "netcdf4", "harmony-py",
+    "planetary-computer", "pystac-client", "pyresample", "harmony-py",
     "herbie-data", "gcsfs", "pytides2", "eo-tides", "copernicusmarine>=2",
     "matplotlib", "cartopy",
 ]

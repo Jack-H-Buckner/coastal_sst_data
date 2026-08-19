@@ -36,9 +36,12 @@ WHOSE SCRATCH IS IT. Atomicity assumed one writer per destination, and cleaning 
 dead run was therefore "delete every `<dest>.part-*` you find". That is wrong the moment two
 runs share an output tree -- a Slurm array with overlapping `--aoi` lists, two shells, a job
 relaunched before the old one died -- because the sweep cannot tell a dead run's leftovers
-from a live run's open file. It deleted the live one, and the writer (whose HDF5 handle is
-reopened BY PATH for each dask chunk) failed mid-day with `errno = 2` on a file it had every
-reason to think it owned.
+from a live run's open file. It deleted the live one, and the writer failed mid-file on a
+path it had every reason to think it owned. (The reopen that turns a deleted scratch file
+into a hard failure is xarray's `CachingFileManager`: it flips `mode="w"` to `"a"` after the
+first open and re-acquires BY PATH, so an eviction from the 128-entry global `FILE_CACHE`
+sends it back to a filename that is no longer there. This has nothing to do with dask -- it
+happens to plain numpy-backed writes just the same.)
 
 So scratch now says WHO made it (`<host>-<pid>-<tid>-<ms>`) and the sweep asks whether that
 writer is still around, using the strongest evidence available:
@@ -207,6 +210,24 @@ def scratch_owner(path: Path) -> str:
     return f"{owner[0]}:{owner[1]}" if owner else "an unidentified run"
 
 
+def _why_dead(path: Path) -> str:
+    """WHICH tier condemned this scratch -- so a discard in the log can be judged.
+
+    "its pid is gone" is routine. "no host/pid in its name" means scratch from before the
+    tag carried an owner, which should stop appearing a few runs after an upgrade. "untouched
+    for Nh" is the only guess of the three, and the only one that could ever be wrong about a
+    live writer, so it is the one worth noticing in a log.
+    """
+    owner = _owner_of(Path(path))
+    if owner is None:
+        return "no host/pid in its name (written before this version)"
+    if owner[0] != _HOST:
+        return f"{owner[0]}:{owner[1]} is on another host and it has been untouched too long"
+    if owner[1] == os.getpid():
+        return "we started it ourselves and are no longer writing it"
+    return f"its process ({owner[0]}:{owner[1]}) is gone"
+
+
 def is_live_scratch(path: Path, *, max_age_s: float | None = None) -> bool:
     """Might something still be WRITING this scratch? Errs toward yes.
 
@@ -223,8 +244,13 @@ def is_live_scratch(path: Path, *, max_age_s: float | None = None) -> bool:
     if owner is not None and owner[0] == _HOST:
         if owner[1] == os.getpid():
             return False                   # ours, and not open -> we abandoned it
-        if not _pid_alive(owner[1]):
-            return False                   # the writer is gone
+        # The writer's process answers for it in BOTH directions, and the clock does not get
+        # to overrule it. Letting a live pid fall through to the age test reintroduces the
+        # original bug on a longer fuse: a writer stalled on a slow read has a frozen mtime
+        # while being entirely alive, and after STALE_SCRATCH_S its file would be deleted.
+        # The cost is a leak -- a pid REUSED after a reboot keeps dead scratch looking live
+        # forever -- and a leak is visible in `check` and clears with `--repair --force`.
+        return _pid_alive(owner[1])
     cutoff = time.time() - (STALE_SCRATCH_S if max_age_s is None else max_age_s)
     return _newest_mtime(path, at_least=cutoff) > cutoff
 
@@ -281,7 +307,8 @@ def sweep_scratch(dest: Path, *, max_age_s: float | None = None) -> list[Path]:
             log.warning("  leaving %s alone -- %s may still be writing it",
                         stale.name, scratch_owner(stale))
             continue
-        log.warning("  discarding %s left by an unfinished run", stale.name)
+        log.warning("  discarding %s left by an unfinished run -- %s",
+                    stale.name, _why_dead(stale))
         _rm(stale)
     return live
 
@@ -325,7 +352,7 @@ def _swap(tmp: Path, dest: Path) -> None:
 
 
 @contextlib.contextmanager
-def atomic(dest: Path):
+def atomic(dest: Path, *, placeholder: bool = False):
     """Yield a scratch path to write to; swap it onto `dest` only if the write RETURNS.
 
         with store.atomic(path) as tmp:
@@ -333,6 +360,24 @@ def atomic(dest: Path):
 
     On any failure -- including KeyboardInterrupt, which is how a long run usually dies --
     the scratch is removed and `dest` is left exactly as it was.
+
+    `placeholder=True` creates the scratch as an EMPTY FILE before yielding, for writers that
+    are noisy about being handed a path that does not exist yet. libnetcdf is: its
+    `NC_infermodel` probes the target with `H5Fis_accessible()` before every create, with no
+    existence check, so creating a new file prints a full `HDF5-DIAG` stack ending
+    `errno = 2` -- about a file that is missing only because it is one instruction away from
+    being created. netcdf-c ignores the answer and the write succeeds; the block is pure
+    stderr noise, and there is no Python exception to catch or suppress.
+
+    Parallel runs saw it and serial runs did not, from identical code: HDF5's error stack is
+    thread-local, and libnetcdf silences it once on whichever thread initialised HDF5 -- the
+    main one -- so every pool worker started printing again. An empty file is enough to make
+    the probe answer "not HDF5" quietly instead of "cannot open", and every writer that wants
+    this truncates what it finds anyway.
+
+    The cost is that the emptiness check below can no longer be `exists()`, since we made it
+    exist. It becomes a SIZE check, which is a better test regardless: a writer that opened
+    the file and wrote nothing used to pass.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -346,14 +391,23 @@ def atomic(dest: Path):
     # Claimed BEFORE the yield, not once the writer has created something: a sweep that ran
     # in the gap would find no file to glob, so registering first leaves no window at all.
     _register(tmp, dest)
+    if placeholder:
+        tmp.touch()
     try:
         yield tmp
-        if not tmp.exists():
+        if not tmp.exists() or (placeholder and tmp.is_file() and tmp.stat().st_size == 0):
             raise RuntimeError(f"nothing was written to {tmp.name}")
         _swap(tmp, dest)
     except BaseException:
         # BaseException, not Exception: a Ctrl-C halfway through the payload must not
         # leave a half-file behind either.
+        #
+        # SAID OUT LOUD, because this is the other way a scratch file disappears mid-write:
+        # not another run sweeping it, but THIS writer cleaning up after a failure of its
+        # own. HDF5 will often print an `errno = 2` stack of its own as it unwinds over the
+        # file we just removed, and without this line that stack looks identical to the
+        # concurrency bug. It is not -- the cause is whatever raised, one frame up.
+        log.info("  removing %s after a failed write", tmp.name)
         _rm(tmp)
         raise
     finally:
@@ -363,12 +417,23 @@ def atomic(dest: Path):
 # --------------------------------------------------------------------------- #
 # Writers
 # --------------------------------------------------------------------------- #
+# The netCDF library every aligned file is written with, named rather than inferred.
+#
+# Left unset, xarray walks ("netcdf4", "h5netcdf", "scipy") and takes the first INSTALLED
+# one -- so a conda env (which has netcdf4) and a bare `pip install .` (which does not; it
+# is only in the `modis`/`all` extras) write through different HDF5 stacks, with different
+# reopen and locking behaviour, from identical code. `zlib`/`complevel` are accepted by both,
+# so nothing fails to reveal which one ran. Naming it makes a cube reproducible off one
+# machine, and makes a future HDF5 report attributable to a known writer.
+NETCDF_ENGINE = "netcdf4"
+
+
 def write_netcdf(ds: xr.Dataset, path: Path, encoding: dict | None = None) -> Path:
     """Atomically write `ds` to `path`."""
     if encoding is None:
         encoding = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
-    with atomic(path) as tmp:
-        ds.to_netcdf(tmp, encoding=encoding)
+    with atomic(path, placeholder=True) as tmp:      # see `atomic`: keeps libnetcdf quiet
+        ds.to_netcdf(tmp, encoding=encoding, engine=NETCDF_ENGINE)
     return path
 
 
@@ -573,7 +638,7 @@ def _find_scratch(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def repair(bad, leftovers) -> int:
+def repair(bad, leftovers, *, force: bool = False) -> int:
     """Delete what `scan` condemned, so the next run re-fetches it.
 
     Deleting is the repair: with the skip guard now asking `is_complete`, simply REMOVING a
@@ -585,6 +650,11 @@ def repair(bad, leftovers) -> int:
     it out; this is the second lock on the same door, because deleting a running job's
     in-flight write is the one mistake this pass must never make.
 
+    `force` overrides that, and exists for exactly one situation: a machine rebooted while
+    scratch was open, and the owning pid has since been REUSED by an unrelated process, so
+    the liveness check will call a dead file live forever. Only use it when you know nothing
+    is running against this tree.
+
     -> how many paths were actually removed.
     """
     removed = 0
@@ -592,7 +662,7 @@ def repair(bad, leftovers) -> int:
         _rm(f)
         removed += 1
     for p in leftovers:
-        if is_live_scratch(p):
+        if is_live_scratch(p) and not force:
             log.warning("  %s is in use by %s; NOT deleting it", p.name, scratch_owner(p))
             continue
         _rm(p)

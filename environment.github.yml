@@ -36,8 +36,10 @@ dependencies:
   - earthaccess
   - zarr>=3.0,<4
   - numcodecs>=0.13,<1
-  # xarray file-reader engines: h5netcdf reads the MUR SST backbone (mur.py);
-  # netcdf4 reads MODIS L2P swaths (modis.py).
+  # xarray engines. h5netcdf reads the MUR SST backbone (mur.py). netcdf4 reads MODIS
+  # L2P swaths (modis.py) AND is what every aligned file is written with
+  # (store.NETCDF_ENGINE) -- named there rather than inferred, so the write path does
+  # not change with whatever engine an environment happens to provide.
   - h5netcdf>=1.4,<2
   - netcdf4>=1.7,<2
   # Landsat via Planetary Computer (landsat_pc.py): STAC search + COG reads.

@@ -225,6 +225,16 @@ def test_check_refuses_to_repair_a_tree_with_a_live_write_in_it(tmp_path):
     assert scratch.exists()
 
 
+def test_force_overrides_the_refusal(tmp_path, capsys):
+    """For the case the liveness rule cannot get right on its own: a reboot leaves scratch
+    whose owning pid has since been reused, so nothing ever calls it dead."""
+    config, scratch = _tree_with_live_scratch(tmp_path)
+    cli.main(["check", "--config", config, "--quick", "--repair", "--force"])
+
+    assert not scratch.exists()
+    assert "Removed 1 path(s)" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing errors.
 # ---------------------------------------------------------------------------
