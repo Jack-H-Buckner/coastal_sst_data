@@ -266,3 +266,67 @@ def test_a_task_runs_under_its_label():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# --------------------------------------------------------------------------- #
+# Liveness. A run's only signal that it is alive is its stages' own log lines, and those go
+# quiet legitimately -- a MUR granule read is minutes inside one blocking call. So a stalled
+# run and a slow one look identical from outside, and one that wedged overnight was
+# indistinguishable from one still working until the next morning.
+# --------------------------------------------------------------------------- #
+def test_a_long_wait_reports_what_it_is_waiting_for(monkeypatch, caplog):
+    monkeypatch.setattr(scheduler, "HEARTBEAT_S", 0.05)
+    release = threading.Event()
+
+    tasks = [Task(key=("acquire", "ecostress", "hobart"),
+                  run=lambda: release.wait(timeout=10) or "done")]
+
+    with caplog.at_level("INFO"):
+        done = threading.Thread(target=lambda: (time.sleep(0.3), release.set()))
+        done.start()
+        outcomes = scheduler.run_graph(tasks, jobs=1)
+        done.join(timeout=5)
+
+    assert outcomes[("acquire", "ecostress", "hobart")].ok
+    assert "still running" in caplog.text
+    assert "acquire/ecostress/hobart" in caplog.text, (
+        "the heartbeat has to NAME the task; 'something is slow' is what we already had")
+
+
+def test_the_heartbeat_escalates_once_slow_stops_explaining_it(monkeypatch, caplog):
+    """`WARNING` in a scrollback should mean "this is no longer plausibly slow work" -- the
+    judgement a person reading the log at 7am is trying to make."""
+    monkeypatch.setattr(scheduler, "HEARTBEAT_S", 0.05)
+    monkeypatch.setattr(scheduler, "STALL_S", 0.0)      # everything is already a stall
+    release = threading.Event()
+
+    with caplog.at_level("INFO"):
+        done = threading.Thread(target=lambda: (time.sleep(0.3), release.set()))
+        done.start()
+        scheduler.run_graph([Task(key=("k",), run=lambda: release.wait(timeout=10))], jobs=1)
+        done.join(timeout=5)
+
+    assert any(r.levelname == "WARNING" and "still running" in r.message
+               for r in caplog.records)
+
+
+def test_the_heartbeat_does_not_change_scheduling(monkeypatch):
+    """It is a report, not a policy: no task is abandoned, retried or reordered because a
+    heartbeat fired. A run that used to finish must still finish, with the same outcomes."""
+    monkeypatch.setattr(scheduler, "HEARTBEAT_S", 0.01)
+    order, lock = [], threading.Lock()
+
+    def note(name, delay=0.0):
+        def run():
+            time.sleep(delay)
+            with lock:
+                order.append(name)
+            return name
+        return run
+
+    tasks = [Task(key=("a",), run=note("a", 0.05)),
+             Task(key=("b",), run=note("b"), deps=(("a",),))]
+    outcomes = scheduler.run_graph(tasks, jobs=2)
+
+    assert order == ["a", "b"]
+    assert all(o.ok for o in outcomes.values())

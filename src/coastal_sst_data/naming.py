@@ -22,6 +22,7 @@ So the format lives here, once, and the parse and the format are defined next to
 other where they cannot drift apart.
 
     stem = naming.time_stem("hood_canal", acq)      # hood_canal_20230715T210043
+    stem = naming.tile_stem("hobart", acq, "55GDP") # hobart_20230715T210043_55GDP
     stem = naming.day_stem("hood_canal", day)       # hood_canal_20230715
     dt   = naming.parse_time(path.name)             # datetime | None
 """
@@ -55,6 +56,26 @@ def day_stamp(d) -> str:
 def time_stem(aoi_id: str, t) -> str:
     """The filename stem of a per-overpass aligned file (no extension)."""
     return f"{aoi_id}_{time_stamp(t)}"
+
+
+def tile_stem(aoi_id: str, t, tile: str) -> str:
+    """The filename stem of a per-overpass aligned file from a TILED product.
+
+    A tiled sensor (ECOSTRESS L2T) delivers one overpass as several granules that share an
+    acquisition time exactly and differ only by tile, so `time_stem` alone names every one of
+    them identically -- the first tile writes the file and `store.done` then reports the rest
+    as already processed. The tile has to be in the name or the granules cannot coexist.
+
+    The stamp stays where `parse_time` finds it (`TIME_RE` searches rather than anchors) and
+    the name still matches the `<aoi>_*T*.nc` glob, so `datacube.scene_index` groups these by
+    day exactly as it does an untiled sensor's and `load_clearest_overpass` mosaics them --
+    which is what `SensorSpec.mosaic_same_day` was already asking for.
+
+    The tile goes AFTER the stamp so that the day's granules sort by tile within their shared
+    instant: `scene_index` orders on `(datetime, name)`, and for a tiled sensor the datetime
+    alone is a tie for the whole overpass.
+    """
+    return f"{time_stem(aoi_id, t)}_{tile}"
 
 
 def day_stem(aoi_id: str, d, prefix: str = "") -> str:

@@ -94,6 +94,18 @@ class AoiGrid:
         lons, lats = inv.transform(xx, yy)
         return np.asarray(lons), np.asarray(lats)
 
+    def geom_lonlat(self) -> BaseGeometry:
+        """The AoI polygon in EPSG:4326 -- `geom_proj` projected back.
+
+        For deciding whether a catalogue granule is worth opening. A search is by
+        `search_bbox`, so a provider returns everything touching the AoI's BOUNDING BOX; a
+        coastal AoI is rarely box-shaped, and for a TILED product the difference is whole
+        110 km tiles that intersect the box, miss the polygon, and would read five COGs to
+        produce an all-nodata file.
+        """
+        inv = Transformer.from_crs(self.target_crs, "EPSG:4326", always_xy=True).transform
+        return shp_transform(inv, self.geom_proj)
+
     def to_area_def(self) -> "AreaDefinition":
         """A pyresample ``AreaDefinition`` matching this grid (projected).
 

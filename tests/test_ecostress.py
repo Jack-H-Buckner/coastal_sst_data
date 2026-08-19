@@ -277,8 +277,9 @@ def test_expected_vars_follows_the_configured_layers(tmp_path, aoi_grid, base_pr
 # ---------------------------------------------------------------------------
 # Suffixes that make filter_links_for_granule find every role in LAYERS.
 _GRANULE_SUFFIXES = ("LST", "cloud", "water", "QC")
-# Deterministic aligned-file stem for a FakeGranule (from GRANULE_STEM's stamp).
+# Deterministic aligned-file stem for a FakeGranule (from GRANULE_STEM's stamp and tile).
 _GRANULE_TSTR = "20230105T123623"
+_GRANULE_TILE = "10UEU"
 
 
 def _eff(tmp_path, *, overwrite=False, fmt="netcdf"):
@@ -343,7 +344,8 @@ def _aligned_path(tmp_path, name, tag="v002"):
     # Per-version tree: <eco_root>/<tag>/aligned/<aoi> (eco_root == tmp_path in these tests).
     aoi_out = tmp_path / tag / "aligned" / name
     aoi_out.mkdir(parents=True, exist_ok=True)
-    return aoi_out / f"{name}_{_GRANULE_TSTR}.nc"
+    # TILED: the tile is part of the name, or every granule of one overpass collides here.
+    return aoi_out / f"{name}_{_GRANULE_TSTR}_{_GRANULE_TILE}.nc"
 
 
 def _write_aligned_file(tmp_path, aoi_grid, *, drop=()):
@@ -491,3 +493,159 @@ def test_source_attr_names_the_version_actually_searched(tmp_path, aoi_grid, bas
     args[0] = ds_cfg
     out = ecostress.process_granule(roles, *args)
     assert out.attrs["source"] == "ECOSTRESS ECO_L2T_LSTE v003"   # follows config, not a literal
+
+
+# --------------------------------------------------------------------------- #
+# TILED product: one overpass, several granules, one filename each.
+#
+# ECO_L2T delivers an overpass as granules that share an acquisition time EXACTLY and differ
+# only by MGRS tile. Named by time alone they all resolve to one output path, so the first
+# tile written made `store.done` report every other tile of that overpass as already
+# processed -- and an AoI wider than a tile silently kept one tile's footprint with nodata
+# across the rest. Nothing failed; the files looked valid and the run reported success.
+# --------------------------------------------------------------------------- #
+class TiledGranule:
+    """A FakeGranule for a chosen tile, optionally carrying a catalogue bounding box."""
+
+    def __init__(self, tile, *, stamp=_GRANULE_TSTR, bbox=None,
+                 suffixes=_GRANULE_SUFFIXES):
+        self.stem = f"ECOv002_L2T_LSTE_25520_009_{tile}_{stamp}_0710_01"
+        self._links = [f"https://data/{self.stem}_{s}.tif" for s in suffixes]
+        self._bbox = bbox
+
+    def data_links(self):
+        return self._links
+
+    def __getitem__(self, key):
+        if key != "umm" or self._bbox is None:
+            raise KeyError(key)
+        w, s, e, n = self._bbox
+        return {"SpatialExtent": {"HorizontalSpatialDomain": {"Geometry": {
+            "BoundingRectangles": [{"WestBoundingCoordinate": w,
+                                    "SouthBoundingCoordinate": s,
+                                    "EastBoundingCoordinate": e,
+                                    "NorthBoundingCoordinate": n}]}}}}
+
+
+def test_tile_id_reads_the_mgrs_field():
+    assert ecostress.tile_id(GRANULE_STEM) == "10UEU"
+    assert ecostress.tile_id(
+        "ECOv003_L2T_LSTE_36012_005_55GDP_20260122T222901_0713_01") == "55GDP"
+
+
+def test_tile_id_is_read_relative_to_the_stamp_not_by_position():
+    """A positional split that quietly returned the orbit number instead would name every
+    tile of an overpass identically again -- the exact failure the tile is in the name to
+    stop. An id it cannot read must say None, not guess."""
+    assert ecostress.tile_id("ECOv002_L2T_LSTE_25520_009_20230105T123623_0710_01") is None
+    assert ecostress.tile_id("not_a_granule_id") is None
+
+
+def test_two_tiles_of_one_overpass_both_get_written(tmp_path, aoi_grid, run_stubs):
+    """The regression. Two granules, same instant, different tiles: both must reach disk
+    under names that differ, or the AoI keeps whichever tile was reached first."""
+    run_stubs["granules"] = [TiledGranule("10UEU"), TiledGranule("10UEV")]
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None, False, False)
+
+    stems = [stem for _out, stem, _fmt in run_stubs["write"]]
+    assert stems == [f"{aoi_grid.name}_{_GRANULE_TSTR}_10UEU",
+                     f"{aoi_grid.name}_{_GRANULE_TSTR}_10UEV"]
+    assert len(run_stubs["open"]) == 2, "the second tile was skipped as already processed"
+
+
+def test_a_tile_on_disk_does_not_skip_its_neighbour(tmp_path, aoi_grid, run_stubs):
+    """`store.done` is a statement about ONE granule's output. Sharing a filename turned it
+    into a statement about the whole overpass, which is how the other tiles were lost."""
+    run_stubs["granules"] = [TiledGranule(_GRANULE_TILE), TiledGranule("10UEV")]
+    _write_aligned_file(tmp_path, aoi_grid)          # only the 10UEU tile is complete
+
+    ecostress.run(_eff(tmp_path, overwrite=False), {aoi_grid.name: aoi_grid},
+                  None, False, False)
+
+    assert len(run_stubs["open"]) == 1, "the absent tile was skipped along with the present one"
+    assert [stem for _o, stem, _f in run_stubs["write"]] == [
+        f"{aoi_grid.name}_{_GRANULE_TSTR}_10UEV"]
+
+
+def test_a_granule_outside_the_aoi_polygon_is_never_opened(tmp_path, aoi_grid, run_stubs):
+    """The search is by BOUNDING BOX, so the catalogue returns 110 km tiles that touch the
+    box and miss the AoI. Reading one costs five COG opens to produce an all-nodata file."""
+    inside = aoi_grid.geom_lonlat().bounds
+    run_stubs["granules"] = [
+        TiledGranule("10UEU", bbox=inside),
+        TiledGranule("10UEV", bbox=(inside[0] + 40, inside[1] + 40,
+                                    inside[0] + 41, inside[1] + 41)),
+    ]
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None, False, False)
+
+    assert len(run_stubs["open"]) == 1
+    assert [stem for _o, stem, _f in run_stubs["write"]] == [
+        f"{aoi_grid.name}_{_GRANULE_TSTR}_10UEU"]
+
+
+def test_a_granule_with_no_extent_metadata_is_kept(tmp_path, aoi_grid, run_stubs):
+    """"The metadata does not say" must never mean "drop it": that would lose real data on a
+    catalogue quirk, which is a far worse failure than reading one tile too many."""
+    run_stubs["granules"] = [TiledGranule("10UEU", bbox=None)]
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None, False, False)
+    assert len(run_stubs["open"]) == 1
+
+
+class _Handle:
+    """An fsspec-like handle that records whether it was closed."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _handle_stub(run_stubs, monkeypatch, opened):
+    def fake_open(urls):
+        urls = list(urls)
+        run_stubs["open"].append(urls)
+        made = [_Handle() for _ in urls]
+        opened.extend(made)
+        return made
+    monkeypatch.setattr(ecostress.earthaccess, "open", fake_open)
+
+
+def test_the_fsspec_handles_are_closed(tmp_path, aoi_grid, run_stubs, monkeypatch):
+    """Each handle holds an HTTPS connection and a one-thread executor for its background
+    block cache, released only when the object is collected. A multi-year AoI is thousands of
+    granules, and tiling multiplied the handles per overpass -- the abandoned sockets were
+    still on the process, in CLOSE-WAIT, hours later."""
+    opened = []
+    _handle_stub(run_stubs, monkeypatch, opened)
+    run_stubs["granules"] = [TiledGranule("10UEU")]
+
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None, False, False)
+
+    assert opened, "the stub never ran"
+    assert all(h.closed for h in opened)
+
+
+def test_the_handles_are_closed_when_the_read_raises(tmp_path, aoi_grid, run_stubs,
+                                                     monkeypatch):
+    """The failing path is the one that matters: a run that leaks only when it errors leaks
+    exactly when a DAAC is misbehaving and the retries are piling handles up fastest."""
+    opened = []
+    _handle_stub(run_stubs, monkeypatch, opened)
+    monkeypatch.setattr(ecostress, "process_granule",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("read failed")))
+    run_stubs["granules"] = [TiledGranule("10UEU")]
+
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None, False, False)
+
+    assert opened, "the stub never ran"
+    assert all(h.closed for h in opened)
+    assert run_stubs["write"] == []
+
+
+def test_a_granule_crossing_the_antimeridian_is_kept(tmp_path, aoi_grid, run_stubs):
+    """W > E is two boxes, and `shapely.box` would build the inside-out one -- which
+    intersects nothing, so the filter would drop a real granule and say nothing."""
+    run_stubs["granules"] = [TiledGranule("10UEU", bbox=(179.0, -45.0, -179.0, -44.0))]
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None, False, False)
+    assert len(run_stubs["open"]) == 1
