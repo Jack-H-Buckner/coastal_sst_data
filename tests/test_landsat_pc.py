@@ -14,7 +14,10 @@ import pytest
 from rasterio.enums import Resampling
 from rasterio.errors import RasterioIOError
 
+import xarray as xr
+
 from coastal_sst_data.config import load_config, parse_config, DataProduct
+from coastal_sst_data import products, store
 from coastal_sst_data.processes import landsat_pc
 
 from .conftest import FakeStacItem, UniformDs
@@ -144,6 +147,41 @@ def test_scene_to_dataset_valid_mask_east_west(aoi_grid, landsat_scene):
     v = ds["valid"].isel(time=0).values
     assert v[:, : v.shape[1] // 4].sum() == 0      # deep west: cloudy -> invalid
     assert v[:, 3 * v.shape[1] // 4 :].sum() > 0   # deep east: clear water -> valid
+
+
+def test_the_mask_layers_survive_a_round_trip_to_disk(tmp_path, aoi_grid, landsat_scene):
+    """The regression, end to end: write the scene the way acquisition does, reopen it, and
+    recompute validity the way the ASSEMBLER does.
+
+    `cloud` is derived from the QA read, which runs `masked=False`, so it arrived carrying
+    that read's `_FillValue: 0`. On a 0/1 mask 0 is CLEAR, not absent -- so every clear cell
+    decoded back as NaN, `datacube._read_granule` read a NaN cloud cell as CLOUDY, and
+    `lst_valid` came out empty on every granule. In the cube that made all of a day's
+    granules tie at zero valid pixels, so the mosaic kept only whichever was read first and
+    a multi-scene AoI showed one scene's footprint.
+    """
+    from coastal_sst_data.processes import datacube
+
+    ds = landsat_pc.scene_to_dataset(landsat_scene, aoi_grid, _MASK, False,
+                                     pd.Timestamp("2023-08-15T19:02:00"), "test_aoi")
+    in_memory = int(ds["valid"].isel(time=0).values.sum())
+    assert in_memory > 0                                    # sane before it is written
+
+    store.write_output(ds, tmp_path, "test_aoi_20230815T190200", "netcdf")
+    out = tmp_path / "test_aoi_20230815T190200.nc"
+
+    reopened = xr.open_dataset(out).isel(time=0)
+    clear = np.asarray(reopened["cloud"].values) == 0
+    assert clear.any(), "every CLEAR cell decoded back as NaN -- the fill value ate them"
+
+    sensor = products.spec(DataProduct.landsat).sensor
+    _s, _c, v, _fp = datacube._read_granule(
+        out, aoi_grid.height, aoi_grid.width,
+        water_is_land=sensor.water_is_land, use_cloud=sensor.use_cloud,
+        qset=list(sensor.qc_levels) if sensor.qc_levels else None,
+        trust_valid=sensor.trust_valid, read_fp=False)
+    assert int(v.sum()) > 0, "the assembler recomputed an EMPTY validity mask"
+    assert int(v.sum()) == pytest.approx(in_memory, rel=0.01)
 
 
 # ---------------------------------------------------------------------------

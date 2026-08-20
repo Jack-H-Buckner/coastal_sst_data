@@ -531,3 +531,85 @@ def test_scan_can_be_limited_to_one_aoi(tmp_path):
 
     _, bad, _, _ = store.scan(tmp_path, aois=["aoi1"])
     assert [f.name for _, f in bad] == ["aoi1_20230101.nc"]
+
+
+# --------------------------------------------------------------------------- #
+# FILL VALUES that collide with real data.
+#
+# A fill value marks data that is ABSENT. One that equals a value actually present does not
+# mark anything -- it DELETES that value for every future reader, on decode, silently.
+#
+# Landsat's `cloud` mask shipped as 0/1 carrying `_FillValue: 0`, inherited from the
+# `masked=False` QA read it was derived from. Every CLEAR cell came back NaN; the assembler
+# reads a NaN cloud cell as CLOUDY (right, when NaN really means unknown), so the sensor's
+# whole validity mask went empty on every granule; with nothing valid anywhere every granule
+# of a day tied at zero and the mosaic collapsed onto whichever was read first. A multi-scene
+# AoI showed one scene's footprint, and nothing failed at any stage.
+# --------------------------------------------------------------------------- #
+def _mask_ds(where="attrs", dtype="float32", fill=0):
+    """A 0/1 mask carrying the CF decode attrs a windowed COG read leaves behind."""
+    arr = np.array([[0, 1], [1, 0]], dtype=dtype)
+    da = xr.DataArray(arr, dims=("y", "x"))
+    cf = {"_FillValue": np.array(fill, dtype=dtype),
+          "scale_factor": 1.0, "add_offset": 0.0}
+    if where in ("attrs", "both"):
+        da.attrs.update(cf)
+    if where in ("encoding", "both"):
+        da.encoding = dict(cf)
+    return xr.Dataset({"cloud": da})
+
+
+@pytest.mark.parametrize("where", ["attrs", "encoding", "both"])
+@pytest.mark.parametrize("dtype", ["float32", "uint8"])
+def test_a_fill_value_that_occurs_in_the_data_is_refused(tmp_path, where, dtype):
+    """The regression: the zeros must survive the round trip.
+
+    Parametrized over both places the attr can arrive from, because clearing only `encoding`
+    does NOT help -- the ATTRIBUTE is what gets written, and it is what does the damage.
+    """
+    store.write_netcdf(_mask_ds(where, dtype), tmp_path / "m.nc")
+    back = xr.open_dataset(tmp_path / "m.nc")["cloud"].values
+    assert not np.isnan(np.asarray(back, dtype="float64")).any(), "a 0 decoded back as NaN"
+    assert sorted(np.unique(np.asarray(back))) == [0, 1]
+
+
+def test_a_fill_value_that_does_not_occur_is_left_alone(tmp_path):
+    """The guard must not strip legitimate nodata -- that one is doing its job."""
+    da = xr.DataArray(np.array([[1.0, 2.0]], dtype="float32"), dims=("y", "x"))
+    da.attrs["_FillValue"] = np.float32(-9999)
+    store.write_netcdf(xr.Dataset({"dem": da}), tmp_path / "d.nc")
+    raw = xr.open_dataset(tmp_path / "d.nc", mask_and_scale=False)
+    assert raw["dem"].attrs.get("_FillValue") == -9999
+
+
+def test_a_nan_fill_on_a_float_field_is_left_alone(tmp_path):
+    """NaN never equals anything, including itself, so it cannot collide."""
+    da = xr.DataArray(np.array([[1.0, np.nan]], dtype="float32"), dims=("y", "x"))
+    da.encoding = {"_FillValue": np.float32(np.nan)}
+    store.write_netcdf(xr.Dataset({"sst": da}), tmp_path / "s.nc")
+    got = xr.open_dataset(tmp_path / "s.nc")["sst"].values
+    assert got[0, 0] == 1.0 and np.isnan(got[0, 1])
+
+
+def test_the_refusal_is_reported(tmp_path, caplog):
+    """Silently rewriting what a caller asked for would be its own kind of surprise."""
+    with caplog.at_level("WARNING"):
+        store.write_netcdf(_mask_ds(), tmp_path / "m.nc")
+    assert "_FillValue that occurs in the data" in caplog.text
+    assert "cloud" in caplog.text
+
+
+def test_clear_cf_decode_attrs_clears_both_places(tmp_path):
+    """`to_netcdf` refuses a key present in attrs AND encoding, so both must go."""
+    da = _mask_ds("both")["cloud"]
+    out = store.clear_cf_decode_attrs(da)
+    for k in ("_FillValue", "scale_factor", "add_offset"):
+        assert k not in out.attrs and k not in out.encoding
+    assert "_FillValue" in da.attrs, "the input must not be mutated"
+
+
+def test_write_output_round_trips_a_mask_through_the_real_writer(tmp_path):
+    """The path acquisition actually uses -- store.write_output -> write_netcdf."""
+    store.write_output(_mask_ds(), tmp_path, "granule", "netcdf")
+    back = xr.open_dataset(tmp_path / "granule.nc")["cloud"].values
+    assert sorted(np.unique(np.asarray(back))) == [0, 1]

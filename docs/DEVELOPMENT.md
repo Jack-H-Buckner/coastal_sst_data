@@ -164,6 +164,19 @@ none can outrank it — collapsed each day onto one tile. The AoI came out with 
 corner and the run reported success. Dedupe the URLs, map each role through *its own* URL,
 and fail loudly if `open` returns fewer handles than distinct URLs.
 
+**A mask's fill value must never be one of its own values.** `grid.read_cog_window`
+reprojects, and rioxarray stamps the result with the read's `_FillValue` plus an identity
+`scale_factor`/`add_offset`. Every array DERIVED from that raster inherits them — and on a
+0/1 mask a `_FillValue: 0` is a data-destroying attribute, because 0 there means CLEAR (or
+LAND), not absent. Landsat's `cloud` shipped that way: every clear cell decoded back as NaN,
+`datacube._read_granule` reads a NaN cloud cell as CLOUDY, `lst_valid` came out empty on
+every granule, and — since granules with zero valid pixels all tie — each day's mosaic
+collapsed onto whichever granule was read first, leaving one scene's footprint in the cube.
+Nothing failed at any stage. Pass a derived mask through `store.clear_cf_decode_attrs`, and
+note that clearing `encoding` alone does nothing: it is the ATTRIBUTE that gets written.
+`store.write_netcdf` also refuses, with a warning, any `_FillValue` that occurs in the data
+it is writing — a fill value that collides deletes data rather than marking its absence.
+
 **One rule for a mask's polarity.** `SensorSpec.water_is_land` is the only place that decides
 which value of a water layer means water, and both the acquisition stage and the assembler go
 through `products.water_cells`. They used to carry the literal separately (`water > 0` at
