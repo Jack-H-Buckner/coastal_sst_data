@@ -77,12 +77,19 @@ class FakeAsset:
 
 
 class FakeStacItem:
-    """Minimal stand-in for a pystac Item (what scene_to_dataset / run touch)."""
-    def __init__(self, assets, properties, dt, id="FAKE_LC09_L2SP"):
+    """Minimal stand-in for a pystac Item (what scene_to_dataset / run touch).
+
+    `geometry` defaults to ABSENT -- no attribute at all, as an item served without one -- so
+    every test that does not care about the AoI-footprint filter keeps exercising the keep
+    path, which is also the convention the filter itself follows (thin metadata means keep).
+    """
+    def __init__(self, assets, properties, dt, id="FAKE_LC09_L2SP", geometry=None):
         self.assets = {k: FakeAsset(h) for k, h in assets.items()}
         self.properties = properties
         self.datetime = dt
         self.id = id
+        if geometry is not None:
+            self.geometry = geometry
 
 
 def write_landsat_cogs(dir_path, g, *, native_res=30.0, pad_m=1500.0):

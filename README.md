@@ -1059,9 +1059,13 @@ Landsat contributes additional high-resolution thermal scenes and the water/clou
 - `collection`: STAC collection (default `landsat-c2-l2`).
 - `stac_url`: STAC API endpoint (default the Planetary Computer catalog).
 - `platforms`: platforms to include (default `landsat-8`, `landsat-9`).
-- `cloud_cover_max`: scene-level cloud-cover cutoff as a fraction 0–1 (default `0.7`).
-- `masking.ndwi_threshold`: NDWI cutoff for classifying water (default `0.0`).
+- `cloud_cover_max`: scene-level cloud-cover cutoff as a fraction 0–1 (default `0.7`). Applied at **search** time, on the STAC `eo:cloud_cover` property — a scene above it is never fetched, however clear it may be over this particular AoI.
+- `masking.ndwi_threshold`: NDWI cutoff for classifying water (default `0.0`). Raise it to demand more water-like pixels, lower it to keep turbid or sun-glinted water.
 - `masking.cloud_buffer_km`: distance to buffer cloud/shadow pixels using `ST_CDIST` (default `1.0`; set `0` to disable).
+
+> **The strictest mask of the three thermal sensors.** Landsat is the only one carrying **both** a water gate and a cloud gate, and the only one that **recomputes water per scene** from that scene's own reflectance rather than reading a water layer the provider shipped. So `landsat_valid` = NDWI water **and** QA-clear **and** ≥ `cloud_buffer_km` from any cloud/shadow — three independent ways for a real observation to be dropped, where ECOSTRESS gates on QC and MODIS arrives already quality-filtered.
+>
+> These knobs change **what the values mean**, not how many observations arrive. `landsat_sst` is the **raw** channel: it carries the scene's temperature at every cell the imagery covered, cloudy and land cells included, so a NaN there is scene footprint, never weather. Only `landsat_valid` (and the `_clean` channels built from it) moves when you turn these. A site with *no* Landsat dates is a coverage question — WRS-2 geometry, or the scene never reaching the AoI — and no masking setting will change it.
 
 **Region-level options**: none.
 

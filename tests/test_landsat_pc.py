@@ -337,6 +337,104 @@ def test_run_finishes_the_date_range_after_a_signature_expires(monkeypatch, tmp_
     assert len(list((tmp_path / "out" / "LANDSAT" / "aligned" / "test_aoi").glob("*.nc"))) == 3
 
 
+# ---------------------------------------------------------------------------
+# The AoI-footprint pre-filter. A STAC search is by BOUNDING BOX, and a Landsat scene is a
+# rotated 185 km parallelogram inside a much larger bbox -- so a whole WRS-2 path can be
+# returned for an AoI its imagery never reaches, downloaded (five windowed COG reads), and
+# written as a COMPLETE all-nodata granule that then becomes the day's mosaic base.
+# ---------------------------------------------------------------------------
+def _geom(minx, miny, maxx, maxy):
+    """A GeoJSON polygon mapping, which is what `item.geometry` is."""
+    return {"type": "Polygon", "coordinates": [[(minx, miny), (maxx, miny), (maxx, maxy),
+                                                (minx, maxy), (minx, miny)]]}
+
+
+# The `aoi_grid` fixture is centred on (-123.925, 45.52) with an 8 km buffer.
+_COVERS = _geom(-124.3, 45.2, -123.6, 45.9)
+_ELSEWHERE = _geom(-120.0, 45.2, -119.4, 45.9)     # same latitudes, 300 km east
+
+
+def _items(landsat_scene, *geometries):
+    """One FakeStacItem per geometry, on consecutive days, sharing the scene's real COGs.
+    A `None` geometry means the item carries NO `geometry` attribute at all."""
+    hrefs = {k: a.href for k, a in landsat_scene.assets.items()}
+    return [FakeStacItem(hrefs,
+                         {"platform": "landsat-9", "datetime": f"2023-08-{15 + i}T19:02:00Z"},
+                         datetime(2023, 8, 15 + i, 19, 2, tzinfo=timezone.utc),
+                         id=f"LC09_{15 + i}", geometry=geom)
+            for i, geom in enumerate(geometries)]
+
+
+def _run_items(monkeypatch, tmp_path, aoi_grid, items):
+    """run() over exactly `items`, returning (report, sorted output stems)."""
+    monkeypatch.setattr(landsat_pc, "search_scenes", lambda *a, **k: items)
+    rep = landsat_pc.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None, dry_run=False)
+    out = (tmp_path / "out" / "LANDSAT" / "aligned" / "test_aoi")
+    return rep, sorted(p.name for p in out.glob("*.nc")) if out.exists() else []
+
+
+def test_a_scene_whose_footprint_misses_the_aoi_is_never_opened(monkeypatch, tmp_path,
+                                                                aoi_grid, landsat_scene,
+                                                                sign_spy):
+    """THE 15 DEAD DOWNLOADS. The item's `geometry` is a true footprint polygon -- better than
+    the bounding box ECOSTRESS has to settle for -- so a scene that cannot reach the AoI is
+    dropped before it is signed, let alone read."""
+    items = _items(landsat_scene, _COVERS, _ELSEWHERE)
+    reads = []
+    real = landsat_pc.read_cog_window
+    monkeypatch.setattr(landsat_pc, "read_cog_window",
+                        lambda *a, **kw: (reads.append(a[0]), real(*a, **kw))[1])
+
+    rep, wrote = _run_items(monkeypatch, tmp_path, aoi_grid, items)
+
+    assert (rep.written, rep.failed) == (1, 0)
+    assert wrote == ["test_aoi_20230815T190200.nc"]
+    assert sign_spy == ["LC09_15"]                 # the off-AoI scene is never even signed
+    assert len(reads) == 5                         # one scene's five assets, not two scenes'
+
+
+def test_a_scene_with_no_geometry_is_kept(monkeypatch, tmp_path, aoi_grid, landsat_scene,
+                                          sign_spy):
+    """Thin metadata is not evidence of absence. Dropping a scene because the catalogue served
+    no footprint would trade a known failure (a dead download, now reported) for a silent one:
+    a real overpass that never appears."""
+    rep, wrote = _run_items(monkeypatch, tmp_path, aoi_grid,
+                            _items(landsat_scene, None, {"type": "Polygon"}))
+
+    assert (rep.written, rep.failed) == (2, 0)     # no geometry, and an unreadable one
+    assert len(wrote) == 2
+
+
+def test_the_footprint_filter_reports_what_it_dropped(monkeypatch, tmp_path, aoi_grid,
+                                                      landsat_scene, sign_spy, caplog):
+    with caplog.at_level("INFO"):
+        _run_items(monkeypatch, tmp_path, aoi_grid,
+                   _items(landsat_scene, _COVERS, _ELSEWHERE, _ELSEWHERE))
+    assert "2 of 3 scene(s) touched the search box but not the AoI polygon" in caplog.text
+
+
+def test_a_scene_that_reads_back_empty_over_the_aoi_is_reported(monkeypatch, tmp_path,
+                                                                aoi_grid, landsat_scene,
+                                                                sign_spy, caplog):
+    """A footprint that reaches the AoI is not the same as imagery that covers it. Such a
+    scene is still written -- it IS what the catalogue served, and a complete granule is what
+    stops the next run fetching it again -- but it must stop reading as a success: it becomes
+    the day's mosaic base and the day looks observed while holding nothing."""
+    real = landsat_pc.read_scene
+
+    def dead(*a, **kw):
+        ds = real(*a, **kw)
+        ds["sst"].values[:] = np.nan
+        return ds
+
+    monkeypatch.setattr(landsat_pc, "read_scene", dead)
+    with caplog.at_level("WARNING"):
+        rep, wrote = _run_items(monkeypatch, tmp_path, aoi_grid, _items(landsat_scene, _COVERS))
+
+    assert (rep.written, wrote) == (1, ["test_aoi_20230815T190200.nc"])
+    assert "1 scene(s) read back with NO finite SST" in caplog.text
+
+
 def test_search_scenes_does_not_sign_at_search_time(monkeypatch):
     """The tripwire on the whole fix. `planetary_computer.sign_url` returns an href that
     already carries st/se/sp UNCHANGED -- so signing here would make every later re-sign a

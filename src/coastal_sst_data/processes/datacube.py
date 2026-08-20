@@ -505,12 +505,14 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
     not report, and its overpass forcing describes the base granule alone -- said out loud on
     the channels themselves via `_MOSAIC_ATTRS`.
 
-    Two consequences of filling only what the base left INVALID, both deliberate:
-      * a lower-ranked granule wins a cell where the base is finite but cloudy/QC-rejected,
-        so `<prefix>_sst` is no longer one granule's raw scene there; and
-      * a cell NO granule validly observed keeps the base's raw value -- possibly NaN -- even
-        where a lower-ranked granule held a masked reading. Filling it would put unvalidated
-        pixels into the sst channel, which is a stronger claim than the files make.
+    One consequence of filling what the base left INVALID, deliberate: a lower-ranked granule
+    wins a cell where the base is finite but cloudy/QC-rejected, so `<prefix>_sst` is no longer
+    one granule's raw scene there. A cell NO granule validly observed is a HOLE, and the
+    highest-ranked granule holding ANY reading for it fills it -- exactly the claim the base
+    already makes about its own unvalidated pixels, which `score < 0` writes verbatim. Refusing
+    it only for granules that did not happen to sort first had no justification and cost a
+    185 km Landsat scene most of its own footprint. `<prefix>_valid` is unaffected either way:
+    a filled hole carries the contributing granule's own verdict, which for these cells is 0.
 
     Ties go to the earliest granule, in both regimes: the contest is a strict `>` over
     `scene_index`'s (time, name) ordering. That is load-bearing under mosaicking, because the
@@ -611,7 +613,24 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                 # the highest-count granule that validly saw it, and a cell none of them saw
                 # ends with the last new base -- which, since `new_base` fires only on running
                 # maxima, is the clearest granule of the day.
-                take = (v | (score < 0)) if new_base else (v & (score < vc))
+                #
+                # Both extra clauses below are about NaN in the RAW sst channel, and both only
+                # bite when granules do NOT overlap -- WRS-2 path/rows, MGRS tiles -- which is
+                # precisely the case `mosaic_same_day` exists for.
+                if new_base:
+                    take = v | (score < 0)
+                    # Never overwrite a real temperature with this granule's NaN. Outside its
+                    # own footprint `s` IS NaN, so without this clause each successive new base
+                    # wipes its predecessors and only the LAST one's footprint survives -- half
+                    # an AoI lost the moment two non-overlapping path/rows share a day.
+                    take &= np.isfinite(s) | ~np.isfinite(sst[i])
+                else:
+                    take = v & (score < vc)
+                    # A cell NO granule has any reading for is a HOLE, not a contested cell.
+                    # Filling it from a lower-ranked granule's raw value is the same claim the
+                    # base makes about its own unvalidated pixels (`score < 0`, above); the
+                    # granule's VALID cells are already covered by the clause above.
+                    take |= np.isfinite(s) & (score < 0) & ~np.isfinite(sst[i])
                 # sst/cloud/valid are written under ONE mask from ONE granule, so a filled
                 # cell's temperature, cloud flag and validity all describe the same overpass.
                 np.copyto(sst[i], s, where=take)
