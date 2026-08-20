@@ -151,6 +151,25 @@ success. The tile makes them separate files, which is all `load_clearest_overpas
 already merges a day's granules for any sensor whose `SensorSpec.mosaic_same_day` is set. Do
 not mosaic at acquisition time.
 
+**Bind a granule's assets to roles BY URL, never by position.** `LAYERS` may map two roles
+onto one asset — ECOSTRESS's `sst` and `lst` are both `_LST.tif` — so the URL list is
+*shorter* than the role list, and `earthaccess.open` returns one handle per **distinct** URL.
+Zipping roles to handles positionally therefore shifted every role after the first onto the
+next role's asset and dropped the last role entirely: `cloud` received the water mask,
+`water` received the QC bit field, `quality` was never opened. Nothing failed. The aligned
+files were written, full of plausible numbers, and the assembler then computed validity from
+a QC field with a water rule, got an empty mask on every granule, and — because an all-zero
+`valid` makes every granule of a day tie at zero, so the first becomes the mosaic base and
+none can outrank it — collapsed each day onto one tile. The AoI came out with data in one
+corner and the run reported success. Dedupe the URLs, map each role through *its own* URL,
+and fail loudly if `open` returns fewer handles than distinct URLs.
+
+**One rule for a mask's polarity.** `SensorSpec.water_is_land` is the only place that decides
+which value of a water layer means water, and both the acquisition stage and the assembler go
+through `products.water_cells`. They used to carry the literal separately (`water > 0` at
+acquisition, `water < 0.5` in the assembler) and contradicted each other for as long as
+neither number mattered.
+
 For chlorophyll:
 
 ```python

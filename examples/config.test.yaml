@@ -297,6 +297,12 @@ extract:
   channels:
     # A bare key is the nearest pixel -- the value of the cell the point falls in.
     depth_cudem:
+    # AoI-WIDE channels -- 1-D (time,), one value per day for the whole grid -- must be
+    # bare: there is no neighbourhood for a radius or a statistic to reduce over, so
+    # `radius_m`/`stat`/`mask` on one of these is an error. They ship one row per date,
+    # the same value for every point in the AoI. This class is every <sensor>_hour, every
+    # tide_*/<sensor>_tide_*, doy_sin/doy_cos, and the <sensor>_georef_* diagnostics.
+    lst_hour:                       # Landsat overpass time, fractional UTC hour
     tide_coops:
     # `radius_m` is a DISC in metres on the ground (not degrees, not pixels), centred on the
     # point. Below the grid posting (default 100 m) it degenerates to the containing pixel,

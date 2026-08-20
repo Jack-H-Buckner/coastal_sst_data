@@ -229,7 +229,12 @@ def process_granule(role_to_file, ds_cfg, grid_cfg, g: AoiGrid, aoi_id,
 
     data_vars, failed = {}, []
     for role, fobj in role_to_file.items():
-        resampling = rs_cat if ds_cfg["layers"][role] in categorical else rs_cont
+        # By ROLE, not by the role's asset suffix. `categorical` lists role names
+        # (cloud/water/quality); looking up `layers[role]` yields the SUFFIX, which matches
+        # only because `cloud` and `water` happen to spell both the same. `quality`'s suffix
+        # is `QC`, so the bit-packed QA layer fell through to the CONTINUOUS resampler and
+        # would have been bilinear-interpolated into bit patterns that mean nothing.
+        resampling = rs_cat if role in categorical else rs_cont
         try:
             da = read_cog_window(fobj, g, resampling=resampling, pad_m=ECO_PAD_M)
             da = da.rio.clip([g.geom_proj], g.target_crs, drop=False)
@@ -281,7 +286,15 @@ def process_granule(role_to_file, ds_cfg, grid_cfg, g: AoiGrid, aoi_id,
                 ds[v].attrs["units"] = "K"
 
     if {"sst", "water", "cloud"} <= set(ds.data_vars):
-        valid = np.isfinite(ds["sst"]) & (ds["water"] > 0) & ~(ds["cloud"] > 0)
+        # Polarity comes from the REGISTRY, through the same helper the assembler uses. This
+        # line used to read `ds["water"] > 0` while `datacube._read_granule` recomputed the
+        # very same mask as `water < 0.5` -- exact opposites, and since the assembler
+        # recomputes (`trust_valid=False` for this sensor) the cube quietly used the other
+        # answer than the file advertised.
+        sensor = products.spec(DataProduct.ecostress).sensor
+        water = products.water_cells(ds["water"], water_is_land=sensor.water_is_land)
+        valid = (np.isfinite(ds["sst"]) & np.isfinite(ds["water"]) & water
+                 & ~(ds["cloud"] > 0))
         ds["valid"] = valid.astype("uint8")
         ds["valid"].attrs["long_name"] = "water & clear & finite SST"
 
@@ -402,18 +415,37 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, list_layers,
                     # handles bound to the fsspec session they were created with, so
                     # re-authenticating cannot heal a handle already held -- only re-opening
                     # can. Retrying the reads alone would keep reading through a dead session.
-                    def _open_and_read(urls=list(role_to_url.values()),
-                                       roles=list(role_to_url)):
+                    def _open_and_read(r2u=dict(role_to_url)):
+                        # Roles are mapped to handles BY URL, never by position. Two roles
+                        # legitimately share one asset -- `sst` and `lst` are both _LST.tif --
+                        # so the URL list is SHORTER than the role list, and `earthaccess.open`
+                        # hands back one handle per DISTINCT url. Zipping roles to handles
+                        # positionally therefore paired every role after `sst` with the NEXT
+                        # role's asset and dropped the last role entirely: `cloud` received the
+                        # water mask, `water` received the QC bit field, and `quality` was never
+                        # opened. Nothing failed -- the aligned files were written, full of
+                        # plausible numbers, and the assembler then computed `valid` from a QC
+                        # field with a water rule and got an empty mask on every granule, which
+                        # collapsed each day's mosaic onto its first tile.
+                        uniq = list(dict.fromkeys(r2u.values()))
                         # CLOSED in a finally: each handle holds an HTTPS connection and a
                         # one-thread executor for its background block cache, and neither is
                         # released until the object is collected. Tiling multiplied the
                         # handles per overpass, so leaking them stopped being survivable.
                         # `process_granule` reprojects to numpy before returning, so the
                         # Dataset it hands back does not read through these again.
-                        fobjs = earthaccess.open(urls)
+                        fobjs = earthaccess.open(uniq)
                         try:
-                            return process_granule(dict(zip(roles, fobjs)), vcfg, grid_cfg,
-                                                   g, name, t)
+                            if len(fobjs) != len(uniq):
+                                # The silent short return is what made the bug above possible;
+                                # refuse to guess which asset is which.
+                                raise RuntimeError(
+                                    f"earthaccess.open returned {len(fobjs)} handle(s) for "
+                                    f"{len(uniq)} distinct URL(s); cannot tell which asset is "
+                                    f"which")
+                            by_url = dict(zip(uniq, fobjs))
+                            return process_granule({r: by_url[u] for r, u in r2u.items()},
+                                                   vcfg, grid_cfg, g, name, t)
                         finally:
                             for fo in fobjs:
                                 try:

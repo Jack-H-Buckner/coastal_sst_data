@@ -1449,14 +1449,14 @@
         "time"
       ],
       "dtype": "float32",
-      "fingerprint": "9a8c6f936ca07db4c3c6f2eee20dba5c598d203fa429b9f60bbf0452d43e70f9",
+      "fingerprint": "c0dece22973f112cecce837386218c58750e86a5f99b2f122876684aa01d148f",
       "shape": [
         3
       ],
       "stats": {
         "max": 0.0,
-        "mean": 0.0,
-        "min": 0.0,
+        "mean": -0.0,
+        "min": -0.0,
         "n_finite": 3
       }
     },
@@ -1542,7 +1542,7 @@
   },
   "global_attrs": {
     "aoi_id": "aoi1",
-    "coverage": "{\"cmems\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"met\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"mur\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}, \"tides\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}}",
+    "coverage": "{\"cmems\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0, \"grid_fraction\": 0.9047619047619048}, \"met\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0, \"grid_fraction\": 1.0}, \"mur\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0, \"grid_fraction\": 0.9285714285714285}, \"tides\": {\"days_expected\": 3, \"days_with_data\": 3, \"fraction\": 1.0}}",
     "crs": "EPSG:32610",
     "insitu_stations": "[{\"index\": 1, \"id\": \"s1\", \"name\": \"Test Station\", \"source\": \"ioos\", \"lat\": 45.5, \"lon\": -123.9, \"row\": 21, \"col\": 20}]",
     "met_time": "reference",

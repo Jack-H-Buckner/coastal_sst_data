@@ -323,6 +323,22 @@ def test_1d_channel_is_one_row_per_time_and_equal_for_every_point(tmp_path, aoi_
     assert a == b == [0.0, 1.0, 2.0, 3.0]
 
 
+def test_overpass_hour_extracts_with_nan_on_days_with_no_overpass(tmp_path, aoi_grid,
+                                                                  cube_dir):
+    """`<sensor>_hour` is the channel that prompted the 1-D error report.
+
+    Bare, it must simply work -- and a day the sensor saw nothing must come through as NaN
+    rather than as a filled-in hour, because a fabricated overpass time is worse than a gap.
+    """
+    df = _run(tmp_path, aoi_grid, {"p": (30, 30)}, {"lst_hour": None})
+    sub = df[df["variable"] == "lst_hour"].sort_values("time")
+    assert len(sub) == 4
+    assert set(sub["stat"]) == {"nearest"} and set(sub["radius_m"]) == {0.0}
+    vals = sub["value"].tolist()
+    assert vals[0] == 10.0 and vals[2] == 12.0 and vals[3] == 13.0
+    assert np.isnan(vals[1])                                 # no overpass on day 2
+
+
 def test_lat_lon_are_the_input_coordinates(tmp_path, aoi_grid, cube_dir):
     pcsv = _sites(tmp_path, aoi_grid, {"p": (60, 60)})
     want = pd.read_csv(pcsv)
@@ -407,12 +423,43 @@ def test_no_channels_is_an_error(tmp_path, aoi_grid, cube_dir):
         extract.extract(project)
 
 
-def test_1d_channel_with_a_radius_fails_loudly(tmp_path, aoi_grid, cube_dir):
+def test_1d_channel_with_a_radius_fails_with_a_usable_message(tmp_path, aoi_grid, cube_dir):
+    """The message has to say the channel IS extractable, and show the exact fix.
+
+    Its predecessor said only that `radius_m`/`stat`/`mask` "have nothing to reduce over",
+    and was read as "extraction does not support overpass times" -- so what is asserted here
+    is the wording, not just that something was raised.
+    """
     pcsv = _sites(tmp_path, aoi_grid, {"p": (60, 60)})
     project = _project(tmp_path, pcsv,
                        {"tide_coops": {"radius_m": 250, "stat": "nanmean"}})
-    with pytest.raises(ValueError, match="is 1-D"):
+    with pytest.raises(ValueError) as exc:
         extract.extract(project)
+    msg = str(exc.value)
+    assert "ARE extracted" in msg                       # the capability, stated outright
+    assert "radius_m: 250" in msg and "stat: nanmean" in msg   # the values to go and edit
+    assert "    channels:\n      tide_coops:\n" in msg  # a copy-pasteable fix
+    assert "one row per date" in msg                    # what you get if you take it
+
+
+def test_every_1d_channel_is_named_in_one_error(tmp_path, aoi_grid, cube_dir):
+    """A real cube has ~11 1-D channels, so one uniform config block trips all of them.
+
+    Raising on the first would mean a dozen edit-and-re-run cycles, each paying for the
+    whole point-assignment pass before failing again on the next name.
+    """
+    pcsv = _sites(tmp_path, aoi_grid, {"p": (60, 60)})
+    project = _project(tmp_path, pcsv, {
+        "eco_sst": {"radius_m": 250, "stat": "nanmean"},          # legitimate, unaffected
+        "tide_coops": {"radius_m": 250, "stat": "nanmean"},
+        "lst_hour": {"radius_m": 250, "stat": "nanmean"},
+    })
+    with pytest.raises(ValueError) as exc:
+        extract.extract(project)
+    msg = str(exc.value)
+    assert "2 channel(s)" in msg
+    assert "tide_coops" in msg and "lst_hour" in msg
+    assert "eco_sst" not in msg                          # the 3-D channel is not implicated
 
 
 def test_missing_cube_skips_with_a_warning(tmp_path, aoi_grid, caplog):

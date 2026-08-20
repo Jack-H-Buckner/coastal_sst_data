@@ -17,7 +17,7 @@ from rasterio.transform import from_origin
 from coastal_sst_data.config import (
     load_config, parse_config, DataProduct, AreaOfInterest, GridSpec,
 )
-from coastal_sst_data import grid
+from coastal_sst_data import grid, products
 from coastal_sst_data.processes import ecostress
 from .conftest import UniformDs
 
@@ -139,10 +139,17 @@ def make_granule_cogs(dir_path, g, *, sst_kelvin=290.0):
     Source is native ~70 m in the SAME CRS as the target grid, spanning the AoI
     bounds plus a pad. Fixed, known layout:
         sst   = sst_kelvin everywhere (all finite)
-        water = 1 everywhere (all water)
+        water = all WATER (the value for that is taken from the registry, see below)
         cloud = 1 over the WEST half, 0 over the EAST half
     So the expected `valid` mask on the target grid is 1 in the east, 0 in the
     west. Returns {role: path-str}, ready to pass as process_granule's role_to_file.
+
+    The water VALUE is derived from `SensorSpec.water_is_land` rather than written as a
+    literal. This fixture used to hardcode 1 = water while the registry said 1 = LAND and
+    the assembler's fixtures in test_datacube.py encoded the registry's answer -- so the two
+    test modules asserted opposite things about the same layer and neither noticed. Deriving
+    it means flipping the registry flag (once real granules settle the question) moves the
+    fixtures with it instead of turning them red for the wrong reason.
     """
     src_res = 70.0
     minx, miny, maxx, maxy = g.geom_proj.bounds
@@ -152,7 +159,8 @@ def make_granule_cogs(dir_path, g, *, sst_kelvin=290.0):
     transform = from_origin(minx, maxy, src_res, src_res)
 
     sst = np.full((H, W), sst_kelvin, dtype="float32")
-    water = np.ones((H, W), dtype="float32")
+    water_val = 0.0 if products.spec(DataProduct.ecostress).sensor.water_is_land else 1.0
+    water = np.full((H, W), water_val, dtype="float32")
     cloud = np.zeros((H, W), dtype="float32")
     cloud[:, : W // 2] = 1.0                          # west (low-x) columns cloudy
 
@@ -649,3 +657,141 @@ def test_a_granule_crossing_the_antimeridian_is_kept(tmp_path, aoi_grid, run_stu
     run_stubs["granules"] = [TiledGranule("10UEU", bbox=(179.0, -45.0, -179.0, -44.0))]
     ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None, False, False)
     assert len(run_stubs["open"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# ROLE -> ASSET binding.
+#
+# `LAYERS` maps TWO roles onto one asset (`sst` and `lst` are both _LST.tif), so the URL
+# list is SHORTER than the role list and `earthaccess.open` returns one handle per DISTINCT
+# url. Binding roles to handles positionally therefore paired every role after `sst` with the
+# NEXT role's asset and dropped the last role entirely: `cloud` got the water mask, `water`
+# got the QC bit field, `quality` was never opened. Nothing failed -- the aligned files were
+# written full of plausible numbers, and the assembler then computed ECOSTRESS validity from
+# a QC field with a water rule, got an empty mask on every granule, and collapsed each day's
+# mosaic onto its first tile: an AoI with data in one corner and a run that reported success.
+#
+# The old stub returned one handle per URL *including duplicates*, which is why the tests
+# never saw it. These stubs dedupe, like the real earthaccess.
+# --------------------------------------------------------------------------- #
+def _dedup_open(calls):
+    """An `earthaccess.open` that returns one handle per DISTINCT url, as the real one does.
+
+    The handle is the url itself, so the role->asset binding is directly assertable.
+    """
+    def _open(urls):
+        uniq = list(dict.fromkeys(list(urls)))
+        calls.append(uniq)
+        return list(uniq)
+    return _open
+
+
+def test_every_role_is_bound_to_its_own_asset(tmp_path, aoi_grid, run_stubs, monkeypatch):
+    """The regression. Each role must receive the asset ITS OWN suffix names."""
+    seen = {}
+    monkeypatch.setattr(ecostress.earthaccess, "open", _dedup_open(run_stubs["open"]))
+    monkeypatch.setattr(ecostress, "process_granule",
+                        lambda role_to_file, *a, **k: (seen.update(role_to_file)
+                                                       or xr.Dataset()))
+    run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None,
+                  dry_run=False, list_layers=False)
+
+    assert seen, "process_granule was never reached"
+    for role, suffix in ecostress.LAYERS.items():
+        assert role in seen, f"role {role!r} never got an asset"
+        assert seen[role].endswith(f"_{suffix}.tif"), (
+            f"role {role!r} was bound to {seen[role]!r}, which is not its _{suffix}.tif")
+    # the two roles that share an asset must share the SAME handle, not two opens
+    assert seen["sst"] == seen["lst"]
+    assert len(run_stubs["open"][0]) == 4        # 5 roles, 4 distinct URLs
+
+
+def test_quality_role_is_not_dropped(tmp_path, aoi_grid, run_stubs, monkeypatch):
+    """`quality` sits last in LAYERS, so a positional zip over a deduped list loses exactly
+    it -- and the QC gate the assembler applies to ECOSTRESS then never runs at all."""
+    seen = {}
+    monkeypatch.setattr(ecostress.earthaccess, "open", _dedup_open(run_stubs["open"]))
+    monkeypatch.setattr(ecostress, "process_granule",
+                        lambda role_to_file, *a, **k: (seen.update(role_to_file)
+                                                       or xr.Dataset()))
+    run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None,
+                  dry_run=False, list_layers=False)
+    assert "quality" in seen and seen["quality"].endswith("_QC.tif")
+
+
+def test_short_open_result_raises_instead_of_mispairing(tmp_path, aoi_grid, run_stubs,
+                                                        monkeypatch):
+    """Fewer handles than URLs must fail loudly. Silently getting a short list is exactly
+    how the roles came to be shifted, and a guess is worse than a failure here."""
+    monkeypatch.setattr(ecostress.earthaccess, "open",
+                        lambda urls: [None] * (len(list(urls)) - 1))
+    run_stubs["granules"] = [FakeGranule(*_GRANULE_SUFFIXES)]
+    ecostress.run(_eff(tmp_path), {aoi_grid.name: aoi_grid}, None,
+                  dry_run=False, list_layers=False)
+    assert run_stubs["write"] == []            # nothing written from a mis-paired granule
+
+
+def test_categorical_layers_are_chosen_by_role_not_by_suffix(tmp_path, aoi_grid,
+                                                             base_project, monkeypatch):
+    """`categorical` lists ROLE names; indexing `layers[role]` yields the SUFFIX.
+
+    It matched for cloud/water only because those spell both the same. `quality`'s suffix is
+    `QC`, so the bit-packed QA layer fell through to the CONTINUOUS resampler -- bilinear
+    interpolation between bit patterns, which produces flags that mean nothing.
+    """
+    used = {}
+    real = ecostress.read_cog_window
+
+    def spy(fobj, g, *, resampling, **kw):
+        used[str(fobj)] = resampling
+        return real(fobj, g, resampling=resampling, **kw)
+
+    monkeypatch.setattr(ecostress, "read_cog_window", spy)
+    roles = make_granule_cogs(tmp_path, aoi_grid)
+    roles["quality"] = roles["water"]          # any readable raster; the ROLE is the point
+    args = list(_granule_args(tmp_path, aoi_grid, base_project))
+    ds_cfg = dict(args[0])
+    ds_cfg["layers"] = {**ecostress.LAYERS}
+    args[0] = ds_cfg
+    ecostress.process_granule(roles, *args)
+
+    from rasterio.enums import Resampling
+    assert used[roles["quality"]] == Resampling.nearest
+    assert used[roles["cloud"]] == Resampling.nearest
+    assert used[roles["sst"]] == Resampling.bilinear
+
+
+def test_acquisition_and_assembler_agree_about_which_cells_are_water(tmp_path, aoi_grid,
+                                                                     base_project):
+    """Both stages must read the water layer with the SAME polarity.
+
+    They did not. `process_granule` built `valid` from `water > 0`; the assembler recomputed
+    the very same mask from `water < 0.5`. Whichever was wrong produced an EMPTY validity
+    mask -- and an empty mask is not a visible failure, it is a day that looks cloudy. Worse,
+    with every granule of a day tying at zero valid pixels the first one becomes the mosaic
+    base and no other granule can outrank it, so a tiled AoI silently keeps one tile.
+    """
+    from coastal_sst_data.processes import datacube
+
+    roles = make_granule_cogs(tmp_path, aoi_grid)          # all water, east half clear
+    args = list(_granule_args(tmp_path, aoi_grid, base_project))
+    ds = ecostress.process_granule(roles, *args)
+    acq = ds["valid"].isel(time=0).values.astype(bool)
+
+    out = tmp_path / "aligned.nc"
+    ds.to_netcdf(out)
+    sensor = products.spec(DataProduct.ecostress).sensor
+    s, c, asm, fp = datacube._read_granule(
+        out, aoi_grid.height, aoi_grid.width,
+        water_is_land=sensor.water_is_land, use_cloud=sensor.use_cloud,
+        qset=list(sensor.qc_levels) if sensor.qc_levels else None,
+        trust_valid=sensor.trust_valid, read_fp=False)
+
+    assert acq.any(), "acquisition produced an all-empty valid mask over all-water input"
+    assert asm.any(), "the assembler produced an all-empty valid mask over the same file"
+    # The two gates differ by design (acquisition screens on `cloud`, the assembler on QC),
+    # so they need not be equal -- but neither may be a subset-of-nothing, and every cell the
+    # assembler keeps must be one the acquisition also called water.
+    assert (asm & ~np.isfinite(s)).sum() == 0

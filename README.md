@@ -672,11 +672,39 @@ is.
 | --- | --- |
 | `point_id`, `lat`, `lon` | from your points file — the coordinates you gave, not the pixel centre |
 | `aoi` | which cube the value came from |
-| `time` | the cube's date; **empty** for a static `(y,x)` channel, which gets one row rather than a copy per date |
+| `time` | the cube's date; **empty** for a static `(y,x)` channel, which gets one row rather than a copy per date. See the channel shapes below |
 | `variable` | the cube channel name, unmodified |
 | `stat` | which statistic this row is |
 | `radius_m` | the neighbourhood this row actually **used** (a `nearest` row is always `0`, whatever the channel declares) |
 | `value` | the number |
+
+**Cube channels come in three shapes**, and a channel's shape decides what you may ask of
+it:
+
+| shape | what you get | options it takes |
+| --- | --- | --- |
+| `(time, y, x)` — a per-day raster (`eco_sst`, `mur_sst`, `cmems_*`) | one row per date | the full set: `radius_m`, `stat`, `mask` |
+| `(y, x)` — a static raster (`depth_cudem`, `elevation_*`, `landcover_water`) | **one** row, with an empty `time` | `radius_m`, `stat`, `mask` |
+| `(time,)` — an **AOI-wide** series | one row per date, the same value for every point in that AOI | **none** — write the channel bare |
+
+The third kind is one number per day for the *whole* grid, so there is no neighbourhood for
+a radius or a statistic to reduce over. Giving one a `radius_m`/`stat`/`mask` is an error
+(which names every offending channel at once, and shows the fix). Write them bare:
+
+```yaml
+  channels:
+    lst_hour:          # Landsat overpass time, fractional UTC hour
+    tide_coops:
+```
+
+A real cube's 1-D channels are the overpass times `<sensor>_hour` (`lst_hour`,
+`modisref_hour`) and `<sensor>_hour_<tag>` (`eco_hour_v002`, `modis_hour_terra`); the tides
+`tide_<src>`, `tide_range_<src>` and `<sensor>_tide_<src>`; the calendar terms `doy_sin` /
+`doy_cos`; and, when those preprocess steps run, the `<sensor>_georef_*` diagnostics and
+`<sensor>_scene_cloud_pct_<src>`.
+
+In `<sensor>_hour` and `<sensor>_tide_<src>`, **NaN means there was no overpass that day** —
+not that the time or the tide is unknown.
 
 **Configuration** lives in an `extract:` block, and the channels are **explicit** — a
 channel you do not list is not extracted, and a channel you list that the cube does not
@@ -689,7 +717,8 @@ extract:
   format: parquet            # or csv
   channels:
     depth_cudem:                                          # bare key = nearest pixel
-    tide_coops:
+    lst_hour:                                             # AoI-wide: bare is the ONLY form
+    tide_coops:                                           # likewise
     eco_sst_clean: { radius_m: 300, stat: [nanmean, nanstd, count_valid] }
     mur_sst:       { radius_m: 1000, stat: mean }
     lst_sst:       { radius_m: 300, stat: nanmean, mask: water }

@@ -519,6 +519,12 @@ class ExtractChannel(BaseModel):
     `mask` restricts the neighbourhood before the reduction -- `water` for the cube's water
     mask, or any 2-D (y,x) channel name. `nearest` ignores it, because `nearest` is one
     specific pixel by definition.
+
+    NONE of these options applies to an AoI-WIDE channel -- one that is 1-D (time,), like an
+    overpass time (`lst_hour`), a tide (`tide_coops`) or a day-of-year term. Those are one
+    value per day for the whole grid, so there is no neighbourhood to reduce over: write them
+    bare (`lst_hour:`) and they ship one row per date. Which channels those are depends on
+    the cube, so the check lives in `processes.extract.plan_channels`, where one is open.
     """
     model_config = {"extra": "forbid"}
     radius_m: float = Field(0.0, ge=0)          # 0 -> just the pixel the point falls in
