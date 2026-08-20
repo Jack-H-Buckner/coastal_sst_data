@@ -1,7 +1,10 @@
 # Landsat coverage: why most sites see a small fraction of the overpasses
 
-*Status: DIAGNOSED, NOT FIXED. Written 2026-08-20 from a real extract; no code changed. Two
-defects are described here with their measured cost and the fix for each.*
+*Status: FIXED 2026-08-20 (v0.6.3). Written from a real extract; the diagnosis below is kept
+verbatim because §1 and §5 are the numbers any re-extract should be judged against. All three
+defects are implemented as described: the AoI-polygon pre-filter and the dead-granule warning
+in `landsat_pc.run`, the two merge clauses in `datacube.load_clearest_overpass`. §7's
+re-acquire is still required to stop the dead downloads that are already on disk.*
 
 Prompted by: in an extract over the Hobart AoI, most sites had far fewer Landsat observations
 than the 8-day revisit predicts, while MODIS and ECOSTRESS looked normal.
@@ -252,9 +255,12 @@ Tests:
 - A cell the base observed and masked keeps the base's value.
 - `<prefix>_valid` stays 0 in a filled hole and equals the contributing granule's own mask.
 
-The golden snapshots will move. Regenerate with `UPDATE_GOLDEN=1` and confirm the diff is
-**only** additional finite cells in the sensor SST channels, with `*_valid` unchanged —
-anything else means the fix reaches further than intended.
+The golden snapshots were expected to move; they did **not**, and that is the right answer.
+Their fixture's Landsat day holds ONE granule (no mosaic at all) and its two ECOSTRESS scenes
+cover the whole grid — both clauses bite only on granules that do not overlap, so neither can
+fire there. If a future fixture does move them, regenerate with `UPDATE_GOLDEN=1` and confirm
+the diff is **only** additional finite cells in the sensor SST channels, with `*_valid`
+unchanged — anything else means the fix reaches further than intended.
 
 ```bash
 pytest tests/test_landsat_pc.py tests/test_datacube.py -q && pytest -q

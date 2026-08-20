@@ -763,6 +763,126 @@ def test_the_one_pass_merge_equals_a_brute_force_ranked_fill(project, grids, day
         assert got_hour[0] == pytest.approx(float(read[base][1])), f"trial {trial}"
 
 
+# --------------------------------------------------------------------------- #
+# The merge and NaN. Both clauses below bite only when granules do NOT overlap -- WRS-2
+# path/rows, MGRS tiles -- which is precisely the case `mosaic_same_day` exists for, and both
+# are about the RAW sst channel, where a granule is NaN outside its own footprint.
+# --------------------------------------------------------------------------- #
+def write_landsat_strip(project, g, day, hour, *, rows, clear, temp=288.0):
+    """One granule covering only `rows` (NaN elsewhere), CLOUDY except over `clear`.
+
+    What a WRS-2 path/row looks like once a strict mask runs: a finite footprint much larger
+    than the part of it that survives water & clear. `write_landsat_rows` cannot express that
+    -- its cloud layer is uniform over the whole grid, so its finite cells and its valid cells
+    are the same set, and that is exactly the case where these two defects hide.
+    """
+    H, W, xs, ys = _grid_hw(g)
+    sst = np.full((H, W), np.nan, "float32")
+    sst[rows] = temp
+    water = np.zeros((H, W), "float32")
+    water[rows] = 1.0                                  # lst polarity: 1 == water
+    cloud = np.zeros((H, W), "float32")
+    cloud[rows] = 1.0
+    cloud[clear] = 0.0
+    ds = xr.Dataset({
+        "sst": (("time", "y", "x"), sst[None]),
+        "cloud": (("time", "y", "x"), cloud[None]),
+        "water": (("time", "y", "x"), water[None]),
+    }, coords={"time": [day], "y": ys, "x": xs})
+    _write(project, "LANDSAT", f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc", ds)
+
+
+def _mosaic(project, grids, days):
+    g = grids[AOI]
+    d = project.output_dir / "LANDSAT" / "aligned" / AOI
+    return datacube.load_clearest_overpass(d, AOI, days, g.height, g.width,
+                                           use_cloud=True, mosaic=True)
+
+
+def test_a_new_base_does_not_wipe_the_earlier_granules_it_cannot_see(project, grids, days):
+    """DEFECT 3a. `take = v | (score < 0)` is true wherever nothing has VALIDLY claimed a cell
+    -- including cells an earlier granule already painted with a real temperature but could
+    not validate. `np.copyto` then writes this granule's value there, and outside its own
+    footprint that value is NaN. Each successive new base therefore wipes its predecessors,
+    and only the LAST one keeps a full footprint.
+
+    Three non-overlapping strips, arriving in INCREASING valid-count order so every one of
+    them becomes a new base. Before the fix the first two survive only as their one or two
+    clear rows; the third's NaN eats the rest.
+    """
+    g = grids[AOI]
+    H = g.height
+    a, b = H // 3, 2 * (H // 3)
+    write_landsat_strip(project, g, days[0], 18, rows=slice(0, a),
+                        clear=slice(0, 1), temp=280.0)
+    write_landsat_strip(project, g, days[0], 19, rows=slice(a, b),
+                        clear=slice(a, a + 2), temp=281.0)
+    write_landsat_strip(project, g, days[0], 20, rows=slice(b, H),
+                        clear=slice(b, H), temp=282.0)
+
+    sst, cloud, valid, hour, _, _ = _mosaic(project, grids, days)
+
+    # Every strip keeps its whole footprint, at its own temperature.
+    assert np.all(sst[0][0:a] == 280.0)
+    assert np.all(sst[0][a:b] == 281.0)
+    assert np.all(sst[0][b:H] == 282.0)
+    # ...and validity is untouched: each strip's own clear rows, nothing invented.
+    exp = np.zeros((H, g.width), bool)
+    exp[0:1] = exp[a:a + 2] = exp[b:H] = True
+    assert np.array_equal(valid[0].astype(bool), exp)
+    assert hour[0] == pytest.approx(20.0)              # the clearest granule still names the day
+
+
+def test_a_lower_ranked_granule_fills_a_hole_it_only_saw_through_cloud(project, grids, days):
+    """DEFECT 3b. `take = v & (score < vc)` requires the granule's OWN validity, so its
+    finite-but-masked pixels never enter the raw channel -- while the base's do, via
+    `score < 0`. With Landsat's mask (NDWI water AND QA cloud AND a 1 km buffer) a granule
+    covering 100% of its half of the AoI delivered about a tenth of it.
+
+    A cell no granule validly observed is a HOLE, not a contested cell, and filling it is the
+    same claim the base already makes about its own unvalidated pixels.
+    """
+    g = grids[AOI]
+    H, W = g.height, g.width
+    cut = H // 2
+    write_landsat_strip(project, g, days[0], 18, rows=slice(0, cut),
+                        clear=slice(0, cut), temp=280.0)      # the base: clear, high count
+    write_landsat_strip(project, g, days[0], 20, rows=slice(cut, H),
+                        clear=slice(0, 0), temp=281.0)        # entirely cloudy -> 0 valid
+
+    sst, cloud, valid, _, _, _ = _mosaic(project, grids, days)
+
+    assert np.all(sst[0][cut:H] == 281.0), "the lower-ranked granule's footprint is a hole"
+    assert np.all(sst[0][0:cut] == 280.0)
+    # The fill is HONEST: `valid` carries the contributing granule's own verdict, which here
+    # is 0 -- the cube gains coverage in the raw channel, not unearned validity.
+    assert valid[0][cut:H].sum() == 0
+    assert np.array_equal(valid[0][0:cut], np.ones((cut, W), "uint8"))
+    assert np.all(cloud[0][cut:H] == 1.0)              # ...and says WHY it is invalid
+
+
+def test_a_cell_the_base_observed_and_masked_keeps_the_bases_value(project, grids, days):
+    """The rule the fix must NOT relax. A hole is a cell with no reading at all; a cell the
+    base observed and its mask rejected is not a hole, and a lower-ranked granule does not get
+    to repaint it just because neither of them validated it.
+
+    Base: the whole grid, clear over the top half only. Contender: the whole grid at another
+    temperature, cloudy throughout, so it validates nothing anywhere.
+    """
+    g = grids[AOI]
+    H, W = g.height, g.width
+    cut = H // 2
+    write_landsat_strip(project, g, days[0], 18, rows=slice(0, H),
+                        clear=slice(0, cut), temp=280.0)
+    write_landsat_strip(project, g, days[0], 20, rows=slice(0, H),
+                        clear=slice(0, 0), temp=281.0)
+
+    sst, _, valid, _, _, _ = _mosaic(project, grids, days)
+
+    assert np.all(sst[0] == 280.0), "a masked-but-observed cell is not a hole to be filled"
+    assert valid[0][0:cut].sum() == cut * W and valid[0][cut:H].sum() == 0
+
+
 def test_mosaic_and_footprints_together_are_refused(project, grids, days):
     """Unreachable through the registry (`_check_registry` forbids the pairing), so this pins
     the loader's own guard for a direct caller."""

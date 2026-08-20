@@ -47,6 +47,7 @@ import xarray as xr
 
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 from rasterio.enums import Resampling
+from shapely.geometry import shape as shp_shape
 
 from ..config import Project, DataProduct, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, read_cog_window, select_aois
@@ -141,6 +142,36 @@ def sign_item(item):
     import planetary_computer
 
     return net.retry(lambda: planetary_computer.sign(item), what=f"Landsat sign {item.id}")
+
+
+def reaches_aoi(item, aoi_lonlat) -> bool:
+    """Does this scene's DATA footprint reach the AoI polygon?
+
+    The search is by `search_bbox`, so the catalogue returns every scene whose BOUNDING BOX
+    touches the AoI's. A Landsat scene is a rotated 185 km parallelogram inside a much larger
+    axis-aligned bbox, so a whole WRS-2 path can be returned for an AoI its imagery never
+    covers -- and nothing downstream notices: `rio.clip_box` succeeds on the intersection,
+    `reproject` fills the rest with nodata, and the result is written as a COMPLETE granule
+    (every `store.REQUIRED_VARS["LANDSAT"]` present) that the skip guard then treats as done.
+    It becomes the day's base and the day reads as observed while holding nothing. Measured on
+    one AoI: an entire path, 15 dates, 15 x 5 windowed COG reads, zero pixels delivered.
+
+    The STAC item's `geometry` is a true footprint polygon -- BETTER than the bounding box
+    ECOSTRESS has to settle for (`ecostress.granule_bbox`) -- so this is the tighter form of
+    the same guard.
+
+    A missing or unreadable geometry means KEEP, as it does for ECOSTRESS. Dropping a scene
+    because its metadata was thin trades a known failure (a dead download, now reported) for a
+    silent one (a real overpass that never appears).
+    """
+    geom = getattr(item, "geometry", None)
+    if not geom:
+        return True
+    try:
+        return bool(shp_shape(geom).intersects(aoi_lonlat))
+    except Exception as exc:          # any malformed geometry -- keep, and say why
+        log.debug("    %s: unreadable geometry (%s), keeping the scene", item.id, exc)
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +310,11 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
         log.info("=== AOI: %s (CRS=%s grid=%dx%d @ %.0fm) ===",
                  name, g.target_crs, g.width, g.height, g.resolution_m)
+        # Said out loud, because these decide what `valid` (and every `_clean` channel built
+        # from it) accepts, and a run whose masks look wrong is diagnosed from the log first.
+        log.info("  masking: ndwi_threshold=%.2f cloud_buffer_km=%.2f cloud_cover_max=%.2f",
+                 float(mask_cfg.get("ndwi_threshold", 0.0)),
+                 float(mask_cfg.get("cloud_buffer_km", 1.0)), cloud_max)
 
         items = search_scenes(ds_cfg["collection"], ds_cfg["stac_url"], g.search_bbox,
                               start, end, platforms, cloud_max)
@@ -289,8 +325,23 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
             log.info("  [dry-run] would process %d scene(s)", len(items))
             continue
 
+        # Once per AoI, not once per scene: the projection back to lon/lat is the same answer
+        # every time and a multi-year AoI is hundreds of scenes (as `ecostress.run` does).
+        aoi_lonlat = g.geom_lonlat()
+        off_aoi = 0
+        # Scenes that DID reach the AoI by their footprint yet read back with no finite SST
+        # over the grid. The acquisition-side twin of the assembler's "finite SST but NO valid
+        # pixels" warning: without it a dead download is indistinguishable from a live one.
+        empty_scenes = 0
+
         aoi_out = out_root / name
         for it in sorted(items, key=lambda i: i.properties["datetime"]):
+            if not reaches_aoi(it, aoi_lonlat):
+                # NOT `rep.skip()`: that counter means "already complete on disk", and these
+                # scenes have nothing on disk and never will.
+                log.debug("  [%s] %s does not reach the AoI polygon, skipping", name, it.id)
+                off_aoi += 1
+                continue
             acq = pd.Timestamp(it.datetime.astimezone(timezone.utc).replace(tzinfo=None))
             stem = naming.time_stem(name, acq)
             if store.done(aoi_out / f"{stem}.nc", store.REQUIRED_VARS["LANDSAT"],
@@ -305,6 +356,12 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 continue
             if ds is None:
                 continue
+            if not bool(np.isfinite(ds["sst"].values).any()):
+                # Written anyway -- it IS what the catalogue served for this AoI, and a
+                # complete granule is what stops the next run downloading it again. Counted,
+                # so it stops looking like a successful acquisition.
+                empty_scenes += 1
+                log.debug("    %s: no finite SST over the AoI", it.id)
             ds.attrs.update(**provenance.stamp(eff))
             try:
                 out = store.write_output(ds, aoi_out, stem, fmt)
@@ -314,6 +371,15 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 continue
             log.info("      wrote %s", out)
             rep.wrote(source="Landsat C2 L2 (Planetary Computer)")
+
+        if off_aoi:
+            log.info("  %s: %d of %d scene(s) touched the search box but not the AoI polygon "
+                     "-- not downloaded", name, off_aoi, len(items))
+        if empty_scenes:
+            log.warning(
+                "  %s: %d scene(s) read back with NO finite SST over the AoI. Their footprint "
+                "polygon reaches the AoI but their imagery does not cover it; those days look "
+                "observed in the cube and hold nothing.", name, empty_scenes)
     rep.log_summary()
     return rep
 
