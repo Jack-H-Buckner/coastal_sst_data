@@ -198,17 +198,23 @@ def scene_to_dataset(item, g: AoiGrid, mask_cfg: dict, to_celsius: bool,
         cdist_km = _read_asset(item, "cdist", g, resampling=Resampling.bilinear) * CDIST_SCALE
         cloudy = cloudy | (cdist_km < buf_km)
 
+    # The masks are DERIVED from windowed COG reads, so they arrive carrying the reads'
+    # `_FillValue` (0, from the `masked=False` QA read) and an identity scale/offset. On a
+    # 0/1 mask a fill of 0 is not "no data" -- it is CLEAR, and half the layer. Left on, every
+    # clear cell decodes back as NaN, the assembler reads a NaN cloud cell as CLOUDY, and the
+    # sensor's whole validity mask goes empty. `store` refuses such a fill value on write as
+    # well; scrubbing here is saying what these layers ARE rather than relying on that net.
     ds = xr.Dataset({
         "sst": sst.astype("float32"),
-        "cloud": cloudy.astype("float32"),
-        "water": water.astype("float32"),
+        "cloud": store.clear_cf_decode_attrs(cloudy.astype("float32")),
+        "water": store.clear_cf_decode_attrs(water.astype("float32")),
     })
     ds["sst"].attrs["units"] = "degC" if to_celsius else "K"
     # Masks may be NaN outside the AoI; treat NaN as 0 for the logic mask.
     valid = (np.isfinite(ds["sst"])
              & (ds["water"].fillna(0) > 0)
              & ~(ds["cloud"].fillna(0) > 0))
-    ds["valid"] = valid.astype("uint8")
+    ds["valid"] = store.clear_cf_decode_attrs(valid.astype("uint8"))
     ds["valid"].attrs["long_name"] = "water & clear & finite SST"
 
     ds = ds.expand_dims(time=[pd.Timestamp(acq_time)])

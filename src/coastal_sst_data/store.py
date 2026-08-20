@@ -68,6 +68,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -428,10 +429,84 @@ def atomic(dest: Path, *, placeholder: bool = False):
 NETCDF_ENGINE = "netcdf4"
 
 
+# The CF attrs a windowed COG read leaves behind. They are how a raster DECLARES its nodata
+# and scaling, and they are meaningful on a raster -- but they ride along onto every array
+# derived from one, and on a 0/1 MASK they are actively harmful. See `clear_cf_decode_attrs`.
+_CF_DECODE_ATTRS = ("_FillValue", "scale_factor", "add_offset")
+
+
+def clear_cf_decode_attrs(da: xr.DataArray) -> xr.DataArray:
+    """Strip the CF decode attrs a COG read leaks onto a derived MASK -> a new DataArray.
+
+    `grid.read_cog_window` reprojects, and rioxarray stamps the result with `_FillValue`
+    (whatever nodata the read used), plus an identity `scale_factor`/`add_offset`. Any mask
+    computed from that raster inherits them, and both are wrong for a mask:
+
+      * `_FillValue: 0` on a 0/1 mask means every ZERO cell decodes to NaN the next time
+        anything opens the file. 0 is not absent data on a mask -- it is CLEAR, or LAND, and
+        it is half the information the layer carries.
+      * the identity scale/offset alone promote a uint8 mask to float64 on read.
+
+    Both places must be cleared: `to_netcdf` refuses a key that sits in `attrs` and
+    `encoding` at once, and clearing only `encoding` leaves the ATTRIBUTE to be written,
+    which is what actually does the damage.
+    """
+    out = da.copy(deep=False)
+    out.attrs = {k: v for k, v in out.attrs.items() if k not in _CF_DECODE_ATTRS}
+    out.encoding = {k: v for k, v in out.encoding.items() if k not in _CF_DECODE_ATTRS}
+    return out
+
+
+def _sanitize_fill_values(ds: xr.Dataset, encoding: dict) -> tuple[xr.Dataset, dict]:
+    """Never write a `_FillValue` that OCCURS in the data -> (dataset, encoding) to write.
+
+    A fill value marks data that is ABSENT. One that collides with a value actually present
+    does not mark anything -- it DELETES that value for every future reader, silently, on
+    decode.
+
+    This is not hypothetical. Landsat's `cloud` mask went to disk as 0/1 carrying
+    `_FillValue: 0` (inherited from the `masked=False` QA read), so every CLEAR cell came
+    back as NaN; `datacube._read_granule` reads a NaN cloud cell as CLOUDY -- correct when
+    NaN really means "unknown" -- and the sensor's entire validity mask went empty on every
+    granule. With nothing valid anywhere, every granule of a day tied at zero and the day's
+    mosaic collapsed onto whichever one happened to be read first, so a multi-scene AoI
+    showed a single scene's footprint. No error, at any stage.
+
+    The check is deliberately narrow: only a FINITE fill value can collide (NaN is the normal
+    float nodata and never equals anything, including itself), so this costs one comparison
+    pass over arrays that are about to be serialised anyway. A non-colliding fill -- NaN on a
+    float field, -9999 on a DEM -- is doing its job and is left exactly as it is.
+    """
+    fixed = []
+    out = ds.copy(deep=False)
+    enc = {k: dict(v) for k, v in encoding.items()}
+    for name in list(out.data_vars):
+        da = out[name]
+        fv = da.attrs.get("_FillValue", da.encoding.get("_FillValue"))
+        if fv is None:
+            continue
+        fv = np.asarray(fv)
+        if fv.dtype.kind == "f" and not np.isfinite(fv):
+            continue
+        values = np.asarray(da.values)
+        if not np.any(values == fv):
+            continue
+        out[name] = clear_cf_decode_attrs(da)
+        # Belt and braces: the attr is gone, and the encoding says explicitly "no fill".
+        enc.setdefault(name, {})["_FillValue"] = None
+        fixed.append(f"{name} (={fv.item()})")
+    if fixed:
+        log.warning("  %s: refusing to write a _FillValue that occurs in the data -- it "
+                    "would decode back as NaN and delete those cells: %s",
+                    getattr(ds, "name", "output"), ", ".join(fixed))
+    return out, enc
+
+
 def write_netcdf(ds: xr.Dataset, path: Path, encoding: dict | None = None) -> Path:
     """Atomically write `ds` to `path`."""
     if encoding is None:
         encoding = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
+    ds, encoding = _sanitize_fill_values(ds, encoding)
     with atomic(path, placeholder=True) as tmp:      # see `atomic`: keeps libnetcdf quiet
         ds.to_netcdf(tmp, encoding=encoding, engine=NETCDF_ENGINE)
     return path

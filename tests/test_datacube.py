@@ -15,7 +15,7 @@ import pytest
 import xarray as xr
 
 from coastal_sst_data.config import parse_config, CompressionSpec
-from coastal_sst_data import grid
+from coastal_sst_data import grid, store
 from coastal_sst_data.processes import datacube
 
 
@@ -316,6 +316,49 @@ def write_landsat_rows(project, g, day, hour, *, rows, temp=288.0, cloud=0.0):
         "water": (("time", "y", "x"), water[None]),
     }, coords={"time": [day], "y": ys, "x": xs})
     _write(project, "LANDSAT", f"{AOI}_{day.strftime('%Y%m%d')}T{hour:02d}0000.nc", ds)
+
+
+def test_a_days_granules_survive_the_writer_that_acquisition_uses(project, grids, days):
+    """The user-visible symptom, as an assertion: one path in the cube, several on disk.
+
+    Two non-overlapping Landsat granules on one day, written through the REAL writer with the
+    `_FillValue: 0` their `cloud` layer used to carry. That fill value ate every CLEAR cell on
+    read-back; the assembler reads a NaN cloud cell as CLOUDY, so validity came out empty for
+    BOTH granules; and with both tied at zero valid pixels the first became the mosaic base
+    and painted its own strip over the whole grid while the second could never outrank it.
+    The cube showed one scene's footprint -- bounded by the diagonal edge of a WRS-2 scene --
+    and every stage reported success.
+    """
+    g = grids[AOI]
+    H, W, xs, ys = _grid_hw(g)
+    cut = H // 2
+
+    def write_like_acquisition(hour, rows, temp):
+        sst = np.full((H, W), np.nan, "float32")
+        sst[rows] = temp
+        water = np.zeros((H, W), "float32")
+        water[rows] = 1.0                              # lst polarity: 1 == water
+        cloud = xr.DataArray(np.zeros((1, H, W), "float32"),
+                             dims=("time", "y", "x"))
+        # what a `masked=False` COG read leaves behind on a derived mask
+        cloud.attrs["_FillValue"] = np.float32(0.0)
+        ds = xr.Dataset({"sst": (("time", "y", "x"), sst[None]),
+                         "cloud": cloud,
+                         "water": (("time", "y", "x"), water[None])},
+                        coords={"time": [days[0]], "y": ys, "x": xs})
+        store.write_output(ds, project.output_dir / "LANDSAT" / "aligned" / AOI,
+                           f"{AOI}_{days[0].strftime('%Y%m%d')}T{hour:02d}0000", "netcdf")
+
+    write_like_acquisition(18, slice(0, cut), 288.0)
+    write_like_acquisition(19, slice(cut, H), 291.0)
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    sst = ds["lst_sst"].isel(time=0).values
+    valid = ds["lst_valid"].isel(time=0).values
+
+    assert int(valid.sum()) > 0, "validity came out empty for every granule"
+    assert np.allclose(sst[:cut], 288.0), "the first granule's strip is missing"
+    assert np.allclose(sst[cut:], 291.0), "the SECOND granule was dropped -- one path only"
 
 
 def test_two_granules_on_a_day_are_mosaicked_not_discarded(project, grids, days):

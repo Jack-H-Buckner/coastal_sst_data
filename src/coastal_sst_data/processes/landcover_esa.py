@@ -125,15 +125,11 @@ def items_to_dataset(items, g: AoiGrid, water_classes, aoi_id: str) -> Optional[
 
     lc = lc.astype("int16")
     water = lc.isin(list(water_classes)).astype("uint8")
-    # `water` is a 0/1 mask -- 0 means LAND, not nodata. The COG read leaks CF decode attrs
-    # onto it (rio.reproject: _FillValue: 0, plus identity scale_factor/add_offset). Left on
-    # disk, xarray's default mask_and_scale=True decodes _FillValue -> land becomes NaN, and
-    # the scale/offset alone promote uint8 -> float64. Scrub all three from attrs and encoding
-    # (both must go: to_netcdf errors if the same key sits in each) so the mask reads back as
-    # a true uint8 0/1. The explicit WATER_ENCODING then pins uint8 with no fill on write.
-    for _k in ("_FillValue", "scale_factor", "add_offset"):
-        water.attrs.pop(_k, None)
-        water.encoding.pop(_k, None)
+    # `water` is a 0/1 mask -- 0 means LAND, not nodata -- and the COG read leaks CF decode
+    # attrs onto it. See `store.clear_cf_decode_attrs` for what they do to a mask; this used
+    # to be an inline copy of it, and the copy is why Landsat's `cloud` repeated the bug
+    # years later. The explicit WATER_ENCODING then pins uint8 with no fill on write.
+    water = store.clear_cf_decode_attrs(water)
     ds = xr.Dataset({"landcover": lc, "water": water})
     ds["landcover"].attrs["long_name"] = "ESA WorldCover class code (0 = no data)"
     ds["water"].attrs["long_name"] = f"WorldCover water (class in {list(water_classes)})"
