@@ -352,6 +352,128 @@ def multi_granule_days(d: Path, aoi_id, days, *, cache=None) -> tuple[int, int]:
     return _cached(cache, ("multiday", str(d)), build)
 
 
+# --------------------------------------------------------------------------- #
+# Which way round is this sensor's water layer?
+# --------------------------------------------------------------------------- #
+# How many granules to sample. The answer is a property of the PRODUCT, not of a scene, so a
+# handful spread across the window is plenty -- and each one costs a file open the merge would
+# otherwise make anyway.
+POLARITY_SAMPLE_GRANULES = 8
+# Below this many cells where BOTH the granule's water layer and the landcover mask are known,
+# the agreement is noise. Small enough that a test-sized AoI still gets a verdict.
+POLARITY_MIN_CELLS = 500
+# The two candidate rules partition the finite cells, so their agreements sum to exactly 1 and
+# one number decides it. Inside this band the layer does not look like either -- say so rather
+# than pick the majority class by a hair.
+POLARITY_MIN_AGREEMENT = 0.65
+
+
+def _looks_binary(w: np.ndarray) -> bool:
+    """Is `w` plausibly a 0/1 mask?
+
+    A mask that is not two-valued in [0,1] is usually not a mask at all -- it is the wrong
+    asset. ECOSTRESS's `water` layer once held QC bit patterns (17088, 33472, ...) because the
+    granule's assets were bound to roles positionally; every downstream test still ran, and the
+    validity mask came out empty on every granule. This is the cheap tell for that whole class.
+    """
+    fin = w[np.isfinite(w)]
+    if fin.size == 0:
+        return True                       # nothing to judge; not this check's business
+    vals = np.unique(fin)
+    return len(vals) <= 2 and float(vals.min()) >= -0.1 and float(vals.max()) <= 1.1
+
+
+def resolve_water_polarity(d: Path, aoi_id, days, H, W, *, declared: bool,
+                           landcover: np.ndarray, cache=None) -> dict:
+    """Which reading of this sensor's `water` layer agrees with the landcover mask -> a record.
+
+    `SensorSpec.water_is_land` decides whether `water` marks water or land, and it is the only
+    input to `products.water_cells`. Backwards, it makes `<prefix>_valid` empty over water --
+    and because granules with zero valid pixels all tie at zero, the day's mosaic then collapses
+    onto whichever granule was read first, leaving a corner of the AoI. That failure has been
+    chased twice; ECOSTRESS's value was never verified against data at all, because for a long
+    while both the acquisition and the assembler were reading the WRONG ASSET and neither could
+    be evidence.
+
+    So it is measured instead of trusted. `(w < 0.5)` and `(w > 0.5)` partition the finite
+    cells, so the two candidate agreements with the landcover mask are exactly complementary --
+    ONE number decides it, and a value near 0.5 means the layer resembles neither.
+
+    Returns the flat record `datum.resolve_aoi` returns for the vertical datum, and for the same
+    reason: the caller needs the answer, how it was reached, and how much to trust it. A status
+    other than `ok`/`corrected` always keeps `declared`.
+    """
+    def build() -> dict:
+        rec = {"declared": bool(declared), "water_is_land": bool(declared),
+               "agreement": float("nan"), "n_cells": 0, "n_granules": 0, "status": "no_granules"}
+
+        lc_known = np.isfinite(landcover)
+        if not lc_known.any():
+            # `_contribute_landcover` coerces unknown -> water, so the emitted CHANNEL cannot
+            # tell "landcover was never acquired" from "this AoI really is all water". The raw
+            # loader keeps the NaN, which is the only place that difference survives.
+            rec["status"] = "no_landcover"
+            return rec
+        lc_water = landcover > 0.5
+        if not (lc_water & lc_known).any() or (lc_water | ~lc_known).all():
+            rec["status"] = "landcover_degenerate"
+            return rec
+
+        want = {naming.day_stamp(dd) for dd in days}
+        files = [f for day, gs in scene_index(d, aoi_id, cache=cache).items() if day in want
+                 for _dt, f in gs]
+        if not files:
+            return rec
+        step = max(1, len(files) // POLARITY_SAMPLE_GRANULES)
+        sample = files[::step][:POLARITY_SAMPLE_GRANULES]
+
+        agree_land = 0          # cells where reading `w < 0.5` as WATER matches landcover
+        n_cells = 0
+        n_granules = 0
+        not_binary = False
+        for f in sample:
+            with xr.open_dataset(f) as raw:
+                ds = raw.isel(time=0) if "time" in raw.dims else raw
+                if "water" not in ds or ds["water"].shape != (H, W):
+                    continue
+                w = ds["water"].values.astype("float32")
+            both = np.isfinite(w) & lc_known
+            if not both.any():
+                continue
+            not_binary = not_binary or not _looks_binary(w)
+            agree_land += int(((w[both] < 0.5) == lc_water[both]).sum())
+            n_cells += int(both.sum())
+            n_granules += 1
+
+        rec.update(n_cells=n_cells, n_granules=n_granules)
+
+        # `not_binary` rides on EVERY post-sampling status, never instead of one. It is the
+        # single most useful signal here -- a layer that is not a 0/1 mask is usually the wrong
+        # asset entirely -- and it is most likely to fire precisely when the polarity comes out
+        # `ambiguous`, which is the branch that would otherwise have swallowed it.
+        def done(status: str) -> dict:
+            rec["status"] = status + ("+water_layer_not_binary" if not_binary else "")
+            return rec
+
+        if n_granules == 0:
+            return done("no_water_layer")
+        if n_cells < POLARITY_MIN_CELLS:
+            return done("too_few_cells")
+
+        frac = agree_land / n_cells
+        rec["agreement"] = float(max(frac, 1.0 - frac))
+        if frac >= POLARITY_MIN_AGREEMENT:
+            detected = True
+        elif frac <= 1.0 - POLARITY_MIN_AGREEMENT:
+            detected = False
+        else:
+            return done("ambiguous")
+        rec["water_is_land"] = detected
+        return done("ok" if detected == bool(declared) else "corrected")
+
+    return _cached(cache, ("water_polarity", str(d)), build)
+
+
 def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                            use_cloud=True, qc_levels=None, trust_valid=False,
                            read_footprint=False, footprint_present=None, mosaic=False,
@@ -985,6 +1107,57 @@ def _contribute_bathymetry(ctx: AssemblyContext) -> None:
         ctx.emit(f"depth_p75_{src}", ("y", "x"), depth_p75)
 
 
+def _polarity_attrs(rec: dict) -> dict:
+    """The polarity record as cube attrs -- plain str/float, which is all Zarr and netCDF take.
+
+    On the VARIABLE, not the cube, and on `<prefix>_valid` specifically: the polarity is what
+    that channel means, and it is per sensor and per version tag -- the same shape as the datum
+    offset, which ships per DEM source for the same reason (see finalize_attrs).
+    """
+    return {
+        "water_polarity": "water_is_land" if rec["water_is_land"] else "water_is_water",
+        "water_polarity_status": str(rec["status"]),
+        "water_polarity_declared": ("water_is_land" if rec["declared"] else "water_is_water"),
+        "water_polarity_agreement": float(rec["agreement"]),
+    }
+
+
+def _log_polarity(rec: dict, adir: Path, ctx: AssemblyContext, sp) -> None:
+    """Say what was detected, and how loudly, per status.
+
+    The tree path rather than `adir.name`, like the mosaic summary above: the name is the AoI id
+    for both ECOSTRESS/v002/... and /v003/..., so identical args would make `_LogOnce` swallow
+    the second version's line.
+    """
+    where = adir.relative_to(ctx.eff["aligned_root"])
+    status = rec["status"]
+    if status.startswith("corrected"):
+        log.warning(
+            "  %s: the `water` layer disagrees with landcover -- reading it as %s, NOT the "
+            "%s this sensor's SensorSpec declares (%.0f%% agreement over %d cells, %d "
+            "granule(s)). The cube uses the DETECTED reading; if this repeats across "
+            "projects, change SensorSpec(water_is_land=...) for %r in products.py.",
+            where, "LAND" if rec["water_is_land"] else "WATER",
+            "LAND" if rec["declared"] else "WATER",
+            100 * rec["agreement"], rec["n_cells"], rec["n_granules"], sp.prefix)
+    elif status == "ambiguous":
+        log.warning(
+            "  %s: the `water` layer matches neither reading of landcover (%.0f%% agreement "
+            "over %d cells) -- keeping the declared %s. A mask that resembles neither is "
+            "usually the wrong asset.", where, 100 * rec["agreement"], rec["n_cells"],
+            "water_is_land" if rec["declared"] else "water_is_water")
+    elif status in ("landcover_degenerate", "too_few_cells"):
+        log.warning("  %s: cannot check the `water` layer's polarity (%s) -- keeping the "
+                    "declared %s.", where, status,
+                    "water_is_land" if rec["declared"] else "water_is_water")
+    elif status == "ok":
+        log.info("  %s: `water` layer polarity confirmed against landcover (%.0f%% agreement "
+                 "over %d cells).", where, 100 * rec["agreement"], rec["n_cells"])
+    if status.endswith("water_layer_not_binary"):
+        log.warning("  %s: the `water` layer is not a 0/1 mask. That is what a MIS-ASSIGNED "
+                    "asset looks like -- check which COG the `water` role was bound to.", where)
+
+
 def _load_sensor(ctx: AssemblyContext, sp, adir):
     """Read one sensor scene-stream from one aligned dir, applying the sensor's validity
     rules. Factored out so a flat sensor and one per-version tree share exactly one path."""
@@ -1007,16 +1180,30 @@ def _load_sensor(ctx: AssemblyContext, sp, adir):
                      "MOSAICKED -- the clearest granule is the base and the rest fill only the "
                      "cells it left invalid, while %s_hour stays the base granule's time",
                      adir.relative_to(ctx.eff["aligned_root"]), n_multi, n_days, sp.prefix)
+    # The water layer's polarity is MEASURED against the landcover mask rather than taken on
+    # faith from the registry -- see resolve_water_polarity. Same two rules as the count above:
+    # gated on `len(ctx.days)` so the census pass does not consume it under `_quiet` (which
+    # would swallow the warning AND cache the answer), and asked over `ctx.all_days` so every
+    # block gets an identical record -- `_merge_block_attrs` makes a block-varying attr fatal.
+    pol, pol_attrs = sp.water_is_land, {}
+    if not sp.trust_valid and len(ctx.days):
+        rec = resolve_water_polarity(
+            adir, ctx.aid, ctx.all_days, ctx.H, ctx.W, declared=sp.water_is_land,
+            landcover=load_landcover(ctx.adir("landcover"), ctx.aid, ctx.H, ctx.W,
+                                     cache=ctx.cache),
+            cache=ctx.cache)
+        pol, pol_attrs = rec["water_is_land"], _polarity_attrs(rec)
+        _log_polarity(rec, adir, ctx, sp)
     return load_clearest_overpass(
         adir, ctx.aid, ctx.days, ctx.H, ctx.W,
-        water_is_land=sp.water_is_land, use_cloud=sp.use_cloud,
+        water_is_land=pol, use_cloud=sp.use_cloud,
         qc_levels=list(sp.qc_levels) if sp.qc_levels is not None else None,
         trust_valid=sp.trust_valid, read_footprint=sp.has_footprint,
         # Decided over the WHOLE cube axis, not this block's days -- see footprint_available.
         footprint_present=(footprint_available(adir, ctx.aid, ctx.all_days, ctx.H, ctx.W,
                                                cache=ctx.cache)
                            if sp.has_footprint else False),
-        mosaic=sp.mosaic_same_day, cache=ctx.cache)
+        mosaic=sp.mosaic_same_day, cache=ctx.cache) + (pol_attrs,)
 
 
 # The footprint index is a per-day identity, and saying so on the variable is the only place a
@@ -1043,14 +1230,15 @@ def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None
     """A single-collection sensor (Landsat, MODIS): one flat `<DIR>/aligned/<aoi>` tree, one
     channel-set under the bare prefix, one entry in `sensor_times`."""
     sp = s.sensor
-    sst, cloud, valid, hour, times, footprint = _load_sensor(
+    sst, cloud, valid, hour, times, footprint, pol = _load_sensor(
         ctx, sp, ctx.adir(s.product.value))
     pre = sp.prefix
     mos = _MOSAIC_ATTRS if sp.mosaic_same_day else {}
     ctx.emit(f"{pre}_sst", T3, sst, **mos)
     if sp.has_cloud:          # MODIS arrives pre-filtered with no cloud layer; an all-zero
         ctx.emit(f"{pre}_cloud", T3, cloud, **mos)   # channel would falsely read "never cloudy"
-    ctx.emit(f"{pre}_valid", T3, valid, **mos)
+    # `pol` on `_valid` only: the polarity is what THIS channel means. See _polarity_attrs.
+    ctx.emit(f"{pre}_valid", T3, valid, **mos, **pol)
     ctx.emit(f"{pre}_hour", ("time",), hour)
     # Only when a granule actually carried the layer (it is optional at acquisition): an
     # all -1 channel would read as "nothing was ever in swath" rather than "never recorded".
@@ -1105,14 +1293,15 @@ def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> N
 
     per_tag_times: dict[str, list] = {}
     for tag in ordered:
-        sst, cloud, valid, hour, times, footprint = _load_sensor(
+        sst, cloud, valid, hour, times, footprint, pol = _load_sensor(
             ctx, sp, ctx.adir(s.product.value, tag))
         pre = sp.prefix
         mos = _MOSAIC_ATTRS if sp.mosaic_same_day else {}
         ctx.emit(f"{pre}_sst_{tag}", T3, sst, **mos)
         if sp.has_cloud:
             ctx.emit(f"{pre}_cloud_{tag}", T3, cloud, **mos)
-        ctx.emit(f"{pre}_valid_{tag}", T3, valid, **mos)
+        # Per TAG: each version tree is checked on its own, and may legitimately differ.
+        ctx.emit(f"{pre}_valid_{tag}", T3, valid, **mos, **pol)
         ctx.emit(f"{pre}_hour_{tag}", ("time",), hour)
         if footprint is not None:
             ctx.emit(f"{pre}_footprint_id_{tag}", T3, footprint, **_FOOTPRINT_ATTRS)

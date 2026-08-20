@@ -177,11 +177,27 @@ note that clearing `encoding` alone does nothing: it is the ATTRIBUTE that gets 
 `store.write_netcdf` also refuses, with a warning, any `_FillValue` that occurs in the data
 it is writing — a fill value that collides deletes data rather than marking its absence.
 
-**One rule for a mask's polarity.** `SensorSpec.water_is_land` is the only place that decides
-which value of a water layer means water, and both the acquisition stage and the assembler go
-through `products.water_cells`. They used to carry the literal separately (`water > 0` at
-acquisition, `water < 0.5` in the assembler) and contradicted each other for as long as
-neither number mattered.
+**One rule for a mask's polarity, and it is MEASURED, not declared.**
+`SensorSpec.water_is_land` says which value of a sensor's water layer means water, and both
+the acquisition stage and the assembler go through `products.water_cells` — they used to
+carry the literal separately (`water > 0` at acquisition, `water < 0.5` in the assembler) and
+contradicted each other for as long as neither number mattered.
+
+Declaring it is not enough, because a wrong declaration is invisible: `<prefix>_valid` comes
+out empty over water, granules with zero valid pixels all tie, and the day's mosaic collapses
+onto whichever granule was read first — a corner-shaped cube and a run that reports success.
+ECOSTRESS's value was never verified at all, because for a long while both stages were
+reading the *wrong asset* and neither could be evidence. So the assembler now CHECKS it:
+`datacube.resolve_water_polarity` compares the layer against the static `landcover_water`
+mask on the same grid, once per (AoI, sensor tree), and the cube uses whichever reading
+agrees. The verdict, its status and its agreement are stamped on `<prefix>_valid`.
+
+Three things a new sensor's author should know about it: the registry value stays the
+declared default and a correction is logged rather than made permanent (change `products.py`
+if it repeats); a `trust_valid` sensor is skipped, having no polarity to get wrong; and the
+check reads `load_landcover` directly rather than the emitted channel, because
+`_contribute_landcover` coerces unknown to water and the channel therefore cannot distinguish
+"landcover was never acquired" from "this AoI really is all water".
 
 For chlorophyll:
 
