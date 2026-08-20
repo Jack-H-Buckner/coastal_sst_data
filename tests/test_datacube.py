@@ -1009,6 +1009,197 @@ def _bare_cube(project, g, days):
     return datacube.assemble_aoi(g, datacube._build_eff(project), days)
 
 
+# --------------------------------------------------------------------------- #
+# WATER-LAYER POLARITY, measured rather than trusted.
+#
+# `SensorSpec.water_is_land` is the only input to `products.water_cells`, and backwards it
+# makes `<prefix>_valid` empty over water -- which, because granules with zero valid pixels
+# all tie at zero, collapses each day's mosaic onto whichever granule was read first and
+# leaves a corner of the AoI. ECOSTRESS's value was never verified against data: for a long
+# while both the acquisition and the assembler read the WRONG ASSET, so neither was evidence.
+# The assembler now checks the layer against the landcover mask and uses what agrees.
+#
+# `_bare_cube` writes an ALL-WATER landcover, which is deliberately the degenerate case -- so
+# these tests write their own coastline via `land_cols`.
+# --------------------------------------------------------------------------- #
+def _cube_with_coast(project, g, days, land_cols=None):
+    """Assemble with a real coastline, so the polarity check has something to compare to."""
+    H, W, _xs, _ys = _grid_hw(g)
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(W // 2, W) if land_cols is None else land_cols)
+    return datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+
+def _pol(ds, name):
+    return {k: v for k, v in ds[name].attrs.items() if k.startswith("water_polarity")}
+
+
+def test_an_inverted_water_layer_is_detected_and_corrected(project, grids, days, caplog):
+    """THE point of the check. The granule's `water` is inverted relative to the registry.
+
+    Read on the registry's word the validity mask is empty, which is not a visible failure --
+    it is a day that looks cloudy, and a mosaic that then keeps only one granule.
+    """
+    g = grids[AOI]
+    H, W, _xs, _ys = _grid_hw(g)
+    # landcover: water in the WEST half. Write the eco `water` layer the OTHER way round from
+    # what `water_is_land=True` expects, i.e. 1 (which eco calls LAND) over the water half.
+    ec = np.zeros((1, H, W), "float32")
+    ec[:, :, : W // 2] = 1.0
+    _write_eco(project, f"{AOI}_{days[0].strftime('%Y%m%d')}T200000.nc", xr.Dataset({
+        "sst": (("time", "y", "x"), np.full((1, H, W), 286.0, "float32")),
+        "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+        "water": (("time", "y", "x"), ec),
+        "quality": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+    }, coords={"time": [days[0]], "y": _grid_hw(g)[3], "x": _grid_hw(g)[2]}))
+
+    with caplog.at_level("WARNING"):
+        ds = _cube_with_coast(project, g, days)
+
+    a = _pol(ds, "eco_valid_v002")
+    assert a["water_polarity_status"] == "corrected"
+    assert a["water_polarity_declared"] == "water_is_land"
+    assert a["water_polarity"] == "water_is_water"
+    assert a["water_polarity_agreement"] > 0.9
+    assert "disagrees with landcover" in caplog.text
+    assert "products.py" in caplog.text          # says how to make the correction permanent
+
+    # And the mask must land on the WATER half. `sum() > 0` would not pin this: read with the
+    # declared polarity the mask is not empty, it is INVERTED -- valid over the land half,
+    # which is a validity mask that is confidently wrong rather than obviously broken.
+    v = ds["eco_valid_v002"].isel(time=0).values
+    assert v[:, : W // 2].sum() == v.shape[0] * (W // 2)     # every water cell valid
+    assert v[:, W // 2:].sum() == 0                          # no land cell valid
+
+
+def test_a_correct_water_layer_is_confirmed_not_changed(project, grids, days):
+    """The check must be a no-op when the registry is right."""
+    g = grids[AOI]
+    H, W, _xs, _ys = _grid_hw(g)
+    water = np.ones((1, H, W), "float32")        # eco: 1 == LAND
+    water[:, :, : W // 2] = 0.0                  # ...so 0 == water, matching landcover's west
+    _write_eco(project, f"{AOI}_{days[0].strftime('%Y%m%d')}T200000.nc", xr.Dataset({
+        "sst": (("time", "y", "x"), np.full((1, H, W), 286.0, "float32")),
+        "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+        "water": (("time", "y", "x"), water),
+        "quality": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+    }, coords={"time": [days[0]], "y": _grid_hw(g)[3], "x": _grid_hw(g)[2]}))
+
+    ds = _cube_with_coast(project, g, days)
+    a = _pol(ds, "eco_valid_v002")
+    assert a["water_polarity_status"] == "ok"
+    assert a["water_polarity"] == a["water_polarity_declared"] == "water_is_land"
+
+
+def test_landsat_the_opposite_polarity_is_also_confirmed(project, grids, days):
+    """The check is generic, so it must not 'correct' a sensor that is already right --
+    and Landsat's polarity is the opposite of ECOSTRESS's."""
+    g = grids[AOI]
+    write_landsat(project, g, days[0], hour=19)          # writes water = 1 (lst: 1 == water)
+    ds = _cube_with_coast(project, g, days, land_cols=slice(0, 0))   # all water
+    # all-water landcover is degenerate, so this one degrades rather than deciding
+    assert _pol(ds, "lst_valid")["water_polarity_status"] == "landcover_degenerate"
+    assert _pol(ds, "lst_valid")["water_polarity"] == "water_is_water"   # declared, kept
+
+
+def test_a_trust_valid_sensor_is_skipped(project, grids, days):
+    """MODIS never reads a `water` layer, so it has no polarity to get wrong; checking would
+    invent a verdict from a layer the assembler does not consult."""
+    g = grids[AOI]
+    write_modis(project, g, days[0])                    # stacked by platform -> _terra
+    ds = _cube_with_coast(project, g, days)
+    assert _pol(ds, "modis_valid_terra") == {}
+
+
+def test_no_landcover_keeps_the_declared_polarity_quietly(project, grids, days, caplog):
+    """The user chose not to acquire landcover; that is not a fault to warn about.
+
+    The emitted `landcover_water` channel cannot express this -- it coerces unknown to water --
+    so the check has to read the raw loader, and this test is what pins that.
+    """
+    g = grids[AOI]
+    write_ecostress(project, g, days[0], water=0.0)
+    write_bathymetry(project, g)                        # ...and NO write_landcover
+    with caplog.at_level("WARNING"):
+        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    a = _pol(ds, "eco_valid_v002")
+    assert a["water_polarity_status"] == "no_landcover"
+    assert a["water_polarity"] == "water_is_land"        # declared, unchanged
+    assert "polarity" not in caplog.text.lower()
+
+
+def test_degenerate_landcover_warns_and_keeps_the_declared_polarity(project, grids, days,
+                                                                    caplog):
+    g = grids[AOI]
+    write_ecostress(project, g, days[0], water=0.0)
+    with caplog.at_level("WARNING"):
+        ds = _bare_cube(project, g, days)               # all-water landcover
+    a = _pol(ds, "eco_valid_v002")
+    assert a["water_polarity_status"] == "landcover_degenerate"
+    assert a["water_polarity"] == "water_is_land"
+    assert "cannot check" in caplog.text
+
+
+def test_a_water_layer_matching_neither_reading_is_ambiguous(project, grids, days, caplog):
+    """A layer that agrees with landcover about half the time resembles neither reading.
+    Picking the majority class by a hair would be a coin toss presented as a measurement."""
+    g = grids[AOI]
+    H, W, _xs, _ys = _grid_hw(g)
+    rng = np.random.RandomState(0)
+    noise = (rng.rand(1, H, W) < 0.5).astype("float32")
+    _write_eco(project, f"{AOI}_{days[0].strftime('%Y%m%d')}T200000.nc", xr.Dataset({
+        "sst": (("time", "y", "x"), np.full((1, H, W), 286.0, "float32")),
+        "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+        "water": (("time", "y", "x"), noise),
+        "quality": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+    }, coords={"time": [days[0]], "y": _grid_hw(g)[3], "x": _grid_hw(g)[2]}))
+    with caplog.at_level("WARNING"):
+        ds = _cube_with_coast(project, g, days)
+    a = _pol(ds, "eco_valid_v002")
+    assert a["water_polarity_status"] == "ambiguous"
+    assert a["water_polarity"] == "water_is_land"        # declared, kept
+    assert "matches neither reading" in caplog.text
+
+
+def test_a_non_binary_water_layer_is_called_out(project, grids, days, caplog):
+    """What a MIS-ASSIGNED asset looks like: ECOSTRESS's `water` once held QC bit patterns
+    (17088, 33472, ...) because the granule's assets were bound to roles positionally."""
+    g = grids[AOI]
+    H, W, _xs, _ys = _grid_hw(g)
+    qc = np.full((1, H, W), 17088.0, "float32")
+    qc[:, :, : W // 2] = 33472.0
+    _write_eco(project, f"{AOI}_{days[0].strftime('%Y%m%d')}T200000.nc", xr.Dataset({
+        "sst": (("time", "y", "x"), np.full((1, H, W), 286.0, "float32")),
+        "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+        "water": (("time", "y", "x"), qc),
+        "quality": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+    }, coords={"time": [days[0]], "y": _grid_hw(g)[3], "x": _grid_hw(g)[2]}))
+    with caplog.at_level("WARNING"):
+        ds = _cube_with_coast(project, g, days)
+    assert "not a 0/1 mask" in caplog.text
+    assert _pol(ds, "eco_valid_v002")["water_polarity_status"].endswith(
+        "water_layer_not_binary")
+
+
+def test_polarity_is_identical_however_the_cube_is_blocked(tmp_path, project, grids, days):
+    """`_merge_block_attrs` makes a block-varying attr a hard error, and the check reads the
+    whole window precisely so every block agrees. Assemble the same cube both ways."""
+    g = grids[AOI]
+    write_ecostress(project, g, days[0], water=0.0)
+    one = _pol(_cube_with_coast(project, g, days), "eco_valid_v002")
+
+    eff = datacube._build_eff(project)
+    zpath = tmp_path / "blocked.zarr"
+    datacube._assemble_blocked(
+        g, eff, days, zpath, block_days=1, time_chunk=1,
+        census={k: (v.dims, v.dtype) for k, v in
+                datacube.assemble_block(g, eff, days[:1], all_days=days,
+                                        cache={}).data_vars.items()},
+        cache={})
+    with xr.open_zarr(zpath) as blocked:
+        assert _pol(blocked, "eco_valid_v002") == one
+
+
 def test_ecostress_water_layer_is_read_with_INVERTED_polarity(project, grids, days):
     """eco `water` >= 0.5 means LAND. Read with Landsat's polarity, a land pixel would be
     counted as a valid sea-surface observation -- and the cube gives no hint that it was."""

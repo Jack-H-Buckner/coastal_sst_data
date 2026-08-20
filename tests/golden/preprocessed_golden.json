@@ -522,7 +522,11 @@
     "eco_valid_v002": {
       "attrs": {
         "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
-        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day",
+        "water_polarity": "water_is_land",
+        "water_polarity_agreement": 0.8809523809523809,
+        "water_polarity_declared": "water_is_land",
+        "water_polarity_status": "ok"
       },
       "dims": [
         "time",
@@ -866,7 +870,11 @@
     "lst_valid": {
       "attrs": {
         "mosaic": "days with more than one granule are merged: the granule with the most valid pixels is the base, and the rest fill ONLY the cells it left invalid",
-        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day"
+        "mosaic_time": "the day's `_hour`, and every overpass-matched forcing (met, tide, in-situ), describe the BASE granule alone -- filled cells may come from another overpass of the same day",
+        "water_polarity": "water_is_water",
+        "water_polarity_agreement": 0.8809523809523809,
+        "water_polarity_declared": "water_is_water",
+        "water_polarity_status": "ok"
       },
       "dims": [
         "time",
