@@ -192,7 +192,11 @@ def build_cube(g, days=CUBE_DAYS):
          "eco_sst_gappy": (("time", "y", "x"), gappy),
          "elevation_cudem": (("y", "x"), cols.astype("float32")),   # varies with COL
          "landcover_water": (("y", "x"), (cols < W // 2).astype("uint8")),  # west = water
-         "tide_coops": (("time",), np.arange(days, dtype="float32"))},
+         "tide_coops": (("time",), np.arange(days, dtype="float32")),
+         # A second 1-D channel, and a NaN day: `<sensor>_hour` is the overpass time, which
+         # is NaN whenever that sensor saw nothing -- the shape a real cube has.
+         "lst_hour": (("time",), np.where(np.arange(days) == 1, np.nan,
+                                          10.0 + np.arange(days)).astype("float32"))},
         coords={"time": pd.date_range("2023-06-01", periods=days, freq="D"),
                 "y": ys, "x": xs},
         attrs={"crs": g.target_crs, "aoi_id": g.name})
@@ -207,6 +211,7 @@ def cube_dir(tmp_path, aoi_grid):
         elevation_cudem  (y,x) = col            -> a row/col swap changes it
         landcover_water  (y,x) = 1 over the WEST half
         tide_coops      (time,) = 0, 1, 2, 3
+        lst_hour        (time,) = 10, NaN, 12, 13   (NaN = no overpass that day)
     """
     d = tmp_path / "datacube"
     d.mkdir(parents=True, exist_ok=True)

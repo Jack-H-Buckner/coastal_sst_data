@@ -568,6 +568,47 @@ def test_ecostress_tiles_of_one_overpass_are_mosaicked(tmp_path, days):
     assert ds["eco_hour_v002"].isel(time=0).item() == pytest.approx(18.0)
 
 
+def test_granules_with_no_valid_pixels_are_reported(tmp_path, days, caplog):
+    """A mask that rejects everything must be LOUD, because its output looks like data.
+
+    This is the production failure that motivated the check: ECOSTRESS acquisition bound the
+    wrong asset to the `water` role, so the assembler tested a QC bit field with a water rule
+    and got an empty `valid` on every granule. Nothing raised. But an all-zero validity makes
+    every granule of a day tie at vc == 0, so the FIRST one becomes the base, `take` is
+    `v | (score < 0)` -- every cell -- and it paints its own mostly-NaN scene across the grid;
+    no later granule can outrank 0, so none of them ever claims a cell. A nine-tile AoI came
+    out with one tile's footprint in the corner, and the run reported success.
+    """
+    project = _eco_versions_project(tmp_path, ["v002"])
+    g = grid.project_grids(project)[AOI]
+    H, W, xs, ys = _grid_hw(g)
+
+    def eco_tile_all_land(day, hour, rows, tile, sst_val):
+        sst = np.full((H, W), np.nan, "float32")
+        sst[rows] = sst_val                            # real observations...
+        water = np.ones((H, W), "float32")             # ...but eco polarity reads 1 as LAND
+        ds = xr.Dataset({
+            "sst": (("time", "y", "x"), sst[None]),
+            "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
+            "water": (("time", "y", "x"), water[None]),
+        }, coords={"time": [day], "y": ys, "x": xs})
+        stamp = f"{day.strftime('%Y%m%d')}T{hour:02d}0000"
+        _write_eco(project, f"{AOI}_{stamp}_{tile}.nc", ds)
+
+    cut = 2 * H // 3
+    eco_tile_all_land(days[0], 18, slice(0, cut), "55GDP", 286.0)
+    eco_tile_all_land(days[0], 18, slice(cut, H), "55GDQ", 289.0)
+
+    with caplog.at_level("WARNING"):
+        ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "NO valid pixels" in caplog.text
+    assert "2 of 2 granule(s)" in caplog.text
+    # and it names the consequence, so the corner-shaped cube is attributable
+    assert "FIRST granule" in caplog.text
+    assert int(ds["eco_valid_v002"].isel(time=0).values.sum()) == 0
+
+
 def test_a_mosaicked_day_opens_each_granule_exactly_once(project, grids, days, monkeypatch):
     """The merge is ONE arrival-ordered pass, not rank-then-fill.
 
@@ -1287,6 +1328,80 @@ def test_coverage_counts_the_days_that_actually_landed(project, grids, days):
     assert cov["mur"]["days_with_data"] == 2      # the lost day is COUNTED, not hidden
     assert cov["mur"]["fraction"] == 2 / 3
     assert ds.sizes["time"] == 3                  # ...while the axis is still full-length
+
+
+def test_coverage_reports_how_much_of_the_GRID_a_covered_day_holds(project, grids, days):
+    """Days alone cannot tell a full AoI from a corner of one.
+
+    A day counts as covered if its slice holds AT LEAST ONE finite value, so a product
+    delivering the same small corner every single day reported 100% -- which is how a tiled
+    sensor whose mosaic had collapsed onto one tile passed for healthy.
+    """
+    g = grids[AOI]
+    W = g.width
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    # every day present, but only the westmost quarter of the grid ever filled
+    write_mur(project, g, days, water_hole_cols=slice(W // 4, W))
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    cov = json.loads(ds.attrs["coverage"])
+
+    assert cov["mur"]["fraction"] == 1.0                    # every day landed...
+    assert cov["mur"]["grid_fraction"] == pytest.approx(0.25, abs=0.02)   # ...as a quarter
+
+
+def test_a_full_grid_product_reports_full_grid_coverage(project, grids, days):
+    """The new number must not cry wolf on a correct run."""
+    g = grids[AOI]
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert json.loads(ds.attrs["coverage"])["mur"]["grid_fraction"] == pytest.approx(1.0)
+
+
+def test_grid_coverage_is_identical_however_the_cube_is_blocked(tmp_path, project, grids,
+                                                                days, monkeypatch):
+    """Blocks are disjoint spans of the time axis, so the tally must SUM across them.
+
+    An averaged-per-block figure would report a different number for the same cube depending
+    only on the memory budget -- which is the bug every blocked tally is prone to.
+    """
+    g = grids[AOI]
+    W = g.width
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    write_mur(project, g, days, water_hole_cols=slice(W // 2, W))
+
+    eff = datacube._build_eff(project)
+    one = json.loads(datacube.assemble_aoi(g, eff, days).attrs["coverage"])
+
+    zpath = tmp_path / "blocked.zarr"
+    datacube._assemble_blocked(
+        g, eff, days, zpath, block_days=1, time_chunk=1,
+        census={k: (v.dims, v.dtype)
+                for k, v in datacube.assemble_block(g, eff, days[:1], all_days=days,
+                                                    cache={}).data_vars.items()},
+        cache={})
+    with xr.open_zarr(zpath) as blocked:
+        many = json.loads(blocked.attrs["coverage"])
+
+    assert one["mur"]["grid_fraction"] == pytest.approx(many["mur"]["grid_fraction"])
+
+
+def test_a_product_with_only_1d_channels_has_no_grid_fraction(project, grids, days):
+    """A tide is one value per day for the whole AoI -- there is no grid to be a share of."""
+    g = grids[AOI]
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+    write_mur(project, g, days, water_hole_cols=slice(0, 0))
+    write_tides(project, g, days)
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    cov = json.loads(ds.attrs["coverage"])
+    assert "tides" in cov and "grid_fraction" not in cov["tides"]
 
 
 def test_thin_coverage_is_warned_about(project, grids, days, caplog):

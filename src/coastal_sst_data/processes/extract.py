@@ -147,7 +147,7 @@ def plan_channels(ds: xr.Dataset, channels: dict) -> list[tuple[str, object, tup
             + "; ".join(problems)
             + f". The cube holds: {', '.join(sorted(ds.data_vars))}")
 
-    plan = []
+    plan, overspecified = [], []
     for name, spec in channels.items():
         dims = tuple(ds[name].dims)
         if dims not in (T3, T2, T1):
@@ -155,14 +155,63 @@ def plan_channels(ds: xr.Dataset, channels: dict) -> list[tuple[str, object, tup
                 f"channel {name!r} has dims {dims}, which this stage cannot place at a "
                 f"point. It handles {T3} (per-day raster), {T2} (static raster) and "
                 f"{T1} (AoI-wide series).")
-        if dims == T1 and (spec.radius_m > 0 or spec.mask
-                           or set(spec.stat) != {"nearest"}):
-            raise ValueError(
-                f"channel {name!r} is 1-D {T1} -- one value per day for the WHOLE AoI, so "
-                f"`radius_m`/`stat`/`mask` have nothing to reduce over. Configure it bare "
-                f"(`{name}:`) or drop it.")
+        if dims == T1:
+            given = _spatial_options(spec)
+            if given:
+                # Collected, not raised: a cube carries a DOZEN 1-D channels (every
+                # <sensor>_hour, every tide_*, doy_sin/cos, the georef diagnostics), so a
+                # config that applies one uniform block to everything trips all of them.
+                # Raising on the first would mean a dozen edit-and-re-run cycles, each one
+                # paying for the whole point-assignment pass before it failed again.
+                overspecified.append((name, given))
+                continue
         plan.append((name, spec, dims))
+
+    if overspecified:
+        raise ValueError(_one_d_message(overspecified))
     return plan
+
+
+def _spatial_options(spec) -> list[str]:
+    """The options on `spec` that only mean something for a channel with a grid.
+
+    Echoed back with their VALUES in the error below: in a config with dozens of channels,
+    "it has a radius" is not enough to find the line to edit.
+    """
+    given = []
+    if spec.radius_m > 0:
+        given.append(f"radius_m: {spec.radius_m:g}")
+    if set(spec.stat) != {"nearest"}:
+        # Bracketed when it is a list, so a multi-stat value cannot be misread as two
+        # separate options in the comma-joined line below.
+        stat = spec.stat[0] if len(spec.stat) == 1 else "[" + ", ".join(spec.stat) + "]"
+        given.append(f"stat: {stat}")
+    if spec.mask:
+        given.append(f"mask: {spec.mask}")
+    return given
+
+
+def _one_d_message(overspecified: list[tuple[str, list[str]]]) -> str:
+    """The error for 1-D channels given spatial options.
+
+    These channels ARE extractable, and the message's whole job is to say so BEFORE it says
+    anything else. The previous wording led with the failure and put the one-word fix last,
+    and was read -- reasonably -- as "extraction does not support overpass times at all".
+    """
+    width = max(len(n) for n, _ in overspecified)
+    listing = "\n".join(f"    {n:<{width}}  has {', '.join(g)}" for n, g in overspecified)
+    yaml = "\n".join(f"      {n}:" for n, _ in overspecified)
+    n = len(overspecified)
+    return (
+        f"{n} channel(s) in extract.channels are 1-D {T1}: one value per day for the WHOLE "
+        f"AoI (an overpass time, a tide height, a day-of-year term), so there is no "
+        f"neighbourhood for a radius or a statistic to reduce over --\n\n"
+        f"{listing}\n\n"
+        f"These channels ARE extracted. Write them with no options:\n\n"
+        f"    channels:\n{yaml}\n\n"
+        f"Each then ships one row per date, with stat=nearest and radius_m=0, carrying that "
+        f"day's AoI-wide value for every point in the AoI. (Writing `stat: nearest` "
+        f"explicitly is also accepted.)")
 
 
 def resolve_mask(ds: xr.Dataset, spec, cache: dict | None = None) -> np.ndarray | None:

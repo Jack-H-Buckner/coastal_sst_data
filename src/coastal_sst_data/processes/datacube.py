@@ -318,7 +318,7 @@ def _read_granule(f: Path, H, W, *, water_is_land, use_cloud, qset, trust_valid,
         else:
             if "water" in ds and ds["water"].shape == (H, W):
                 w = ds["water"].values.astype("float32")
-                wp = np.isfinite(w) & ((w < 0.5) if water_is_land else (w > 0.5))
+                wp = np.isfinite(w) & products.water_cells(w, water_is_land=water_is_land)
             else:
                 wp = np.zeros((H, W), dtype=bool)      # no water layer -> claim NOTHING
             q = (ds["quality"].values if "quality" in ds and ds["quality"].shape == (H, W)
@@ -445,6 +445,15 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
     didx = {naming.day_stamp(dd): i for i, dd in enumerate(days)}
     missing_fp = 0
     scene_days = 0
+    # Granules that HAVE observations but whose validity mask came out entirely empty. That is
+    # never a real scene: it means the water/cloud/QC gate is rejecting everything, which is
+    # what an inverted polarity or a mis-assigned mask layer looks like from here. It is also
+    # invisible in the output -- an all-zero `valid` makes every granule tie at 0, so the first
+    # one becomes the base, paints its raw (mostly NaN) scene over the whole grid, and no other
+    # granule can ever outrank it. The day's mosaic silently collapses onto ONE granule, and a
+    # tiled sensor ends up with a single tile's footprint in a corner of the AoI.
+    blank_valid = 0
+    granules_read = 0
     for day, granules in scene_index(d, aoi_id, cache=cache).items():
         i = didx.get(day)
         if i is None:
@@ -467,6 +476,9 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                 saw_footprint = True
 
             vc = int(v.sum())
+            granules_read += 1
+            if vc == 0 and np.isfinite(s).any():
+                blank_valid += 1
             new_base = best is None or vc > best[0]
             if mosaic_day:
                 # THE MERGE, in one pass. A new base claims every cell it validly observes plus
@@ -508,6 +520,15 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
         # warning below explains. Kept distinct from "no granule ever had one" (-> None, no
         # channel at all), because those say different things about the tree.
         footprint = np.full((len(days), H, W), -1, dtype="int32")
+    if blank_valid:
+        log.warning(
+            "  %s: %d of %d granule(s) have finite SST but NO valid pixels -- the "
+            "water/cloud/QC gate is rejecting everything they observed. %s Check that the "
+            "aligned files carry the mask layers this sensor's SensorSpec expects "
+            "(water_is_land/use_cloud/qc_levels).", d.name, blank_valid, granules_read,
+            "Each day's mosaic therefore keeps only its FIRST granule, so a tiled sensor "
+            "shows one tile's footprint." if mosaic else
+            "Those scenes contribute nothing to the cube.")
     if saw_footprint and missing_fp:
         # A partly backfilled directory: some granules predate the layer, or were acquired
         # with `footprint_id: false`. Those days stay -1, which is indistinguishable from
@@ -1456,15 +1477,17 @@ def finalize_attrs(eff: dict, aid: str, fields, days, cov: dict, prod: dict) -> 
         provenance_products=json.dumps(rec["products"], sort_keys=True))
 
 
-def finish_cube(ds: xr.Dataset, g: AoiGrid, eff: dict, days, cache: dict, hits=None) -> dict:
+def finish_cube(ds: xr.Dataset, g: AoiGrid, eff: dict, days, cache: dict, hits=None,
+                grid_hits=None) -> dict:
     """Release the AoI's cache, then stamp the whole-cube attrs on `ds`. Returns the coverage.
 
     Closing the cache FIRST is not tidiness: `provenance.collect` re-opens every aligned file
     in the tree, and doing that while the cached in-situ tables are still open segfaults the
     netCDF library outright.
 
-    `hits` are pre-tallied coverage counts, for a caller that assembled the cube in blocks and
-    no longer has it in hand. Without them the counts are taken from `ds`.
+    `hits` / `grid_hits` are pre-tallied coverage counts (days with data, and summed grid
+    share), for a caller that assembled the cube in blocks and no longer has it in hand.
+    Without them the counts are taken from `ds`.
     """
     close_cache(cache)
 
@@ -1476,7 +1499,9 @@ def finish_cube(ds: xr.Dataset, g: AoiGrid, eff: dict, days, cache: dict, hits=N
     prod = provenance.collect(eff["aligned_root"], g.name, PRODUCT_DIRS)
     cov = coverage_from_hits(coverage_hits(ds) if hits is None else hits, len(days),
                              present=set(prod),
-                             sparse=eff.get("sparse_daily", {}).get(g.name))
+                             sparse=eff.get("sparse_daily", {}).get(g.name),
+                             grid_hits=(coverage_grid_hits(ds) if grid_hits is None
+                                        else grid_hits))
     ds.attrs.update(finalize_attrs(eff, g.name, list(ds.data_vars), days, cov, prod))
     return cov
 
@@ -1500,6 +1525,12 @@ def assemble_aoi(g: AoiGrid, eff: dict, days) -> xr.Dataset:
 # Coverage
 # --------------------------------------------------------------------------- #
 COVERAGE_WARN = 0.95      # below this fraction of days, a daily product is reported thin
+# Below this share of the GRID -- on the days it does have data -- a product that is
+# otherwise well covered is worth a word. Deliberately low: a polar-orbiting swath or a
+# scene footprint clips a large AoI as a matter of course, and a threshold that fires on
+# every correct run is how the one real case gets ignored. The failure this exists to catch
+# put a ninth of the AoI on every single day and reported 100%.
+GRID_COVERAGE_WARN = 0.25
 
 # Products that SHOULD have a value every day, and the channel that proves it. DERIVED from
 # the registry (products.ProductSpec.coverage_channel).
@@ -1530,7 +1561,8 @@ def coverage(ds: xr.Dataset, days, present=None, sparse=None) -> dict:
     warn about a gap the user chose. A warning that fires on every run of a correct config is
     how a real one gets ignored.
     """
-    return coverage_from_hits(coverage_hits(ds), len(days), present=present, sparse=sparse)
+    return coverage_from_hits(coverage_hits(ds), len(days), present=present, sparse=sparse,
+                              grid_hits=coverage_grid_hits(ds))
 
 
 def coverage_hits(ds: xr.Dataset) -> dict[str, int]:
@@ -1544,21 +1576,8 @@ def coverage_hits(ds: xr.Dataset) -> dict[str, int]:
     Tally everything here and drop the absent products in `coverage_from_hits`.
     """
     out: dict[str, int] = {}
-    # Coverage-channel PREFIXES. A per-source product (D5) has no single channel any more, so
-    # judge it present on a day if ANY of its per-source channels is finite (S4.7): met's
-    # `airtemp` prefix matches `airtemp_hrrr`/`airtemp_era5`, tides' `tide` matches
-    # `tide_<src>`/`tide_range_<src>`, mur's `mur_sst` is still the bare channel. `cmems` is
-    # discovered (its channels are config-dependent). A stacked source with NO regional coverage
-    # is all-NaN by design, so "any source finite" is the honest presence test.
-    prefixes = dict(DAILY_CHANNELS)
-    prefixes["cmems"] = "cmems"
-
     n_time = ds.sizes.get("time", 0)
-    for product, c in prefixes.items():
-        chans = [v for v in ds.data_vars
-                 if (v == c or v.startswith(c + "_")) and "time" in ds[v].dims]
-        if not chans:
-            continue
+    for product, chans in _coverage_channels(ds).items():
         has = np.zeros(n_time, dtype=bool)
         for v in chans:
             finite = np.isfinite(ds[v].values)
@@ -1568,7 +1587,60 @@ def coverage_hits(ds: xr.Dataset) -> dict[str, int]:
     return out
 
 
-def coverage_from_hits(hits: dict[str, int], n_days: int, present=None, sparse=None) -> dict:
+def _coverage_channels(ds: xr.Dataset) -> dict[str, list[str]]:
+    """{product: its coverage channels in `ds`}.
+
+    Coverage-channel PREFIXES. A per-source product (D5) has no single channel any more, so
+    judge it present on a day if ANY of its per-source channels is finite (S4.7): met's
+    `airtemp` prefix matches `airtemp_hrrr`/`airtemp_era5`, tides' `tide` matches
+    `tide_<src>`/`tide_range_<src>`, mur's `mur_sst` is still the bare channel. `cmems` is
+    discovered (its channels are config-dependent). A stacked source with NO regional coverage
+    is all-NaN by design, so "any source finite" is the honest presence test.
+    """
+    prefixes = dict(DAILY_CHANNELS)
+    prefixes["cmems"] = "cmems"
+    out = {}
+    for product, c in prefixes.items():
+        chans = [v for v in ds.data_vars
+                 if (v == c or v.startswith(c + "_")) and "time" in ds[v].dims]
+        if chans:
+            out[product] = chans
+    return out
+
+
+def coverage_grid_hits(ds: xr.Dataset) -> dict[str, float]:
+    """{product: summed share of the GRID it fills, over the days it has data}.
+
+    The companion to `coverage_hits`, and the number that was missing. Coverage as it stood
+    is purely TEMPORAL -- a day counts as covered if its slice holds AT LEAST ONE finite
+    value -- so a product delivering one corner of the AoI every single day reported 100%.
+    That is exactly how a tiled sensor whose mosaic had collapsed onto a single tile passed
+    for healthy through a whole release.
+
+    Summed rather than averaged, for the same reason `coverage_hits` counts rather than
+    divides: blocks are disjoint spans of the time axis, so a cube's total is the sum of its
+    blocks' and the division happens once, at the end, in `coverage_from_hits`.
+
+    Only channels with a grid are counted; a 1-D `(time,)` channel (a tide, an overpass hour)
+    has no spatial extent to be a fraction of, and a product with only those is absent here.
+    """
+    out: dict[str, float] = {}
+    for product, chans in _coverage_channels(ds).items():
+        grids = [v for v in chans if {"y", "x"} <= set(ds[v].dims)]
+        if not grids:
+            continue
+        covered = None
+        for v in grids:
+            finite = np.isfinite(ds[v].values)
+            covered = finite if covered is None else (covered | finite)
+        axes = tuple(range(1, covered.ndim))          # everything but time
+        per_day = covered.mean(axis=axes)             # share of the grid, per day
+        out[product] = float(per_day[per_day > 0].sum())   # days with data only
+    return out
+
+
+def coverage_from_hits(hits: dict[str, int], n_days: int, present=None, sparse=None,
+                       grid_hits=None) -> dict:
     """Per-block tallies -> the cube's coverage report.
 
     `n_days` is the FULL axis however the tallies were gathered: coverage exists to say how
@@ -1583,6 +1655,11 @@ def coverage_from_hits(hits: dict[str, int], n_days: int, present=None, sparse=N
             continue
         out[product] = {"days_with_data": n, "days_expected": n_days,
                         "fraction": (n / n_days) if n_days else 0.0}
+        # How much of the GRID a covered day actually holds. Optional, because a product made
+        # only of 1-D channels has no grid to be a fraction of -- and because a caller with
+        # pre-tallied day counts and no grid tally must still get the report it always got.
+        if grid_hits is not None and product in grid_hits and n:
+            out[product]["grid_fraction"] = grid_hits[product] / n
         if sparse and product in sparse:
             out[product]["sparse"] = True
     return out
@@ -1932,6 +2009,7 @@ def _assemble_blocked(g: AoiGrid, eff: dict, days, zpath: Path, *, block_days: i
     here than for a single write: this loop can run for hours.
     """
     hits: dict[str, int] = {}
+    grid_hits: dict[str, float] = {}
     attrs: dict = {}
     blocks = [days[i:i + block_days] for i in range(0, len(days), block_days)]
     quiet = _LogOnce()
@@ -1945,6 +2023,8 @@ def _assemble_blocked(g: AoiGrid, eff: dict, days, zpath: Path, *, block_days: i
                 _merge_block_attrs(attrs, dict(ds.attrs), i)
                 for product, n in coverage_hits(ds).items():
                     hits[product] = hits.get(product, 0) + n
+                for product, frac in coverage_grid_hits(ds).items():
+                    grid_hits[product] = grid_hits.get(product, 0.0) + frac
                 if i == 0:
                     # The encoding is settled here, against the FINISHED cube's shape -- not
                     # this block's, which would chunk the time axis in blocks.
@@ -1959,7 +2039,7 @@ def _assemble_blocked(g: AoiGrid, eff: dict, days, zpath: Path, *, block_days: i
                     del ds                                    # before the next block is built
             # `ds` is the LAST block, kept only so `finish_cube` can name the cube's fields
             # and hang the finished attrs somewhere; the values are already on disk.
-            cov = finish_cube(ds, g, eff, days, cache, hits=hits)
+            cov = finish_cube(ds, g, eff, days, cache, hits=hits, grid_hits=grid_hits)
             attrs.update(ds.attrs)      # + the whole-cube attrs finish_cube just stamped on
             finalize_cube(tmp, attrs)
     finally:
@@ -2134,13 +2214,34 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
 
         # `t=%d` was always len(days) -- it said nothing about how much of the cube is real.
         # Report the coverage the cube actually has, so a thin product is visible here.
-        cov_str = ", ".join(f"{p} {100 * c['fraction']:.0f}%" for p, c in sorted(cov.items()))
+        # Days AND grid. Days alone said a product was complete when every one of its days
+        # held a single corner of the AoI -- which is what a tiled sensor looks like when its
+        # mosaic has collapsed onto one tile, and it read as 100% for a whole release.
+        cov_str = ", ".join(
+            f"{p} {100 * c['fraction']:.0f}% of days"
+            + (f" ({100 * c['grid_fraction']:.0f}% of grid)" if "grid_fraction" in c else "")
+            for p, c in sorted(cov.items()))
         log.info("  wrote %s  vars=%d shape=(t=%d,y=%d,x=%d)  coverage: %s", zpath.name,
                  nvars, *shape, cov_str or "n/a")
         rep.wrote()
         thin = [p for p, c in cov.items() if c["fraction"] < COVERAGE_WARN]
         if thin:
             rep.note = f"thin coverage: {', '.join(sorted(thin))} (see the cube's `coverage` attr)"
+        # A product whose DAYS are well covered but whose GRID is not: every day arrived and
+        # every day is mostly empty. Sensor swaths legitimately clip a large AoI, so this
+        # warns rather than failing -- but it is the only place a corner-shaped cube announces
+        # itself, and silence here is what let one ship.
+        patchy = [p for p, c in cov.items()
+                  if c["fraction"] >= COVERAGE_WARN
+                  and c.get("grid_fraction", 1.0) < GRID_COVERAGE_WARN]
+        if patchy:
+            log.warning("  %s: covered on most days but filling under %.0f%% of the grid on "
+                        "those days (%s). A sensor can legitimately clip a large AoI; if it "
+                        "should not, check that every granule is contributing -- a mask that "
+                        "rejects everything collapses a mosaicked day onto one granule.",
+                        zpath.name, 100 * GRID_COVERAGE_WARN,
+                        ", ".join(f"{p} {100 * cov[p]['grid_fraction']:.0f}%"
+                                  for p in sorted(patchy)))
 
     rep.log_summary()
     return rep

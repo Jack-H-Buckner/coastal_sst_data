@@ -619,6 +619,22 @@ REGISTRY: tuple[ProductSpec, ...] = (
 BY_PRODUCT: dict[DataProduct, ProductSpec] = {s.product: s for s in REGISTRY}
 
 
+def water_cells(w, *, water_is_land: bool):
+    """The cells of a raw water layer that are WATER, for a sensor of this polarity.
+
+    ONE definition, because there were two and they contradicted each other: the ECOSTRESS
+    acquisition stage built every granule's `valid` from `water > 0` while the assembler
+    recomputed the same mask from `water < 0.5`. Exact opposites on the same layer, so
+    whichever ran second was wrong -- and nothing anywhere compared them, because for a long
+    while both were reading the wrong asset entirely and neither number meant anything.
+
+    The polarity now has exactly one home, `SensorSpec.water_is_land`, and both stages route
+    through here. `w` is the RAW layer, so a caller still excludes non-finite cells itself;
+    this answers only the polarity question.
+    """
+    return (w < 0.5) if water_is_land else (w > 0.5)
+
+
 def spec(product: DataProduct) -> ProductSpec:
     return BY_PRODUCT[product]
 
