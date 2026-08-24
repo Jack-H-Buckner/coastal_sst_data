@@ -98,14 +98,21 @@ def write_ecostress_two_scenes(project, g, day, tag="v002"):
         _write_eco(project, f"{AOI}_{stamp}.nc", ds, tag=tag)
 
 
-def write_landsat(project, g, day, hour, temp=288.0):
-    """One Landsat scene. Landsat polarity: water = 1 (unlike ECOSTRESS), cloud reliable."""
+def write_landsat(project, g, day, hour, temp=288.0, platform_id=None):
+    """One Landsat scene. Landsat polarity: water = 1 (unlike ECOSTRESS), cloud reliable.
+
+    `platform_id` is the mission label acquisition stamps on each granule (5 = Landsat 5,
+    8 = Landsat 8, ...). Left off by default so the existing tests keep exercising the
+    unlabelled tree -- a granule written before the label existed -- which must still assemble.
+    """
     H, W, xs, ys = _grid_hw(g)
     ds = xr.Dataset({
         "sst": (("time", "y", "x"), np.full((1, H, W), temp, "float32")),
         "cloud": (("time", "y", "x"), np.zeros((1, H, W), "float32")),
         "water": (("time", "y", "x"), np.ones((1, H, W), "float32")),
     }, coords={"time": [day], "y": ys, "x": xs})
+    if platform_id is not None:
+        ds.attrs["platform_id"] = platform_id
     stamp = day.strftime("%Y%m%d") + f"T{hour:02d}0000"
     _write(project, "LANDSAT", f"{AOI}_{stamp}.nc", ds)
 
@@ -738,7 +745,7 @@ def test_the_one_pass_merge_equals_a_brute_force_ranked_fill(project, grids, day
         for hour, rows, temp in spec:
             write_landsat_rows(project, g, day, hour, rows=rows, temp=temp)
 
-        got_sst, got_cloud, got_valid, got_hour, got_times, _ = (
+        got_sst, got_cloud, got_valid, got_hour, got_times, _, _ = (
             datacube.load_clearest_overpass(d, AOI, days, H, W, use_cloud=True, mosaic=True))
 
         # --- brute force: read all, rank by valid count, fill what the base left invalid ---
@@ -820,7 +827,7 @@ def test_a_new_base_does_not_wipe_the_earlier_granules_it_cannot_see(project, gr
     write_landsat_strip(project, g, days[0], 20, rows=slice(b, H),
                         clear=slice(b, H), temp=282.0)
 
-    sst, cloud, valid, hour, _, _ = _mosaic(project, grids, days)
+    sst, cloud, valid, hour, _, _, _ = _mosaic(project, grids, days)
 
     # Every strip keeps its whole footprint, at its own temperature.
     assert np.all(sst[0][0:a] == 280.0)
@@ -850,7 +857,7 @@ def test_a_lower_ranked_granule_fills_a_hole_it_only_saw_through_cloud(project, 
     write_landsat_strip(project, g, days[0], 20, rows=slice(cut, H),
                         clear=slice(0, 0), temp=281.0)        # entirely cloudy -> 0 valid
 
-    sst, cloud, valid, _, _, _ = _mosaic(project, grids, days)
+    sst, cloud, valid, _, _, _, _ = _mosaic(project, grids, days)
 
     assert np.all(sst[0][cut:H] == 281.0), "the lower-ranked granule's footprint is a hole"
     assert np.all(sst[0][0:cut] == 280.0)
@@ -877,7 +884,7 @@ def test_a_cell_the_base_observed_and_masked_keeps_the_bases_value(project, grid
     write_landsat_strip(project, g, days[0], 20, rows=slice(0, H),
                         clear=slice(0, 0), temp=281.0)
 
-    sst, _, valid, _, _, _ = _mosaic(project, grids, days)
+    sst, _, valid, _, _, _, _ = _mosaic(project, grids, days)
 
     assert np.all(sst[0] == 280.0), "a masked-but-observed cell is not a hole to be filled"
     assert valid[0][0:cut].sum() == cut * W and valid[0][cut:H].sum() == 0
@@ -979,6 +986,96 @@ def _modis_base(project, g, days):
     write_mur(project, g, days, water_hole_cols=slice(0, 0))
     write_bathymetry(project, g)
     write_landcover(project, g, land_cols=slice(0, 0))
+
+
+# --------------------------------------------------------------------------- #
+# `lst_platform` -- which mission produced each day. A Landsat record reaching back to 1984 is
+# THREE sensors merged into one channel set, and C2 Level-2 does not homogenize them: published
+# validation puts TM at -0.28 degC and TIRS at +0.65 degC against the same buoys, a ~0.9 degC
+# step at the 2013 boundary, which is the same order as several decades of coastal warming.
+# Merged and unlabelled, that step is indistinguishable from a trend.
+# --------------------------------------------------------------------------- #
+def _landsat_base(project, g):
+    write_bathymetry(project, g)
+    write_landcover(project, g, land_cols=slice(0, 0))
+
+
+def test_the_mission_of_each_day_reaches_the_cube(project, grids, days):
+    g = grids[AOI]
+    _landsat_base(project, g)
+    write_landsat(project, g, days[0], hour=18, platform_id=5)     # Landsat 5 TM
+    write_landsat(project, g, days[1], hour=18, platform_id=8)     # Landsat 8 OLI-TIRS
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "lst_platform" in ds.data_vars
+    assert ds["lst_platform"].dims == ("time",)          # per DAY, like lst_hour
+    assert ds["lst_platform"].isel(time=0).item() == 5
+    assert ds["lst_platform"].isel(time=1).item() == 8
+    # The codes are useless without the mapping, so it travels on the variable.
+    assert "landsat-5" in ds["lst_platform"].attrs["comment"]
+
+
+def test_a_day_with_no_landsat_scene_is_not_a_mission(project, grids, days):
+    """0 is reserved for "not recorded" and must never be read as a mission number."""
+    g = grids[AOI]
+    _landsat_base(project, g)
+    write_landsat(project, g, days[0], hour=18, platform_id=7)
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert ds["lst_platform"].isel(time=0).item() == 7
+    assert ds["lst_platform"].isel(time=1).item() == 0    # no scene that day
+
+
+def test_an_unlabelled_tree_emits_no_platform_channel_at_all(project, grids, days):
+    """A tree acquired before the label existed. An all-zero channel would read as "the mission
+    was never identified"; absence says "this cube does not carry the information", which is
+    the true statement -- the same rule `_footprint_id` follows."""
+    g = grids[AOI]
+    _landsat_base(project, g)
+    write_landsat(project, g, days[0], hour=18)          # no platform_id attr
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert "lst_platform" not in ds.data_vars
+    assert "lst_hour" in ds.data_vars                    # the rest of the channel set is intact
+
+
+def test_a_mosaicked_day_reports_the_base_granules_mission(project, grids, days):
+    """Same rule as `lst_hour`: a merged day describes the BASE granule. The 1999-2011 overlap
+    puts Landsat 5 and Landsat 7 on the same day over one AoI, so this is the ordinary case."""
+    g = grids[AOI]
+    H = g.height
+    _landsat_base(project, g)
+    write_landsat_rows(project, g, days[0], 18, rows=slice(0, 2 * H // 3))   # base: more valid
+    write_landsat_rows(project, g, days[0], 20, rows=slice(H // 2, H))
+    d = project.output_dir / "LANDSAT" / "aligned" / AOI
+    for fname, pid in ((f"{AOI}_{days[0].strftime('%Y%m%d')}T180000.nc", 5),
+                       (f"{AOI}_{days[0].strftime('%Y%m%d')}T200000.nc", 7)):
+        with xr.open_dataset(d / fname) as raw:
+            ds1 = raw.load()
+        ds1.attrs["platform_id"] = pid
+        ds1.to_netcdf(d / fname)
+
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+    assert ds["lst_hour"].isel(time=0).item() == pytest.approx(18.0)
+    assert ds["lst_platform"].isel(time=0).item() == 5, (
+        "the mission followed a granule the cube does not report as the overpass")
+
+
+def test_a_partly_labelled_tree_still_emits_one_channel_set_per_block(project, grids, days):
+    """BLOCK INVARIANCE, the reason `platform_available` asks over the whole axis.
+
+    A partly re-acquired tree -- some granules labelled, some not -- is the ORDINARY state
+    during the migration that introduced the label. Decided per block, the channel would appear
+    in some blocks and vanish from others, and a cube whose variables disagree on their time
+    length does not fail to write, it fails to READ.
+    """
+    g = grids[AOI]
+    _landsat_base(project, g)
+    write_landsat(project, g, days[0], hour=18)                    # unlabelled
+    write_landsat(project, g, days[1], hour=18, platform_id=8)     # labelled
+    ds = datacube.assemble_aoi(g, datacube._build_eff(project), days)
+
+    assert "lst_platform" in ds.data_vars                # one labelled granule is enough
+    assert ds["lst_platform"].isel(time=0).item() == 0   # the unlabelled day says "unknown"
+    assert ds["lst_platform"].isel(time=1).item() == 8
 
 
 def test_modis_footprint_id_reaches_the_cube(project, grids, days):

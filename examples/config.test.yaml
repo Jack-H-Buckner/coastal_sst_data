@@ -130,6 +130,51 @@ products:
     depths: [0, 10]      # metres; each SNAPPED to the nearest model level
   landsat:
     source: "pc"        # pc (default) | aws | gee
+    # Which missions to search. Absent -> [landsat-8, landsat-9], i.e. 2013-onwards.
+    #
+    # TO REACH BACK BEFORE 2013, add the older missions. C2 Level-2 is ONE product across all
+    # of them -- one single-channel algorithm, one scale/offset, and only the thermal asset's
+    # name differs (`lwir` for TM/ETM+, `lwir11` for OLI-TIRS) -- so this is the whole change:
+    #
+    #   platforms: [landsat-5, landsat-7, landsat-8, landsat-9]
+    #
+    #   landsat-5  TM      1984-03 .. 2011-11   (thermal ENDS Nov 2011; the 2012 tail is
+    #                                            MSS-only and has no thermal band)
+    #   landsat-7  ETM+    1999-04 .. 2024-01
+    #   landsat-4  TM      1982-08 .. 1993-12   opportunistic scenes, NOT a time series --
+    #                                            single digits per year even where covered
+    #
+    # What you are signing up for, in rough order of how much it will bite:
+    #   * L5+L7 do NOT homogenize with L8/9. Published validation over water puts TM at
+    #     -0.28 degC and TIRS at +0.65 degC against the same buoys -- a ~0.9 degC step at the
+    #     2013 boundary, the same order as decades of coastal warming. The cube records which
+    #     mission produced each day in `lst_platform`; FIT A PER-MISSION CALIBRATION (the
+    #     `modis_ref` block below is the tool) before reading any long-term trend.
+    #   * Landsat 7 after 2003-05-31 is SLC-off: diagonal no-data wedges, ~22% of the scene,
+    #     absent at nadir and widening to the edges. Ingested as-is; gaps are NaN in `lst_sst`
+    #     and `lst_cloud`, and 0 in `lst_valid`. Nothing is gap-filled.
+    #   * Coverage before 1999 is thin and UNEVEN. Landsat 4/5 had no onboard recorder, so
+    #     outside a US ground station's line of sight the archive depends on what international
+    #     stations happened to keep. Census your own AoI with --dry-run before committing.
+    #   * TM/ETM+ has no cirrus band, so CFMask misses more thin cloud than it does on L8/9.
+    #     Consider a stricter cloud_cover_max for a pre-2013 run.
+    #
+    # Landsat 1-3 and the MSS sensor have NO thermal band and no Level-2 product at all --
+    # naming one is refused at config time rather than failing scene by scene.
+    # cloud_cover_max: 0.7
+    # masking:
+    #   ndwi_threshold: 0.0     # (green - nir) / (green + nir) cutoff for water
+    #   # Green surface reflectance above which a cell is TOO BRIGHT to be water, whatever its
+    #   # NDWI. 0 disables. NDWI is a ratio and so blind to absolute brightness: a thick cloud
+    #   # whose green channel saturates has green > nir, passes, and is admitted as water --
+    #   # on exactly the scenes CFMask rated low-confidence, so nothing downstream catches it.
+    #   # Measured over 9.0M pixels (3 AoIs x 3 missions), among the pixels ndwi>=0 admits:
+    #   # real water sits at green P50 0.017 / P99 0.075, cloud at P50 0.671, and 12.6% of the
+    #   # admitted set exceeds 1.0 -- nonphysical. The default is loose on purpose (2x the
+    #   # measured P99), because turbid estuary water is the point and is brighter than open
+    #   # ocean. Cannot catch cloud SHADOW, which is dark -- that is cloud_buffer_km's job.
+    #   brightness_max: 0.15
+    #   cloud_buffer_km: 1.0    # buffer around cloud/shadow, via the ST_CDIST band
   modis:                # the standalone ~1 km thermal sensor (GHRSST MODIS L2P skin SST)
     # DISTINCT-DATA PLATFORMS are STACKED (one modis_sst_<platform> channel-set each), not
     # picked-one: Terra and Aqua are two spacecraft in two orbits and never observe the same

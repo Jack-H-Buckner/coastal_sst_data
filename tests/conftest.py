@@ -92,18 +92,36 @@ class FakeStacItem:
             self.geometry = geometry
 
 
-def write_landsat_cogs(dir_path, g, *, native_res=30.0, pad_m=1500.0):
+def write_landsat_cogs(dir_path, g, *, native_res=30.0, pad_m=1500.0,
+                       thermal_key="lwir11", fill_rows=None):
     """Write synthetic Landsat C2 L2 single-band COGs (raw DN) for one scene.
 
     DN values are chosen so the DERIVED layers are known after a source module
     reprojects them onto grid `g`:
         lwir11 (thermal) DN 41252  -> 290 K everywhere
-        green DN 14545 / nir08 DN 10909 -> NDWI ~0.33 -> water everywhere
+        green DN 9091 (0.05) / nir08 DN 8000 (0.02) -> NDWI ~0.43 -> water everywhere
         qa_pixel: cloud bit (1<<3) over the WEST half, 0 over the EAST half
         cdist DN 200 -> 2 km, so the 1 km cloud buffer never fires
+
+    The reflectances are DARK ON PURPOSE, and were not always: they used to be green 0.20 /
+    NIR 0.10, which has the right NDWI but is four times brighter than real water. Measured
+    over 9.0M pixels across three AoIs and three missions, QA-confirmed water sits at green
+    P50 0.017 and P99 0.075 -- 0.20 is cloud-top territory, and once `masking.brightness_max`
+    existed the fixture's "water everywhere" stopped being water at all. 0.05/0.02 is squarely
+    inside the real distribution while keeping NDWI comfortably positive.
     => expected valid mask: 1 in the EAST half, 0 in the WEST half.
     Source is native ~30 m in the SAME CRS as the target grid. Returns
     {asset_key: path-str}, ready to hang off a FakeStacItem.
+
+    `thermal_key` names the thermal asset: `lwir11` is what OLI-TIRS (Landsat 8/9) serves and
+    `lwir` is what TM/ETM+ (Landsat 4/5/7) serves. The SAME array either way -- that is the
+    point of the parameter. C2 Level-2 uses one single-channel algorithm and one scale/offset
+    for every mission, so a TM scene differs from an OLI-TIRS scene in the asset's NAME and
+    nothing else, and a test that feeds both through one module proves exactly that.
+
+    `fill_rows` (a row `slice`) marks a band of the scene as QA fill -- `qa_pixel` bit 0 set and
+    thermal/SR at their nodata -- which is how a Landsat 7 SLC-off gap arrives. Verified against
+    a real scene: every gap pixel reads `QA_PIXEL == 1` exactly, with no cloud bit set.
     """
     minx, miny, maxx, maxy = g.geom_proj.bounds
     minx, miny, maxx, maxy = minx - pad_m, miny - pad_m, maxx + pad_m, maxy + pad_m
@@ -112,13 +130,21 @@ def write_landsat_cogs(dir_path, g, *, native_res=30.0, pad_m=1500.0):
     transform = from_origin(minx, maxy, native_res, native_res)
 
     thermal = np.full((H, W), 41252, dtype="uint16")   # -> 290.0 K
-    green = np.full((H, W), 14545, dtype="uint16")      # reflectance ~0.20
-    nir = np.full((H, W), 10909, dtype="uint16")        # reflectance ~0.10 -> water
+    green = np.full((H, W), 9091, dtype="uint16")       # reflectance ~0.05
+    nir = np.full((H, W), 8000, dtype="uint16")         # reflectance ~0.02 -> dark water
     qa = np.zeros((H, W), dtype="uint16")
     qa[:, : W // 2] = 1 << 3                             # west half: cloud bit
     cdist = np.full((H, W), 200, dtype="uint16")        # 2 km -> no buffer effect
 
-    layers = [("lwir11", thermal, 0), ("green", green, 0), ("nir08", nir, 0),
+    if fill_rows is not None:
+        # An SLC-off gap: bit 0 alone, and nodata in every band that carries a value. Written
+        # LAST so it overwrites the cloud bit -- a real fill pixel carries no other flag.
+        qa[fill_rows, :] = 1
+        thermal[fill_rows, :] = 0
+        green[fill_rows, :] = 0
+        nir[fill_rows, :] = 0
+
+    layers = [(thermal_key, thermal, 0), ("green", green, 0), ("nir08", nir, 0),
               ("qa_pixel", qa, 1), ("cdist", cdist, 0)]
     paths = {}
     for key, arr, nodata in layers:
@@ -141,8 +167,28 @@ def landsat_scene(tmp_path, aoi_grid):
     paths = write_landsat_cogs(tmp_path, aoi_grid)
     dt = datetime(2023, 8, 15, 19, 2, 0, tzinfo=timezone.utc)
     props = {"platform": "landsat-9", "datetime": "2023-08-15T19:02:00Z",
-             "eo:cloud_cover": 10.0}
+             "instruments": ["oli", "tirs"], "eo:cloud_cover": 10.0}
     return FakeStacItem(paths, props, dt)
+
+
+@pytest.fixture
+def landsat_scene_tm(tmp_path, aoi_grid):
+    """`landsat_scene`'s pre-2013 twin: a Landsat 5 TM scene, thermal asset named `lwir`.
+
+    The SAME synthetic pixels as `landsat_scene`, so the two fixtures are directly comparable:
+    anything a source module produces differently for this one is a difference it invented,
+    because C2 Level-2 gives TM and OLI-TIRS one algorithm and one scale/offset.
+
+    Written to its own subdirectory so both fixtures can be requested by one test without the
+    `lwir`/`lwir11` files colliding in a shared `tmp_path`.
+    """
+    d = tmp_path / "tm"
+    d.mkdir()
+    paths = write_landsat_cogs(d, aoi_grid, thermal_key="lwir")
+    dt = datetime(1995, 7, 18, 18, 30, 0, tzinfo=timezone.utc)
+    props = {"platform": "landsat-5", "datetime": "1995-07-18T18:30:00Z",
+             "instruments": ["tm"], "eo:cloud_cover": 10.0}
+    return FakeStacItem(paths, props, dt, id="FAKE_LT05_L2SP")
 
 
 class UniformDs(dict):

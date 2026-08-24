@@ -149,6 +149,211 @@ def test_scene_to_dataset_valid_mask_east_west(aoi_grid, landsat_scene):
     assert v[:, 3 * v.shape[1] // 4 :].sum() > 0   # deep east: clear water -> valid
 
 
+# ---------------------------------------------------------------------------
+# The PRE-2013 missions. Landsat 4/5 (TM) and 7 (ETM+) are in the same
+# `landsat-c2-l2` collection, produced by the same single-channel algorithm with
+# the same scale/offset, and differ from OLI-TIRS in the THERMAL ASSET'S NAME
+# alone -- `lwir` rather than `lwir11`. That fallback existed in the module long
+# before anything exercised it; these are what exercise it.
+# ---------------------------------------------------------------------------
+def test_a_tm_scene_reads_through_the_lwir_fallback(aoi_grid, landsat_scene_tm):
+    """The Landsat 5 path, end to end. Same DN, same asset contents, different key."""
+    ds = landsat_pc.scene_to_dataset(landsat_scene_tm, aoi_grid, _MASK, False,
+                                     pd.Timestamp("1995-07-18"), "test_aoi")
+    assert {"sst", "cloud", "water", "valid"} <= set(ds.data_vars)
+    finite = ds["sst"].values[np.isfinite(ds["sst"].values)]
+    assert finite.min() == pytest.approx(290.0, abs=0.5)    # SAME constants as L8/9
+    assert finite.max() == pytest.approx(290.0, abs=0.5)
+
+
+def test_a_tm_scene_and_an_oli_scene_agree(aoi_grid, landsat_scene, landsat_scene_tm):
+    """Identical pixels through both asset namings must give an identical answer.
+
+    The claim the whole pre-2013 extension rests on: C2 Level-2 is one product across the
+    missions, so nothing downstream should be able to tell TM from OLI-TIRS except by the
+    label. If this ever fails, some per-mission arithmetic has crept in.
+    """
+    kw = dict(mask_cfg=_MASK, to_celsius=False, aoi_id="test_aoi")
+    a = landsat_pc.scene_to_dataset(landsat_scene, aoi_grid,
+                                    acq_time=pd.Timestamp("2023-08-15"), **kw)
+    b = landsat_pc.scene_to_dataset(landsat_scene_tm, aoi_grid,
+                                    acq_time=pd.Timestamp("1995-07-18"), **kw)
+    for var in ("sst", "cloud", "water", "valid"):
+        np.testing.assert_allclose(a[var].isel(time=0).values,
+                                   b[var].isel(time=0).values, equal_nan=True)
+
+
+def test_a_scene_records_its_mission(aoi_grid, landsat_scene_tm):
+    """`platform_id` is what lets a forty-year cube say which sensor produced each date."""
+    ds = landsat_pc.scene_to_dataset(landsat_scene_tm, aoi_grid, _MASK, False,
+                                     pd.Timestamp("1995-07-18"), "test_aoi")
+    assert ds.attrs["platform"] == "landsat-5"
+    assert ds.attrs["platform_id"] == 5
+    assert ds.attrs["instrument"] == "tm"
+
+
+def test_a_scene_with_no_thermal_asset_is_skipped_not_failed(aoi_grid, landsat_scene_tm):
+    """An L2SR scene -- surface reflectance produced, surface temperature not.
+
+    ~8% of the archive. The catalogue serves the item with NO thermal asset at all, and the
+    STAC query cannot exclude it. None (skip), never an exception: a scene that never had a
+    temperature band is not a broken download, and a date range full of them must not read
+    like a network outage in the run report.
+    """
+    del landsat_scene_tm.assets["lwir"]
+    assert landsat_pc.scene_to_dataset(landsat_scene_tm, aoi_grid, _MASK, False,
+                                       pd.Timestamp("1995-07-18"), "test_aoi") is None
+
+
+def test_slc_off_gaps_are_unobserved_not_clear(aoi_grid, tmp_path):
+    """Landsat 7's SLC-off wedges must not read as clear sky.
+
+    QA_PIXEL bit 0 is FILL, and a fill pixel carries bit 0 and NOTHING ELSE -- so the
+    cloud/shadow/dilated bits are all zero there and the cell used to come out `cloud = 0`,
+    asserting clear sky over ~22% of every post-2003 ETM+ scene. Verified against a real
+    scene (LE07_L2SP_047029_20040927_02_T1): every gap pixel is `QA_PIXEL == 1` exactly, 0%
+    with any cloud bit set, 100% agreement with `lwir == 0`.
+    """
+    from .conftest import write_landsat_cogs
+    paths = write_landsat_cogs(tmp_path, aoi_grid, thermal_key="lwir",
+                               fill_rows=slice(0, 400))     # a wide band of the SOURCE raster
+    item = FakeStacItem(paths, {"platform": "landsat-7", "instruments": ["etm+"],
+                                "datetime": "2004-09-27T18:30:00Z", "eo:cloud_cover": 10.0},
+                        datetime(2004, 9, 27, 18, 30, tzinfo=timezone.utc))
+    ds = landsat_pc.scene_to_dataset(item, aoi_grid, _MASK, False,
+                                     pd.Timestamp("2004-09-27"), "test_aoi")
+    sst = ds["sst"].isel(time=0).values
+    cloud = ds["cloud"].isel(time=0).values
+    valid = ds["valid"].isel(time=0).values
+
+    gap = ~np.isfinite(sst)
+    assert gap.any(), "the fixture produced no gap at all"
+    # THE REGRESSION: not one gap cell may claim to be clear.
+    assert not (cloud[gap] == 0).any(), "an SLC-off gap read back as CLEAR sky"
+    assert np.isnan(cloud[gap]).all()
+    assert valid[gap].sum() == 0
+    # And the rest of the scene is untouched -- the fix must not swallow real observations.
+    assert (cloud[~gap] == 0).any(), "the clear half went missing with the gap"
+
+
+# ---------------------------------------------------------------------------
+# The brightness gate. NDWI is a RATIO and so blind to absolute brightness: a
+# thick cloud whose green channel saturates has green > NIR, passes NDWI, and is
+# admitted as water. Measured over 9.0M pixels (3 AoIs x 3 missions) among the
+# pixels `ndwi >= 0` admits: QA-confirmed water sits at green P50 0.017 / P99
+# 0.075, QA-confirmed cloud at P50 0.671 -- and 12.6% of the admitted set has
+# green > 1.0, which is nonphysical.
+# ---------------------------------------------------------------------------
+def _bright_cloud_item(tmp_path, g, *, green_dn, nir_dn):
+    """A scene whose reflectance is uniform at the given DN -- water by NDWI if green > nir."""
+    from .conftest import write_landsat_cogs
+    import rasterio
+    paths = write_landsat_cogs(tmp_path, g)
+    for key, dn in (("green", green_dn), ("nir08", nir_dn)):
+        with rasterio.open(paths[key], "r+") as src:
+            src.write(np.full((src.height, src.width), dn, "uint16"), 1)
+    return FakeStacItem(paths, {"platform": "landsat-7", "instruments": ["etm+"],
+                                "datetime": "2010-09-12T18:45:00Z", "eo:cloud_cover": 14.0},
+                        datetime(2010, 9, 12, 18, 45, tzinfo=timezone.utc))
+
+
+def _dn(reflectance):
+    """Surface reflectance -> C2 L2 DN (the inverse of SR_SCALE/SR_OFFSET)."""
+    return int(round((reflectance - landsat_pc.SR_OFFSET) / landsat_pc.SR_SCALE))
+
+
+def test_bright_cloud_that_passes_ndwi_is_not_water(aoi_grid, tmp_path):
+    """The real failure, reproduced. `LE07_L2SP_047026_20100912_02_T2` reported 14% cloud and
+    read green 1.602 (saturated, nonphysical) against NIR 0.72 over open water: NDWI = +0.38,
+    so `ndwi_threshold: 0.0` called dense cloud at -24.5 degC water, and no QA cloud bit was
+    set to catch it."""
+    item = _bright_cloud_item(tmp_path, aoi_grid, green_dn=_dn(1.602), nir_dn=_dn(0.72))
+    ds = landsat_pc.scene_to_dataset(item, aoi_grid, _MASK, False,
+                                     pd.Timestamp("2010-09-12"), "test_aoi")
+    ndwi_would_admit = (1.602 - 0.72) / (1.602 + 0.72)
+    assert ndwi_would_admit > 0, "the fixture is not actually the failing case"
+    assert np.nanmax(ds["water"].isel(time=0).values) == 0.0, "bright cloud admitted as water"
+    assert ds["valid"].values.sum() == 0
+
+
+def test_dark_water_still_passes(aoi_grid, tmp_path):
+    """The gate must not cost real observations. 0.017 green is the measured MEDIAN of
+    QA-confirmed water across all three missions."""
+    item = _bright_cloud_item(tmp_path, aoi_grid, green_dn=_dn(0.017), nir_dn=_dn(0.005))
+    ds = landsat_pc.scene_to_dataset(item, aoi_grid, _MASK, False,
+                                     pd.Timestamp("2010-09-12"), "test_aoi")
+    assert np.nanmin(ds["water"].isel(time=0).values) == 1.0
+
+
+def test_turbid_coastal_water_still_passes(aoi_grid, tmp_path):
+    """The case the default is chosen FOR. Sediment-laden estuary water is much brighter than
+    open ocean, and it is the whole point of this project -- 0.075 is the measured P99 of every
+    QA-confirmed water pixel sampled, and the 0.15 default sits 2x above it."""
+    item = _bright_cloud_item(tmp_path, aoi_grid, green_dn=_dn(0.075), nir_dn=_dn(0.02))
+    ds = landsat_pc.scene_to_dataset(item, aoi_grid, _MASK, False,
+                                     pd.Timestamp("2010-09-12"), "test_aoi")
+    assert np.nanmin(ds["water"].isel(time=0).values) == 1.0
+
+
+def test_the_brightness_gate_is_tunable_and_can_be_switched_off(aoi_grid, tmp_path):
+    """`<= 0` disables it, the same idiom `cloud_buffer_km` uses -- so the previous behaviour
+    stays reachable for anyone who needs to reproduce an older extract."""
+    item = _bright_cloud_item(tmp_path, aoi_grid, green_dn=_dn(1.602), nir_dn=_dn(0.72))
+    off = landsat_pc.scene_to_dataset(item, aoi_grid, {**_MASK, "brightness_max": 0}, False,
+                                      pd.Timestamp("2010-09-12"), "test_aoi")
+    assert np.nanmax(off["water"].isel(time=0).values) == 1.0   # admitted again, as before
+
+    strict = landsat_pc.scene_to_dataset(item, aoi_grid, {**_MASK, "brightness_max": 0.01},
+                                         False, pd.Timestamp("2010-09-12"), "test_aoi")
+    assert np.nanmax(strict["water"].isel(time=0).values) == 0.0
+
+
+def test_the_brightness_gate_does_not_touch_the_raw_temperature(aoi_grid, tmp_path):
+    """`lst_sst` is the RAW channel: it carries the scene's temperature wherever the imagery
+    covered, cloudy cells included. Only `water` (and `valid` through it) may move."""
+    item = _bright_cloud_item(tmp_path, aoi_grid, green_dn=_dn(1.602), nir_dn=_dn(0.72))
+    kw = (aoi_grid, ), dict(to_celsius=False, acq_time=pd.Timestamp("2010-09-12"),
+                            aoi_id="test_aoi")
+    on = landsat_pc.scene_to_dataset(item, *kw[0], mask_cfg=_MASK, **kw[1])
+    off = landsat_pc.scene_to_dataset(item, *kw[0], mask_cfg={**_MASK, "brightness_max": 0},
+                                      **kw[1])
+    np.testing.assert_array_equal(on["sst"].values, off["sst"].values)
+    np.testing.assert_array_equal(on["cloud"].values, off["cloud"].values)
+
+
+def test_outside_the_scene_footprint_is_unobserved_not_clear(aoi_grid, tmp_path):
+    """The bigger half of the same defect, and it is not a pre-2013 problem at all.
+
+    A Landsat scene is a rotated parallelogram, so an AoI straddling a scene edge is largely
+    OUTSIDE the source raster. `read_cog_window` fills an unmasked read with 0 by default --
+    NaN is not representable in an integer band -- and 0 is a perfectly valid QA_PIXEL word
+    meaning "no flag set", i.e. CLEAR. So every off-footprint cell reprojected in as clear sky.
+
+    Measured on a real Landsat 7 scene over Tillamook before the fix: 81.6% of the AoI had no
+    temperature and 28 percentage points of that claimed to be cloud-free. Reading `qa_pixel`
+    with its own declared fill value (1 = bit 0 = fill) puts off-footprint cells and SLC-off
+    gaps on the same footing.
+
+    A NEGATIVE pad makes the synthetic source SMALLER than the AoI grid, which is what a scene
+    edge cutting through the AoI looks like from here.
+    """
+    from .conftest import write_landsat_cogs
+    paths = write_landsat_cogs(tmp_path, aoi_grid, pad_m=-2000.0)
+    item = FakeStacItem(paths, {"platform": "landsat-8", "instruments": ["oli", "tirs"],
+                                "datetime": "2020-07-01T19:00:00Z", "eo:cloud_cover": 5.0},
+                        datetime(2020, 7, 1, 19, 0, tzinfo=timezone.utc))
+    ds = landsat_pc.scene_to_dataset(item, aoi_grid, _MASK, False,
+                                     pd.Timestamp("2020-07-01"), "test_aoi")
+    sst = ds["sst"].isel(time=0).values
+    cloud = ds["cloud"].isel(time=0).values
+
+    off = ~np.isfinite(sst)
+    assert off.any(), "the fixture covered the whole grid; nothing was off-footprint"
+    assert not (cloud[off] == 0).any(), "an off-footprint cell read back as CLEAR sky"
+    # And the covered part still carries a real verdict, both ways.
+    assert (cloud[~off] == 0).any()
+
+
 def test_the_mask_layers_survive_a_round_trip_to_disk(tmp_path, aoi_grid, landsat_scene):
     """The regression, end to end: write the scene the way acquisition does, reopen it, and
     recompute validity the way the ASSEMBLER does.
@@ -175,7 +380,7 @@ def test_the_mask_layers_survive_a_round_trip_to_disk(tmp_path, aoi_grid, landsa
     assert clear.any(), "every CLEAR cell decoded back as NaN -- the fill value ate them"
 
     sensor = products.spec(DataProduct.landsat).sensor
-    _s, _c, v, _fp = datacube._read_granule(
+    _s, _c, v, _fp, _pid = datacube._read_granule(
         out, aoi_grid.height, aoi_grid.width,
         water_is_land=sensor.water_is_land, use_cloud=sensor.use_cloud,
         qset=list(sensor.qc_levels) if sensor.qc_levels else None,
@@ -456,6 +661,73 @@ def test_search_scenes_does_not_sign_at_search_time(monkeypatch):
                                      landsat_pc.DEFAULT_PLATFORMS, 0.7)
     assert items == []
     assert "modifier" not in seen["kwargs"]
+
+
+def _spy_search(monkeypatch):
+    """Record the `datetime` interval of every STAC search issued, and serve no items."""
+    pystac_client = pytest.importorskip("pystac_client")
+    seen = []
+
+    class _Cat:
+        def search(self, **kw):
+            seen.append(kw["datetime"])
+            return type("S", (), {"items": lambda self: []})()
+
+    monkeypatch.setattr(pystac_client.Client, "open", lambda url, **kw: _Cat())
+    return seen
+
+
+def test_a_short_range_is_still_one_search(monkeypatch):
+    """The 2013-onwards case must issue the byte-identical query it always did."""
+    seen = _spy_search(monkeypatch)
+    landsat_pc.search_scenes(landsat_pc.COLLECTION, landsat_pc.STAC_URL,
+                             (-124.0, 45.4, -123.8, 45.6), "2023-08-01", "2023-08-31",
+                             landsat_pc.DEFAULT_PLATFORMS, 0.7)
+    assert seen == ["2023-08-01/2023-08-31"]
+
+
+def test_a_decadal_range_is_searched_in_windows(monkeypatch):
+    """A 1984-2011 AoI is thousands of scenes and dozens of pages, and `list(search.items())`
+    pages to exhaustion INSIDE the retry -- so one failure on the last page used to throw away
+    the whole decade. Windows must cover the range exactly, disjointly, in order."""
+    seen = _spy_search(monkeypatch)
+    landsat_pc.search_scenes(landsat_pc.COLLECTION, landsat_pc.STAC_URL,
+                             (-124.0, 45.4, -123.8, 45.6), "1984-03-01", "1990-06-30",
+                             ["landsat-5"], 0.7)
+    assert len(seen) > 1
+    bounds = [w.split("/") for w in seen]
+    assert bounds[0][0] == "1984-03-01" and bounds[-1][1] == "1990-06-30"
+    for (_, prev_end), (nxt_start, _) in zip(bounds, bounds[1:]):
+        assert (pd.Timestamp(nxt_start) - pd.Timestamp(prev_end)).days == 1, "gap or overlap"
+
+
+# ---------------------------------------------------------------------------
+# Missions with no thermal product. Landsat 1-3 and MSS carry no thermal band
+# AT ALL and have no Collection-2 Level-2 product, so asking for one is not a
+# thin-coverage request -- it is a request for data that does not exist.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("platform", ["landsat-1", "landsat-2", "landsat-3"])
+def test_a_mission_with_no_thermal_band_is_refused(base_project, platform):
+    base_project["products"]["landsat"] = {"platforms": [platform, "landsat-8"]}
+    with pytest.raises(ValueError, match=platform):
+        landsat_pc._build_eff(parse_config(base_project))
+
+
+def test_the_refusal_says_why_and_what_is_available(base_project):
+    base_project["products"]["landsat"] = {"platforms": ["landsat-1"]}
+    with pytest.raises(ValueError) as exc:
+        landsat_pc._build_eff(parse_config(base_project))
+    msg = str(exc.value)
+    assert "no thermal band" in msg              # the reason, not just the rejection
+    assert "landsat-5" in msg and "landsat-8" in msg     # what the user can ask for instead
+
+
+def test_the_pre_2013_missions_are_accepted_and_normalized(base_project):
+    """The whole point of the change: L5/L7 alongside L8/9, however the config spells them."""
+    base_project["products"]["landsat"] = {
+        "platforms": ["LANDSAT_5", "landsat-7", "Landsat-8"]}
+    eff = landsat_pc._build_eff(parse_config(base_project))
+    assert _ds(eff)["platforms"] == ["landsat-5", "landsat-7", "landsat-8"]
 
 
 if __name__ == "__main__":
