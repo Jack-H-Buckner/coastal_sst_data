@@ -141,7 +141,7 @@ def _resolve_datum(g: AoiGrid, elev, source, fallback, stations) -> dict:
 def _datum_pending(path: Path) -> bool:
     """True if an existing output was written with its datum offset still PENDING."""
     try:
-        with xr.open_dataset(path) as ds:
+        with store.open_netcdf(path) as ds:
             return str(ds.attrs.get("datum_status", "")) == PENDING_DATUM
     except Exception:
         return False
@@ -155,7 +155,7 @@ def _reresolve_datum(path: Path, g: AoiGrid, source, fallback, stations) -> dict
     PENDING if the resolver could not reach a source), or None if the file is unreadable.
     """
     try:
-        with xr.open_dataset(path) as ds:
+        with store.open_netcdf(path) as ds:
             ds = ds.load()
     except Exception as exc:
         log.warning("  %s: could not re-open %s to retry its datum (%s)", g.name, path.name, exc)

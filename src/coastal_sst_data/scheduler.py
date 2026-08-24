@@ -156,6 +156,7 @@ def run_graph(tasks: list[Task], *, jobs: int = 1, gates: dict | None = None) ->
     pending = set(order)
     running: dict = {}                 # future -> key
     started: dict = {}                 # key -> monotonic time it was submitted
+    dumped = False                     # have we already dumped stacks for a stalled run?
     jobs = max(1, int(jobs))
 
     def _blockers(task: Task) -> tuple:
@@ -219,11 +220,22 @@ def run_graph(tasks: list[Task], *, jobs: int = 1, gates: dict | None = None) ->
                     now = time.monotonic()
                     waits = sorted(((now - started[k], k) for k in running.values()),
                                    reverse=True)
-                    log.log(logging.WARNING if waits and waits[0][0] >= STALL_S
-                            else logging.INFO,
+                    stalled = bool(waits) and waits[0][0] >= STALL_S
+                    log.log(logging.WARNING if stalled else logging.INFO,
                             "  still running %d task(s): %s",
                             len(waits),
                             ", ".join(f"{_name(k)} ({secs / 60:.0f}m)" for secs, k in waits))
+                    if stalled and not dumped:
+                        # ONCE per run, not once per heartbeat. A hang that lasts overnight is
+                        # hundreds of heartbeats, and a dump is one stack per thread -- which
+                        # for a pool plus its backends' own pools ran to ~190 of them in the
+                        # run that prompted this. Repeating it would bury the log lines that
+                        # say what the run was doing before it stopped.
+                        dumped = True
+                        log.warning("  no task has completed in %.0fm; dumping every thread's "
+                                    "stack below (the run continues). The frames shared by "
+                                    "every worker are where it is stuck.", STALL_S / 60)
+                        logctx.dump_all_stacks()
                     continue
 
                 for future in finished:

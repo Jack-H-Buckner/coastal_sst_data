@@ -330,3 +330,35 @@ def test_the_heartbeat_does_not_change_scheduling(monkeypatch):
 
     assert order == ["a", "b"]
     assert all(o.ok for o in outcomes.values())
+
+
+def test_a_stalled_run_dumps_its_stacks_once(monkeypatch, caplog):
+    """The hang this was written for ran 36 hours with the heartbeat ticking and nobody
+    watching. The dump is what turns that scrollback into a diagnosis -- and it fires ONCE:
+    at ~430 heartbeats x ~190 threads, repeating it would bury the log it is meant to explain.
+    """
+    monkeypatch.setattr(scheduler, "HEARTBEAT_S", 0.05)
+    monkeypatch.setattr(scheduler, "STALL_S", 0.0)      # every heartbeat is a stall
+    dumps = []
+    monkeypatch.setattr(scheduler.logctx, "dump_all_stacks", lambda: dumps.append(1))
+    release = threading.Event()
+
+    with caplog.at_level("INFO"):
+        done = threading.Thread(target=lambda: (time.sleep(0.4), release.set()))
+        done.start()
+        scheduler.run_graph([Task(key=("k",), run=lambda: release.wait(timeout=10))], jobs=1)
+        done.join(timeout=5)
+
+    assert dumps == [1], f"expected exactly one stack dump, got {len(dumps)}"
+    assert any("dumping every thread's stack" in r.message for r in caplog.records)
+
+
+def test_a_healthy_run_dumps_nothing(monkeypatch):
+    """A run that is merely SLOW is not a run that is stuck, and must stay quiet."""
+    monkeypatch.setattr(scheduler, "HEARTBEAT_S", 0.05)
+    monkeypatch.setattr(scheduler, "STALL_S", 3600.0)   # nothing is a stall yet
+    dumps = []
+    monkeypatch.setattr(scheduler.logctx, "dump_all_stacks", lambda: dumps.append(1))
+
+    scheduler.run_graph([Task(key=("k",), run=lambda: time.sleep(0.2))], jobs=1)
+    assert dumps == []

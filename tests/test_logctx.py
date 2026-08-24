@@ -159,3 +159,39 @@ def test_installing_the_dumper_twice_is_harmless():
     than one, so re-registering has to be a no-op rather than an error."""
     assert logctx._install_stack_dumper() is True
     assert logctx._install_stack_dumper() is True
+
+
+def test_dump_all_stacks_dumps_every_thread_without_a_signal(capfd):
+    """The same dump SIGUSR1 gives, for the caller that has no signal to send -- which is
+    what lets `scheduler.run_graph` self-diagnose a stall nobody is watching."""
+    parked = threading.Event()
+    started = threading.Event()
+
+    def worker():
+        started.set()
+        parked.wait(timeout=10)
+
+    t = threading.Thread(target=worker, name="a_parked_worker", daemon=True)
+    t.start()
+    assert started.wait(timeout=5)
+
+    try:
+        logctx.dump_all_stacks()
+        err = capfd.readouterr().err
+    finally:
+        parked.set()
+        t.join(timeout=5)
+
+    assert "Thread" in err, f"no stack dump appeared:\n{err}"
+    assert "worker" in err, "the parked thread's frame is missing -- all_threads did not apply"
+
+
+def test_dump_all_stacks_never_raises(monkeypatch):
+    """A debugging aid that can take the run down is worse than no debugging aid."""
+    import faulthandler
+
+    def boom(*a, **kw):
+        raise RuntimeError("stderr is gone")
+
+    monkeypatch.setattr(faulthandler, "dump_traceback", boom)
+    logctx.dump_all_stacks()          # must not raise

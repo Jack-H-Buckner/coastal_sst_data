@@ -51,6 +51,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from .. import store
+
 log = logging.getLogger(__name__)
 
 # `<sensor>_water_class` codes.
@@ -77,7 +79,7 @@ def load_tide_series(d, aoi_id) -> pd.Series | None:
     f = d / f"{aoi_id}_tides.nc"
     if not f.exists():
         return None
-    with xr.open_dataset(f) as ds:
+    with store.open_netcdf(f) as ds:
         if "tide" not in ds or "time" not in ds["tide"].dims:
             return None
         s = ds["tide"].to_series().astype("float64")

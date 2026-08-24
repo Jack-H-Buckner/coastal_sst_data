@@ -81,6 +81,22 @@ def current() -> str:
     return getattr(_local, "label", "")
 
 
+def dump_all_stacks() -> None:
+    """Every thread's Python stack on stderr, right now. The SIGUSR1 dump, without the signal.
+
+    `_install_stack_dumper` covers the case where a person is watching and can send a signal.
+    This covers the case where nobody is: `scheduler.run_graph` calls it once a run crosses the
+    stall threshold, so the scrollback a person reads the next morning already contains the one
+    artefact that explains a hang -- rather than requiring them to have been there to ask.
+
+    Never raises. A stack dump that took the run down with it would be worse than no dump.
+    """
+    try:
+        faulthandler.dump_traceback(all_threads=True)
+    except Exception:                # noqa: BLE001 -- closed stderr, exotic platform
+        logging.getLogger(__name__).debug("could not dump thread stacks", exc_info=True)
+
+
 def _install_stack_dumper() -> bool:
     """`kill -USR1 <pid>` -> every thread's Python stack on stderr, run CONTINUES.
 

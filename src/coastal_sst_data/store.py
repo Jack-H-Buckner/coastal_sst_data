@@ -428,6 +428,58 @@ def atomic(dest: Path, *, placeholder: bool = False):
 # machine, and makes a future HDF5 report attributable to a known writer.
 NETCDF_ENGINE = "netcdf4"
 
+# ONE process-global gate on netCDF4, held across every open/read/write/close this package
+# does. Two workers are never inside the netCDF backend at the same time.
+#
+# WHY A SLEDGEHAMMER. A production run wedged for 36 hours with eight workers and 62 seconds
+# of CPU between them: every thread was blocked in `xarray.backends.locks.CombinedLock`
+# `__enter__` (via `CachingFileManager._optional_lock`), none was doing I/O, and the stack dump
+# showed NO HOLDER -- because a `CombinedLock` acquires its constituent locks one at a time and
+# keeps what it already has while blocking on the rest, so a stuck holder is itself a waiter.
+#
+# The precise trigger is NOT established. The obvious candidate -- that `CombinedLock`'s
+# `tuple(set(locks))` lets two files disagree about acquisition order -- was tested and
+# disproved: the two process-global locks are inserted first, keep their hash slots, and their
+# relative order never varies. What remains is a lock left permanently held (a partial
+# acquisition that never unwound, a release that aborted midway), and a leaked
+# `threading.Lock` has no owner to name, which is exactly the shape of the dump.
+#
+# Since we cannot name the trigger, we remove the precondition instead: every path into the
+# backend goes through here, so no interleaving of two threads inside xarray's lock layer is
+# possible in the first place. The cost is close to nothing -- netCDF4 work was ALREADY
+# serialized process-wide by xarray's own HDF5_LOCK + NETCDFC_LOCK -- and unlike patching a
+# third-party internal it cannot be invalidated by an xarray release.
+#
+# REENTRANT, because the read helper below is used inside code that also writes.
+NETCDF_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def open_netcdf(path, **kwargs):
+    """`xr.open_dataset(path)` with the netCDF gate held for the WHOLE block.
+
+        with store.open_netcdf(path) as ds:
+            ...
+
+    The lock has to span open->use->close rather than wrapping the open alone: xarray reads
+    lazily, so touching `ds[v].values` after the block would re-enter the backend unguarded --
+    which is the interleaving this exists to prevent. Anything a caller needs after the block
+    must be materialised inside it (`.load()`, or read the scalar out). Keep the block TIGHT
+    for the same reason it exists: heavy numpy work under the gate stalls every other worker's
+    I/O for no benefit.
+
+    EVERY netCDF read in this package goes through here -- there is no second way in, and
+    `tests/test_store.py` fails if a bare `xr.open_dataset` reappears anywhere under `src/`.
+    That is the invariant the gate rests on: one unguarded reader is enough to put two
+    threads back inside xarray's lock layer.
+
+    `path` is whatever `xr.open_dataset` accepts -- `processes.mur` passes an `io.BytesIO`,
+    which is on the h5netcdf path and shares HDF5_LOCK, so it belongs under the same gate.
+    """
+    with NETCDF_LOCK:
+        with xr.open_dataset(path, **kwargs) as ds:
+            yield ds
+
 
 # The CF attrs a windowed COG read leaves behind. They are how a raster DECLARES its nodata
 # and scaling, and they are meaningful on a raster -- but they ride along onto every array
@@ -508,7 +560,10 @@ def write_netcdf(ds: xr.Dataset, path: Path, encoding: dict | None = None) -> Pa
         encoding = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
     ds, encoding = _sanitize_fill_values(ds, encoding)
     with atomic(path, placeholder=True) as tmp:      # see `atomic`: keeps libnetcdf quiet
-        ds.to_netcdf(tmp, encoding=encoding, engine=NETCDF_ENGINE)
+        # INSIDE `atomic`, so the swap and the scratch registry stay off the lock -- os.replace
+        # is not what deadlocks, and holding a global across it would serialize the cheap half.
+        with NETCDF_LOCK:                            # see NETCDF_LOCK: two writers, one writer
+            ds.to_netcdf(tmp, encoding=encoding, engine=NETCDF_ENGINE)
     return path
 
 
@@ -620,7 +675,7 @@ def is_complete(path: Path, expected_vars=(), *, shape=None, deep: bool = False)
         return bool(tifs)
 
     try:
-        with xr.open_dataset(path) as ds:
+        with open_netcdf(path) as ds:
             for v in expected_vars:
                 if v not in ds.variables:
                     return False
@@ -648,7 +703,7 @@ def _covers_range(path: Path, start, end) -> bool:
     unreadable) is treated as NOT covering, so it is rebuilt once and gains the stamp.
     """
     try:
-        with xr.open_dataset(path) as ds:
+        with open_netcdf(path) as ds:
             rs = ds.attrs.get("requested_start")
             re = ds.attrs.get("requested_end")
     except Exception:

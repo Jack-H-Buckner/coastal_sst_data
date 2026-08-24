@@ -196,12 +196,12 @@ def load_daily_sensor(d: Path, aoi_id, days, H, W, var, *, prefix="", cache=None
         f = files.get(naming.day_stamp(dd))
         if f is None:
             continue
-        ds = xr.open_dataset(f)
-        if var in ds:
-            arr = ds[var].isel(time=0).values if "time" in ds[var].dims else ds[var].values
-            if arr.shape == (H, W):
-                out[i] = arr
-        ds.close()
+        with store.open_netcdf(f) as ds:
+            if var in ds:
+                arr = (ds[var].isel(time=0).values if "time" in ds[var].dims
+                       else ds[var].values)
+                if arr.shape == (H, W):
+                    out[i] = arr
     return out
 
 
@@ -221,12 +221,12 @@ def load_at_times(d: Path, aoi_id, times, H, W, var):
         f = d / f"{naming.time_stem(aoi_id, t)}.nc"
         if not f.exists():
             continue
-        ds = xr.open_dataset(f)
-        if var in ds:
-            arr = ds[var].isel(time=0).values if "time" in ds[var].dims else ds[var].values
-            if arr.shape == (H, W):
-                out[i] = arr
-        ds.close()
+        with store.open_netcdf(f) as ds:
+            if var in ds:
+                arr = (ds[var].isel(time=0).values if "time" in ds[var].dims
+                       else ds[var].values)
+                if arr.shape == (H, W):
+                    out[i] = arr
     return out
 
 
@@ -281,7 +281,7 @@ def footprint_available(d: Path, aoi_id, days, H, W, *, cache=None) -> bool:
             if day not in want:
                 continue
             for _dt, f in granules:
-                with xr.open_dataset(f) as ds:
+                with store.open_netcdf(f) as ds:
                     if "time" in ds.dims:
                         ds = ds.isel(time=0)
                     # Same guards, same order as the loader: a granule whose sst is off-grid
@@ -303,7 +303,7 @@ def _read_granule(f: Path, H, W, *, water_is_land, use_cloud, qset, trust_valid,
     mosaic them) and only one way to READ one -- the guards and the mask algebra are identical
     either way, and duplicating them is how the two regimes would drift apart.
     """
-    with xr.open_dataset(f) as raw:
+    with store.open_netcdf(f) as raw:
         ds = raw.isel(time=0) if "time" in raw.dims else raw
         if "sst" not in ds or ds["sst"].shape != (H, W):
             return None
@@ -432,7 +432,7 @@ def resolve_water_polarity(d: Path, aoi_id, days, H, W, *, declared: bool,
         n_granules = 0
         not_binary = False
         for f in sample:
-            with xr.open_dataset(f) as raw:
+            with store.open_netcdf(f) as raw:
                 ds = raw.isel(time=0) if "time" in raw.dims else raw
                 if "water" not in ds or ds["water"].shape != (H, W):
                     continue
@@ -690,7 +690,7 @@ def tide_daily_lut(d: Path, aoi_id, *, cache=None) -> tuple[dict, dict]:
         f = d / f"{aoi_id}_tides.nc"
         if not f.exists():
             return {}, {}
-        with xr.open_dataset(f) as ds:
+        with store.open_netcdf(f) as ds:
             t = ds["tide"]
             dm = t.resample(time="1D").mean()
             dr = t.resample(time="1D").max() - t.resample(time="1D").min()
@@ -744,18 +744,17 @@ def load_bathy(d: Path, aoi_id, H, W, *, cache=None):
             log.warning("  %s: no bathymetry file (%s); elevation/depth/depth_p25/depth_p75 "
                         "will be NaN", aoi_id, f.name)
         else:
-            ds = xr.open_dataset(f)
+            with store.open_netcdf(f) as ds:
 
-            def g(name):
-                return (ds[name].values.astype("float32")
-                        if name in ds and ds[name].shape == (H, W) else None)
-            if g("elevation") is not None:
-                elev = g("elevation")
-            else:
-                log.warning("  %s: bathymetry file has no usable `elevation` on this grid; "
-                            "depth fields will be NaN", aoi_id)
-            depth, dp25, dp75 = g("depth"), g("depth_p25"), g("depth_p75")
-            ds.close()
+                def g(name):
+                    return (ds[name].values.astype("float32")
+                            if name in ds and ds[name].shape == (H, W) else None)
+                if g("elevation") is not None:
+                    elev = g("elevation")
+                else:
+                    log.warning("  %s: bathymetry file has no usable `elevation` on this "
+                                "grid; depth fields will be NaN", aoi_id)
+                depth, dp25, dp75 = g("depth"), g("depth_p25"), g("depth_p75")
 
         known = np.isfinite(elev)
         if depth is None:  # derive mean depth from elevation -- ONLY where it is known
@@ -769,8 +768,8 @@ def load_bathy(d: Path, aoi_id, H, W, *, cache=None):
     return _cached(cache, ("bathy", str(d)), build)
 
 
-def load_insitu(base: Path, aoi_id) -> list[tuple[str, xr.Dataset]]:
-    """Every in-situ source's station table for this AoI -> [(source, Dataset), ...].
+def load_insitu(base: Path, aoi_id) -> list[tuple[str, insitu.InsituTable]]:
+    """Every in-situ source's station table for this AoI -> [(source, InsituTable), ...].
 
     In-situ STACKS (D10): a public network and the user's own thermometers are not two pipes
     to the same observations, they are different PLATFORMS, so each source writes its own
@@ -781,8 +780,17 @@ def load_insitu(base: Path, aoi_id) -> list[tuple[str, xr.Dataset]]:
     tag, and one stray leftover directory was enough to produce silent all-sentinel channels
     across a whole project (docs/bug-empty-version-tag-channels.md). Every skip is logged, so
     a mis-named tree is visible rather than absorbed.
+
+    Each file is read inside ONE gated block and shut; what comes back is plain arrays
+    (`insitu.InsituTable`) that own no handle. This used to hand back open Datasets read
+    lazily for the whole of an AoI's assembly -- the last live netCDF handle outside
+    `store.open_netcdf`. See `InsituTable` for what that cost.
     """
-    out: list[tuple[str, xr.Dataset]] = []
+    def _read(path: Path) -> insitu.InsituTable:
+        with store.open_netcdf(path) as ds:
+            return insitu.InsituTable.from_dataset(ds)
+
+    out: list[tuple[str, insitu.InsituTable]] = []
     if not base.exists():
         return out
     for d in sorted(p for p in base.iterdir() if p.is_dir()):
@@ -793,7 +801,7 @@ def load_insitu(base: Path, aoi_id) -> list[tuple[str, xr.Dataset]]:
             log.warning("  INSITU/%s holds no %s_insitu.nc; not read as an in-situ source",
                         d.name, aoi_id)
             continue
-        out.append((d.name, xr.open_dataset(f)))
+        out.append((d.name, _read(f)))
 
     # The pre-0.2 flat layout. Read it rather than silently dropping a project's only ground
     # truth -- but say so, because nothing writes there any more. IOOS was the sole source
@@ -806,39 +814,36 @@ def load_insitu(base: Path, aoi_id) -> list[tuple[str, xr.Dataset]]:
         else:
             log.warning("  reading in-situ from the LEGACY flat layout %s; move it to "
                         "INSITU/ioos/aligned/ -- it is no longer written there", legacy.parent)
-            out.append(("ioos", xr.open_dataset(legacy)))
+            out.append(("ioos", _read(legacy)))
     return out
 
 
-def insitu_sources(base: Path, aoi_id, *, cache=None) -> list[tuple[str, xr.Dataset]]:
+def insitu_sources(base: Path, aoi_id, *, cache=None) -> list[tuple[str, insitu.InsituTable]]:
     """`load_insitu`, cached per tree.
 
-    An in-situ source writes ONE file spanning the whole window, so re-opening it per time
-    block would re-parse a multi-year station table for every block. When cached, the
-    Datasets are owned by the CACHE -- `close_cache` closes them once the AoI is done, and
-    the caller must not close them itself.
+    An in-situ source writes ONE file spanning the whole window, so re-reading it per time
+    block would re-parse a multi-year station table for every block. What the cache holds is
+    plain arrays (`insitu.InsituTable`), not open files: there is nothing to release, and a
+    caller that keeps a table past `close_cache` merely holds data.
     """
     return _cached(cache, ("insitu", str(base)), lambda: load_insitu(base, aoi_id))
 
 
 def close_cache(cache) -> None:
-    """Release anything an assembly cache holds open, and empty it.
+    """Empty an assembly cache. Called once per AoI, after the last time block.
 
-    Only the in-situ tables are open handles; everything else the cache keeps is plain data.
-    Called once per AoI, after the last time block -- not per block, which is the whole point
-    of caching them.
+    NOTHING IN THE CACHE IS AN OPEN FILE any more -- the in-situ tables were the last, and
+    they are plain arrays now (see `insitu.InsituTable`). So this drops references rather
+    than releasing handles, and the name is kept for its callers, which invoke it from
+    `finally` and should not have to care that it got cheaper.
     """
     if not cache:
         return
-    for key, val in cache.items():
-        if isinstance(key, tuple) and key and key[0] == "insitu":
-            for _src, ds in val:
-                ds.close()
     cache.clear()
 
 
-def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, targets: dict,
-                 max_dt_min, *, cache=None):
+def build_insitu(sources: list[tuple[str, insitu.InsituTable]], g: AoiGrid, days,
+                 targets: dict, max_dt_min, *, cache=None):
     """In-situ channels: the station's value at each target time, in the station's pixel.
 
     `targets` maps a channel prefix to one target datetime per day -- 'insitu' (the daily
@@ -879,19 +884,18 @@ def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, target
     cells: dict[tuple[int, int], dict] = {}
     seen_ids: dict[str, str] = {}                           # station id -> its source
 
-    for src, ids in sources:
-        lons = np.asarray(ids["lon"].values, dtype="float64")
-        lats = np.asarray(ids["lat"].values, dtype="float64")
+    for src, tab in sources:
+        lons, lats = tab.lon, tab.lat
         # water=None: no snapping. Cached per source -- the placement is a property of the
         # stations and the grid, and building it spins up a pyproj Transformer each time.
         placed = _cached(cache, ("insitu_pixels", src),
                          lambda: insitu.station_pixels(lons, lats, g))
 
-        times = pd.DatetimeIndex(ids["time"].values)
-        sst = ids["sst"].values                     # (station, time)
+        times = tab.times
+        sst = tab.sst                               # (station, time)
 
         for s, place in enumerate(placed):
-            sid = str(ids["station_id"].values[s])
+            sid = str(tab.ids[s])
             if not place["inside"]:
                 log.warning("  in-situ station %s [%s] falls outside the AoI grid; dropped",
                             sid, src)
@@ -907,7 +911,7 @@ def build_insitu(sources: list[tuple[str, xr.Dataset]], g: AoiGrid, days, target
             seen_ids.setdefault(sid, src)
 
             table.append({"index": len(table) + 1, "id": sid,
-                          "name": str(ids["station_name"].values[s]),
+                          "name": str(tab.names[s]),
                           "source": src,
                           "lat": float(lats[s]), "lon": float(lons[s]),
                           "row": r, "col": c})
@@ -966,7 +970,7 @@ def cmems_channels(d: Path, aoi_id, *, cache=None) -> list[str]:
         if not d.exists():
             return []
         for f in sorted(d.glob(f"{aoi_id}_*.nc")):
-            with xr.open_dataset(f) as ds:
+            with store.open_netcdf(f) as ds:
                 return [v for v in ds.data_vars if v != "valid"]
         return []
 
@@ -979,7 +983,7 @@ def load_bathy_attrs(d: Path, aoi_id, *, cache=None) -> dict:
         f = d / f"{aoi_id}.nc"
         if not f.exists():
             return {}
-        with xr.open_dataset(f) as ds:
+        with store.open_netcdf(f) as ds:
             return dict(ds.attrs)
 
     return _cached(cache, ("bathy_attrs", str(d)), build)
@@ -991,10 +995,9 @@ def load_landcover(d: Path, aoi_id, H, W, *, cache=None):
         water = np.full((H, W), np.nan, "float32")
         f = d / f"{aoi_id}.nc"
         if f.exists():
-            ds = xr.open_dataset(f)
-            if "water" in ds and ds["water"].shape == (H, W):
-                water = ds["water"].values.astype("float32")
-            ds.close()
+            with store.open_netcdf(f) as ds:
+                if "water" in ds and ds["water"].shape == (H, W):
+                    water = ds["water"].values.astype("float32")
         return water
 
     return _cached(cache, ("landcover", str(d)), build)
@@ -1399,7 +1402,7 @@ def _overpass_met_vars(d: Path, aoi_id, *, cache=None) -> list[str]:
         if not d.exists():
             return []
         for f in sorted(d.glob(f"{aoi_id}_*T*.nc")):
-            with xr.open_dataset(f) as ds:
+            with store.open_netcdf(f) as ds:
                 return list(ds.data_vars)
         return []
 
@@ -1501,7 +1504,6 @@ def _contribute_insitu(ctx: AssemblyContext) -> None:
     targets = {"insitu": ctx.slots[SLOT_REF_UTC], **ctx.slots[SLOT_SENSOR_TIMES]}
     insitu_vars, station_table, station_map = build_insitu(
         sources, ctx.g, ctx.days, targets, ctx.eff["insitu_max_dt_min"], cache=ctx.cache)
-    # The Datasets belong to the cache now; `close_cache` releases them once the AoI is done.
     log.info("  in-situ: %d station(s) placed from %d source(s): %s",
              len(station_table), len(sources), ", ".join(s for s, _ in sources))
     for name, (dims, arr) in insitu_vars.items():
@@ -1689,9 +1691,11 @@ def finish_cube(ds: xr.Dataset, g: AoiGrid, eff: dict, days, cache: dict, hits=N
                 grid_hits=None) -> dict:
     """Release the AoI's cache, then stamp the whole-cube attrs on `ds`. Returns the coverage.
 
-    Closing the cache FIRST is not tidiness: `provenance.collect` re-opens every aligned file
-    in the tree, and doing that while the cached in-situ tables are still open segfaults the
-    netCDF library outright.
+    Releasing the cache FIRST was once load-bearing: `provenance.collect` re-opens every
+    aligned file in the tree, and doing that while the cached in-situ tables were still open
+    segfaulted the netCDF library outright. That can no longer happen -- the tables are plain
+    arrays and nothing here holds a handle (see `insitu.InsituTable`) -- but the ordering
+    stays, because it is free and because the lesson is worth keeping in view.
 
     `hits` / `grid_hits` are pre-tallied coverage counts (days with data, and summed grid
     share), for a caller that assembled the cube in blocks and no longer has it in hand.

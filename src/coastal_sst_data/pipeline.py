@@ -354,6 +354,9 @@ def run_pipeline(project: Project, *, aois=None, products=None, dry_run=False,
     # acquire(). Both are idempotent `setdefault`-style installs, so this is not a behaviour
     # change today -- it is the point at which "several stages racing to install the same
     # global" stops being a thing that can happen at all.
+    #
+    # (The netCDF gate needs no install step: `store.NETCDF_LOCK` is a module global taken by
+    # the store helpers themselves, so there is nothing to set up and nothing to forget.)
     net.setup_gdal_env()
     net.setup_requests_timeout()
 

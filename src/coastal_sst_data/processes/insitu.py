@@ -27,6 +27,7 @@ Two problems to get right:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -38,6 +39,54 @@ log = logging.getLogger(__name__)
 SNAP_WARN_M = 500.0
 
 DEFAULT_MAX_DT_MIN = 60.0     # matchup tolerance
+
+
+@dataclass(frozen=True)
+class InsituTable:
+    """One source's station table, IN MEMORY. Mirrors the on-disk schema that
+    `insitu_acquire.build_dataset` writes: dims (station, time).
+
+    WHY THIS IS NOT AN `xr.Dataset`. It used to be one, handed back still open and read
+    lazily for the whole of an AoI's assembly. That put a live netCDF handle outside
+    `store.open_netcdf` -- the one place in the package that was, after the gate went in --
+    on a thread pool, which is the precondition for the upstream deadlock the gate exists to
+    remove (see store.NETCDF_LOCK). It also kept alive a documented segfault: `provenance`
+    re-opening every aligned file while these were open took netCDF down outright, and
+    nothing but call ordering prevented it.
+
+    Plain arrays make that unrepresentable. The file is read inside one gated block and shut;
+    what comes back is data, owns nothing, and cannot be closed at the wrong moment.
+
+    `qc` is deliberately absent. `insitu_acquire.build_dataset` writes it, but nothing in this
+    package reads it -- carrying it would double the table for no consumer. Add it here if a
+    consumer ever appears; its absence is a decision, not an oversight.
+    """
+
+    lon: np.ndarray            # (station,) float64
+    lat: np.ndarray            # (station,) float64
+    ids: np.ndarray            # (station,) station identifiers
+    names: np.ndarray          # (station,) human-readable station names
+    times: pd.DatetimeIndex    # (time,) the union axis every station is reindexed onto
+    sst: np.ndarray            # (station, time) float32
+
+    @classmethod
+    def from_dataset(cls, ds) -> InsituTable:
+        """Materialise every array from an open Dataset -> a table that owns no handle.
+
+        CALL THIS INSIDE THE `store.open_netcdf` BLOCK. Every `.values` here is what forces
+        the read; doing it after the block would be the unguarded lazy read this type exists
+        to prevent -- and, once the file is shut, an error rather than a subtle one.
+        """
+        return cls(lon=np.asarray(ds["lon"].values, dtype="float64"),
+                   lat=np.asarray(ds["lat"].values, dtype="float64"),
+                   ids=np.asarray(ds["station_id"].values),
+                   names=np.asarray(ds["station_name"].values),
+                   times=pd.DatetimeIndex(ds["time"].values),
+                   sst=np.asarray(ds["sst"].values))
+
+    @property
+    def n_stations(self) -> int:
+        return len(self.ids)
 
 
 def station_pixels(lons, lats, g, water: np.ndarray | None = None):

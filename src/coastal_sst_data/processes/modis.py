@@ -266,12 +266,14 @@ def harmony_variables(variable: str) -> tuple[str, ...]:
 # --------------------------------------------------------------------------- #
 def read_swath(path, variable, quality_min, to_celsius):
     """Read a MODIS L2P granule -> (sst, lat, lon) 2D swath arrays (NaN where bad)."""
-    ds = xr.open_dataset(path, engine="netcdf4")
-    sst = ds[variable].values.squeeze().astype("float32")     # Kelvin
-    qual = ds[QUALITY_VAR].values.squeeze().astype("int16")
-    lat = ds["lat"].values
-    lon = ds["lon"].values
-    ds.close()
+    # Every array is materialised INSIDE the block: `store.open_netcdf` holds the netCDF gate
+    # for its duration, and xarray reads lazily, so a `.values` after the block would go back
+    # to the file unguarded (see store.NETCDF_LOCK for what that costs).
+    with store.open_netcdf(path, engine="netcdf4") as ds:
+        sst = ds[variable].values.squeeze().astype("float32")     # Kelvin
+        qual = ds[QUALITY_VAR].values.squeeze().astype("int16")
+        lat = ds["lat"].values
+        lon = ds["lon"].values
     sst[(qual < quality_min) | ~np.isfinite(sst)] = np.nan
     if to_celsius:
         sst = sst - 273.15

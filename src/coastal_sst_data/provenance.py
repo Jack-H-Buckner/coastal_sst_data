@@ -37,9 +37,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-import xarray as xr
-
-from . import products
+from . import products, store
 
 log = logging.getLogger(__name__)
 
@@ -130,7 +128,7 @@ def access_of(path: Path) -> tuple[str, str]:
     a downstream reader can tell a recorded date from a filesystem guess.
     """
     try:
-        with xr.open_dataset(path) as ds:
+        with store.open_netcdf(path) as ds:
             got = ds.attrs.get("acquired_at")
         if got:
             return str(got), STAMPED
@@ -142,7 +140,7 @@ def access_of(path: Path) -> tuple[str, str]:
 
 def source_of(path: Path) -> str | None:
     try:
-        with xr.open_dataset(path) as ds:
+        with store.open_netcdf(path) as ds:
             return ds.attrs.get("source")
     except Exception:
         return None
