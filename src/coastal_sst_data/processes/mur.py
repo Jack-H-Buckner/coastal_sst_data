@@ -174,7 +174,7 @@ def subset_and_reproject(fobj, variable, bbox_ll, pad, target_crs, transform,
     # `with`, because the window is `.load()`ed and the time read out before we return: the
     # Dataset is finished with at that point, and leaving it open pins the HDF5 handle -- and
     # through it the caller's fsspec object -- for as long as the DataArray is alive.
-    with xr.open_dataset(fobj, engine="h5netcdf", mask_and_scale=True) as ds:
+    with store.open_netcdf(fobj, engine="h5netcdf", mask_and_scale=True) as ds:
         da = ds[variable].isel(time=0)
         da = da.sel(lat=slice(s - pad, n + pad), lon=slice(w - pad, e + pad)).load()
         t = pd.Timestamp(ds["time"].values[0]).tz_localize(None)
@@ -258,7 +258,7 @@ def _dap_axes(base: str, short_name: str) -> tuple[np.ndarray, np.ndarray]:
         if short_name not in _DAP_AXES:
             raw = _dap_get(f"{base}.dap.nc4?dap4.ce={quote('/lat;/lon', safe='')}",
                            f"{short_name} coordinate axes")
-            with xr.open_dataset(io.BytesIO(raw), engine="h5netcdf") as d:
+            with store.open_netcdf(io.BytesIO(raw), engine="h5netcdf") as d:
                 _DAP_AXES[short_name] = (np.asarray(d["lat"].values).copy(),
                                          np.asarray(d["lon"].values).copy())
             log.info("  OPeNDAP: read %s axes (%d lat x %d lon)", short_name,
@@ -304,7 +304,7 @@ def _fetch_opendap(granule, variable, g: AoiGrid, pad, grid_cfg):
 
     # mask_and_scale on the RESPONSE: Hyrax preserves the packing and the CF attributes, so
     # the int16 -> Kelvin conversion is the same arithmetic the streamed path applies.
-    with xr.open_dataset(io.BytesIO(raw), engine="h5netcdf", mask_and_scale=True) as ds:
+    with store.open_netcdf(io.BytesIO(raw), engine="h5netcdf", mask_and_scale=True) as ds:
         da = ds[variable].isel(time=0).load()
         t = pd.Timestamp(ds["time"].values[0]).tz_localize(None)
     return _to_grid(da, g.target_crs, g.transform, g.width, g.height,

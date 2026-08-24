@@ -227,7 +227,7 @@
         "time"
       ],
       "dtype": "float32",
-      "fingerprint": "4716b77fc9403bfcd2844fa7bcbc0469a217819acbe6ffe2e4c416fbf888277c",
+      "fingerprint": "b4fff5c0f6fa4aebbf310cfd6bbbf1cc02b4973e19e8eed6c8833d0bb4557fd7",
       "shape": [
         3
       ],
@@ -244,7 +244,7 @@
         "time"
       ],
       "dtype": "float32",
-      "fingerprint": "887a78d9165cdce9d6f0f563192dad0f69a4bb1e4f6e4cb115be04801188240c",
+      "fingerprint": "3e7c250bc9aaa3466f5ec7b451b3ed171543482b9d225e7fd6a8a39ea1457913",
       "shape": [
         3
       ],
@@ -440,7 +440,7 @@
         "time"
       ],
       "dtype": "float32",
-      "fingerprint": "c6b44048a3999d91dd6bf4a7d3c613ee4f678bb56e556ce5fd60e8fddbaeaee0",
+      "fingerprint": "886ecc4bf2b4bdbb69e4658f70865b75ea35aba5a1a497ea88e5237943d64773",
       "shape": [
         3
       ],
@@ -821,7 +821,7 @@
         "time"
       ],
       "dtype": "float32",
-      "fingerprint": "a2ed5efbf2f82dda3fc690502e47de69f016756415d568cdaaf87c1edd5b476c",
+      "fingerprint": "826fc2d15cd7ac83b7def4f04d3fd95b2eb58516134b60fc7d790f9daf56242e",
       "shape": [
         3
       ],
@@ -1228,14 +1228,14 @@
         "time"
       ],
       "dtype": "float32",
-      "fingerprint": "c0dece22973f112cecce837386218c58750e86a5f99b2f122876684aa01d148f",
+      "fingerprint": "5738b31d01c570e7fe1f96f0f0439ad4393130c312d70a910d79ac08c95be5fa",
       "shape": [
         3
       ],
       "stats": {
         "max": 0.0,
-        "mean": -0.0,
-        "min": -0.0,
+        "mean": 0.0,
+        "min": 0.0,
         "n_finite": 3
       }
     },

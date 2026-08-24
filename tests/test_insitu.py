@@ -473,3 +473,61 @@ def test_insitu_can_be_turned_off(project, g, days):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+# --------------------------------------------------------------------------- #
+# InsituTable: the station table as DATA. It used to be an open Dataset handed back for the
+# caller to read lazily -- the last live netCDF handle outside `store.open_netcdf`, on a
+# thread pool, which is the precondition for the deadlock the gate exists to remove.
+# --------------------------------------------------------------------------- #
+def _written_table(tmp_path):
+    """A real (station, time) file, written by the real writer."""
+    ds = insitu_acquire.build_dataset([
+        {"id": "mooring_a", "title": "Mooring A", "lat": LAT, "lon": LON, "var": "swt",
+         "df": pd.DataFrame({"time": pd.to_datetime(["2026-06-01T18:00Z",
+                                                     "2026-06-01T18:30Z"]).tz_localize(None),
+                             "value": [11.0, 11.2]})},
+        {"id": "mooring_b", "title": "Mooring B", "lat": LAT + 0.01, "lon": LON, "var": "swt",
+         "df": pd.DataFrame({"time": pd.to_datetime(["2026-06-01T18:00Z"]).tz_localize(None),
+                             "value": [12.0]})},
+    ])
+    return ds, insitu_acquire.write_output(ds, tmp_path / "out", AOI)
+
+
+def test_from_dataset_carries_what_the_assembler_reads(tmp_path):
+    """Every field `datacube.build_insitu` touches, and the (station, time) shape."""
+    ds, path = _written_table(tmp_path)
+    with xr.open_dataset(path) as opened:
+        table = insitu.InsituTable.from_dataset(opened)
+
+    assert [str(i) for i in table.ids] == ["mooring_a", "mooring_b"]
+    assert [str(n) for n in table.names] == ["Mooring A", "Mooring B"]
+    assert table.n_stations == 2
+    assert table.sst.shape == (2, len(table.times))
+    np.testing.assert_allclose(table.lat, ds["lat"].values)
+    np.testing.assert_allclose(table.lon, ds["lon"].values)
+    np.testing.assert_allclose(table.sst, ds["sst"].values, equal_nan=True)
+    assert list(table.times) == list(pd.DatetimeIndex(ds["time"].values))
+
+
+def test_the_table_holds_no_handle_on_the_file(tmp_path):
+    """The direct proof, and the whole point of the type: once read, the file is not ours
+    any more. A retained handle is invisible until it deadlocks or segfaults something."""
+    _ds, path = _written_table(tmp_path)
+    with xr.open_dataset(path) as opened:
+        table = insitu.InsituTable.from_dataset(opened)
+
+    path.unlink()                       # would fail on Windows, and prove nothing on POSIX
+    assert not path.exists()
+    # The arrays still answer -- they are memory, not a view onto a file that is now gone.
+    assert table.sst.shape == (2, len(table.times))
+    assert float(np.nanmax(table.sst)) == pytest.approx(12.0)
+
+
+def test_qc_is_deliberately_not_carried(tmp_path):
+    """The writer emits `qc`; nothing reads it. Carrying it would double the table, so its
+    absence is a decision -- and this test is where that decision is recorded."""
+    ds, path = _written_table(tmp_path)
+    assert "qc" in ds, "the writer stopped emitting qc; this test's premise is stale"
+    with xr.open_dataset(path) as opened:
+        table = insitu.InsituTable.from_dataset(opened)
+    assert not hasattr(table, "qc")

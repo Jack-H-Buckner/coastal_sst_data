@@ -404,5 +404,8 @@ def test_a_stray_directory_under_insitu_is_ignored_not_read_as_a_source(tmp_path
         sources = datacube.load_insitu(project.output_dir / "INSITU", AOI)
     assert [s for s, _ in sources] == ["csv"]
     assert "_tmp_scratch" in caplog.text
-    for _, d in sources:
-        d.close()
+    # Plain data, not an open file: nothing to close, and the table carries the stations the
+    # CSV declared (see insitu.InsituTable for why this is not a Dataset any more).
+    (_src, table), = sources
+    assert [str(i) for i in table.ids] == ["mooring_a"]     # 2 ROWS, one platform
+    assert table.sst.shape == (table.n_stations, len(table.times))

@@ -613,3 +613,118 @@ def test_write_output_round_trips_a_mask_through_the_real_writer(tmp_path):
     store.write_output(_mask_ds(), tmp_path, "granule", "netcdf")
     back = xr.open_dataset(tmp_path / "granule.nc")["cloud"].values
     assert sorted(np.unique(np.asarray(back))) == [0, 1]
+
+
+# --------------------------------------------------------------------------- #
+# The netCDF gate. A production run wedged for 36 hours with every worker blocked inside
+# xarray's netCDF lock layer and none of them doing I/O -- the long-standing upstream hang
+# (pydata/xarray#4406). A cycle needs two threads in that layer at once, so every path into it
+# goes through store.NETCDF_LOCK and there is only ever one.
+#
+# These tests pin OUR invariants: the lock is held where it must be, and concurrent callers
+# finish. They cannot reproduce the upstream deadlock, which needed eight workers and hours.
+# --------------------------------------------------------------------------- #
+def _lock_is_held():
+    """True iff THIS thread holds NETCDF_LOCK. An RLock cannot be asked directly, but a
+    non-blocking acquire from another thread fails exactly when someone holds it.
+
+    The probe acquires AND releases inside the helper thread. Releasing an RLock from a
+    thread that does not own it raises, and the lock would then stay held by a thread that
+    has already exited -- which hangs every later test in the file rather than failing one.
+    """
+    got = []
+
+    def probe():
+        acquired = store.NETCDF_LOCK.acquire(blocking=False)
+        if acquired:
+            store.NETCDF_LOCK.release()
+        got.append(acquired)
+
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join()
+    return not got[0]
+
+
+def test_write_netcdf_holds_the_gate(tmp_path, monkeypatch):
+    """`to_netcdf` must never run with the gate open."""
+    seen = []
+    original = xr.Dataset.to_netcdf
+
+    def spy(self, *a, **kw):
+        seen.append(_lock_is_held())
+        return original(self, *a, **kw)
+
+    monkeypatch.setattr(xr.Dataset, "to_netcdf", spy)
+    store.write_netcdf(_ds(), tmp_path / "w.nc")
+    assert seen == [True], "to_netcdf ran without store.NETCDF_LOCK held"
+
+
+def test_open_netcdf_holds_the_gate_for_the_whole_block(tmp_path):
+    """It has to span open->use->close: xarray reads LAZILY, so a lock released at the end
+    of the open call would leave the actual read unguarded."""
+    store.write_netcdf(_ds(), tmp_path / "r.nc")
+    with store.open_netcdf(tmp_path / "r.nc") as ds:
+        assert _lock_is_held(), "the gate was open midway through a read"
+        assert "sst" in ds
+    assert not _lock_is_held(), "the gate stayed shut after the block"
+
+
+def test_open_netcdf_releases_the_gate_when_the_block_raises(tmp_path):
+    """A read that raises must not stall every other worker for the rest of the run."""
+    store.write_netcdf(_ds(), tmp_path / "r.nc")
+    with pytest.raises(ValueError):
+        with store.open_netcdf(tmp_path / "r.nc"):
+            raise ValueError("boom")
+    assert not _lock_is_held()
+
+
+def test_concurrent_readers_and_writers_complete(tmp_path):
+    """The shape of the hang that prompted all this: N workers, one output tree, mixed
+    reads and writes. A regression here does not fail -- it never returns."""
+    import concurrent.futures as cf
+
+    def write(i):
+        return store.write_netcdf(_ds(), tmp_path / f"aoi{i}.nc")
+
+    def read_back(i):
+        path = tmp_path / f"aoi{i}.nc"
+        with store.open_netcdf(path) as ds:
+            return float(ds["sst"].sum())
+
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        written = [pool.submit(write, i) for i in range(24)]
+        done, not_done = cf.wait(written, timeout=120)
+        assert not not_done, "concurrent netCDF writes did not finish -- deadlock is back"
+        mixed = ([pool.submit(read_back, i) for i in range(24)]
+                 + [pool.submit(write, i) for i in range(24, 40)])
+        done, not_done = cf.wait(mixed, timeout=120)
+    assert not not_done, "concurrent netCDF reads+writes did not finish -- deadlock is back"
+    for f in done:
+        f.result()
+
+
+def test_no_unguarded_open_dataset_survives_in_the_package():
+    """THE invariant the gate rests on, checked at the source level because nothing else can.
+
+    One bare `xr.open_dataset` anywhere puts two threads back inside xarray's lock layer, and
+    the failure that follows is a hang hours later on a machine you are not sitting at -- not
+    a test failure. `store.open_netcdf` is the single permitted caller.
+    """
+    import pathlib
+
+    root = pathlib.Path(store.__file__).parent
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            if "xr.open_dataset(" not in line and "xarray.open_dataset(" not in line:
+                continue
+            if line.lstrip().startswith("#") or '"""' in line:
+                continue                       # prose about the rule, not a call
+            if path.name == "store.py":
+                continue                       # the one permitted caller, inside open_netcdf
+            offenders.append(f"{path.relative_to(root)}:{n}: {line.strip()}")
+
+    assert not offenders, (
+        "these bypass store.open_netcdf and can deadlock a threaded run:\n  "
+        + "\n  ".join(offenders))

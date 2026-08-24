@@ -1913,11 +1913,24 @@ def _long_project(tmp_path, n_days=10):
 
 
 def _fingerprint(arr) -> str:
-    """A NaN-aware content hash of an array: value-level, not bit-payload-level.
+    """A NaN-aware, precision-aware content hash of an array: value-level, not bit-level.
 
     NaN positions are hashed separately from the (NaN-zeroed) values, so two arrays that
     agree on which cells are missing and on every finite value fingerprint identically --
     regardless of the particular NaN bit pattern a given code path happened to produce.
+
+    FLOATS ARE QUANTISED FIRST, for the same reason one magnitude up. A golden is compared
+    across machines and library versions, and the last bits of a float are not stable across
+    either. `tide_coops` is the case that taught us: the fixture's tide is a 12 h sinusoid, so
+    its DAILY MEAN is mathematically zero and arrives as a ~2.5e-09 residual whose SIGN
+    depends on the summation order numpy/pandas happened to use. The committed golden held a
+    negative residual, this machine produces a positive one, and the test failed over a
+    difference of 5e-09 in a tide height in metres -- a number no reader would call a change.
+
+    Six decimals is the precision `_stats` already reports, and nothing this suite guards
+    (degC, metres, fractions, counts) has a real regression hiding below it. Zeros are folded
+    onto +0.0 afterwards, because quantising a small negative lands on -0.0, whose sign bit
+    would put the instability straight back.
     """
     b = np.ascontiguousarray(np.asarray(arr))
     if b.dtype.kind == "M":                    # datetime64 -> integer ns
@@ -1929,6 +1942,8 @@ def _fingerprint(arr) -> str:
         nan = np.isnan(b)
         b[nan] = 0.0
         h.update(nan.tobytes())
+        b = np.round(b, 6)
+        b[b == 0.0] = 0.0                      # -0.0 and +0.0 are the same value
     h.update(b.tobytes())
     return h.hexdigest()
 
