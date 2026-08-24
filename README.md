@@ -1051,21 +1051,72 @@ ECOSTRESS provides the core high resolution thermal images used in the analysis.
 Landsat contributes additional high-resolution thermal scenes and the water/cloud masks derived from its surface-reflectance and QA bands.
 
 - **Where it comes from**: the `landsat-c2-l2` (Collection 2, Level-2) collection served by Microsoft Planetary Computer via a STAC search + windowed Cloud-Optimized GeoTIFF reads. Planetary Computer signs asset URLs anonymously, so **no credentials are required**. The module (`landsat_pc.py`) is one interchangeable source behind a common contract; future `landsat_aws` / `landsat_gee` sources honour the same output schema.
-- **What it measures**: Landsat 8/9 surface temperature from the thermal band (`sst`, scaled to K or °C). `water` is derived from NDWI (green vs. NIR surface reflectance) and `cloud` from the `QA_PIXEL` cloud/shadow/dilated bits, optionally buffered by the `ST_CDIST` cloud-distance band. Also emits the derived `valid` layer.
+- **What it measures**: surface temperature from the thermal band (`sst`, scaled to K or °C). `water` is derived from NDWI (green vs. NIR surface reflectance) and `cloud` from the `QA_PIXEL` cloud/shadow/dilated bits, optionally buffered by the `ST_CDIST` cloud-distance band. Also emits the derived `valid` layer.
+
+#### Reaching back before 2013
+
+The default is Landsat 8/9, so the record starts in 2013. **Collection 2 Level-2 surface temperature also exists for Landsat 4/5 (TM) and Landsat 7 (ETM+)**, in the same collection, produced by the same single-channel algorithm with the same scale and offset — only the thermal asset's name differs (`lwir` rather than `lwir11`), which the module already handles. Extending the record is therefore a config change:
+
+```yaml
+products:
+  landsat:
+    platforms: [landsat-5, landsat-7, landsat-8, landsat-9]
+```
+
+| Mission | Sensor | Thermal band | Native GSD | Thermal record |
+|---|---|---|---|---|
+| Landsat 4 | TM | band 6 | 120 m | 1982-08 – 1993-12 |
+| Landsat 5 | TM | band 6 | 120 m | 1984-03 – **2011-11** |
+| Landsat 7 | ETM+ | band 6 | 60 m | 1999-04 – 2024-01 |
+| Landsat 8/9 | TIRS | band 10 | 100 m | 2013-02 – present |
+| Landsat 1–3 | MSS | **none** | — | **no thermal band exists** |
+
+Landsat 1–3 and MSS carry no thermal band and have no Level-2 product, so **the Landsat SST record cannot start before 1982**; naming one of those platforms is refused at config time rather than failing scene by scene. Landsat 4 is in the archive but is not a time series — single-digit scene counts per year even where it is covered at all.
+
+Everything is delivered at 30 m, but the *information* is at the native thermal GSD above, resampled. Land–water mixed pixels therefore extend roughly two native pixels either side of the shoreline — **~240 m for TM**, ~120 m for ETM+, ~200 m for TIRS — and daytime land is much warmer than water, so any shoreline buffer should be sized to the mission, not to 30 m.
+
+**What to expect from a pre-2013 record:**
+
+- **The missions are not cross-calibrated.** Published validation over water puts TM at −0.28 °C and TIRS at +0.65 °C against the same buoys — a **~0.9 °C step at the 2013 boundary**, the same order as several decades of coastal warming, with essentially identical scatter. The cube records which mission produced each day in **`lst_platform`**; fit a per-mission calibration (the `modis_ref` product is the tool, chaining L5→L7 across the 1999–2011 overlap and L7→L8 across 2013–2021) before reading any long-term trend.
+- **Landsat 7 is SLC-off after 2003-05-31.** Diagonal no-data wedges cover ~22% of each scene, absent at nadir and widening toward the edges — so how much you actually get depends on where your AoI falls in the WRS-2 footprint. Gaps are ingested as-is and **never gap-filled**: they are NaN in `lst_sst` *and* in `lst_cloud`, and 0 in `lst_valid`.
+- **Coverage before 1999 is thin and geographically uneven.** Landsat 4/5 had no onboard recorder, so outside a US ground station's line of sight the archive holds only what international stations happened to keep and later repatriate. Effective revisit is 16 days at best (one satellite from 1994–1999), and after cloud rejection a coastal site may see only a handful of usable dates a year. **Census your own AoI with `--dry-run` before committing to a start date.**
+- **TM/ETM+ cloud masking is weaker.** CFMask has no cirrus band before OLI, so more thin cloud survives as "clear". Its published accuracy is also at its worst over water.
+- **Atmospheric correction works harder.** TM/ETM+ band 6 is much wider than TIRS band 10 and straddles more water-vapour absorption, so transmittance over water runs ~0.60–0.70 against ~0.83 for TIRS. Since the atmosphere is the dominant error term, pre-2013 uncertainty is structurally larger in the same scenes.
+- **Other products do not reach this far back.** MUR starts 2002, MODIS 2000, ECOSTRESS 2018. A 1984 start yields a cube whose first ~16 years hold Landsat and little else, and `modis_ref.match_landsat` can match nothing before 2000.
 
 **Project-level options** (`products.landsat`):
 
 - `source`: which Landsat backend to use (default `pc` = Planetary Computer).
 - `collection`: STAC collection (default `landsat-c2-l2`).
 - `stac_url`: STAC API endpoint (default the Planetary Computer catalog).
-- `platforms`: platforms to include (default `landsat-8`, `landsat-9`).
+- `platforms`: missions to include (default `landsat-8`, `landsat-9`; see above to extend back to 1984). Accepts either spelling — `LANDSAT_5` and `landsat-5` are the same thing.
 - `cloud_cover_max`: scene-level cloud-cover cutoff as a fraction 0–1 (default `0.7`). Applied at **search** time, on the STAC `eo:cloud_cover` property — a scene above it is never fetched, however clear it may be over this particular AoI.
 - `masking.ndwi_threshold`: NDWI cutoff for classifying water (default `0.0`). Raise it to demand more water-like pixels, lower it to keep turbid or sun-glinted water.
+- `masking.brightness_max`: green surface reflectance above which a cell is **too bright to be water**, whatever its NDWI (default `0.15`; set `0` to disable). See below.
 - `masking.cloud_buffer_km`: distance to buffer cloud/shadow pixels using `ST_CDIST` (default `1.0`; set `0` to disable).
 
-> **The strictest mask of the three thermal sensors.** Landsat is the only one carrying **both** a water gate and a cloud gate, and the only one that **recomputes water per scene** from that scene's own reflectance rather than reading a water layer the provider shipped. So `landsat_valid` = NDWI water **and** QA-clear **and** ≥ `cloud_buffer_km` from any cloud/shadow — three independent ways for a real observation to be dropped, where ECOSTRESS gates on QC and MODIS arrives already quality-filtered.
+> **Why NDWI needs a brightness gate.** NDWI is a *ratio*, so it is blind to absolute brightness: anything whose green exceeds its NIR passes, however luminous. Cloud usually has green < NIR and fails — but a thick cloud whose green channel **saturates** does not. The reflectance pins at the top of the valid range while NIR is merely high, the ratio goes positive, and a cloud top is admitted as water. Nothing downstream catches it either, because the scenes where this bites are exactly the ones CFMask rated low-confidence.
+>
+> Measured over 9.0M pixels — three AoIs (Tillamook, Grays Harbor, Puget Sound) × three missions (TM, ETM+, OLI-TIRS) — restricted to the pixels `ndwi >= 0` admits:
+>
+> | population | n | green P50 | P95 | P99 |
+> |---|---|---|---|---|
+> | QA says water (real) | 1,419,279 | **0.017** | 0.041 | **0.075** |
+> | QA says cloud (false water) | 1,035,794 | **0.671** | 1.602 | 1.602 |
+>
+> Two populations ~40× apart in median, and **12.6% of everything NDWI admits has green > 1.0** — nonphysical, since reflectance cannot exceed 1. Water is dark in the visible almost by definition; that is the discriminator the ratio throws away.
+>
+> The `0.15` default is deliberately loose — it sits 2× above the P99 of every water pixel measured, keeping **99.91%** of QA-confirmed water (99.13% at `0.08`, 100% at `0.20`). Turbid, sediment-laden estuary water is the point of this project and is brighter than open ocean, so silently dropping real estuary observations is the more expensive error. On a real 15-scene acquisition the gate removed **20.4% of cells previously called water** while costing only **0.3% of valid observations** — most over-bright cells were already excluded by the QA cloud mask, and `lst_sst` was byte-identical throughout.
+>
+> It cannot catch cloud **shadow**, which is dark — that is what the QA shadow bit and `cloud_buffer_km` are for. The two gates are complementary.
+
+> **The strictest mask of the three thermal sensors.** Landsat is the only one carrying **both** a water gate and a cloud gate, and the only one that **recomputes water per scene** from that scene's own reflectance rather than reading a water layer the provider shipped. So `landsat_valid` = NDWI water **and** dark enough to be water **and** QA-clear **and** ≥ `cloud_buffer_km` from any cloud/shadow — four independent ways for a real observation to be dropped, where ECOSTRESS gates on QC and MODIS arrives already quality-filtered.
 >
 > These knobs change **what the values mean**, not how many observations arrive. `landsat_sst` is the **raw** channel: it carries the scene's temperature at every cell the imagery covered, cloudy and land cells included, so a NaN there is scene footprint, never weather. Only `landsat_valid` (and the `_clean` channels built from it) moves when you turn these. A site with *no* Landsat dates is a coverage question — WRS-2 geometry, or the scene never reaching the AoI — and no masking setting will change it.
+
+**Channels emitted**: `lst_sst`, `lst_cloud`, `lst_valid`, `lst_hour`, and — when the granules on disk carry the label — **`lst_platform`**, a 1-D `(time,)` channel giving the mission number of each day's base granule (`4`, `5`, `7`, `8`, `9`; `0` = not recorded, never a mission). It is emitted only when at least one granule records it, so a tree acquired before the label existed omits the channel rather than shipping an all-zero one that would read as "the mission was never identified". A tree that is only partly labelled still emits it for every block, with `0` on the unlabelled days.
+
+> **NaN in `lst_cloud` means *no observation*, not "clear".** A cell outside the scene footprint, or inside a Landsat 7 SLC-off gap, is NaN in both `lst_sst` and `lst_cloud`. Downstream the conservative reading is applied — an unknown cell counts as cloudy for validity, never as an observation.
 
 **Region-level options**: none.
 

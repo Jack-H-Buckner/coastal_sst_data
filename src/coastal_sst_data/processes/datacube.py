@@ -295,18 +295,65 @@ def footprint_available(d: Path, aoi_id, days, H, W, *, cache=None) -> bool:
     return _cached(cache, ("footprint", str(d)), build)
 
 
+def platform_available(d: Path, aoi_id, days, H, W, *, cache=None) -> bool:
+    """Did ANY granule in the WINDOW record a `platform_id`?
+
+    `footprint_available`'s twin, hoisted to the whole window for the SAME reason and it is not
+    a stylistic echo: `<sensor>_platform` is the second channel whose existence depends on file
+    CONTENTS rather than on which files exist. Decided per block it would appear in the blocks
+    holding labelled granules and vanish from the rest, and a cube whose variables disagree on
+    their time length does not fail to write, it fails to READ:
+
+        ValueError: conflicting sizes for dimension 'time'
+
+    Which is exactly what a PARTLY re-acquired Landsat tree looks like -- 2013-onwards granules
+    written before `platform_id` existed, pre-2013 ones written after -- so this is the ordinary
+    case for the change that introduced it, not a corner.
+
+    An ATTR, so no shape check of its own; the `sst` guard is kept so this agrees with the
+    loader about which granules count at all. Early-exits on the first hit.
+    """
+    def build() -> bool:
+        want = {naming.day_stamp(dd) for dd in days}
+        for day, granules in scene_index(d, aoi_id, cache=cache).items():
+            if day not in want:
+                continue
+            for _dt, f in granules:
+                with store.open_netcdf(f) as raw:
+                    ds = raw.isel(time=0) if "time" in raw.dims else raw
+                    if "sst" not in ds or ds["sst"].shape != (H, W):
+                        continue
+                    try:
+                        if int(raw.attrs.get("platform_id", 0) or 0):
+                            return True
+                    except (TypeError, ValueError):
+                        continue
+        return False
+
+    return _cached(cache, ("platform", str(d)), build)
+
+
 def _read_granule(f: Path, H, W, *, water_is_land, use_cloud, qset, trust_valid, read_fp):
-    """One granule -> (sst, cloud, valid, footprint|None), or None if it is not on this grid.
+    """One granule -> (sst, cloud, valid, footprint|None, platform_id), or None if it is not on
+    this grid.
 
     The validity rules `load_clearest_overpass` documents, applied to a single file. Split out
     because that function now has two ways to combine a day's granules (keep the clearest, or
     mosaic them) and only one way to READ one -- the guards and the mask algebra are identical
     either way, and duplicating them is how the two regimes would drift apart.
+
+    `platform_id` is a GLOBAL ATTR, not a layer -- it describes the whole granule, so it costs
+    nothing to read and needs no shape check. 0 means the granule does not carry one: either the
+    sensor never writes it, or the file predates `landsat_pc` writing it. Never a mission.
     """
     with store.open_netcdf(f) as raw:
         ds = raw.isel(time=0) if "time" in raw.dims else raw
         if "sst" not in ds or ds["sst"].shape != (H, W):
             return None
+        try:
+            pid = int(raw.attrs.get("platform_id", 0) or 0)
+        except (TypeError, ValueError):       # a hand-edited or malformed attr -> "not recorded"
+            pid = 0
         s = ds["sst"].values.astype("float32")
         c = (ds["cloud"].values.astype("float32")
              if "cloud" in ds and ds["cloud"].shape == (H, W) else np.zeros((H, W), "float32"))
@@ -331,7 +378,7 @@ def _read_granule(f: Path, H, W, *, water_is_land, use_cloud, qset, trust_valid,
                 fin = np.isfinite(q)
                 mqa[fin] = q[fin].astype("int64") & 0b11   # mandatory-QA bits 0-1
                 v &= np.isin(mqa, qset)
-    return s, c, v, fp
+    return s, c, v, fp, pid
 
 
 def multi_granule_days(d: Path, aoi_id, days, *, cache=None) -> tuple[int, int]:
@@ -477,7 +524,7 @@ def resolve_water_polarity(d: Path, aoi_id, days, H, W, *, declared: bool,
 def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                            use_cloud=True, qc_levels=None, trust_valid=False,
                            read_footprint=False, footprint_present=None, mosaic=False,
-                           cache=None):
+                           platform_present=None, cache=None):
     """Per-overpass sensors (ECOSTRESS/Landsat/MODIS): one scene-set per day, clearest first.
 
     Two regimes for a day holding MORE than one granule, chosen per sensor by
@@ -496,7 +543,14 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
           - use_cloud gates on the binary cloud layer (Landsat: reliable).
           - qc_levels (e.g. {0,1}) gates on QC mandatory-QA bits 0-1 instead of
             cloud (ECOSTRESS: cloud over-masks cold water, so gate on QC).
-    Returns (sst, cloud, valid, hour, times, footprint).
+    Returns (sst, cloud, valid, hour, times, footprint, platform).
+    `platform` is the BASE granule's `platform_id` per day -- 1-D `(time,)`, like `hour`, and
+    chosen by exactly the same rule, so a mosaicked day reports the base granule's mission
+    alongside the base granule's instant. None when NO granule on disk carried the attr, on the
+    same reasoning as `footprint`: its absence is a fact about the files (a sensor that does not
+    write one, or a tree acquired before it did), not a failure, and collapsing that into the
+    value lets the caller emit the channel or not with a plain `is not None` rather than shipping
+    an all-zero array that reads as "the mission was unknown".
     `times` is the BASE scene's datetime per day (None where the sensor had no scene), so
     the tide and the met snapshot can be matched to that exact scene rather than to the day.
     MOSAICKING DOES NOT CHANGE IT: a merged day still reports the base granule's instant, and
@@ -553,6 +607,13 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
     hour = np.full(len(days), np.nan, dtype="float32")
     times: list = [None] * len(days)
     footprint = None
+    # int8 (T,) -- 0 = "not recorded", the same reserved code the granule attr uses. Allocated
+    # up front rather than lazily like `footprint`, because it is one byte per DAY, not per cell.
+    platform = np.zeros(len(days), dtype="int8")
+    # `platform_present` is `platform_available`'s whole-window answer, so every time block emits
+    # the same channel set. None keeps the self-contained behaviour -- decide from the granules
+    # actually read -- for a caller holding one window, exactly as `footprint_present` does.
+    saw_platform = bool(platform_present)
     # Per-cell provenance for the mosaic: the valid-pixel count of the granule each cell's
     # values came from, or -1 for a cell no granule has validly claimed yet. This is what lets
     # a ranked fill run in ONE arrival-ordered pass -- see the merge below. Allocated lazily,
@@ -595,9 +656,11 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                                 qset=qset, trust_valid=trust_valid, read_fp=read_fp)
             if got is None:
                 continue
-            s, c, v, fp = got
+            s, c, v, fp, pid = got
             if fp is not None:
                 saw_footprint = True
+            if pid:
+                saw_platform = True
 
             vc = int(v.sum())
             granules_read += 1
@@ -634,20 +697,33 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
                 # sst/cloud/valid are written under ONE mask from ONE granule, so a filled
                 # cell's temperature, cloud flag and validity all describe the same overpass.
                 np.copyto(sst[i], s, where=take)
-                np.copyto(cloud[i], np.nan_to_num(c, nan=0.0), where=take)
+                np.copyto(cloud[i], c, where=take)
                 np.copyto(valid[i], v, where=take)
                 np.copyto(score, np.int32(vc), where=take & v)   # unclaimed cells stay at -1
             if new_base:
-                best = (vc, s, c, v, fp, dt)
+                best = (vc, s, c, v, fp, dt, pid)
         if best is None:
             continue                                       # every granule failed the shape check
-        _, s, c, v, fp, dt = best
+        _, s, c, v, fp, dt, pid = best
         if not mosaic_day:
             sst[i] = s
-            cloud[i] = np.nan_to_num(c, nan=0.0)
+            # NaN is KEPT, here and in the mosaic above. It used to be flattened to 0, which put
+            # "clear sky" into every cell the granule had no observation for -- and `cloud` is
+            # already NaN for a day with no scene at all (`_empty3d`), so 0 was claiming MORE
+            # than the no-scene case does about a cell that is equally unobserved.
+            #
+            # Landsat 7 is what makes this matter. Post-2003 SLC-off scenes carry diagonal
+            # no-data wedges over ~22% of the scene, and `landsat_pc.scene_to_dataset` now marks
+            # them NaN (QA_PIXEL bit 0 = fill); flattening here would put them straight back to
+            # "clear". `valid` is unaffected either way -- `_read_granule` reads a NaN cloud cell
+            # as CLOUDY (`nan_to_num(c, nan=1.0)`), which is the conservative direction and
+            # stays that way -- and the one consumer of the raw raster, `filter_clouds` under
+            # `use_cloud_raster`, already does its own `nan_to_num(cloud, nan=0.0)`.
+            cloud[i] = c
             valid[i] = v.astype("uint8")
         hour[i] = dt.hour + dt.minute / 60.0
         times[i] = dt
+        platform[i] = pid
         scene_days += 1
         if fp is None:
             missing_fp += 1
@@ -676,7 +752,7 @@ def load_clearest_overpass(d: Path, aoi_id, days, H, W, *, water_is_land=False,
         # "off-swath" unless we say so here. Re-acquire with --overwrite to fill them.
         log.warning("  %s: %d of %d scene-days have no footprint_id layer; those days are "
                     "all -1 in the footprint channel", d.name, missing_fp, scene_days)
-    return sst, cloud, valid, hour, times, footprint
+    return sst, cloud, valid, hour, times, footprint, (platform if saw_platform else None)
 
 
 def tide_daily_lut(d: Path, aoi_id, *, cache=None) -> tuple[dict, dict]:
@@ -1225,6 +1301,12 @@ def _load_sensor(ctx: AssemblyContext, sp, adir):
         footprint_present=(footprint_available(adir, ctx.aid, ctx.all_days, ctx.H, ctx.W,
                                                cache=ctx.cache)
                            if sp.has_footprint else False),
+        # Same whole-axis rule, same reason -- see platform_available. Asked of EVERY sensor
+        # rather than gated on a spec flag: the attr is written by the acquisition module, so
+        # "does this tree carry one" is a question about the files, and a sensor that never
+        # writes one answers False on its first granule at the cost of one open.
+        platform_present=platform_available(adir, ctx.aid, ctx.all_days, ctx.H, ctx.W,
+                                            cache=ctx.cache),
         mosaic=sp.mosaic_same_day, cache=ctx.cache) + (pol_attrs,)
 
 
@@ -1235,6 +1317,21 @@ _FOOTPRINT_ATTRS = dict(
     long_name="native sensor pixel index this grid cell was resampled from; -1 = none",
     comment="ids identify a pixel WITHIN one day's chosen scene only -- they restart at 0 "
             "for every scene and are NOT comparable across days")
+
+# Which spacecraft produced each day's observation. Landsat is the reason: a record reaching
+# back to 1984 is THREE sensors -- TM, ETM+, OLI-TIRS -- merged into one channel set, and
+# merging is right (they share one ~10:00 descending orbit) but leaves a mission boundary
+# looking exactly like a trend. The mapping is spelled out on the variable because the codes
+# are useless without it, and because this is the only place a user reading the cube will see
+# that the channel is per-DAY and describes the base granule alone on a mosaicked day.
+_PLATFORM_ATTRS = dict(
+    long_name="Landsat mission number of the day's base granule (0 = not recorded)",
+    comment="4=landsat-4 (TM), 5=landsat-5 (TM), 7=landsat-7 (ETM+), 8=landsat-8 (OLI-TIRS), "
+            "9=landsat-9 (OLI-TIRS); 0 means the granule carried no platform_id. Calibration, "
+            "cloud masking and gap structure differ by mission -- notably landsat-7 after "
+            "2003-05-31, whose SLC-off scenes lose ~22% of their pixels -- so filter on this "
+            "before reading any long-term trend. On a mosaicked day it names the BASE granule, "
+            "like `_hour`.")
 
 
 # Said on the channels themselves, because it is the only place a user reading the cube would
@@ -1252,7 +1349,7 @@ def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None
     """A single-collection sensor (Landsat, MODIS): one flat `<DIR>/aligned/<aoi>` tree, one
     channel-set under the bare prefix, one entry in `sensor_times`."""
     sp = s.sensor
-    sst, cloud, valid, hour, times, footprint, pol = _load_sensor(
+    sst, cloud, valid, hour, times, footprint, platform, pol = _load_sensor(
         ctx, sp, ctx.adir(s.product.value))
     pre = sp.prefix
     mos = _MOSAIC_ATTRS if sp.mosaic_same_day else {}
@@ -1262,6 +1359,11 @@ def _contribute_flat_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> None
     # `pol` on `_valid` only: the polarity is what THIS channel means. See _polarity_attrs.
     ctx.emit(f"{pre}_valid", T3, valid, **mos, **pol)
     ctx.emit(f"{pre}_hour", ("time",), hour)
+    # Only when a granule actually recorded one -- same rule and same reason as _footprint_id
+    # below. An all-zero channel would read as "the mission was never identified" where the
+    # truth is "this tree was written before the label existed".
+    if platform is not None:
+        ctx.emit(f"{pre}_platform", ("time",), platform, **_PLATFORM_ATTRS)
     # Only when a granule actually carried the layer (it is optional at acquisition): an
     # all -1 channel would read as "nothing was ever in swath" rather than "never recorded".
     if footprint is not None:
@@ -1315,7 +1417,7 @@ def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> N
 
     per_tag_times: dict[str, list] = {}
     for tag in ordered:
-        sst, cloud, valid, hour, times, footprint, pol = _load_sensor(
+        sst, cloud, valid, hour, times, footprint, platform, pol = _load_sensor(
             ctx, sp, ctx.adir(s.product.value, tag))
         pre = sp.prefix
         mos = _MOSAIC_ATTRS if sp.mosaic_same_day else {}
@@ -1325,6 +1427,8 @@ def _contribute_stacked_sensor(ctx: AssemblyContext, s, sensor_times: dict) -> N
         # Per TAG: each version tree is checked on its own, and may legitimately differ.
         ctx.emit(f"{pre}_valid_{tag}", T3, valid, **mos, **pol)
         ctx.emit(f"{pre}_hour_{tag}", ("time",), hour)
+        if platform is not None:
+            ctx.emit(f"{pre}_platform_{tag}", ("time",), platform, **_PLATFORM_ATTRS)
         if footprint is not None:
             ctx.emit(f"{pre}_footprint_id_{tag}", T3, footprint, **_FOOTPRINT_ATTRS)
         per_tag_times[tag] = times

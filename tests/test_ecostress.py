@@ -783,7 +783,7 @@ def test_acquisition_and_assembler_agree_about_which_cells_are_water(tmp_path, a
     out = tmp_path / "aligned.nc"
     ds.to_netcdf(out)
     sensor = products.spec(DataProduct.ecostress).sensor
-    s, c, asm, fp = datacube._read_granule(
+    s, c, asm, fp, _pid = datacube._read_granule(
         out, aoi_grid.height, aoi_grid.width,
         water_is_land=sensor.water_is_land, use_cloud=sensor.use_cloud,
         qset=list(sensor.qc_levels) if sensor.qc_levels else None,
