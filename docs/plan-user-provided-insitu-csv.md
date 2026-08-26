@@ -2,13 +2,21 @@
 
 > **Status.** The CSV loading half of issue #47 **SHIPPED in 0.2.0**: `insitu` is a stacked-DATA
 > product, `insitu_csv` reads long-format files, and `insitu_acquire` fans out over the sources.
-> What remains is §1 below — the **moving-platform data model**, which was deliberately deferred
-> because it changes the shared in-situ contract and the cube schema.
 >
-> Until it lands, a platform whose observations stray beyond `max_position_drift_m` (default: one
-> grid cell) is **dropped and reported** by `insitu_acquire.split_moving_platforms` rather than
-> collapsed onto its median position. Sections 2–7 below are DONE and kept only as the record of
-> why the stacking is shaped the way it is.
+> **§1 is SUPERSEDED.** Moving platforms shipped in 2026-08 — but as a SEPARATE PRODUCT
+> (`insitu_mobile`), not as the shared data-model change §1 designs. See
+> [plan-insitu-mobile-platforms.md](plan-insitu-mobile-platforms.md) for what was actually built
+> and why the shape changed; §1 is kept below because its analysis of what breaks is accurate and
+> its two new primitives (`observation_pixels`, `nearest_index`) were implemented as written.
+>
+> The short version: §1 makes `lat`/`lon` `(station, time)` everywhere and `insitu_station`
+> `(time, y, x)`. That is a real breaking change — `mask: insitu_station` in `extract` requires a
+> static channel — and it carries a silent hazard §1 did not see: `append_zarr(mode="a-")` leaves
+> static `(y,x)` channels alone after the first block, so a time-varying station map written as
+> `(y,x)` would freeze at block 0 with no error at all. Two products sidestep both, and the fixed
+> path did not change by a byte.
+>
+> Sections 2–7 are DONE and kept as the record of why the stacking is shaped the way it is.
 
 Issue #47 — "add a method to load user-provided in-situ data into the data cubes".
 

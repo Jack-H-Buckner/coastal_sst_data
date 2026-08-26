@@ -220,15 +220,46 @@ products:
     # stations: {hood_canal: "9445133"}
   insitu:                    # in-situ buoys/gauges -- the cube's ground truth
     # STACKED: every source listed is acquired into its own INSITU/<source>/ tree and the
-    # cube merges their platforms into ONE station table. `ioos` discovers public buoys;
-    # `csv` reads your own files. List both to get both.
-    sources: [ioos]          # ioos (IOOS Sensors ERDDAP: NDBC + CO-OPS + CDIP + regionals) | csv
+    # cube merges their platforms into ONE station table. `ioos` discovers public buoys in
+    # NORTH AMERICA; `marineinsitu` discovers them ANYWHERE; `csv` reads your own files.
+    # List as many as you want.
+    sources: [ioos]          # ioos | marineinsitu | csv
     variables: [sea_water_temperature]   # falls back to sea_surface_temperature per station
     qc_flags: [1, 2]         # QARTOD: 1 pass, 2 not-evaluated (3/4/9 dropped)
     max_sensor_depth_m: 5    # ignore deep sensors on profiling moorings (csv: your `z` column;
                              # |z| is compared, so either sign convention works)
     # stations: [noaa_nos_co_ops_9437540]   # optional allow-list (else auto-discovered)
     # exclude_stations: []
+    # --- the `marineinsitu` source: Copernicus Marine In-Situ TAC --------------------
+    # The GLOBAL counterpart to `ioos` -- Argo, OceanSITES, GOSUD, the GTS and the EuroGOOS
+    # national coastal networks, harmonised. NEEDS A CREDENTIAL: a free Copernicus Marine
+    # account, the same one `cmems` uses, so one ~/.netrc entry
+    # (machine auth.marine.copernicus.eu) covers both.
+    #
+    # WHAT TO EXPECT. Only FIXED platforms can be placed by this cube, and under 5% of the
+    # archive is fixed -- drifters and profiling floats alone are ~70%. Measured over one AoI:
+    # 421 files carrying temperature, of which 2 were moorings. An AoI can legitimately return
+    # NOTHING (all of Tasmania does), and that is a fact about the ocean, not a failure. Run
+    # with --dry-run first: it lists what was found before a byte is downloaded.
+    #
+    # These are BULK temperatures at a stated depth (~1 m on a moored buoy), never skin --
+    # expect a skin-bulk difference of ~0.1-0.5 K plus diurnal warming in the top metre when
+    # validating a satellite retrieval against them.
+    #
+    # dataset_id: glo         # glo (global, default) | arc | bal | blk | ibi | med | nws,
+    #                         #   or a full `cmems_obs-ins_*` dataset id. PREFER THE REGIONAL
+    #                         #   product where one covers your AoI: its production unit
+    #                         #   ingests national networks the global stream never sees
+    #                         #   (measured: 11 fixed platforms off Galicia via `ibi`, back to
+    #                         #   1998, against 1-4 in a comparable US box via `glo`).
+    # dataset_part: history   # history (the full archive, default) | monthly | latest.
+    #                         #   `monthly`/`latest` BEGIN 2020-01-01; only `history` reaches
+    #                         #   the multi-decade record (1987 at one AoI measured).
+    # platform_types: [MO, TG]  # MO moorings, TG tide gauges -- the platforms that hold still.
+    #                         #   Adding mobile types (GL gliders, TS ship tracks, DB drifters)
+    #                         #   fetches them, but the shared drift guard then drops them:
+    #                         #   the cube places one position per station for the whole
+    #                         #   window, so a track cannot be represented yet.
     # --- the `csv` source: your own thermometers, in long format ----------------------
     # One row per observation. Rows are GROUPED BY station_id, so one file may hold any
     # number of platforms -- each becomes its own station, in its own pixel.
@@ -246,6 +277,35 @@ products:
     # units: degC             # degC | degF | K -- converted to degC
     # qc_pass_values: [1, 2]  # values of the qc column to keep; omit to keep every row
     # default_station_id: null  # id for a single-platform file with no station_id column
+  # insitu_mobile:           # OPTIONAL: gliders, ship transects, drifters
+  #   # The counterpart to `insitu`, for platforms that MOVE. `insitu` stores one position per
+  #   # station for the whole window -- which is what a fixed station IS -- so a track needs a
+  #   # different shape of file, and gets its own tree under INSITU_MOBILE/.
+  #   #
+  #   # THE CUBE MERGES THEM: both feed the one `insitu_sst` channel set, because ground truth
+  #   # is ground truth. A transect paints the pixels it crossed on the day it crossed them
+  #   # (measured: 96 pixels on one real day off Hobart), and `insitu_hour` records when each
+  #   # cell was observed. `insitu_station` stays fixed-only -- a track has no static pixel.
+  #   #
+  #   # `insitu_sst` takes EVERY observation a track made that day, not only those near the
+  #   # daily reference time: a transect is a spatial sample of its day, and gating it would
+  #   # discard most of it. The `<sensor>_insitu_sst` MATCHUP channels stay strictly gated
+  #   # either way -- a glider that passed at 03:00 is not truth for a satellite that flew at
+  #   # 18:30, and admitting it is how a validation set acquires a bias.
+  #   sources: [marineinsitu]   # marineinsitu | ioos | csv. Nothing by default.
+  #   # `marineinsitu` reaches tracks through a DIFFERENT service than the fixed product, and
+  #   # so has a different reach: 2020-onwards, where fixed goes back to 1987. An earlier
+  #   # start date is clamped with a log line, not an error. (The fixed product's route lists
+  #   # a platform's whole-life file, which for a drifter is an ocean of data to find the hours
+  #   # it spent in your AoI -- measured at 348 MB to yield 4 in-AoI observations.)
+  #   dataset_id: glo
+  #   max_sensor_depth_m: 5
+  #   qc_flags: [1, 2]
+  #   # platform_types: []      # empty -> everything that is not a fixed class (MO/TG)
+  #   # min_position_drift_m: null   # how far a platform must move to belong here (default:
+  #                                  #   one grid cell -- the exact complement of `insitu`'s
+  #                                  #   max_position_drift_m, so the two products partition
+  #                                  #   platforms with no gap and no overlap)
   landcover:
     source: esa               # esa (ESA WorldCover via Planetary Computer) | gee (future)
     year: 2021                # WorldCover v200 (2021); 2020 -> v100

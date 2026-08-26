@@ -894,6 +894,37 @@ def load_insitu(base: Path, aoi_id) -> list[tuple[str, insitu.InsituTable]]:
     return out
 
 
+def load_tracks(base: Path, aoi_id) -> list[tuple[str, "insitu.TrackTable"]]:
+    """Every MOVING-platform source's observation table -> [(source, TrackTable), ...].
+
+    `load_insitu`'s sibling for `INSITU_MOBILE/`, and the same rules apply: one tree per
+    source, only a directory that actually holds this AoI's file counts as one, and each file
+    is read inside ONE gated block so what comes back owns no handle.
+
+    No legacy layout to honour -- this product has never had one.
+    """
+    def _read(path: Path) -> "insitu.TrackTable":
+        with store.open_netcdf(path) as ds:
+            return insitu.TrackTable.from_dataset(ds)
+
+    out: list[tuple[str, "insitu.TrackTable"]] = []
+    if not base.exists():
+        return out
+    for d in sorted(p for p in base.iterdir() if p.is_dir()):
+        f = d / "aligned" / aoi_id / f"{aoi_id}_insitu.nc"
+        if not f.exists():
+            log.warning("  INSITU_MOBILE/%s holds no %s_insitu.nc; not read as a source",
+                        d.name, aoi_id)
+            continue
+        out.append((d.name, _read(f)))
+    return out
+
+
+def track_sources(base: Path, aoi_id, *, cache=None) -> list[tuple[str, "insitu.TrackTable"]]:
+    """`load_tracks`, cached per tree -- same reasoning as `insitu_sources`."""
+    return _cached(cache, ("tracks", str(base)), lambda: load_tracks(base, aoi_id))
+
+
 def insitu_sources(base: Path, aoi_id, *, cache=None) -> list[tuple[str, insitu.InsituTable]]:
     """`load_insitu`, cached per tree.
 
@@ -918,8 +949,97 @@ def close_cache(cache) -> None:
     cache.clear()
 
 
+def _new_cell_acc(days, targets, dts) -> dict:
+    """One station cell's accumulators. `hour_*` back `insitu_hour`, which only ships when a
+    moving platform is present -- see `_contribute_insitu`."""
+    return {
+        "sums": {k: np.zeros(len(days), dtype="float64") for k in targets},
+        "dt_sums": {k: np.zeros(len(days), dtype="float64") for k in dts},
+        "hits": {k: np.zeros(len(days), dtype="int32") for k in targets},
+        "hour_sums": np.zeros(len(days), dtype="float64"),
+        "hour_hits": np.zeros(len(days), dtype="int32"),
+    }
+
+
+def _accumulate_track(trk, rows_o, cols_o, inside_o, days, targets, dts, cells, counts,
+                      max_dt_min) -> int:
+    """Fold one source's track observations into `build_insitu`'s per-cell accumulator.
+
+    THE MATCHUP RULE IS UNCHANGED, and that is the point. An observation contributes to a
+    (day, target) only if it is the nearest one within `max_dt_min` -- so a glider that crossed
+    at 03:00 contributes to the daily reference-time channel if that is close enough, and
+    contributes NOTHING to a sensor that flew at 18:30. A track observation fifteen hours from
+    an overpass is not a matchup, and the tolerance is what keeps a validation set honest.
+
+    Per TARGET, the winner is chosen among the observations in that target's own pixel -- not
+    the nearest observation anywhere. Choosing globally and then placing it would let one
+    pixel's value be decided by an observation taken kilometres away.
+
+    Returns how many observations were placed, for the log.
+    """
+    if not len(days):
+        return 0
+    times = pd.DatetimeIndex(trk.times)
+    keep = inside_o & np.isfinite(trk.sst)
+    if not keep.any():
+        return 0
+
+    # THE DAY an observation was recorded is what bounds it, and it has to: `insitu_sst` takes
+    # every track observation rather than only those near the reference instant (see below), so
+    # without a day bound the nearest-to-reference search would happily reach across weeks and
+    # paint a March transect onto a day in April.
+    day_of = pd.DatetimeIndex(times).normalize()
+    day_idx = pd.DatetimeIndex(days).normalize().get_indexer(day_of)   # -1 = not in this block
+
+    # Group by (day, cell), once. A track visits few cells per day, so this stays small -- the
+    # same sparsity the `cells` accumulator itself exploits.
+    groups: dict[tuple[int, int, int], list[int]] = {}
+    for k in np.flatnonzero(keep).tolist():
+        i = int(day_idx[k])
+        if i < 0:
+            continue
+        groups.setdefault((i, int(rows_o[k]), int(cols_o[k])), []).append(k)
+
+    placed = 0
+    for (i, r, c), ks in groups.items():
+        idx = np.asarray(ks)
+        t_cell, v_cell = times[idx], trk.sst[idx]
+        acc = cells.setdefault((r, c), _new_cell_acc(days, targets, dts))
+
+        # `insitu_sst`: EVERY observation counts, gated by DAY rather than by the reference
+        # instant. A transect is a spatial sample of its day -- discarding the 95% of it that
+        # was not taken within an hour of 10:30 would throw away the thing that makes a ship
+        # track worth having. Measured on one real day: gating leaves 1 pixel where the whole
+        # transect fills 96. Where a track revisits a cell, the observation NEAREST the
+        # reference time wins it, so the value stays as contemporaneous with the met channels
+        # as that cell allows, and `insitu_hour` records when it actually was.
+        j, _ = insitu.nearest_index(t_cell, v_cell, targets["insitu"][i], max_dt_min=np.inf)
+        if j is not None:
+            acc["sums"]["insitu"][i] += float(v_cell[j])
+            acc["hits"]["insitu"][i] += 1
+            t = pd.Timestamp(t_cell[j])
+            acc["hour_sums"][i] += t.hour + t.minute / 60.0
+            acc["hour_hits"][i] += 1
+            counts[i, r, c] += 1
+            placed += 1
+
+        # The MATCHUP channels stay strictly gated, and that is not negotiable: a glider that
+        # passed at 03:00 is not ground truth for a satellite that flew at 18:30, and admitting
+        # it is how a validation set quietly acquires a bias.
+        for key, tgt in targets.items():
+            if key == "insitu":
+                continue
+            j, dt = insitu.nearest_index(t_cell, v_cell, tgt[i], max_dt_min)
+            if j is None:
+                continue
+            acc["sums"][key][i] += float(v_cell[j])
+            acc["hits"][key][i] += 1
+            acc["dt_sums"][key][i] += dt
+    return placed
+
+
 def build_insitu(sources: list[tuple[str, insitu.InsituTable]], g: AoiGrid, days,
-                 targets: dict, max_dt_min, *, cache=None):
+                 targets: dict, max_dt_min, *, tracks=None, cache=None):
     """In-situ channels: the station's value at each target time, in the station's pixel.
 
     `targets` maps a channel prefix to one target datetime per day -- 'insitu' (the daily
@@ -947,6 +1067,7 @@ def build_insitu(sources: list[tuple[str, insitu.InsituTable]], g: AoiGrid, days
     chans = {k: _empty3d(days, H, W) for k in targets}
     dts = {k: _empty3d(days, H, W) for k in targets if k != "insitu"}
     counts = np.zeros((len(days), H, W), dtype="float32")   # stations sharing a cell
+    hours = _empty3d(days, H, W)                            # when `insitu_sst` was observed
     station_map = np.zeros((H, W), dtype="uint16")          # 0 = no station
     table = []
     # Sums + contributor counts, so N co-located stations give their true MEAN. A running
@@ -993,21 +1114,53 @@ def build_insitu(sources: list[tuple[str, insitu.InsituTable]], g: AoiGrid, days
                           "row": r, "col": c})
             station_map[r, c] = len(table)
 
-            acc = cells.setdefault((r, c), {
-                "sums": {k: np.zeros(len(days), dtype="float64") for k in targets},
-                "dt_sums": {k: np.zeros(len(days), dtype="float64") for k in dts},
-                "hits": {k: np.zeros(len(days), dtype="int32") for k in targets},
-            })
+            acc = cells.setdefault((r, c), _new_cell_acc(days, targets, dts))
             for i in range(len(days)):
                 for key, tgt in targets.items():
-                    v, dt = insitu.value_at(times, sst[s], tgt[i], max_dt_min)
-                    if not np.isfinite(v):
+                    k, dt = insitu.nearest_index(times, sst[s], tgt[i], max_dt_min)
+                    if k is None:
                         continue
-                    acc["sums"][key][i] += v
+                    acc["sums"][key][i] += float(sst[s][k])
                     acc["hits"][key][i] += 1
                     if key in acc["dt_sums"]:
                         acc["dt_sums"][key][i] += dt
+                    if key == "insitu":
+                        # Backs `insitu_hour`, which only ships alongside a moving platform --
+                        # but recording it here too keeps that channel meaning ONE thing
+                        # ("when the value in this cell was observed") rather than being NaN
+                        # over buoys and finite over tracks.
+                        t = pd.Timestamp(times[k])
+                        acc["hour_sums"][i] += t.hour + t.minute / 60.0
+                        acc["hour_hits"][i] += 1
                 counts[i, r, c] += 1
+
+    # --- MOVING PLATFORMS ---------------------------------------------------------------- #
+    # The same accumulator, keyed by the same (row, col), so a track and a buoy sharing a cell
+    # average together exactly as two buoys already do. What differs is only WHICH cell each
+    # observation goes to -- for a track that is a property of the observation, not the
+    # platform, so the pixel lookup moves inside the per-observation loop.
+    #
+    # NOT added to `station_map`: that channel is a static (y,x) index into the station table,
+    # and a track has no static pixel. Keeping it fixed-only is what makes this whole feature
+    # additive rather than a schema break -- see the `insitu_mobile` ProductSpec.
+    for src, trk in (tracks or []):
+        if trk.n_obs == 0:
+            continue
+        # One vectorized transform for the whole track, however long. `station_pixels` would
+        # have been a Python loop over every observation.
+        rows_o, cols_o, inside_o = insitu.observation_pixels(trk.lon, trk.lat, g)
+        if not inside_o.any():
+            log.warning("  in-situ track source %s: no observation falls inside the AoI grid",
+                        src)
+            continue
+        if not inside_o.all():
+            # Per OBSERVATION, not per platform: a track legitimately leaves and re-enters.
+            log.info("  %s: %d of %d track observation(s) fall outside the AoI grid",
+                     src, int((~inside_o).sum()), int(inside_o.size))
+        n_placed = _accumulate_track(trk, rows_o, cols_o, inside_o, days, targets, dts,
+                                     cells, counts, max_dt_min)
+        log.info("  in-situ tracks [%s]: %d observation(s) placed across %d platform(s)",
+                 src, n_placed, len(np.unique(trk.platform)))
 
     # Densify, one station cell at a time. The dtypes going into `np.divide` are the ones the
     # dense form used (float64 sums / int32 hits -> float32 out, casting="unsafe"): the ufunc
@@ -1025,6 +1178,10 @@ def build_insitu(sources: list[tuple[str, insitu.InsituTable]], g: AoiGrid, days
                 dcol = np.full(len(days), np.nan, dtype="float32")
                 np.divide(acc["dt_sums"][key], hit, out=dcol, where=got, casting="unsafe")
                 dts[key][:, r, c] = dcol
+        hh = acc["hour_hits"]
+        hcol = np.full(len(days), np.nan, dtype="float32")
+        np.divide(acc["hour_sums"], hh, out=hcol, where=hh > 0, casting="unsafe")
+        hours[:, r, c] = hcol
 
     out = {}
     for key in targets:
@@ -1033,6 +1190,14 @@ def build_insitu(sources: list[tuple[str, insitu.InsituTable]], g: AoiGrid, days
         if key in dts:
             out[f"{key}_insitu_dt_min"] = (("time", "y", "x"), dts[key])
     out["insitu_n"] = (("time", "y", "x"), counts)
+    # Emitted ONLY when a moving platform is present. For a fixed-station cube every
+    # `insitu_sst` value is within `max_dt_min` of the reference time by construction, so the
+    # channel would say nothing the reference time does not -- and adding it unconditionally
+    # would change a fixed-only cube, which this whole design exists not to do. Presence of a
+    # track is a property of the TREE, identical in every time block, so the channel set stays
+    # block-invariant either way (see `_check_channel_set`).
+    if tracks:
+        out["insitu_hour"] = (("time", "y", "x"), hours)
     return out, table, station_map
 
 
@@ -1603,13 +1768,20 @@ def _contribute_insitu(ctx: AssemblyContext) -> None:
         return
     sources = insitu_sources(ctx.eff["aligned_root"] / PRODUCT_DIRS["insitu"], ctx.aid,
                              cache=ctx.cache)
-    if not sources:
+    # Moving platforms live in their own tree and their own schema, but they merge into THESE
+    # channels: ground truth is ground truth however it was collected. A track paints the
+    # pixels it crossed on the day it crossed them.
+    tracks = track_sources(ctx.eff["aligned_root"] / PRODUCT_DIRS["insitu_mobile"], ctx.aid,
+                           cache=ctx.cache)
+    if not sources and not tracks:
         return
     targets = {"insitu": ctx.slots[SLOT_REF_UTC], **ctx.slots[SLOT_SENSOR_TIMES]}
     insitu_vars, station_table, station_map = build_insitu(
-        sources, ctx.g, ctx.days, targets, ctx.eff["insitu_max_dt_min"], cache=ctx.cache)
+        sources, ctx.g, ctx.days, targets, ctx.eff["insitu_max_dt_min"],
+        tracks=tracks, cache=ctx.cache)
     log.info("  in-situ: %d station(s) placed from %d source(s): %s",
-             len(station_table), len(sources), ", ".join(s for s, _ in sources))
+             len(station_table), len(sources),
+             ", ".join(s for s, _ in sources) or "none")
     for name, (dims, arr) in insitu_vars.items():
         ctx.emit(name, dims, arr)
     if station_map is not None:
@@ -1620,6 +1792,39 @@ def _contribute_insitu(ctx: AssemblyContext) -> None:
         ctx.global_attrs["insitu_stations"] = json.dumps(station_table)
         ctx.var_attrs.setdefault("insitu_station", {})["long_name"] = (
             "index into the insitu_stations attr (0 = none)")
+    if tracks:
+        # A ROSTER of the moving platforms, not a placement: a track has no pixel to record.
+        # It answers "whose observations are in this cube", which `insitu_station` cannot for
+        # a platform that moved.
+        #
+        # Deliberately derived from the WHOLE table rather than this block's days:
+        # `_merge_block_attrs` makes a global attr that differs between blocks a hard error,
+        # and rightly so -- it describes the cube, not the block. Anything per-day here (a
+        # first/last-seen date, a per-block observation count) would raise on block 1.
+        roster = []
+        for src, trk in tracks:
+            plats = np.asarray(trk.platform)
+            t = pd.DatetimeIndex(trk.times)
+            for p in np.unique(plats):
+                m = plats == p
+                roster.append({"id": str(p), "source": src, "platform_type": "mobile",
+                               "n_obs": int(m.sum()),
+                               "first_obs": str(t[m].min()), "last_obs": str(t[m].max())})
+        ctx.global_attrs["insitu_tracks"] = json.dumps(roster)
+        # `insitu_sst` no longer means one thing across the cube, so it has to SAY so on
+        # itself: over a buoy it is the reading nearest the reference time, over a track it is
+        # the transect, and `insitu_hour` is how a reader tells which they are looking at.
+        ctx.var_attrs.setdefault("insitu_sst", {})["comment"] = (
+            "over a FIXED station: the observation nearest the daily reference time, within "
+            "insitu_max_dt_min. over a MOVING platform: every observation the platform made "
+            "inside the AoI that day, each in the pixel it was taken in (nearest the reference "
+            "time where a track revisits a pixel). `insitu_hour` gives the UTC hour of the "
+            "value in each cell; `insitu_tracks` lists the moving platforms and their time "
+            "spans. The <sensor>_insitu_sst matchup channels remain strictly time-gated for "
+            "both kinds.")
+        ctx.var_attrs.setdefault("insitu_hour", {}).update(
+            long_name="UTC hour of the observation behind insitu_sst in this cell",
+            units="hours since 00:00 UTC")
 
 
 def _contribute_doy(ctx: AssemblyContext) -> None:
@@ -1698,10 +1903,17 @@ def _check_contributors() -> None:
             continue
         if s.cube_opt_out:              # a product that deliberately has no cube presence
             continue
+        if s.cube_via:                  # reaches the cube through another product's contributor
+            if s.cube_via not in keys:
+                raise RuntimeError(
+                    f"{s.product.value}: cube_via={s.cube_via!r} names no registered "
+                    f"contributor; choose from {sorted(keys)}.")
+            continue
         if s.product.value not in keys:
             raise RuntimeError(
                 f"{s.product.value}: no cube contributor registered. Add one to "
-                "datacube.CONTRIBUTORS, or set cube_opt_out=True on its ProductSpec.")
+                "datacube.CONTRIBUTORS, set cube_via to the contributor that emits its "
+                "channels, or set cube_opt_out=True on its ProductSpec.")
     produced = {w for c in CONTRIBUTORS for w in c.writes}
     for c in CONTRIBUTORS:
         missing = set(c.reads) - produced

@@ -89,6 +89,80 @@ class InsituTable:
         return len(self.ids)
 
 
+@dataclass(frozen=True)
+class TrackTable:
+    """One source's MOVING-platform observations, IN MEMORY. Mirrors the on-disk schema that
+    `insitu_mobile.build_track_dataset` writes: dims `(obs,)`.
+
+    A FLAT LIST, not `InsituTable`'s `(station, time)` rectangle, because a track has no
+    rectangle: every observation carries its own position, and platforms whose sampling
+    schedules have nothing in common would make a union time axis the SUM of their lengths
+    with a block that is almost entirely NaN.
+
+    Same handle-ownership rule as `InsituTable`: built inside the `store.open_netcdf` block,
+    owns nothing, cannot be closed at the wrong moment.
+    """
+
+    times: pd.DatetimeIndex    # (obs,)
+    lon: np.ndarray            # (obs,) float64
+    lat: np.ndarray            # (obs,) float64
+    sst: np.ndarray            # (obs,) float32
+    platform: np.ndarray       # (obs,) the platform each observation came from
+
+    @classmethod
+    def from_dataset(cls, ds) -> TrackTable:
+        """Materialise every array from an open Dataset. CALL THIS INSIDE THE GATED BLOCK."""
+        return cls(times=pd.DatetimeIndex(ds["time"].values),
+                   lon=np.asarray(ds["lon"].values, dtype="float64"),
+                   lat=np.asarray(ds["lat"].values, dtype="float64"),
+                   sst=np.asarray(ds["sst"].values, dtype="float32"),
+                   platform=np.asarray(ds["platform_id"].values))
+
+    @property
+    def n_obs(self) -> int:
+        return len(self.times)
+
+
+def observation_pixels(lons, lats, g):
+    """Positions -> (rows, cols, inside) arrays, one entry per position. Vectorized, no snapping.
+
+    The placement half of `station_pixels`, split out because a MOVING platform needs a pixel
+    per OBSERVATION rather than one per station, and a track can be 10^5-10^6 rows -- far too
+    many for the per-point Python loop and list-of-dicts that `station_pixels` returns.
+
+    One `Transformer` and one affine inversion for every position, however many there are; the
+    arithmetic was always vectorized (only the return shape was not). Positions outside the grid
+    come back with `inside=False` and their row/col clamped to 0 -- the caller must mask on
+    `inside` rather than trusting the index, which is exactly what `station_pixels` does.
+
+    NO SNAPPING, deliberately, and that is not merely an omission to keep this pure: snapping
+    exists to move a mooring's NOMINAL coordinates onto water when a coarse mask disagrees with
+    them. A glider's position is MEASURED. Moving it would be inventing a track.
+    """
+    from pyproj import Transformer
+
+    fwd = Transformer.from_crs("EPSG:4326", g.target_crs, always_xy=True)
+    lon = np.asarray(lons, dtype="float64").ravel()
+    lat = np.asarray(lats, dtype="float64").ravel()
+    # Plain lists, not 0-d/1-element arrays: pyproj takes its scalar path on those and
+    # emits a NumPy deprecation that becomes an error in a later release.
+    xs, ys = fwd.transform(lon.tolist(), lat.tolist())
+
+    # Invert the affine: the grid's origin is its top-left corner, y descending.
+    x0, y0, res = g.transform.c, g.transform.f, g.transform.a
+    cols = np.floor((np.asarray(xs, dtype="float64") - x0) / res)
+    rows = np.floor((y0 - np.asarray(ys, dtype="float64")) / res)
+
+    # A non-finite position is not "outside the grid", it is no position at all -- but it would
+    # sail through the bounds test below as NaN, and `astype(int)` on NaN is a platform-dependent
+    # garbage index. Excluded explicitly.
+    ok = np.isfinite(rows) & np.isfinite(cols)
+    rows = np.where(ok, rows, 0).astype("int64")
+    cols = np.where(ok, cols, 0).astype("int64")
+    inside = ok & (rows >= 0) & (rows < g.height) & (cols >= 0) & (cols < g.width)
+    return np.where(inside, rows, 0), np.where(inside, cols, 0), inside
+
+
 def station_pixels(lons, lats, g, water: np.ndarray | None = None):
     """Map stations to grid cells, snapping a land cell to the nearest water pixel.
 
@@ -98,18 +172,16 @@ def station_pixels(lons, lats, g, water: np.ndarray | None = None):
     `water` is the cube's (H,W) boolean water mask. When it is None (no land-cover and no
     bathymetry), no snapping is attempted -- with nothing known to be water, snapping
     would be guesswork.
+
+    A thin wrapper over `observation_pixels` since tracks arrived: the placement arithmetic is
+    identical, and only the snapping and the dict-per-station return shape are this function's
+    own. `points.assign_aois` and `extract` share this exact affine so a lat/lon cannot land in
+    one pixel here and another there -- which is why the split had to leave this signature and
+    its behaviour untouched.
     """
-    from pyproj import Transformer
-
-    fwd = Transformer.from_crs("EPSG:4326", g.target_crs, always_xy=True)
-    # Plain lists, not 0-d/1-element arrays: pyproj takes its scalar path on those and
-    # emits a NumPy deprecation that becomes an error in a later release.
-    xs, ys = fwd.transform([float(v) for v in lons], [float(v) for v in lats])
-
-    # Invert the affine: the grid's origin is its top-left corner, y descending.
-    x0, y0, res = g.transform.c, g.transform.f, g.transform.a
-    cols = np.floor((np.asarray(xs, dtype="float64") - x0) / res).astype(int)
-    rows = np.floor((y0 - np.asarray(ys, dtype="float64")) / res).astype(int)
+    rows_a, cols_a, inside_a = observation_pixels(lons, lats, g)
+    rows, cols = rows_a.tolist(), cols_a.tolist()
+    res = g.transform.a
 
     idx = None
     if water is not None and water.any():
@@ -119,8 +191,8 @@ def station_pixels(lons, lats, g, water: np.ndarray | None = None):
                                            return_indices=True)
 
     out = []
-    for r, c in zip(rows, cols):
-        if not (0 <= r < g.height and 0 <= c < g.width):
+    for r, c, ins in zip(rows, cols, inside_a.tolist()):
+        if not ins:
             out.append({"row": None, "col": None, "snap_m": None, "inside": False})
             continue
         snap = 0.0
@@ -132,27 +204,48 @@ def station_pixels(lons, lats, g, water: np.ndarray | None = None):
     return out
 
 
-def value_at(times: pd.DatetimeIndex, values: np.ndarray, target,
-             max_dt_min: float = DEFAULT_MAX_DT_MIN):
-    """The observation NEAREST `target`, as (value, signed_dt_minutes).
+def nearest_index(times: pd.DatetimeIndex, values: np.ndarray, target,
+                  max_dt_min: float = DEFAULT_MAX_DT_MIN):
+    """The observation NEAREST `target`, as (index, signed_dt_minutes), or (None, NaN).
 
-    Only finite observations are candidates -- the nearest-in-time record is useless if it
-    is a gap. Beyond `max_dt_min` the answer is (NaN, NaN): a buoy reading two hours away
-    from an overpass is not a matchup, and pretending otherwise is how a validation set
-    quietly acquires a bias.
+    THE INDEX, not just the value, and it is an index into the ORIGINAL `times`/`values` -- not
+    into the finite-only subset. That distinction is the whole reason this function exists: a
+    moving platform needs to look up the winning observation's POSITION, and a position array
+    is indexed by the original axis. `value_at` used to compact by `finite` first and return
+    only the value, so its internal `k` was an index into the compacted array; reusing it for a
+    track would have placed observations at the wrong coordinates -- silently, and plausibly.
+
+    Only finite observations are candidates -- the nearest-in-time record is useless if it is a
+    gap. Beyond `max_dt_min` the answer is (None, NaN): a buoy reading two hours away from an
+    overpass is not a matchup, and pretending otherwise is how a validation set quietly acquires
+    a bias.
 
     `dt` is signed: positive means the observation came AFTER the target.
     """
     if target is None or len(times) == 0:
-        return np.nan, np.nan
-    finite = np.isfinite(values)
+        return None, np.nan
+    finite = np.isfinite(np.asarray(values))
     if not finite.any():
-        return np.nan, np.nan
+        return None, np.nan
 
+    # `where` maps a position in the compacted array back to the original axis.
+    where = np.flatnonzero(finite)
     t = pd.DatetimeIndex(times)[finite]
-    v = np.asarray(values)[finite]
     dt_min = (t - pd.Timestamp(target)).total_seconds().to_numpy() / 60.0
-    k = int(np.argmin(np.abs(dt_min)))
-    if abs(dt_min[k]) > float(max_dt_min):
+    j = int(np.argmin(np.abs(dt_min)))
+    if abs(dt_min[j]) > float(max_dt_min):
+        return None, np.nan
+    return int(where[j]), float(dt_min[j])
+
+
+def value_at(times: pd.DatetimeIndex, values: np.ndarray, target,
+             max_dt_min: float = DEFAULT_MAX_DT_MIN):
+    """The observation NEAREST `target`, as (value, signed_dt_minutes), or (NaN, NaN).
+
+    A wrapper over `nearest_index` for the fixed-station callers, which need the value and
+    never the position -- their position is a property of the station, not of the observation.
+    """
+    k, dt = nearest_index(times, values, target, max_dt_min)
+    if k is None:
         return np.nan, np.nan
-    return float(v[k]), float(dt_min[k])
+    return float(np.asarray(values)[k]), dt
