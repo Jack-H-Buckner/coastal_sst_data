@@ -235,6 +235,66 @@ def _reject_merged_stations(sid: str, grp: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The discovery seam: what is in the user's files, near this AoI
+# --------------------------------------------------------------------------- #
+def stations(bbox, start, end, cfg: dict) -> list:
+    """The discovery seam: every platform in the user's files inside `bbox` -> [Station, ...].
+
+    The one EXACT source of the three -- the files are local, so this reads real positions and
+    real timestamps rather than a catalogue's claim about them.
+
+    Deliberately NOT `insitu.station_pixels(...)["inside"]`, which is how `fetch_aoi` decides
+    what belongs to an AoI. That test asks "does this land on the grid", and the whole point of
+    the map is to show the platforms that DO NOT -- the ones a small move of the box would
+    capture. A plain bbox test is the right one here.
+
+    `mobile` is measured drift against the same threshold the two products partition on
+    (`insitu_acquire.platform_drift_m` > one grid cell by default), so a platform drawn small
+    here is exactly the one `insitu_mobile` would claim.
+    """
+    from . import insitu_acquire
+    from .insitu_stations import Station
+
+    if not cfg.get("path"):
+        return []                            # csv configured but given no path: nothing to show
+    files = resolve_paths(cfg["path"])
+    if not files:
+        raise ValueError(f"insitu.path {cfg['path']!r} matched no CSV files.")
+
+    df = pd.concat([read_file(f, cfg) for f in files], ignore_index=True)
+    lo, hi = pd.Timestamp(start), pd.Timestamp(end) + pd.Timedelta(days=1)
+
+    w, s, e, n = bbox
+    max_drift = cfg.get("max_position_drift_m")
+    if max_drift is None:
+        max_drift = cfg.get("resolution_m") or 100.0
+    allow, deny = set(cfg.get("stations") or []), set(cfg.get("exclude_stations") or [])
+
+    out = []
+    for sid, grp in df.groupby("station_id", sort=True):
+        if (allow and str(sid) not in allow) or str(sid) in deny:
+            continue
+        grp = grp.dropna(subset=["time", "latitude", "longitude"])
+        if grp.empty:
+            continue
+        lat, lon = float(grp["latitude"].median()), float(grp["longitude"].median())
+        if not (s <= lat <= n and w <= lon <= e):
+            continue
+        # The record must OVERLAP the project window -- but the label carries the platform's
+        # whole record, which is the more useful fact when deciding on a window.
+        first, last = grp["time"].min(), grp["time"].max()
+        if last < lo or first >= hi:
+            continue
+        names = grp["station_name"].dropna().unique()
+        out.append(Station(
+            id=str(sid), title=str(names[0]) if len(names) else str(sid), source=SOURCE,
+            lat=lat, lon=lon,
+            start=first.strftime("%Y-%m-%d"), end=last.strftime("%Y-%m-%d"),
+            mobile=insitu_acquire.platform_drift_m(grp) > float(max_drift)))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # The source seam: one AoI's platforms -> records
 # --------------------------------------------------------------------------- #
 def fetch_aoi(g, start, end, cfg: dict, dry_run: bool = False) -> list[dict]:

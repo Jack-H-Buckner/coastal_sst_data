@@ -781,6 +781,30 @@ This writes an **overview map** of every AOI, coloured by region, plus **one zoo
 
 Plotting is an **optional** capability: it needs `matplotlib` (install with `conda install matplotlib`). If `cartopy` is also installed the maps gain coastlines and land/ocean shading; without it they fall back to plain longitude/latitude axes.
 
+#### Seeing the in-situ stations near an AOI
+
+An AOI is a few numbers in a config, and moving its centre a few kilometres is free — but only if you can *see* that a mooring sits just outside the corner. `--insitu` adds one map per AOI showing the temperature platforms around it, so a near-miss is visible **before** a multi-hour acquisition run rather than after it:
+
+```bash
+coastal-sst-data grids --config config.yaml --plot --insitu
+coastal-sst-data grids --config config.yaml --insitu --insitu-halo-km 25   # look further out
+```
+
+For each AOI this writes `aoi_insitu_<aoi>.png` and a sidecar `aoi_insitu_<aoi>.csv`:
+
+- **Fixed stations** — a labelled marker with the years the station actually ran. Stations already inside the AOI are drawn in the region colour, stations in the surrounding halo in grey, so "already captured" and "one nudge away" separate at a glance.
+- **Moving platforms** (drifters, gliders, ship transects) — a small unlabelled dot, to mark that they pass through without crowding the map. A track whose reported extent *engulfs* the search area is **not drawn at all** — an open-ocean glider's bounding box says nothing about where it was — but it is counted in the title and listed in the CSV.
+- **The halo** — a dashed rectangle at the search distance.
+
+The CSV carries every platform, including any the label budget left off the figure, with a `km_from_aoi` column: how far the box would have to move to capture it.
+
+- `--insitu` — draw the in-situ maps (implies `--plot`).
+- `--insitu-halo-km <km>` — how far beyond each AOI to look for stations (default `10`).
+- `--insitu-pad <factor>` — how much wider than the AOI to draw the map (default `2.5`). The frame is the union of this and the halo, so raising the halo widens the figure rather than searching an area that is then cropped away.
+- `--insitu-max-labels <n>` — cap on labelled stations per map (default `25`); a dense box like Puget Sound returns hundreds, and the rest go to the CSV.
+
+Discovery covers the same three sources as the `insitu` product — `ioos`, `marineinsitu` (Copernicus) and `csv` — resolved from the config exactly as acquisition would be, including region overrides and station allow/deny lists. It reads **metadata only**: two ERDDAP catalogue queries, the Copernicus index catalog (shared with the acquire cache), and your own CSVs. No observations are downloaded. It is opt-in for exactly that reason — `--plot` on its own never touches the network. A source that fails is logged and skipped, so a missing Copernicus credential costs you those platforms, not the map.
+
 ## Running in parallel
 
 A full run spends most of its wall clock **waiting on other people's servers** — a catalogue search here, a granule download there, one product at a time, one AOI at a time. Most of that waiting is independent, and the pipeline can overlap it.

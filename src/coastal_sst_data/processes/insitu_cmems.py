@@ -97,6 +97,11 @@ TEMP_VAR = "TEMP"
 # with a "# " glued to the front of the first column name.
 _INDEX_HEADER_ROW = 5
 
+# How wide a platform's ADVERTISED bounds may be before the map stops believing it is fixed.
+# 0.5 deg is ~55 km: far beyond any mooring's watch circle, and far below the multi-degree
+# boxes both real tracks and the catalog's bogus rows carry. See `stations`.
+_WIDE_BOUNDS_DEG = 0.5
+
 # The parsed catalog, per (dataset, part). `fetch_aoi` runs once per AoI and this answer is
 # AoI-independent; the index is ~28 MB of CSV, so a ten-AoI project would otherwise fetch and
 # parse 280 MB of identical bytes.
@@ -418,6 +423,61 @@ def read_platform_file(path: Path, qc_flags, max_depth_m) -> pd.DataFrame | None
     out = df[keep].sort_values("time").reset_index(drop=True)
     out.attrs = attrs
     return out
+
+
+def stations(bbox, start, end, cfg: dict) -> list:
+    """The discovery seam: every platform the index knows about in `bbox` -> [Station, ...].
+
+    THE CHEAPEST SOURCE OF THE THREE. The index catalog is already fetched and cached for
+    acquisition, and it carries position, record span and platform class for every platform in
+    the product -- so on a warm cache this costs one `read_csv` and no network at all. Nothing
+    is downloaded and no file is opened.
+
+    Two departures from what `fetch_aoi` asks the same catalog:
+
+      * EVERY platform class, not `cfg["platform_types"]`. The map is about what EXISTS near
+        this AoI -- a drifter passing through is information about the box even for a config
+        that only keeps moorings.
+      * A WIDE-BOUNDS GUARD. `within()` catches a platform whose advertised box is wrong by
+        continents (`GL_TS_MO_31261` claims lat -31.5..48.7, lon -123.4..-34.6 while sitting
+        off Brazil) -- but only after the file is open, which is exactly what this path will
+        not do. So a row whose bounds span more than `_WIDE_BOUNDS_DEG` is treated as MOBILE
+        regardless of its declared class: drawn as a small unlabelled dot rather than as a
+        labelled mooring that is not there. A genuinely wide-ranging platform and a platform
+        with nonsense bounds deserve the same hedge, and it is the honest one.
+
+    `bbox` arrives ALREADY GROWN by the caller's halo; see `insitu_stations.discover`.
+    """
+    from .insitu_mobile import FIXED_PLATFORM_TYPES
+    from .insitu_stations import Station
+
+    dataset_id = REGIONAL_DATASETS.get(str(cfg.get("dataset_id") or "").lower(),
+                                       cfg.get("dataset_id") or DEFAULT_DATASET_ID)
+    part = cfg.get("dataset_part") or DEFAULT_PART
+    idx = catalog(dataset_id, part, Path(cfg["cache_dir"]))
+    sel = select_files(idx, bbox, start, end, _all_types(idx), pad_deg=0.0)
+
+    allow, deny = set(cfg.get("stations") or []), set(cfg.get("exclude_stations") or [])
+    out = []
+    for _, row in sel.iterrows():
+        code = str(row["file_name"]).rsplit("/", 1)[-1].removesuffix(".nc").split("_")[-1]
+        if (allow and code not in allow) or code in deny:
+            continue
+        lo_lon, hi_lon = float(row["geospatial_lon_min"]), float(row["geospatial_lon_max"])
+        lo_lat, hi_lat = float(row["geospatial_lat_min"]), float(row["geospatial_lat_max"])
+        wide = max(hi_lon - lo_lon, hi_lat - lo_lat) > _WIDE_BOUNDS_DEG
+        mobile = wide or str(row["platform_type"]) not in FIXED_PLATFORM_TYPES
+        out.append(Station(
+            id=code, title=f"{code} ({row['platform_type']})", source=SOURCE,
+            lat=(lo_lat + hi_lat) / 2.0, lon=(lo_lon + hi_lon) / 2.0,
+            start=_iso_day(row["time_coverage_start"]), end=_iso_day(row["time_coverage_end"]),
+            mobile=mobile, bbox=(lo_lon, lo_lat, hi_lon, hi_lat) if wide else None))
+    return out
+
+
+def _iso_day(ts) -> str | None:
+    """A catalog timestamp -> `YYYY-MM-DD`, or None when it did not parse."""
+    return None if pd.isna(ts) else pd.Timestamp(ts).strftime("%Y-%m-%d")
 
 
 def within(lat: float, lon: float, bbox, pad_deg: float = 0.0) -> bool:
