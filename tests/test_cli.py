@@ -165,23 +165,48 @@ def test_run_forwards_assemble_flag(config_file, monkeypatch):
     assert calls["assemble"] is True
 
 
+def _plot_stub(seen):
+    from pathlib import Path
+
+    def stub(project, *, grids=None, out_dir=None, show=False, **kw):
+        seen.update(out_dir=out_dir, show=show, n_grids=len(grids), **kw)
+        return [Path("figs/aoi_overview.png")]
+    return stub
+
+
 def test_grids_plot_flag_wires_to_plotting(config_file, monkeypatch, capsys):
     """--plot forwards grids/plot-dir/show to plot_project_aois and reports paths."""
-    from pathlib import Path
     seen = {}
-
-    def stub(project, *, grids=None, out_dir=None, show=False):
-        seen.update(out_dir=out_dir, show=show, n_grids=len(grids))
-        return [Path("figs/aoi_overview.png")]
-
-    monkeypatch.setattr("coastal_sst_data.plot.plot_project_aois", stub)
+    monkeypatch.setattr("coastal_sst_data.plot.plot_project_aois", _plot_stub(seen))
     cli.main(["grids", "--config", config_file, "--plot", "--plot-dir", "figs"])
 
     out = capsys.readouterr().out
     assert seen["out_dir"] == "figs" and seen["show"] is False
     assert seen["n_grids"] == 1                    # a1 gridded and passed through
+    assert seen["insitu"] is False                 # the network layer stays off
     assert "a1" in out                             # base text still printed
     assert "Wrote map(s)" in out and "aoi_overview.png" in out
+
+
+def test_grids_insitu_flag_implies_plot_and_forwards_knobs(config_file, monkeypatch):
+    """--insitu is useless without a map, so it turns --plot on rather than doing nothing."""
+    seen = {}
+    monkeypatch.setattr("coastal_sst_data.plot.plot_project_aois", _plot_stub(seen))
+    cli.main(["grids", "--config", config_file, "--insitu",
+              "--insitu-halo-km", "25", "--insitu-pad", "4", "--insitu-max-labels", "8"])
+
+    assert seen["insitu"] is True                  # ... even with no --plot on the line
+    assert seen["insitu_halo_km"] == 25.0
+    assert seen["insitu_pad"] == 4.0
+    assert seen["insitu_max_labels"] == 8
+
+
+def test_grids_insitu_halo_defaults_to_none(config_file, monkeypatch):
+    """Unset means "the module default", resolved in one place rather than two."""
+    seen = {}
+    monkeypatch.setattr("coastal_sst_data.plot.plot_project_aois", _plot_stub(seen))
+    cli.main(["grids", "--config", config_file, "--insitu"])
+    assert seen["insitu_halo_km"] is None
 
 
 # ---------------------------------------------------------------------------

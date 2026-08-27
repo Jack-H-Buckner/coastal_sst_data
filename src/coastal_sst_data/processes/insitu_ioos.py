@@ -48,6 +48,7 @@ from __future__ import annotations
 import io
 import logging
 import time
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -125,6 +126,105 @@ def find_stations(bbox, start, end, pad=DEFAULT_PAD_DEG, searchfor="sea_water_te
     return [{"id": r[i_id], "title": r[i_title]} for r in tbl["rows"]]
 
 
+def station_metadata(bbox, pad=DEFAULT_PAD_DEG) -> dict[str, dict]:
+    """Every dataset overlapping the box -> {id: {lat, lon, start, end, mobile, title, bbox}}.
+
+    ERDDAP's `allDatasets` table is the server's own catalogue of itself, so ONE request
+    returns position, record span and platform class for the whole box -- the three things
+    `find_stations` does not tell you. Without it a station's position is only known after its
+    data is fetched, which is the cost this whole module exists to avoid.
+
+    INTERSECTION, NOT CONTAINMENT, in the constraints -- `maxLongitude >= W`, not
+    `minLongitude >= W`. This is the same trap `insitu_cmems.select_files` documents: the
+    containment form is the one that reads naturally and it silently drops every trajectory,
+    because a glider's bounds span degrees and never fall inside a coastal box. Measured on
+    the live server: a Puget Sound box returns 205 TimeSeries and 7 TrajectoryProfile with
+    intersection, and zero trajectories with containment.
+
+    `cdm_data_type` is the platform class, declared by the provider: `TimeSeries` /
+    `TimeSeriesProfile` are moorings and tide gauges, `Trajectory` / `TrajectoryProfile` are
+    gliders and ship tracks.
+    """
+    import json
+
+    w, s, e, n = bbox
+    w, s, e, n = w - pad, s - pad, e + pad, n + pad
+    cols = ("datasetID,cdm_data_type,title,minLongitude,maxLongitude,"
+            "minLatitude,maxLatitude,minTime,maxTime")
+    # tabledap's projection+constraint syntax is not key=value, so it is built into the URL
+    # rather than handed to requests as params -- exactly as `fetch_station` does.
+    query = (f"{quote(cols)}"
+             f"&maxLongitude%3E={w}&minLongitude%3C={e}"
+             f"&maxLatitude%3E={s}&minLatitude%3C={n}")
+    body = _get(f"{ERDDAP}/tabledap/allDatasets.json?{query}")
+    if body.lstrip().startswith("Error") or '"table"' not in body:
+        log.info("  allDatasets returned no rows for this box")
+        return {}
+
+    tbl = json.loads(body)["table"]
+    i = {name: k for k, name in enumerate(tbl["columnNames"])}
+    out: dict[str, dict] = {}
+    for r in tbl["rows"]:
+        kind = str(r[i["cdm_data_type"]] or "")
+        lo_lon, hi_lon = r[i["minLongitude"]], r[i["maxLongitude"]]
+        lo_lat, hi_lat = r[i["minLatitude"]], r[i["maxLatitude"]]
+        if lo_lon is None or lo_lat is None:
+            continue                                  # nothing placeable in this row
+        mobile = kind.startswith("Trajectory")
+        out[str(r[i["datasetID"]])] = {
+            "title": str(r[i["title"]] or r[i["datasetID"]]),
+            "lat": (float(lo_lat) + float(hi_lat)) / 2.0,
+            "lon": (float(lo_lon) + float(hi_lon)) / 2.0,
+            "start": r[i["minTime"]], "end": r[i["maxTime"]],
+            "mobile": mobile,
+            # Only worth carrying when it has real extent: a mooring's bounds are a point.
+            "bbox": ((float(lo_lon), float(lo_lat), float(hi_lon), float(hi_lat))
+                     if mobile else None),
+        }
+    return out
+
+
+def stations(bbox, start, end, cfg: dict) -> list:
+    """The discovery seam: every IOOS temperature platform in `bbox` -> [Station, ...].
+
+    Two requests, and each answers half the question. `find_stations` is the only query that
+    knows which datasets carry a TEMPERATURE variable -- so using it means the map shows what
+    `fetch_aoi` would actually acquire, not every barometer on the coast. `station_metadata`
+    then says where each one is and when it ran.
+
+    `bbox` arrives ALREADY GROWN by the caller's halo, so no padding is applied here; see
+    `insitu_stations.discover`.
+    """
+    from .insitu_stations import Station
+
+    variables = cfg.get("variables") or DEFAULT_VARIABLES
+    found = find_stations(bbox, start, end, 0.0, searchfor=variables[0])
+    allow, deny = set(cfg.get("stations") or []), set(cfg.get("exclude_stations") or [])
+    if allow:
+        found = [s for s in found if s["id"] in allow]
+    found = [s for s in found if s["id"] not in deny]
+    if not found:
+        return []
+
+    meta = station_metadata(bbox)
+    out, unplaced = [], []
+    for s in found:
+        m = meta.get(s["id"])
+        if m is None:
+            # The search found it and the catalogue did not describe it. Rare, and never
+            # silent: an in-situ platform that vanishes without being named is the failure
+            # mode this module refuses to have.
+            unplaced.append(s["id"])
+            continue
+        out.append(Station(id=s["id"], title=s["title"] or m["title"], source=SOURCE,
+                           lat=m["lat"], lon=m["lon"], start=m["start"], end=m["end"],
+                           mobile=m["mobile"], bbox=m["bbox"]))
+    if unplaced:
+        log.warning("  %d IOOS station(s) have no position in allDatasets and are missing "
+                    "from the map: %s", len(unplaced), ", ".join(unplaced[:8]))
+    return out
+
+
 def station_variables(station_id: str) -> set[str]:
     """The variables a station ACTUALLY exposes.
 
@@ -161,8 +261,6 @@ def fetch_station(station_id: str, var: str, start, end, qc_flags, max_depth_m,
     Only columns the station actually has are requested: `z` and the QC flag are absent on
     some providers, and asking for either would be an HTTP 400 that kills the station.
     """
-    from urllib.parse import quote
-
     available = available if available is not None else {"z", f"{var}_qc_agg"}
     cols = ["time", "latitude", "longitude"]
     if "z" in available:

@@ -175,11 +175,16 @@ def _cmd_grids(args):
         print(f"{name}: crs={g.target_crs} {g.width}x{g.height} @ {g.resolution_m:.0f} m "
               f"bbox=({w:.3f},{s:.3f},{e:.3f},{n:.3f})")
 
-    if args.plot:
+    # --insitu is only ever useful as a layer ON a map, so it implies --plot rather than
+    # silently doing nothing when someone forgets the other flag.
+    if args.plot or args.insitu:
         from .plot import plot_project_aois
         try:
             paths = plot_project_aois(project, grids=grids, out_dir=args.plot_dir,
-                                      show=args.show)
+                                      show=args.show, insitu=args.insitu,
+                                      insitu_halo_km=args.insitu_halo_km,
+                                      insitu_pad=args.insitu_pad,
+                                      insitu_max_labels=args.insitu_max_labels)
         except ImportError as exc:
             raise SystemExit(
                 f"plotting needs matplotlib (optional): {exc}. Install it with "
@@ -293,6 +298,19 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Directory for the maps (default: <output_dir>/figures).")
     p_grids.add_argument("--show", action="store_true",
                          help="Display the maps interactively (with --plot).")
+    p_grids.add_argument("--insitu", action="store_true",
+                         help="Also save one in-situ context map per AoI, showing the "
+                              "monitoring stations near it. Implies --plot. Queries ERDDAP "
+                              "and the Copernicus index (metadata only, no data download).")
+    p_grids.add_argument("--insitu-halo-km", dest="insitu_halo_km", type=float, default=None,
+                         help="How far beyond each AoI to look for stations, in km "
+                              "(default: 10). Raise it to see what a bigger move would catch.")
+    p_grids.add_argument("--insitu-pad", dest="insitu_pad", type=float, default=2.5,
+                         help="How much wider than the AoI to draw the in-situ maps "
+                              "(linear factor, default: 2.5).")
+    p_grids.add_argument("--insitu-max-labels", dest="insitu_max_labels", type=int, default=25,
+                         help="Cap on labelled fixed stations per in-situ map (default: 25); "
+                              "the full list is always written to the sidecar CSV.")
     p_grids.set_defaults(func=_cmd_grids)
 
     p_asm = sub.add_parser("assemble",
