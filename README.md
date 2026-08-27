@@ -1307,13 +1307,40 @@ gives `thetao_0m` (level 0.494 m), `thetao_10m` (level **9.573** m), `thetao_30m
 machine auth.marine.copernicus.eu login <username> password <password>
 ```
 
-### In-situ (IOOS + your own CSVs)
+### In-situ (IOOS + Copernicus Marine + your own CSVs)
 In-situ observations are the cube's **only ground truth**. Every other channel is modelled (met, CMEMS, tides) or remotely sensed (ECOSTRESS, Landsat, MODIS, MUR); this is what a thermometer in the water actually read. The assembler writes each station's value into **the grid cell the station sits in**, and — the point of the exercise — **at the instant each satellite flew**, so a scene can be validated against a buoy pixel-for-pixel and minute-for-minute.
 
-In-situ sources **STACK**: `sources: [ioos, csv]` acquires both, each into its own `INSITU/<source>/aligned/` tree, and the cube merges their platforms into **one** station table and one channel set. Public buoys and your own moorings are different *platforms*, not two routes to the same data, so a cube can carry both — with each station recording which source it came from.
+In-situ sources **STACK**: `sources: [ioos, marineinsitu, csv]` acquires each into its own `INSITU/<source>/aligned/` tree, and the cube merges their platforms into **one** station table and one channel set. Public buoys and your own moorings are different *platforms*, not two routes to the same data, so a cube can carry all of them — with each station recording which source it came from.
 
 - **`ioos`** — the [IOOS Sensors ERDDAP](https://erddap.sensors.ioos.us/erddap): one server aggregating **NDBC, NOAA CO-OPS, CDIP and the IOOS regional associations**, so most of North America is a single query. Stations are auto-discovered inside each AOI's bounding box. **No credentials.** It measures water temperature (`sea_water_temperature`, falling back per station to `sea_surface_temperature` — providers do not agree on the name), quality-flagged with QARTOD. The native sampling interval is kept (6 min for CO-OPS gauges), because matching an overpass needs the sub-hourly series.
+- **`marineinsitu`** — the [Copernicus Marine In-Situ TAC](https://marineinsitu.eu/), the **global** counterpart: seven production units harmonising Argo, OceanSITES, GOSUD, the GTS and the EuroGOOS national coastal networks into one format with one QC scale. **Needs a free Copernicus Marine account** — the same credential `cmems` uses, so one `~/.netrc` entry serves both. See below.
 - **`csv`** — your own thermometers, in **long format**: one row per observation. See below.
+
+#### Copernicus Marine In-Situ (`sources: [marineinsitu]`)
+
+This is the source for **any coast outside North America**, where `ioos` returns nothing at all.
+
+```yaml
+products:
+  insitu:
+    sources: [marineinsitu]
+    dataset_id: ibi          # glo (default) | arc | bal | blk | ibi | med | nws
+```
+
+**Prefer the regional product where one covers your AOI.** Its production unit ingests national networks the global stream never sees: measured over a Galician box, `ibi` finds 11 fixed platforms back to 1998, against 1–4 in a comparable US box via `glo`.
+
+**`dataset_part` decides how far back you can reach**, and the default matters. `monthly` and `latest` are the convenient tidy-DataFrame services — and both **begin 2020-01-01**. Only `history` (the default here) holds the multi-decade archive; over one AOI it reaches 1987 where `monthly` starts in 2020.
+
+> **Only fixed platforms, and that is most of what you need to know.** Under **5%** of this archive is moorings and tide gauges; drifters and profiling floats alone are ~70%. Measured over one AOI: **421 files carrying temperature, of which 2 were moorings**. Mobile platforms are counted and reported but never downloaded, because the cube's in-situ model is one position per station for the whole window and the drift guard would drop them again anyway. **An AOI can legitimately return nothing** — all of Tasmania does — and that is a fact about the ocean rather than a failure. Run `--dry-run` first: it lists what was found before a byte is fetched.
+
+Two data-quality traps this source guards, both found in the live archive:
+
+- **The index's geographic bounds are sometimes wrong by continents.** `GL_TS_MO_31261` advertises a box spanning lat −31→49, lon −123→−35 — half the planet — while the file itself sits off **Brazil**. It intersected a Puget Sound AOI on paper and arrived looking like a plausible mooring reporting 0.0–38.9 °C. Every platform's **own** position is therefore re-checked against the AOI after download, and a disagreement is dropped by name.
+- **A mooring reports several depths.** The shallowest level surviving `max_sensor_depth_m` wins per timestamp — that is the one comparable to a satellite's surface retrieval.
+
+**These are bulk temperatures at a stated depth** (~1 m on a moored buoy), never skin. When validating a satellite retrieval against them, expect a skin–bulk difference of ~0.1–0.5 K plus diurnal warming in the top metre.
+
+> **Overlap with `ioos` in US waters.** The moorings this source finds off North America are largely the same NDBC buoys `ioos` already serves, under a different id (`46211` here, `gov-ndbc-46211` there). The assembler's duplicate guard only catches *identical* ids, so stacking both would enter one buoy twice and **average it into one pixel** — not wrong, but it double-counts one instrument as two independent observations. In US waters, pick one.
 
 #### Your own observations (`sources: [csv]`)
 
@@ -1354,7 +1381,7 @@ Three failures this loader refuses to make quiet, because a *wrong* ground-truth
 - **A `units` mistake is range-checked.** 54 °F is a perfectly plausible °C sea temperature, so nothing downstream would ever catch it; values outside −5…45 °C after conversion warn loudly with a count.
 - **Merged stations are rejected.** If a multi-station file's `station_id` column isn't mapped, every station collapses into one platform. Where they share a time base (synchronised loggers usually do) de-duplication would keep one station's rows and silently discard the rest, so a "platform" reporting one instant from two positions is a hard error naming `station_id`. Where they don't, the moving-platform guard below catches it.
 
-**Moving platforms are not supported yet.** The cube's in-situ model is fixed-station: one position per platform for the whole window. A platform whose observations stray beyond `max_position_drift_m` (default: one grid cell, so GPS jitter passes) is **dropped and reported** — never collapsed onto its median position, which would place a whole track in a pixel it may never have visited. Drifters, gliders and ship transects need per-observation placement, a change to the shared data model and the cube schema; see [`docs/plan-user-provided-insitu-csv.md`](docs/plan-user-provided-insitu-csv.md).
+**Moving platforms belong to a different product.** This one is fixed-station: one position per platform for the whole window. A platform whose observations stray beyond `max_position_drift_m` (default: one grid cell, so GPS jitter passes) is **dropped and reported** — never collapsed onto its median position, which would place a whole track in a pixel it may never have visited. Gliders, ship transects and drifters are acquired by **[`insitu_mobile`](#moving-platforms-insitu_mobile)** instead, which stores a position per *observation*; the two products share a threshold, so they partition platforms with no gap and no overlap.
 
 **Quality control.** QARTOD flags are `1` pass, `2` not-evaluated, `3` suspect, `4` fail, `9` missing. The default keeps **`[1, 2]`**: flag 2 is what stations that don't run QARTOD emit, and demanding flag 1 would discard much of the network.
 
@@ -1362,16 +1389,19 @@ Three failures this loader refuses to make quiet, because a *wrong* ground-truth
 
 **Project-level options** (`products.insitu`):
 
-- `sources`: which networks to **stack** (default `[ioos]`; `csv` must be opted into, since it needs a `path`).
+- `sources`: which networks to **stack** (default `[ioos]`; `csv` must be opted into since it needs a `path`, and `marineinsitu` since it needs a credential).
 - `qc_flags`: QARTOD flags to keep (default `[1, 2]`).
 - `max_sensor_depth_m`: ignore sensors deeper than this on profiling moorings (default `5`) — the station's `z` variable for `ioos`, your `z` column for `csv`.
 - `stations` / `exclude_stations`: an allow-list (else auto-discovery for `ioos`, every platform for `csv`) and a deny-list. Both match on station id, in **either** source — so a 50-platform CSV can be narrowed to the 5 that matter without editing the file.
 - `max_position_drift_m`: how far a platform's observations may stray before it is rejected as moving (default: one grid cell).
 - `variables` *(ioos)*: preference order of ERDDAP variable names (default `[sea_water_temperature]`; `sea_surface_temperature` is tried as a fallback).
-- `pad_deg` *(ioos)*: extra search padding around the AOI bbox.
+- `pad_deg` *(ioos, marineinsitu)*: extra search padding around the AOI bbox.
+- `dataset_id` *(marineinsitu)*: which In-Situ TAC product — a region shorthand (`glo`, `arc`, `bal`, `blk`, `ibi`, `med`, `nws`) or a full `cmems_obs-ins_*` id (default `glo`).
+- `dataset_part` *(marineinsitu)*: `history` (default, the full archive), `monthly` or `latest` (both 2020-onwards only).
+- `platform_types` *(marineinsitu)*: Copernicus data-type codes to accept (default `[MO, TG]` — moorings and tide gauges, the platforms that hold still).
 - `path`, `columns`, `units`, `time_zone`, `qc_pass_values`, `default_station_id` *(csv)*: see above.
 
-A region may override `sources`, `path`, `stations`, `exclude_stations` and `variables` — which data reaches *this* region is a fact about the world. It may **not** override `columns`, `units` or `qc_pass_values`: those decide what the channel *means*, and letting a region change them would make two AOIs' cubes silently non-comparable.
+A region may override `sources`, `path`, `stations`, `exclude_stations`, `variables`, `dataset_id` and `dataset_part` — which data reaches *this* region, and which catalogue holds it, are facts about the world. It may **not** override `columns`, `units`, `qc_pass_values` or `platform_types`: those decide what the channel *means*, and letting a region change them would make two AOIs' cubes silently non-comparable.
 
 **In the cube** (`datacube.insitu`, default `true`):
 
@@ -1385,7 +1415,40 @@ A region may override `sources`, `path`, `stations`, `exclude_stations` and `var
 
 All are sparse — NaN everywhere except station cells — which costs almost nothing under the cube's Blosc/zstd encoding. Beyond `datacube.insitu_max_dt_min` (default 60) a matchup is **NaN rather than a stale value**: a buoy reading two hours off an overpass is not truth for that scene, and pretending otherwise is how a validation set quietly acquires a bias.
 
-**The land-pixel problem.** A station near shore can land in a cell the cube calls *land* (coarse water mask, or a gauge on a pier), where it would be masked out of every downstream loss. Such a station is **snapped to the nearest water pixel**, and the snap distance is recorded; a snap beyond 500 m warns, because that means the station is probably not where we think it is.
+**The land-pixel problem.** A station near shore can land in a cell the cube calls *land* (coarse water mask, or a gauge on a pier), where it would be masked out of every downstream loss. `insitu.station_pixels` can **snap such a station to the nearest water pixel**, recording the distance and warning beyond 500 m. Note that the **cube does not currently use it**: `build_insitu` places stations with no water mask, so a station in a land cell stays there — masking is a downstream determination now. The snapping path remains for callers that want it.
+
+### Moving platforms (`insitu_mobile`)
+
+Gliders, ship transects and drifters are a **separate product**, because they are a different shape of data: `insitu` stores one position per station for the whole window — which is what a fixed station *is* — while a moving platform's position belongs to each **observation**. So `insitu_mobile` writes a flat observation table (`INSITU_MOBILE/<source>/aligned/<aoi>/`, dims `(obs,)`) rather than the fixed product's `(station, time)` rectangle.
+
+```yaml
+products:
+  insitu_mobile:
+    sources: [marineinsitu]     # marineinsitu | ioos | csv — nothing by default
+    dataset_id: glo
+```
+
+**The cube merges them.** Both products feed the one `insitu_sst` channel set: ground truth is ground truth however it was collected. A transect paints the pixels it crossed on the day it crossed them — measured on one real day off Hobart, **96 pixels** spanning hours 01:00–22:00.
+
+| Channel | Dims | Meaning |
+| --- | --- | --- |
+| `insitu_sst` | (time,y,x) | over a **fixed** station: the observation nearest the reference time. Over a **moving** platform: every observation it made in the AOI that day, each in the pixel it was taken in |
+| `insitu_hour` | (time,y,x) | UTC hour of the observation behind each `insitu_sst` cell. **Only present when a moving platform is** — a fixed station's value is at the reference time by construction |
+| `insitu_n` | (time,y,x) | fixed stations resident in the cell, **plus** track observations placed there that day |
+| `insitu_station` | (y,x) | **fixed stations only** — a track has no static pixel. Unchanged, so `mask: insitu_station` keeps working |
+
+The `insitu_tracks` cube attribute lists each moving platform with its source, observation count and time span, as `insitu_stations` does for fixed ones.
+
+> **`insitu_sst` takes a track's whole day, but the matchup channels do not.** A transect is a spatial sample of its day; gating it to the hour either side of the reference instant would discard most of it (96 pixels collapse to 1). Where a track revisits a pixel, the observation nearest the reference time wins it. The **`<sensor>_insitu_sst` matchup channels stay strictly time-gated for tracks too** — a glider that passed at 03:00 is not ground truth for a satellite that flew at 18:30, and admitting it is how a validation set quietly acquires a bias.
+
+**Project-level options**: the same as `insitu` (`sources`, `qc_flags`, `max_sensor_depth_m`, `stations`/`exclude_stations`, `dataset_id`, `dataset_part`, the `csv` column mapping), plus:
+
+- `min_position_drift_m`: how far a platform must move to belong here (default: one grid cell). The exact complement of `insitu`'s `max_position_drift_m`.
+- `platform_types`: Copernicus classes to accept; empty (the default) means **everything that is not a fixed class**, so a class the archive adds later is picked up without this list tracking the fixed product's.
+
+> **`marineinsitu` reaches tracks by a different route, with a different reach: 2020 onwards**, where the fixed product goes back to 1987. An earlier `start_date` is clamped with a log line, not an error. The fixed product's route lists a platform's *whole-life* file, which for a drifter means downloading an ocean to find the hours it spent in your AOI — measured at **348 MB to yield 4 in-AOI observations**. The sparse service used here subsets by bounding box server-side: same AOI, **16,088 observations, 100% of them in-box**.
+>
+> A platform whose declared class is mobile is kept here **even if its measured drift is zero** — a track clipping the AOI can leave a single observation inside it, and one position has no drift by construction. Without that rule such observations fell between the two products and were lost (two of five platforms on the first live Hobart run).
 
 ### Bathymetry
 Bathymetry is a static (time-invariant) covariate: one file per AOI describing water depth, used both as a model input and to build the land mask.

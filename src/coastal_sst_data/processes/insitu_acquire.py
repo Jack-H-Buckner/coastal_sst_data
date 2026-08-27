@@ -46,18 +46,24 @@ import xarray as xr
 
 from ..config import DataProduct, Project, opt as _opt, resolve_opts
 from ..grid import AoiGrid, project_grids, select_aois
-from .. import entry, products, provenance, report, store
-from . import insitu_csv, insitu_ioos
+from .. import auth, entry, products, provenance, report, store
+from . import insitu_cmems, insitu_csv, insitu_ioos
 
 log = logging.getLogger(__name__)
 
 # IOOS only, unless the config says otherwise. NOT "every known source": `csv` cannot do
-# anything without a `path`, so it has to be opted into rather than defaulted on.
-DEFAULT_SOURCES = ["ioos"]
+# anything without a `path`, and `marineinsitu` needs a Copernicus credential, so both have to
+# be opted into rather than defaulted on.
+#
+# READ FROM THE REGISTRY, not spelled again here. The auth preflight has to know the same list
+# -- an unset `sources` means THIS, and if the preflight assumed something wider it would demand
+# credentials for sources the run will never acquire (see config.required_backend).
+DEFAULT_SOURCES = list(products.spec(DataProduct.insitu).default_sources)
 
 SOURCES = {
     "ioos": insitu_ioos.fetch_aoi,
     "csv": insitu_csv.fetch_aoi,
+    "marineinsitu": insitu_cmems.fetch_aoi,
 }
 
 
@@ -160,6 +166,31 @@ def write_output(ds: xr.Dataset, out_dir: Path, aoi_id: str) -> Path:
                                         "qc": {"zlib": True, "complevel": 4}})
 
 
+# --------------------------------------------------------------------------- #
+# Auth, for the sources that need it
+# --------------------------------------------------------------------------- #
+# Which backend each source authenticates to, read from the registry so it cannot drift from
+# what the config preflight validated. `ioos` and `csv` are public and map to None.
+def _source_backend(src: str, product: DataProduct = DataProduct.insitu) -> "str | None":
+    auth_map = products.spec(product).auth
+    return auth_map.get(src) if isinstance(auth_map, dict) else auth_map
+
+
+def _ensure_source_auth(src: str, eff: dict,
+                        product: DataProduct = DataProduct.insitu) -> None:
+    """Re-validate this source's credential, if it has one.
+
+    In-situ used to need no auth at all, so `acquire` called none. `marineinsitu` reaches the
+    Copernicus Marine Data Store -- the same backend `cmems` uses -- and a multi-year, many-AoI
+    in-situ run is long enough to outlive a credential. Called at the (AoI, source) boundary
+    because that is a point between writes, so a refresh cannot land mid-file.
+    """
+    backend = _source_backend(src, product)
+    strategy = eff.get("auth_strategy", {}).get(backend) if backend else None
+    if backend and strategy:
+        auth.ensure_fresh(backend, {"auth_strategy": strategy})
+
+
 def aligned_dir(root: Path, source: str, aoi_id: str) -> Path:
     """`<out>/INSITU/<source>/aligned/<aoi>` -- built through the registry helper so the
     write side and the assembler's `ctx.adir` cannot drift apart."""
@@ -203,8 +234,17 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, only_source=Non
                 continue
 
             log.info("=== AOI: %s | source=%s ===", name, src)
+            # A credentialed source outlives its credential on a long run, so it is re-checked
+            # at each (AoI, source) boundary -- a safe point, between writes -- exactly as
+            # `cmems.run` does. No-op for the public sources.
+            _ensure_source_auth(src, eff)
+            # Downloaded originals are shared across AoIs and runs: a platform's `history` file
+            # is its WHOLE LIFE, so two adjacent AoIs routinely want the same one, and a
+            # re-acquisition should not re-fetch what is already on disk.
+            src_cfg = {**ds_cfg, "cache_dir": out_root / products.spec(
+                DataProduct.insitu).dir / src / "_cache"}
             try:
-                records = SOURCES[src](g, start, end, ds_cfg, dry_run=dry_run)
+                records = SOURCES[src](g, start, end, src_cfg, dry_run=dry_run)
             except Exception as exc:
                 log.warning("  %s: %s in-situ source failed (%s); no stations from it",
                             name, src, exc)
@@ -276,6 +316,12 @@ def _ds_cfg(opts) -> dict:
         # ioos
         "variables": list(_opt(opts, "variables", insitu_ioos.DEFAULT_VARIABLES)),
         "pad_deg": float(_opt(opts, "pad_deg", insitu_ioos.DEFAULT_PAD_DEG)),
+        # marineinsitu (Copernicus Marine In-Situ TAC). `dataset_id` accepts a region shorthand
+        # ("nws") as well as a full dataset id; the module resolves it.
+        "dataset_id": _opt(opts, "dataset_id", insitu_cmems.DEFAULT_DATASET_ID),
+        "dataset_part": _opt(opts, "dataset_part", insitu_cmems.DEFAULT_PART),
+        "platform_types": list(_opt(opts, "platform_types",
+                                    insitu_cmems.DEFAULT_PLATFORM_TYPES)),
         # csv
         "path": _opt(opts, "path", None),
         "columns": dict(_opt(opts, "columns", {}) or {}),
@@ -291,10 +337,18 @@ def _build_eff(project: Project) -> dict:
     if opts is None:
         raise ValueError("insitu is not a selected product in this config")
 
+    # The auth STRATEGY per backend, not the secret -- `auth.login` reads the credential itself
+    # (~/.netrc, the environment, or a prompt). Only backends this product's sources can use,
+    # and only when the config actually configured one.
+    strategies = {}
+    if getattr(project.auth, "copernicus", None) is not None:
+        strategies["copernicus"] = project.auth.copernicus.auth_strategy
+
     return {
         "config_sha256": project.config_sha256,
         "ds": {a.name: _ds_cfg(resolve_opts(project, a.name, DataProduct.insitu))
                for a in project.all_areas},
+        "auth_strategy": strategies,
         "out_dir": Path(project.output_dir),
         "overwrite": bool(_opt(opts, "overwrite", False)),
         "time": {
@@ -324,7 +378,27 @@ def acquire(project: Project, *, grids=None, aois=None, dry_run=False,
     if bad:
         raise ValueError(f"insitu source not recognized ({', '.join(bad)}); "
                          f"choose from {sorted(SOURCES)}.")
+
+    # Credentials expire and runs are long: apply this project's refresh policy, then log in
+    # ONCE per run for whichever backends the configured sources actually need. A run of
+    # `ioos`/`csv` alone authenticates to nothing, exactly as before.
+    auth.configure(project.auth)
+    wanted = {s for c in eff["ds"].values() for s in c["sources"]
+              if only_source_matches(s, source)}
+    for backend in sorted({b for s in wanted if (b := _source_backend(s))}):
+        strategy = eff["auth_strategy"].get(backend)
+        if strategy:
+            auth.login(backend, {"auth_strategy": strategy})
     return run(eff, grids, aois, dry_run, only_source=source)
+
+
+def only_source_matches(src: str, only_source) -> bool:
+    """Whether `src` will actually be acquired on this invocation.
+
+    The per-source CLIs narrow a run to one source, and logging in for the others would prompt
+    (or fail) for a credential this invocation has no use for.
+    """
+    return only_source is None or src == only_source
 
 
 def main():

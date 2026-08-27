@@ -75,6 +75,7 @@ class DataProduct(str, Enum):
     tides = "tides"
     landcover = "landcover"
     insitu = "insitu"
+    insitu_mobile = "insitu_mobile"
 
 
 class Kind(str, Enum):
@@ -93,6 +94,7 @@ class Kind(str, Enum):
     STATIC_RASTER = "static_raster"      # <aoi>.nc, no time dim    -- bathymetry, land-cover
     SERIES_1D = "series_1d"              # <aoi>_tides.nc, dims (time,) -- tides
     STATION_TABLE = "station_table"      # <aoi>_insitu.nc, dims (station, time) -- in-situ
+    OBS_TABLE = "obs_table"              # <aoi>_insitu.nc, dims (obs,) -- moving platforms
 
 
 class SourceKind(str, Enum):
@@ -185,6 +187,21 @@ class ProductSpec:
     # they are (v002/v003 of the same product), not distinct providers. Only meaningful for
     # a stacked-DATA product; it must be one of that product's `options`.
     sources_option: str = "sources"
+    # Which stacked sources are acquired when the config NAMES NONE. `None` means "unknown --
+    # assume every one", which is the conservative reading for a product that has not declared
+    # its default. An explicit tuple means exactly that tuple, INCLUDING the empty one: `()` is
+    # "none of them", not "all of them", and the distinction is load-bearing. `insitu_mobile`
+    # defaults to no sources, and under the old "empty means all" reading merely SELECTING it
+    # demanded a Copernicus credential for a source the run would never touch.
+    #
+    # It exists because the auth PREFLIGHT and the acquisition stage have to agree about that
+    # default. They did not: `required_backend` assumed every known source while
+    # `insitu_acquire` acquired only its own `DEFAULT_SOURCES`. Harmless while every in-situ
+    # source was public -- and a breaking change the moment one needed a credential, because
+    # every config with an `insitu:` block and no `sources:` list would start demanding an
+    # `auth.copernicus` block for a source it was never going to run. One definition, read by
+    # both. See config.required_backend and _check_registry's agreement check.
+    default_sources: tuple[str, ...] | None = None
 
     # --- config surface -------------------------------------------------- #
     # Which options the module actually READS. A key not listed here does NOTHING, and
@@ -237,6 +254,14 @@ class ProductSpec:
     # the loud-omission invariant (datacube._check_contributors) fails at import for any
     # non-sensor product without a registered contributor -- opt out here to say "on purpose".
     cube_opt_out: bool = False
+    # A product whose cube presence is produced by ANOTHER product's contributor, named here.
+    # Not the same as `cube_opt_out`: this product DOES reach the cube, just not through a
+    # contributor of its own. `insitu_mobile` is the case -- its observations merge into the
+    # `insitu_*` channel set, because ground truth is ground truth however it was collected,
+    # and a second contributor writing the same channels would double-count instead of merge.
+    # Saying so here keeps `_check_contributors`'s loud-omission invariant intact rather than
+    # buying silence with `cube_opt_out=True`, which would claim the product has no channels.
+    cube_via: str | None = None
     # The cube channel that proves this product produced data on a given day, for the
     # coverage check. Only DAILY products can be judged this way: an overpass sensor with no
     # scene on a day is normal, not a defect, and warning about it would train the user to
@@ -596,22 +621,82 @@ REGISTRY: tuple[ProductSpec, ...] = (
         # family by the source count while making `insitu_sst` stop meaning "ground truth". Each
         # platform records which source it came from in the cube's station table.
         sources={"ioos": "coastal_sst_data.processes.insitu_acquire",
-                 "csv": "coastal_sst_data.processes.insitu_acquire"},
+                 "csv": "coastal_sst_data.processes.insitu_acquire",
+                 "marineinsitu": "coastal_sst_data.processes.insitu_acquire"},
         source_kind=SourceKind.DATA,
-        auth={"ioos": None, "csv": None},   # public network; local files
+        # IOOS only. `csv` cannot do anything without a `path`, and `marineinsitu` needs a
+        # Copernicus credential -- neither may be switched on by a config that never named it.
+        default_sources=("ioos",),
+        # Public network; local files; and the Copernicus Marine account `cmems` already uses,
+        # so one ~/.netrc entry serves both.
+        auth={"ioos": None, "csv": None, "marineinsitu": "copernicus"},
         options=_COMMON | {
             "sources", "variables", "stations", "exclude_stations", "qc_flags", "pad_deg",
             "max_sensor_depth_m", "max_position_drift_m",
             # csv source: where the user's files are and how to read them.
-            "path", "columns", "time_zone", "units", "qc_pass_values", "default_station_id"},
+            "path", "columns", "time_zone", "units", "qc_pass_values", "default_station_id",
+            # marineinsitu source: which In-Situ TAC product, which part of it, and which
+            # platform classes are placeable by a fixed-station cube.
+            "dataset_id", "dataset_part", "platform_types"},
         # Station lists and FILE PATHS are inherently local; `variables` is a per-NETWORK naming
         # preference (sea_water_temperature vs sea_surface_temperature), not a channel choice.
         # `columns`/`units`/`qc_pass_values` decide what the channel MEANS and so stay global --
         # a region that changed them would make two AoIs' cubes silently non-comparable.
+        # `dataset_id`/`dataset_part` join the list for the same reason `path` is on it: WHICH
+        # catalogue holds this region's observations is a fact about the world, and a regional
+        # In-Situ product ingests national networks the global one never sees. `platform_types`
+        # is NOT region-overridable -- it decides what the channel MEANS, and two AoIs whose
+        # ground truth came from different classes of instrument are not comparable.
         region_options=frozenset({"sources", "stations", "exclude_stations", "variables",
-                                  "path"}),
+                                  "path", "dataset_id", "dataset_part"}),
         required_vars=("sst", "qc"),
         provenance_inputs=("insitu",),
+    ),
+
+    ProductSpec(
+        product=DataProduct.insitu_mobile,
+        gate="erddap",
+        dir="INSITU_MOBILE",
+        kind=Kind.OBS_TABLE,
+        # A SEPARATE PRODUCT, not another `insitu` source, and the reason is the SCHEMA.
+        #
+        # `insitu` writes (station, time) with ONE position per station -- which is not a
+        # limitation to route around but the definition of a fixed station. A glider measures
+        # as it moves, so its position belongs to the OBSERVATION; there is no rectangle to
+        # reindex it onto, and forcing one would build a dense (station, time) block for
+        # platforms whose time axes have nothing in common. So this product writes a FLAT
+        # observation list instead, and the two schemas live in two trees.
+        #
+        # Keeping them apart is also what makes this additive. Folding per-observation
+        # positions into the shared model would turn `insitu_station` from a static (y,x) map
+        # into (time,y,x) -- a breaking change for any config using it as an `extract` mask,
+        # and worse, a silent one: `append_zarr(mode="a-")` leaves static channels alone after
+        # the first block, so a time-varying map written as (y,x) would freeze at block 0 with
+        # no error at all. Nothing about the fixed path changes here.
+        #
+        # The CUBE still merges them: both trees feed the one `insitu_sst` channel set, because
+        # ground truth is ground truth. `insitu_station` stays fixed-only.
+        sources={"ioos": "coastal_sst_data.processes.insitu_mobile",
+                 "csv": "coastal_sst_data.processes.insitu_mobile",
+                 "marineinsitu": "coastal_sst_data.processes.insitu_mobile"},
+        source_kind=SourceKind.DATA,
+        # NOTHING by default. Unlike `insitu`, no source here is the obvious one to want, and
+        # `marineinsitu` needs a credential -- selecting the product is the opt-in.
+        default_sources=(),
+        auth={"ioos": None, "csv": None, "marineinsitu": "copernicus"},
+        options=_COMMON | {
+            "sources", "variables", "stations", "exclude_stations", "qc_flags", "pad_deg",
+            "max_sensor_depth_m", "min_position_drift_m",
+            "path", "columns", "time_zone", "units", "qc_pass_values", "default_station_id",
+            "dataset_id", "dataset_part", "platform_types"},
+        region_options=frozenset({"sources", "stations", "exclude_stations", "variables",
+                                  "path", "dataset_id", "dataset_part"}),
+        # No `qc`: a flat observation list has already been QC-filtered at acquisition, and
+        # carrying a per-observation flag nothing reads would double the file (see
+        # InsituTable's note on the same decision).
+        required_vars=("sst",),
+        provenance_inputs=("insitu_mobile",),
+        cube_via="insitu",          # merged into the `insitu_*` channels -- see above
     ),
 )
 
@@ -708,6 +793,18 @@ def _check_registry() -> None:
                 raise RuntimeError(
                     f"{s.product.value}: sources_option {s.sources_option!r} is not in "
                     f"`options`; add it so the stacked-source list is a recognised key.")
+            # `default_sources` is what an unset list means, so it can only name real sources.
+            # A typo here would send the auth preflight looking for a backend under a key that
+            # does not exist, which is a KeyError deep inside validation rather than a message.
+            unknown = sorted(set(s.default_sources or ()) - set(s.sources))
+            if unknown:
+                raise RuntimeError(
+                    f"{s.product.value}: default_sources {unknown} are not among "
+                    f"{sorted(s.sources)}.")
+        elif s.default_sources:
+            raise RuntimeError(
+                f"{s.product.value}: default_sources is only meaningful for a stacked-DATA "
+                "product; a pick-one product uses default_source.")
         elif s.sources_option != "sources":
             # Only a stacked-DATA product has a stacked-source list to name.
             raise RuntimeError(

@@ -126,7 +126,7 @@ def test_process_order_is_stable_and_matches_the_previous_hand_kept_list():
     """The topological sort must not have quietly reshuffled a working pipeline."""
     assert [p.value for p in pipeline.process_order()] == [
         "bathymetry", "cmems", "ecostress", "landsat", "modis", "mur", "modis_ref",
-        "met", "met_overpass", "tides", "landcover", "insitu",
+        "met", "met_overpass", "tides", "landcover", "insitu", "insitu_mobile",
     ]
 
 

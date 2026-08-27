@@ -168,9 +168,15 @@ _EXACT = {
     "elevation": ["bathymetry"],
     "depth": ["bathymetry"], "depth_p25": ["bathymetry"], "depth_p75": ["bathymetry"],
     "landcover_water": ["landcover"],
-    "insitu_sst": ["insitu", "met"],      # sampled at met's reference time
-    "insitu_n": ["insitu"],
-    "insitu_station": ["insitu"],
+    # Both in-situ products feed these: a fixed station and a ship transect are both ground
+    # truth, and the cube merges them into one channel set (see the `insitu_mobile` ProductSpec).
+    "insitu_sst": ["insitu", "insitu_mobile", "met"],   # sampled at met's reference time
+    "insitu_n": ["insitu", "insitu_mobile"],
+    # WHEN each `insitu_sst` cell was observed -- only shipped when a moving platform is
+    # present, since a fixed station's value is at the reference time by construction. `met`
+    # is an input because the reference time is what a track's revisited pixel is chosen by.
+    "insitu_hour": ["insitu", "insitu_mobile", "met"],
+    "insitu_station": ["insitu"],         # FIXED stations only -- a track has no static pixel
     # purely computed from the time axis -- no data source at all
     "doy_sin": [], "doy_cos": [],
 }

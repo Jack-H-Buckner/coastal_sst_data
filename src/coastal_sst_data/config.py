@@ -792,7 +792,16 @@ def required_backend(product: DataProduct, opts) -> "str | None":
         s = spec(product)
         if s.is_stacked_data:
             key = s.sources_option
-            names = getattr(opts, key, None) or list(req)   # unset -> every known source
+            # Unset -> the product's OWN default list, which is what the acquisition stage will
+            # actually run. It used to fall back to every known source, which was invisible
+            # while all of a product's sources were public: the union of Nones is None either
+            # way. It stops being invisible the moment ONE source needs a credential -- the
+            # preflight then demands that credential from every config with the product
+            # selected and no explicit list, for a source the run will never touch.
+            # `default_sources` empty keeps the old reading, for products where it is right.
+            declared = (list(s.default_sources) if s.default_sources is not None
+                        else list(req))
+            names = getattr(opts, key, None) or declared
             if isinstance(names, str):
                 names = [names]
             unknown = sorted(n for n in names if n not in req)
