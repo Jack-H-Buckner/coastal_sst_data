@@ -106,6 +106,16 @@ log = logging.getLogger(__name__)
 PRODUCT_DIRS = products.product_dirs()
 
 
+class PartialRebuildError(RuntimeError):
+    """A partial rebuild's preconditions are not met, and the user is the one who can fix it.
+
+    Its own class so the CLI can render these as a message instead of a traceback WITHOUT also
+    swallowing an assembly bug that happens to raise RuntimeError -- every message here names
+    the remedy, and every one of them is `--overwrite`, a full assemble, or a different
+    `--products`.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Loaders (each returns arrays on the daily axis / shared AoI grid)
 # --------------------------------------------------------------------------- #
@@ -1289,6 +1299,11 @@ class AssemblyContext:
 
     `cache` is shared across every block of one AoI; pass it to the loaders that take it so
     a directory is scanned once per AoI rather than once per block.
+
+    `owner` / `emitting` are set by the ORCHESTRATOR around each contributor, never by a
+    contributor itself. `owner` records which contributor emitted each channel (the ledger a
+    partial rebuild needs -- see `channel_census`); `emitting=False` makes `emit` a no-op, for
+    a contributor that runs only to populate a slot another one reads (see `assemble_block`).
     """
     g: AoiGrid
     eff: dict
@@ -1302,6 +1317,9 @@ class AssemblyContext:
     var_attrs: dict[str, dict]
     all_days: Any = None
     cache: dict = field(default_factory=dict)
+    owner: str | None = None
+    emitting: bool = True
+    channel_owner: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.all_days is None:
@@ -1318,10 +1336,53 @@ class AssemblyContext:
                 / products.aligned_rel(PRODUCT_DIRS[product], source) / self.aid)
 
     def emit(self, name: str, dims, arr, **attrs) -> None:
-        """Add a channel (and, optionally, merge in its per-variable attrs)."""
+        """Add a channel (and, optionally, merge in its per-variable attrs).
+
+        A no-op when `emitting` is False: the contributor is running only to fill a slot, and
+        its channels are already on the cube being updated. Dropping the array HERE rather than
+        filtering `channels` afterwards is what keeps a partial rebuild's peak memory down --
+        the array is unreferenced as soon as the caller's local goes out of scope, instead of
+        being held to the end of the block.
+        """
+        if not self.emitting:
+            return
+        if self.owner is not None:
+            # Ownership must be a FUNCTION, or a partial rebuild cannot know whose channel it is
+            # replacing. Recorded on the write rather than diffed from `channels.keys()` after
+            # each contributor: a diff cannot see an OVERWRITE, and would attribute the channel
+            # to whoever created it rather than whoever last wrote it.
+            prev = self.channel_owner.get(name)
+            if prev is not None and prev != self.owner:
+                raise RuntimeError(
+                    f"channel {name!r} is emitted by both {prev!r} and {self.owner!r}; a "
+                    "channel must have exactly one owning contributor or a partial rebuild "
+                    "cannot tell whose it is.")
+            self.channel_owner[name] = self.owner
         self.channels[name] = (dims, arr)
         if attrs:
             self.var_attrs.setdefault(name, {}).update(attrs)
+
+    @contextlib.contextmanager
+    def running(self, key: str, *, emitting: bool = True):
+        """Run one contributor under this context: its channels attributed to `key`, and --
+        when `emitting` is False -- discarded along with anything else it says about the cube.
+
+        A non-emitting contributor is running only to fill a SLOT that a selected one reads, so
+        none of its opinions may land. `emit` drops its channels; the rollback here drops its
+        `global_attrs` too. Those attrs (the water-polarity record, the in-situ station table)
+        describe channels this run is NOT rebuilding, and the versions already on the cube are
+        the ones that match the values there -- re-deriving them from a config that has moved on
+        would leave the cube describing itself in terms of data it does not hold.
+        """
+        prior = None if emitting else dict(self.global_attrs)
+        self.owner, self.emitting = key, emitting
+        try:
+            yield self
+        finally:
+            self.owner, self.emitting = None, True
+            if prior is not None:
+                self.global_attrs.clear()
+                self.global_attrs.update(prior)
 
 
 @dataclass(frozen=True)
@@ -1889,6 +1950,111 @@ def _topo_order(contributors: tuple[Contributor, ...]) -> list[Contributor]:
     return out
 
 
+def contributor_plan(only=None) -> list[Contributor]:
+    """The contributors to RUN, in slot order, for a rebuild of `only` (None = every one).
+
+    A partial rebuild cannot just run the selected contributors. `met_overpass`, `tide_overpass`
+    and `insitu` read the per-sensor overpass times that `sensors` leaves in a slot, so `sensors`
+    has to RUN whenever one of them is selected -- even though none of its channels are being
+    replaced. So the selection is closed transitively over `reads` -> `writes`, and everything
+    outside that closure is skipped entirely, which is where a partial rebuild's speed comes
+    from. The callers run whatever the closure added with `emitting=False` (see
+    `AssemblyContext.running`), so a slot-filler costs its scan but changes nothing.
+
+    The closure runs over the graph `_topo_order` already validated, so it cannot pull in a
+    contributor that is not registered or starve on a slot with no producer.
+    """
+    order = _topo_order(CONTRIBUTORS)
+    if only is None:
+        return order
+    by_key = {c.key: c for c in CONTRIBUTORS}
+    writers: dict[str, list[str]] = {}
+    for c in CONTRIBUTORS:
+        for w in c.writes:
+            writers.setdefault(w, []).append(c.key)
+    need = set(only)
+    stack = [k for k in need if k in by_key]
+    while stack:
+        c = by_key[stack.pop()]
+        for r in c.reads:
+            for wk in writers.get(r, ()):
+                if wk not in need:
+                    need.add(wk)
+                    stack.append(wk)
+    return [c for c in order if c.key in need]
+
+
+def contributor_for_product(spec) -> str | None:
+    """Which contributor emits this product's channels -- None if it has no cube presence.
+
+    The one place the product -> contributor rule lives. Three cases, in order:
+
+      * `cube_opt_out`  -> None. The product acquires to disk and deliberately has no channel.
+      * `cube_via`      -> that contributor. `insitu_mobile`'s observations merge into the
+                           `insitu_*` channels, so its channels are `insitu`'s to rebuild.
+      * a SENSOR        -> `"sensors"`. Every per-overpass thermal sensor is served by one
+                           collective contributor, so ECOSTRESS and Landsat cannot be rebuilt
+                           independently of each other -- `--products ecostress` rebuilds all
+                           of them, and the CLI says so.
+      * otherwise       -> the product's own name.
+
+    Factored out of `_check_contributors` (which still enforces it at import) so the CLI's
+    `--products` validator resolves names by exactly the same rule rather than a second copy.
+    """
+    if spec.cube_opt_out:
+        return None
+    if spec.cube_via:
+        return spec.cube_via
+    if spec.sensor is not None:
+        return "sensors"
+    return spec.product.value
+
+
+def contributor_keys(prods) -> set[str] | None:
+    """The contributor keys a `--products` selection asks a partial rebuild to replace.
+
+    None for an empty selection, i.e. "assemble everything" -- the caller's signal to take the
+    full path. Raises for a selection that names nothing rebuildable, rather than quietly
+    rewriting a cube with no channel changed.
+
+    Two facts about the mapping the caller has to be TOLD, not left to discover from a diff:
+
+      * a `cube_opt_out` product has no channels at all, so naming it rebuilds nothing;
+      * the per-overpass thermal sensors share ONE contributor, so naming any of them rebuilds
+        all of them. That is not a limitation of the selection mechanism -- a day's clearest
+        overpass, and the overpass times every matchup channel keys off, are resolved across
+        the sensors together (`_contribute_sensors`) -- so it warns rather than pretending.
+    """
+    if not prods:
+        return None
+    keys: set[str] = set()
+    empty, sensors = [], []
+    for p in prods:
+        sp = products.spec(p)
+        key = contributor_for_product(sp)
+        if key is None:
+            empty.append(p.value)
+            continue
+        if sp.sensor is not None:
+            sensors.append(p.value)
+        keys.add(key)
+    if empty:
+        log.warning("  %s has no cube channels of its own (it acquires to disk only), so "
+                    "naming it rebuilds nothing.", ", ".join(sorted(empty)))
+    if not keys:
+        raise PartialRebuildError(
+            f"none of {sorted(p.value for p in prods)} contributes channels to the cube, so "
+            "there is nothing to rebuild. Drop --products to assemble the whole cube.")
+    if sensors:
+        others = sorted({s.product.value for s in products.REGISTRY
+                         if s.sensor is not None} - set(sensors))
+        if others:
+            log.warning("  every per-overpass thermal sensor is assembled together (one day, "
+                        "one clearest overpass, one set of matchup times), so naming %s "
+                        "rebuilds %s as well.", ", ".join(sorted(sensors)), ", ".join(others))
+    return keys
+
+
 def _check_contributors() -> None:
     """Fail LOUDLY at import if a non-sensor product has cube presence but no contributor.
 
@@ -1901,15 +2067,16 @@ def _check_contributors() -> None:
     for s in products.REGISTRY:
         if s.sensor is not None:        # covered collectively by the `sensors` contributor
             continue
-        if s.cube_opt_out:              # a product that deliberately has no cube presence
+        want = contributor_for_product(s)
+        if want is None:                # a product that deliberately has no cube presence
             continue
         if s.cube_via:                  # reaches the cube through another product's contributor
-            if s.cube_via not in keys:
+            if want not in keys:
                 raise RuntimeError(
                     f"{s.product.value}: cube_via={s.cube_via!r} names no registered "
                     f"contributor; choose from {sorted(keys)}.")
             continue
-        if s.product.value not in keys:
+        if want not in keys:
             raise RuntimeError(
                 f"{s.product.value}: no cube contributor registered. Add one to "
                 "datacube.CONTRIBUTORS, set cube_via to the contributor that emits its "
@@ -1925,7 +2092,8 @@ def _check_contributors() -> None:
 _check_contributors()
 
 
-def assemble_block(g: AoiGrid, eff: dict, days, *, all_days=None, cache=None) -> xr.Dataset:
+def assemble_block(g: AoiGrid, eff: dict, days, *, all_days=None, cache=None,
+                   only=None) -> xr.Dataset:
     """The cube's channels for ONE span of days -- no coverage, no provenance.
 
     UNIFORM CONTRIBUTOR PROTOCOL: every product -- sensor and non-sensor alike -- contributes
@@ -1943,14 +2111,19 @@ def assemble_block(g: AoiGrid, eff: dict, days, *, all_days=None, cache=None) ->
     The attrs set here are the ones contributors produce. The whole-cube attrs (coverage,
     provenance) are `finalize_attrs`'s job: they describe the finished cube, so a block cannot
     know them, and appending to a Zarr store overwrites the group attrs anyway.
+
+    `only` (a set of contributor keys) builds ONE PRODUCT'S share of the block, for a partial
+    rebuild: the returned Dataset holds just those contributors' channels, with everything the
+    closure pulled in for its slots run but discarded (`contributor_plan`).
     """
     ctx = AssemblyContext(
         g=g, eff=eff, days=days, aid=g.name, H=g.height, W=g.width,
         slots={}, channels={}, global_attrs={}, var_attrs={},
         all_days=all_days if all_days is not None else days,
         cache=cache if cache is not None else {})
-    for c in _topo_order(CONTRIBUTORS):
-        c.fn(ctx)
+    for c in contributor_plan(only):
+        with ctx.running(c.key, emitting=only is None or c.key in only):
+            c.fn(ctx)
 
     xs, ys = g.xy_centers()
     ds = xr.Dataset(ctx.channels, coords={"time": days, "y": ys, "x": xs})
@@ -1961,7 +2134,8 @@ def assemble_block(g: AoiGrid, eff: dict, days, *, all_days=None, cache=None) ->
     return ds
 
 
-def finalize_attrs(eff: dict, aid: str, fields, days, cov: dict, prod: dict) -> dict:
+def finalize_attrs(eff: dict, aid: str, fields, days, cov: dict, prod: dict,
+                   owners: dict | None = None) -> dict:
     """The whole-cube attrs: coverage (already tallied) plus provenance.
 
     Split out of `assemble_aoi` because both are properties of the FINISHED cube -- a blocked
@@ -1993,7 +2167,7 @@ def finalize_attrs(eff: dict, aid: str, fields, days, cov: dict, prod: dict) -> 
         log.warning("  %s: access dates for %s came from FILE MTIMES, not recorded stamps "
                     "(acquired before provenance existed, or the tree was copied)",
                     aid, ", ".join(sorted(guessed)))
-    return dict(
+    out = dict(
         coverage=json.dumps(cov, sort_keys=True),
         created_at=rec["created_at"], package_version=rec["package_version"],
         code_version=rec["code_version"],
@@ -2001,10 +2175,18 @@ def finalize_attrs(eff: dict, aid: str, fields, days, cov: dict, prod: dict) -> 
         config_yaml=rec["config_yaml"] or "",
         provenance=json.dumps(rec["fields"], sort_keys=True),
         provenance_products=json.dumps(rec["products"], sort_keys=True))
+    if owners is not None:
+        # WHO EMITTED WHAT. A partial rebuild reads this back to know which channels are the
+        # product it is replacing -- and, by subtracting the new census from it, which channels
+        # that product used to own and no longer does (a dropped CMEMS variable, a removed DEM
+        # source), so the cube stops shipping output the config no longer claims. The preprocess
+        # stage's `preprocess_channels` is the same idea for the same reason.
+        out["channel_owners"] = json.dumps(owners, sort_keys=True)
+    return out
 
 
 def finish_cube(ds: xr.Dataset, g: AoiGrid, eff: dict, days, cache: dict, hits=None,
-                grid_hits=None) -> dict:
+                grid_hits=None, owners=None) -> dict:
     """Release the AoI's cache, then stamp the whole-cube attrs on `ds`. Returns the coverage.
 
     Releasing the cache FIRST was once load-bearing: `provenance.collect` re-opens every
@@ -2030,7 +2212,7 @@ def finish_cube(ds: xr.Dataset, g: AoiGrid, eff: dict, days, cache: dict, hits=N
                              sparse=eff.get("sparse_daily", {}).get(g.name),
                              grid_hits=(coverage_grid_hits(ds) if grid_hits is None
                                         else grid_hits))
-    ds.attrs.update(finalize_attrs(eff, g.name, list(ds.data_vars), days, cov, prod))
+    ds.attrs.update(finalize_attrs(eff, g.name, list(ds.data_vars), days, cov, prod, owners))
     return cov
 
 
@@ -2235,14 +2417,38 @@ def channel_census(g: AoiGrid, eff: dict, days, *, cache=None) -> dict:
     placement, which met variant, whether a footprint layer exists -- is the scan they would
     have done anyway.
     """
+    return census_with_owners(g, eff, days, cache=cache)[0]
+
+
+def census_with_owners(g: AoiGrid, eff: dict, days, *, cache=None,
+                       only=None) -> tuple[dict, dict]:
+    """`channel_census`, plus {contributor key: [channel names]} -- who emits what.
+
+    The ownership half is what a PARTIAL rebuild stands on: to replace one product's channels
+    and carry the rest through, the assembler has to know which channels are that product's,
+    and there is no declarative map to read it off. (`provenance.field_inputs` is not one -- it
+    attributes `<sensor>_tide_<src>` to `tides` and the sensor, when the contributor that emits
+    it is `tide_overpass`. It answers "what data fed this channel", not "who wrote it".)
+
+    So ownership is recorded on the WRITE, by `AssemblyContext.emit`, over the same zero-length
+    pass the flat census already does -- no second traversal, and no second list to drift.
+
+    `only` narrows it to those contributors' channels -- what a partial rebuild is about to
+    replace, asked of the same code that will replace it.
+    """
     with _quiet(logging.getLogger(__package__.split(".")[0])):
         ctx = AssemblyContext(
             g=g, eff=eff, days=days[:0], aid=g.name, H=g.height, W=g.width,
             slots={}, channels={}, global_attrs={}, var_attrs={},
             all_days=days, cache=cache if cache is not None else {})
-        for c in _topo_order(CONTRIBUTORS):
-            c.fn(ctx)
-    return {name: (dims, np.asarray(arr).dtype) for name, (dims, arr) in ctx.channels.items()}
+        for c in contributor_plan(only):
+            with ctx.running(c.key, emitting=only is None or c.key in only):
+                c.fn(ctx)
+    census = {name: (dims, np.asarray(arr).dtype) for name, (dims, arr) in ctx.channels.items()}
+    owners: dict[str, list[str]] = {}
+    for name, key in ctx.channel_owner.items():
+        owners.setdefault(key, []).append(name)
+    return census, {k: sorted(v) for k, v in sorted(owners.items())}
 
 
 def bytes_per_day(census: dict, H: int, W: int) -> int:
@@ -2460,6 +2666,57 @@ def write_zarr_safe(ds: xr.Dataset, zpath: Path, encoding: dict):
         write_zarr(ds, tmp, encoding)
 
 
+def source_time_chunk(ds_cube: xr.Dataset) -> int | None:
+    """The on-disk time chunk of the store `ds_cube` was opened from, or None.
+
+    From `encoding["chunks"]`, which the Zarr backend fills with the array's REAL chunk shape --
+    not `.chunks`, which is the dask chunking `chunks="auto"` may have fused, and not
+    `datacube.chunks.time`, which is the CONFIGURED value. Those differ on exactly the cubes
+    this matters for: the assembler reduces the time chunk when the memory budget cannot hold
+    one chunk's worth of days, and a stage that REWRITES an existing cube -- preprocess, or a
+    partial assemble -- must inherit that reduction rather than quietly undo it by re-chunking
+    the whole store back to the config.
+
+    Lives here rather than in `preprocess` because both rewriting stages need it and neither
+    owns it; `preprocess` was merely the first to.
+    """
+    seen = set()
+    for name, da in ds_cube.data_vars.items():
+        if "time" not in da.dims:
+            continue
+        ch = da.encoding.get("chunks")
+        if ch:
+            seen.add(int(ch[list(da.dims).index("time")]))
+    if not seen:
+        return None
+    if len(seen) > 1:
+        log.warning("  the cube's variables disagree on their time chunk (%s); taking the "
+                    "largest so every append stays aligned", sorted(seen))
+    return max(seen)
+
+
+def _for_write(ds_blk: xr.Dataset, eff: dict, time_chunk: int) -> xr.Dataset:
+    """A block ready for `to_zarr`: the SOURCE store's encoding scrubbed, dask chunks matched.
+
+    For any stage that rewrites a cube it is reading. A block is `ds_cube.isel(time=...)`, so
+    every channel carried over from the source still holds the encoding of the store it was
+    OPENED from -- `chunks`, `preferred_chunks`, codecs, all measured against the OLD layout.
+    Zarr would then be told two different chunkings for one array, and on an append (which
+    passes no `encoding=`) the stale one wins. A FULL assemble never has this problem: its
+    blocks are freshly built arrays.
+
+    The rechunk is the other half. A zarr chunk spanning more than one dask chunk makes xarray
+    refuse the write outright; a dask chunk spanning the whole grid makes every `to_zarr` task
+    materialise a full slab, times the thread pool -- which is how the untouched channels, the
+    ones that are supposed to just stream through, would blow the budget anyway.
+    """
+    out = ds_blk.copy()
+    for v in out.data_vars:            # data_vars only: the `time` coord's units/calendar must
+        out[v].encoding = {}           # survive, or the axis is rewritten in a different epoch
+    return out.chunk({"time": time_chunk,
+                      "y": eff["chunks"].get("y", -1), "x": eff["chunks"].get("x", -1)})
+
+
 # --------------------------------------------------------------------------- #
 # Blocked assembly
 # --------------------------------------------------------------------------- #
@@ -2529,7 +2786,7 @@ def _merge_block_attrs(acc: dict, new: dict, block_i: int) -> None:
 
 
 def _assemble_blocked(g: AoiGrid, eff: dict, days, zpath: Path, *, block_days: int,
-                      time_chunk: int, census: dict, cache: dict) -> dict:
+                      time_chunk: int, census: dict, cache: dict, owners=None) -> dict:
     """Assemble and write one AoI a block of days at a time. Returns its coverage report.
 
     The whole run happens inside ONE `store.atomic`, so the cube at `zpath` is either the
@@ -2567,12 +2824,208 @@ def _assemble_blocked(g: AoiGrid, eff: dict, days, zpath: Path, *, block_days: i
                     del ds                                    # before the next block is built
             # `ds` is the LAST block, kept only so `finish_cube` can name the cube's fields
             # and hang the finished attrs somewhere; the values are already on disk.
-            cov = finish_cube(ds, g, eff, days, cache, hits=hits, grid_hits=grid_hits)
+            cov = finish_cube(ds, g, eff, days, cache, hits=hits, grid_hits=grid_hits,
+                              owners=owners)
             attrs.update(ds.attrs)      # + the whole-cube attrs finish_cube just stamped on
             finalize_cube(tmp, attrs)
     finally:
         log.removeFilter(quiet)
     return cov
+
+
+# --------------------------------------------------------------------------- #
+# Partial (per-product) assembly
+#
+# Rebuild ONE product's channels into an existing cube and carry the rest through untouched.
+# The expensive part of an assembly is per-contributor -- opening a season of granules, mosaicking
+# a day, snapping a station roster -- so re-fetching one product should not cost a re-read of
+# every other. What makes it safe is that the cube records WHO EMITTED WHAT (`channel_owners`,
+# written by `finalize_attrs` from the census ledger): without that ledger a rebuild could not
+# tell which channels are the product's to replace, nor which ones it USED to own and no longer
+# does. A cube assembled before the ledger existed therefore has to be built once in full.
+# --------------------------------------------------------------------------- #
+
+# A partial rebuild holds more at once than a full one: the source block streaming through
+# alongside the block it is building. Same reasoning as preprocess, same factor.
+_PARTIAL_TRANSIENT_FACTOR = 3.0
+
+
+def _check_partial_axes(ds_cube: xr.Dataset, g: AoiGrid, days, zname: str) -> None:
+    """Refuse a partial rebuild whose carried channels would not line up with the rebuilt ones.
+
+    The rebuilt channels are built on the CONFIG's axes; the carried ones come off the store on
+    the axes it was written with. A partial rebuild only means anything while those agree -- a
+    changed date range or a changed grid makes every carried channel the wrong shape, and there
+    is no partial answer to that, only a full assemble.
+    """
+    have = pd.DatetimeIndex(ds_cube["time"].values)
+    want = pd.DatetimeIndex(days)
+    if not have.equals(want):
+        raise PartialRebuildError(
+            f"{zname}: the cube spans {len(have)} day(s) "
+            f"({have[0].date()}..{have[-1].date()}) but the config asks for {len(want)} "
+            f"({want[0].date()}..{want[-1].date()}). A partial rebuild carries the other "
+            f"products' channels through on the cube's own time axis, so it cannot change "
+            f"that axis -- assemble the whole cube instead (--overwrite).")
+    if (int(ds_cube.sizes["y"]), int(ds_cube.sizes["x"])) != (g.height, g.width):
+        raise PartialRebuildError(
+            f"{zname}: the cube's grid is {ds_cube.sizes['y']}x{ds_cube.sizes['x']} but this "
+            f"AoI's grid is {g.height}x{g.width}. The carried channels are on the OLD grid -- "
+            f"assemble the whole cube instead (--overwrite).")
+
+
+def resolve_partial_plan(ds_cube: xr.Dataset, census: dict, owners: dict,
+                         keys: set[str]) -> tuple[list, list, dict, dict]:
+    """What a partial rebuild replaces, drops, carries through, and records afterwards.
+
+    Returns `(rebuilt, orphans, expected, owners_out)`:
+
+      * `rebuilt` -- the selected contributors' channels as the CURRENT config emits them.
+      * `orphans` -- channels the cube's ledger attributes to a selected contributor that it no
+        longer emits (a dropped CMEMS variable, a DEM source removed from the config). They are
+        dropped, or the cube keeps shipping output nothing claims.
+      * `expected` -- the finished cube's channel set (dims + dtype), for `_check_channel_set`.
+        Built from the SOURCE for the carried channels, never from a census: a census describes
+        what the CURRENT config would emit, and for a product this run is not rebuilding that
+        may differ from what is actually on the cube. The cube is the authority for those.
+      * `owners_out` -- the ledger to stamp back: the prior one for every contributor left
+        alone, this run's for the ones it replaced.
+
+    Raises when the cube carries no ledger, or when a rebuilt channel belongs to somebody else.
+    """
+    raw = ds_cube.attrs.get("channel_owners")
+    if not raw:
+        raise PartialRebuildError(
+            "this cube records no channel ownership, so a partial rebuild cannot tell which "
+            "channels belong to the product(s) you named. It was assembled before ownership "
+            "was recorded; assemble it once in full (--overwrite) and partial rebuilds work "
+            "from then on.")
+    prior = {k: list(v) for k, v in json.loads(raw).items()}
+    owned_by = {n: k for k, names in prior.items() for n in names}
+
+    # A channel this run would emit that the cube says belongs to a contributor we are NOT
+    # rebuilding. Assigning it anyway would replace another product's data with this one's.
+    foreign = sorted(n for n in census
+                     if n in ds_cube.data_vars and owned_by.get(n, None) not in keys)
+    if foreign:
+        raise PartialRebuildError(
+            f"channel(s) {foreign} are on the cube under a different contributor than the one "
+            f"rebuilding them now ({sorted(keys)}); ownership moved, so the cube and the code "
+            f"disagree about what these channels are. Assemble the whole cube (--overwrite).")
+
+    rebuilt = sorted(census)
+    orphans = sorted(({n for k in keys for n in prior.get(k, ())} - set(census))
+                     & set(ds_cube.data_vars))
+    expected = {n: (ds_cube[n].dims, ds_cube[n].dtype)
+                for n in ds_cube.data_vars if n not in orphans and n not in census}
+    expected.update(census)
+    owners_out = {k: v for k, v in prior.items() if k not in keys}
+    owners_out.update({k: sorted(v) for k, v in owners.items() if v})
+    return rebuilt, orphans, expected, {k: v for k, v in sorted(owners_out.items()) if v}
+
+
+def _merge_partial_block(ds_src: xr.Dataset, ds_new: xr.Dataset, orphans) -> xr.Dataset:
+    """One block of the source cube with the rebuilt channels swapped in, orphans dropped.
+
+    The new channels are assigned ONTO the source block, on the source's own coords -- not
+    merged with it. `assemble_block` rebuilds `y`/`x` from the grid, and two float axes that
+    agree to the last bit in principle are exactly what an `xr.merge` mis-aligns in practice.
+    """
+    keep = [n for n in ds_src.data_vars if n not in orphans and n not in ds_new.data_vars]
+    out = ds_src[keep]
+    for n, da in ds_new.data_vars.items():
+        out[n] = (da.dims, da.values, dict(da.attrs))
+    out.attrs.update(ds_new.attrs)
+    return out
+
+
+def _assemble_partial(g: AoiGrid, eff: dict, days, zpath: Path, *, keys: set[str],
+                      cache: dict) -> tuple[dict, int, tuple]:
+    """Rebuild the selected contributors' channels into the cube at `zpath`, in blocks.
+
+    Returns `(coverage, n_vars, shape)`. Like preprocess, the stage reads and writes the SAME
+    path, so the source must stay open across the whole loop and the swap happen only after it
+    closes -- hence `store.atomic` is driven here rather than through `write_zarr_safe`, and
+    the source's `with` encloses it. A run killed part-way leaves the existing cube untouched.
+    """
+    with xr.open_zarr(zpath) as ds_cube:
+        _check_partial_axes(ds_cube, g, days, zpath.name)
+        census, owners = census_with_owners(g, eff, days, cache=cache, only=keys)
+        rebuilt, orphans, expected, owners_out = resolve_partial_plan(
+            ds_cube, census, owners, keys)
+        carried = sorted(set(expected) - set(census))
+
+        # Both halves cost memory: the block being BUILT, and the source block streaming
+        # through beside it. Sizing off the rebuilt channels alone is how a one-product
+        # rebuild of a fifty-channel cube gets OOM-killed.
+        per_day = (bytes_per_day(census, g.height, g.width)
+                   + bytes_per_day({n: expected[n] for n in carried}, g.height, g.width))
+        # The block must not outrun the store it READS: inherit the on-disk time chunk rather
+        # than the configured one, which a previous assembly may have deliberately reduced.
+        tc_src = source_time_chunk(ds_cube) or eff["chunks"].get("time", len(days))
+        block_days, time_chunk = resolve_block_days(
+            {**eff, "chunks": {**eff["chunks"], "time": tc_src}}, per_day, len(days),
+            transient=_PARTIAL_TRANSIENT_FACTOR)
+        budget, src = budget_bytes(eff)
+        log.info("  rebuilding %d channel(s) from %s, carrying %d through%s: %.0f MB/day; "
+                 "budget %.1f GiB (%s) -> %d block(s) of %d day(s), time chunk %d",
+                 len(rebuilt), ", ".join(sorted(keys)), len(carried),
+                 f", dropping {len(orphans)}" if orphans else "",
+                 per_day / 1e6, budget / 1024**3, src,
+                 -(-len(days) // block_days), block_days, time_chunk)
+        if orphans:
+            log.info("  dropping %d channel(s) the selection no longer emits: %s",
+                     len(orphans), ", ".join(orphans))
+        if time_chunk != tc_src:
+            log.warning("  %s: the memory budget fits only %d day(s) per block, fewer than the "
+                        "store's time chunk of %d; the rebuilt cube is chunked at %d instead. "
+                        "Raise datacube.memory_budget_gb to keep the layout.",
+                        zpath.name, block_days, tc_src, time_chunk)
+
+        n = len(days)
+        blocks = [slice(i, min(i + block_days, n)) for i in range(0, n, block_days)]
+        hits: dict[str, int] = {}
+        grid_hits: dict[str, float] = {}
+        attrs: dict = {}
+        quiet = _LogOnce()
+        log.addFilter(quiet)
+        try:
+            with store.atomic(Path(zpath)) as tmp:
+                for i, sl in enumerate(blocks):
+                    blk = days[sl]
+                    ds_new = assemble_block(g, eff, blk, all_days=days, cache=cache, only=keys)
+                    _merge_block_attrs(attrs, dict(ds_new.attrs), i)
+                    ds = _merge_partial_block(ds_cube.isel(time=sl), ds_new, orphans)
+                    del ds_new
+                    _check_channel_set({k: (ds[k].dims, ds[k].dtype) for k in ds.data_vars},
+                                       expected, i, blk)
+                    for product, c in coverage_hits(ds).items():
+                        hits[product] = hits.get(product, 0) + c
+                    for product, frac in coverage_grid_hits(ds).items():
+                        grid_hits[product] = grid_hits.get(product, 0.0) + frac
+                    ds = _for_write(ds, eff, time_chunk)
+                    if i == 0:
+                        # Encoding settled against the FINISHED cube's shape, not this block's.
+                        write_zarr(ds, tmp, build_encoding(
+                            ds, eff["compression"], {**eff["chunks"], "time": time_chunk},
+                            sizes={"time": n}), consolidated=False)
+                    else:
+                        append_zarr(ds, tmp)
+                    log.info("    block %d/%d: %s..%s", i + 1, len(blocks),
+                             blk[0].date(), blk[-1].date())
+                    if i < len(blocks) - 1:
+                        del ds
+                # `ds` is the LAST block, kept so `finish_cube` can name the cube's fields and
+                # hang the finished attrs somewhere; the values are already on disk. It carries
+                # the SOURCE's attrs (it was built from a slice of it), so the products left
+                # alone keep their own -- see `AssemblyContext.running`.
+                cov = finish_cube(ds, g, eff, days, cache, hits=hits, grid_hits=grid_hits,
+                                  owners=owners_out)
+                nvars, shape = len(expected), (n, g.height, g.width)
+                finalize_cube(tmp, dict(ds.attrs))
+        finally:
+            log.removeFilter(quiet)
+    return cov, nvars, shape
 
 
 # --------------------------------------------------------------------------- #
@@ -2674,13 +3127,61 @@ def _build_eff(project: Project) -> dict:
     }
 
 
-def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
-    """Assemble one Zarr cube per AoI from the pre-computed shared grids."""
+def _report_cube(zpath: Path, nvars: int, shape: tuple, cov: dict, rep, *, verb: str) -> None:
+    """Log what one finished cube holds and how much of it is real, and fold it into the report.
+
+    Shared by the full and partial paths: a rebuilt cube deserves the same coverage scrutiny as
+    a fresh one -- more, if anything, since the point of rebuilding a product is usually that
+    its coverage was wrong.
+    """
+    # `t=%d` was always len(days) -- it said nothing about how much of the cube is real.
+    # Report the coverage the cube actually has, so a thin product is visible here.
+    # Days AND grid. Days alone said a product was complete when every one of its days
+    # held a single corner of the AoI -- which is what a tiled sensor looks like when its
+    # mosaic has collapsed onto one tile, and it read as 100% for a whole release.
+    cov_str = ", ".join(
+        f"{p} {100 * c['fraction']:.0f}% of days"
+        + (f" ({100 * c['grid_fraction']:.0f}% of grid)" if "grid_fraction" in c else "")
+        for p, c in sorted(cov.items()))
+    log.info("  %s %s  vars=%d shape=(t=%d,y=%d,x=%d)  coverage: %s", verb, zpath.name,
+             nvars, *shape, cov_str or "n/a")
+    rep.wrote()
+    thin = [p for p, c in cov.items() if c["fraction"] < COVERAGE_WARN]
+    if thin:
+        rep.note = f"thin coverage: {', '.join(sorted(thin))} (see the cube's `coverage` attr)"
+    # A product whose DAYS are well covered but whose GRID is not: every day arrived and
+    # every day is mostly empty. Sensor swaths legitimately clip a large AoI, so this
+    # warns rather than failing -- but it is the only place a corner-shaped cube announces
+    # itself, and silence here is what let one ship.
+    patchy = [p for p, c in cov.items()
+              if c["fraction"] >= COVERAGE_WARN
+              and c.get("grid_fraction", 1.0) < GRID_COVERAGE_WARN]
+    if patchy:
+        log.warning("  %s: covered on most days but filling under %.0f%% of the grid on "
+                    "those days (%s). A sensor can legitimately clip a large AoI; if it "
+                    "should not, check that every granule is contributing -- a mask that "
+                    "rejects everything collapses a mosaicked day onto one granule.",
+                    zpath.name, 100 * GRID_COVERAGE_WARN,
+                    ", ".join(f"{p} {100 * cov[p]['grid_fraction']:.0f}%"
+                              for p in sorted(patchy)))
+
+
+def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run, products=None):
+    """Assemble one Zarr cube per AoI from the pre-computed shared grids.
+
+    `products` restricts the run to those products' channels, rebuilt INTO the existing cube
+    with every other channel carried through (`_assemble_partial`). Naming products is itself
+    the intent to rewrite, so that path does not additionally require `overwrite` -- but it
+    does require a cube to rebuild into, since there is nothing to carry through without one.
+    """
     out_dir = eff["out_dir"]
     overwrite = eff["overwrite"]
     days = pd.date_range(eff["time"]["start_date"], eff["time"]["end_date"], freq="D")
 
     names = select_aois(grids, only_aoi)
+    # Resolved once, before any AoI is touched: a bad selection must fail before it has
+    # rewritten the first cube and left the run half-applied across the AoIs.
+    keys = contributor_keys(products)
 
     rep = report.ProductReport("datacube")
 
@@ -2690,23 +3191,44 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
     for name in names:
         g = grids[name]
         zpath = out_dir / f"{name}.zarr"
-        if zpath.exists() and not overwrite:
+        if keys is not None and not zpath.exists():
+            log.warning("=== %s: no cube at %s to rebuild into; a partial rebuild carries the "
+                        "other products' channels through, so there must be a cube to carry "
+                        "them FROM. Assemble it in full first -- skipping ===",
+                        name, zpath.name)
+            rep.skip()
+            continue
+        if keys is None and zpath.exists() and not overwrite:
             log.info("=== %s: %s exists, skipping (use overwrite) ===", name, zpath.name)
             rep.skip()
             continue
         store.sweep_scratch(zpath)      # clear scratch from a run that died mid-write
         if dry_run:
-            log.info("=== %s: [dry-run] would assemble %d day(s) -> %s ===",
-                     name, len(days), zpath.name)
+            if keys is not None:
+                log.info("=== %s: [dry-run] would rebuild %s into %s ===",
+                         name, ", ".join(sorted(keys)), zpath.name)
+            else:
+                log.info("=== %s: [dry-run] would assemble %d day(s) -> %s ===",
+                         name, len(days), zpath.name)
             continue
 
-        log.info("=== assembling %s (%d days, grid=%dx%d) ===", name, len(days), g.width, g.height)
+        if keys is not None:
+            log.info("=== rebuilding %s in %s (%d days, grid=%dx%d) ===",
+                     ", ".join(sorted(keys)), name, len(days), g.width, g.height)
+        else:
+            log.info("=== assembling %s (%d days, grid=%dx%d) ===",
+                     name, len(days), g.width, g.height)
 
         # How much cube is one day? Ask the contributors, over a zero-length axis, before
         # committing to anything -- and keep the scan they do for the blocks that follow.
         cache: dict = {}
         try:
-            census = channel_census(g, eff, days, cache=cache)
+            if keys is not None:
+                cov, nvars, shape = _assemble_partial(g, eff, days, zpath,
+                                                      keys=keys, cache=cache)
+                _report_cube(zpath, nvars, shape, cov, rep, verb="rebuilt")
+                continue
+            census, owners = census_with_owners(g, eff, days, cache=cache)
             per_day = bytes_per_day(census, g.height, g.width)
             block_days, time_chunk = resolve_block_days(eff, per_day, len(days))
             budget, src = budget_bytes(eff)
@@ -2728,59 +3250,36 @@ def run(eff: dict, grids: dict[str, AoiGrid], only_aoi, dry_run):
                 # through assemble_block rather than assemble_aoi so it inherits the scan the
                 # census already paid for, instead of repeating it.
                 ds = assemble_block(g, eff, days, all_days=days, cache=cache)
-                cov = finish_cube(ds, g, eff, days, cache)
+                cov = finish_cube(ds, g, eff, days, cache, owners=owners)
                 write_zarr_safe(ds, zpath,
                                 build_encoding(ds, eff["compression"], eff["chunks"]))
                 nvars, shape = len(ds.data_vars), (ds.sizes["time"], ds.sizes["y"], ds.sizes["x"])
                 del ds
             else:
                 cov = _assemble_blocked(g, eff, days, zpath, block_days=block_days,
-                                        time_chunk=time_chunk, census=census, cache=cache)
+                                        time_chunk=time_chunk, census=census, cache=cache,
+                                        owners=owners)
                 nvars, shape = len(census), (len(days), g.height, g.width)
         finally:
             close_cache(cache)
 
-        # `t=%d` was always len(days) -- it said nothing about how much of the cube is real.
-        # Report the coverage the cube actually has, so a thin product is visible here.
-        # Days AND grid. Days alone said a product was complete when every one of its days
-        # held a single corner of the AoI -- which is what a tiled sensor looks like when its
-        # mosaic has collapsed onto one tile, and it read as 100% for a whole release.
-        cov_str = ", ".join(
-            f"{p} {100 * c['fraction']:.0f}% of days"
-            + (f" ({100 * c['grid_fraction']:.0f}% of grid)" if "grid_fraction" in c else "")
-            for p, c in sorted(cov.items()))
-        log.info("  wrote %s  vars=%d shape=(t=%d,y=%d,x=%d)  coverage: %s", zpath.name,
-                 nvars, *shape, cov_str or "n/a")
-        rep.wrote()
-        thin = [p for p, c in cov.items() if c["fraction"] < COVERAGE_WARN]
-        if thin:
-            rep.note = f"thin coverage: {', '.join(sorted(thin))} (see the cube's `coverage` attr)"
-        # A product whose DAYS are well covered but whose GRID is not: every day arrived and
-        # every day is mostly empty. Sensor swaths legitimately clip a large AoI, so this
-        # warns rather than failing -- but it is the only place a corner-shaped cube announces
-        # itself, and silence here is what let one ship.
-        patchy = [p for p, c in cov.items()
-                  if c["fraction"] >= COVERAGE_WARN
-                  and c.get("grid_fraction", 1.0) < GRID_COVERAGE_WARN]
-        if patchy:
-            log.warning("  %s: covered on most days but filling under %.0f%% of the grid on "
-                        "those days (%s). A sensor can legitimately clip a large AoI; if it "
-                        "should not, check that every granule is contributing -- a mask that "
-                        "rejects everything collapses a mosaicked day onto one granule.",
-                        zpath.name, 100 * GRID_COVERAGE_WARN,
-                        ", ".join(f"{p} {100 * cov[p]['grid_fraction']:.0f}%"
-                                  for p in sorted(patchy)))
+        _report_cube(zpath, nvars, shape, cov, rep, verb="wrote")
 
     rep.log_summary()
     return rep
 
 
 def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
-             overwrite=False, memory_budget_gb=None) -> None:
+             overwrite=False, memory_budget_gb=None, products=None) -> None:
     """Assemble datacubes for a validated Project. Terminal pipeline stage.
 
     Same signature as every product's acquire(); reads only the aligned files the
     acquisition stages wrote, so it must run AFTER them.
+
+    `products` asks for a PARTIAL rebuild: only those products' channels are rebuilt, into the
+    existing cube, with every other channel carried through untouched. It needs a cube already
+    there to carry them from, and it needs that cube to carry the ownership ledger a full
+    assemble stamps on (`channel_owners`).
 
     `memory_budget_gb` overrides the config's (and the detection chain's) answer for THIS
     call. It exists for one caller: an orchestrator assembling several AoIs at once, which
@@ -2796,7 +3295,7 @@ def assemble(project: Project, *, grids=None, aois=None, dry_run=False,
         eff["memory_budget_gb"] = float(memory_budget_gb)
     if grids is None:
         grids = project_grids(project)
-    return run(eff, grids, aois, dry_run)
+    return run(eff, grids, aois, dry_run, products=products)
 
 
 def main():

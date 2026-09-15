@@ -6,6 +6,7 @@ was written with the expected chunking/compressor. No network, no real data."""
 import hashlib
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -14,8 +15,8 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from coastal_sst_data.config import parse_config, CompressionSpec
-from coastal_sst_data import grid, store
+from coastal_sst_data.config import parse_config, CompressionSpec, DataProduct
+from coastal_sst_data import grid, products, store
 from coastal_sst_data.processes import datacube
 
 
@@ -2249,6 +2250,82 @@ def test_channel_census_matches_the_assembled_cube(project, grids, days):
         assert dtype == ds[name].dtype, name
 
 
+def test_channel_owners_accounts_for_every_channel(project, grids, days):
+    """The ownership ledger a partial rebuild stands on: every channel, exactly one owner.
+
+    A channel missing from the ledger could never be rebuilt on its own; a channel claimed by
+    two contributors could be rebuilt by the wrong one. Both are silent, so both are asserted.
+    """
+    g = grids[AOI]
+    _write_full_fixture(project, g, days)
+    eff = _eff_with_overpass(project)
+    # ...and the tide matchups, so `tide_overpass` actually emits and can be attributed.
+    eff["tide_overpass_combos"] = [("eco", "coops"), ("lst", "coops")]
+
+    census, owners = datacube.census_with_owners(g, eff, days)
+    ds = datacube.assemble_aoi(g, eff, days)
+
+    owned = [n for names in owners.values() for n in names]
+    assert sorted(owned) == sorted(ds.data_vars), "the ledger and the cube disagree"
+    assert len(owned) == len(set(owned)), "a channel is claimed by two contributors"
+    assert set(owned) == set(census)
+    assert set(owners) <= {c.key for c in datacube.CONTRIBUTORS}
+
+    # The attribution must be by EMITTER, not by data lineage -- the distinction
+    # `provenance.field_inputs` gets wrong, and the reason ownership is recorded on the write.
+    assert "eco_tide_coops" in owners["tide_overpass"]
+    assert "eco_airtemp_hrrr" in owners["met_overpass"]
+    assert "eco_insitu_sst" in owners["insitu"]
+
+
+def test_a_channel_emitted_by_two_contributors_is_a_hard_error(project, grids, days):
+    """Two owners for one channel makes a partial rebuild ambiguous, so `emit` refuses it."""
+    ctx = datacube.AssemblyContext(
+        g=grids[AOI], eff=_eff_with_overpass(project), days=days, aid=AOI,
+        H=grids[AOI].height, W=grids[AOI].width,
+        slots={}, channels={}, global_attrs={}, var_attrs={})
+    arr = np.zeros((len(days), grids[AOI].height, grids[AOI].width), "float32")
+
+    ctx.owner = "mur"
+    ctx.emit("shared_sst", datacube.T3, arr)
+    ctx.owner = "mur"
+    ctx.emit("shared_sst", datacube.T3, arr)          # same owner re-emitting is fine
+
+    ctx.owner = "cmems"
+    with pytest.raises(RuntimeError, match="emitted by both"):
+        ctx.emit("shared_sst", datacube.T3, arr)
+
+
+def test_a_non_emitting_contributor_records_nothing(project, grids, days):
+    """`emitting=False` is how a slot-only contributor runs without replacing its channels."""
+    ctx = datacube.AssemblyContext(
+        g=grids[AOI], eff=_eff_with_overpass(project), days=days, aid=AOI,
+        H=grids[AOI].height, W=grids[AOI].width,
+        slots={}, channels={}, global_attrs={}, var_attrs={})
+    ctx.owner, ctx.emitting = "sensors", False
+    ctx.emit("eco_sst", datacube.T3, np.zeros((len(days), 2, 2), "float32"), long_name="x")
+
+    assert ctx.channels == {}
+    assert ctx.channel_owner == {}
+    assert ctx.var_attrs == {}, "a discarded channel must not leave its attrs behind"
+
+
+def test_contributor_for_product_matches_the_registry_rule():
+    """One rule, shared by the import-time check and the CLI's `--products` validator."""
+    spec = products.spec
+    assert datacube.contributor_for_product(spec(DataProduct.mur)) == "mur"
+    # Every per-overpass thermal sensor is served by the one collective contributor.
+    assert datacube.contributor_for_product(spec(DataProduct.ecostress)) == "sensors"
+    assert datacube.contributor_for_product(spec(DataProduct.landsat)) == "sensors"
+    # `cube_via` wins: moving platforms merge into the in-situ channels.
+    assert datacube.contributor_for_product(spec(DataProduct.insitu_mobile)) == "insitu"
+    # ...and every answer must name a contributor that actually exists.
+    keys = {c.key for c in datacube.CONTRIBUTORS}
+    for s in products.REGISTRY:
+        got = datacube.contributor_for_product(s)
+        assert got is None or got in keys, s.product.value
+
+
 def test_footprint_channel_survives_blocking_when_one_block_lacks_the_layer(tmp_path):
     """`footprint_id` is the one channel whose existence depends on file CONTENTS.
 
@@ -2378,6 +2455,346 @@ def test_a_failure_part_way_through_a_blocked_write_leaves_the_previous_cube_int
         assert _diff_snapshots(before, _snapshot(ds)) == []
     assert not list(zpath.parent.glob(f"{AOI}.zarr.part-*")), "scratch left behind"
     assert not list(zpath.parent.glob(f"{AOI}.zarr.old-*")), "stash left behind"
+
+
+# --------------------------------------------------------------------------- #
+# Partial rebuild (`assemble --products`)
+#
+# Editing one product's config must not cost a whole cube. The stage opens the existing store,
+# recomputes only the named contributors' channels and carries every other one through. The
+# contract is the same one blocking has: HOW the cube is written must not change WHAT is in it,
+# so the central test rebuilds with nothing changed on disk and demands a byte-identical cube.
+# --------------------------------------------------------------------------- #
+def _partial_project(tmp_path, n_days=4):
+    """A full-fixture project ready to assemble, plus its grid and days."""
+    p = _long_project(tmp_path, n_days=n_days)
+    g = grid.project_grids(p)[AOI]
+    days = pd.date_range(p.time.start_date, p.time.end_date, freq="D")
+    _write_full_fixture(p, g, days)
+    return p, g, days
+
+
+def _partial_eff(project, block_days=None, **over):
+    eff = _eff_with_overpass(project)
+    eff["tide_overpass_combos"] = [("eco", "coops"), ("lst", "coops")]
+    # A stacked sensor's overpass identity must not fall back to on-disk alphabetical order,
+    # or `aqua` silently becomes the identity every matchup keys off (see `_assemble_to_zarr`).
+    eff["sensor_version_pref"]["modis"] = ["terra", "aqua"]
+    if block_days is not None:
+        eff["block_days"] = block_days
+    eff.update(over)
+    return eff
+
+
+def _assemble(project, eff, products=None):
+    datacube.run(eff, grid.project_grids(project), None, False, products=products)
+
+
+def _partial_cube(eff):
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        return _snapshot(ds)
+
+
+def _changed_channels(diff) -> set[str]:
+    """The data_vars whose VALUES moved, out of `_diff_snapshots`' lines."""
+    return {d.split("[", 1)[1].split("]", 1)[0] for d in diff
+            if d.startswith("data_vars[") and "VALUES changed" in d}
+
+
+@pytest.mark.parametrize("block_days", [None, 2])
+@pytest.mark.parametrize("sel", [
+    [DataProduct.mur],                              # a pure leaf contributor
+    [DataProduct.insitu],                           # reads BOTH slots; forces sensors + met
+    [DataProduct.met_overpass],                     # reads one slot
+    [DataProduct.bathymetry, DataProduct.tides],    # more than one at a time
+])
+def test_a_partial_rebuild_is_identical_to_a_full_one(tmp_path, block_days, sel):
+    """THE test. With nothing changed on disk, rebuilding a product must reproduce the cube
+    exactly -- the same guarantee blocking gives, and for the same reason: a partial rebuild is
+    a way of WRITING the cube, not a different cube."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p, block_days=block_days)
+    _assemble(p, eff)
+    before = _partial_cube(eff)
+
+    _assemble(p, eff, products=sel)
+
+    diff = _diff_snapshots(before, _partial_cube(eff))
+    assert diff == [], (
+        f"rebuilding {[s.value for s in sel]} (block_days={block_days}) changed the cube:\n  "
+        + "\n  ".join(diff))
+
+
+def test_only_the_named_products_channels_change(tmp_path):
+    """The other half: a partial rebuild must actually PICK UP the product it names, and must
+    leave every channel it does not name alone -- even when their inputs moved too."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+    before = _partial_cube(eff)
+
+    # Move BOTH products' inputs -- the fixture writes a NaN hole in each, so closing the hole
+    # changes every cell of that channel -- then rebuild only one of them.
+    write_mur(p, g, days, water_hole_cols=slice(0, 0))
+    write_cmems(p, g, days, land_cols=slice(0, 0), src="my_global")
+
+    _assemble(p, eff, products=[DataProduct.mur])
+    after = _partial_cube(eff)
+
+    changed = _changed_channels(_diff_snapshots(before, after))
+    assert "mur_sst" in changed, "the rebuilt product did not pick up its new input"
+    assert "cmems_thetao_0m_my_global" not in changed, (
+        "a product that was NOT named was rebuilt from its changed input")
+
+
+def test_a_slot_producer_runs_but_its_channels_are_read_through(tmp_path):
+    """`insitu` needs the sensor overpass times, so `sensors` must RUN -- but its channels are
+    already on the cube and must be carried, not replaced. Moving the ECOSTRESS files proves
+    both halves at once: the matchup changes (the slot was really populated) and `eco_sst` does
+    not (the discard really discarded)."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+    before = _partial_cube(eff)
+
+    write_ecostress_two_scenes(p, g, days[0], tag="v002")     # same times, different values
+    for hh in (18, 20):
+        stamp = days[0].strftime("%Y%m%d") + f"T{hh:02d}0000"
+        path = (p.output_dir / "ECOSTRESS" / "v002" / "aligned" / AOI / f"{AOI}_{stamp}.nc")
+        with xr.open_dataset(path) as ds:
+            ds = ds.load()
+        ds["sst"] = ds["sst"] + 5.0
+        ds.to_netcdf(path)
+
+    _assemble(p, eff, products=[DataProduct.insitu])
+    after = _partial_cube(eff)
+
+    changed = _changed_channels(_diff_snapshots(before, after))
+    assert not any(c.startswith("eco_sst") for c in changed), (
+        f"a slot-only contributor replaced its own channels: {sorted(changed)}")
+    assert "eco_insitu_sst" not in changed, (
+        "the in-situ matchup is keyed on the overpass TIME, which did not move")
+
+
+def test_a_slot_only_contributor_does_not_restamp_its_global_attrs(tmp_path):
+    """`met` writes `met_time` even when its channels are discarded, so a partial rebuild of
+    `insitu` under a config that resolves the other variant would leave the cube describing met
+    data it is not holding. `AssemblyContext.running` rolls those attrs back."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        assert ds.attrs["met_time"] == "reference"
+
+    # insitu reads ref_utc, so met RUNS -- now under a config that would say "daily_mean".
+    _assemble(p, _partial_eff(p, met_time="daily_mean"), products=[DataProduct.insitu])
+
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        assert ds.attrs["met_time"] == "reference", (
+            "a slot-only met flipped the cube's met_time while its channels stayed put")
+
+
+def test_a_shrunken_product_drops_its_orphan_channels(tmp_path):
+    """A product whose channel set SHRANK must lose the channels it no longer emits, or the
+    cube keeps shipping output the config no longer claims."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        assert "cmems_thetao_0m_anfc_global" in ds.data_vars
+
+    shutil.rmtree(p.output_dir / "CMEMS" / "anfc_global")
+    _assemble(p, eff, products=[DataProduct.cmems])
+
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        assert "cmems_thetao_0m_anfc_global" not in ds.data_vars, "orphan channel survived"
+        assert "cmems_thetao_0m_my_global" in ds.data_vars, "the surviving source was dropped"
+        assert "mur_sst" in ds.data_vars, "a carried channel was dropped"
+        owners = json.loads(ds.attrs["channel_owners"])
+        assert owners["cmems"] == ["cmems_thetao_0m_my_global"], "the ledger was not updated"
+
+
+def test_a_product_absent_from_the_cube_can_be_added_by_a_partial_rebuild(tmp_path):
+    """Acquiring a product after the cube was built is the same operation as changing one: its
+    channels are simply not there yet, and nothing else may move to make room for them."""
+    p, g, days = _partial_project(tmp_path)
+    shutil.rmtree(p.output_dir / "TIDE")                  # assemble without tides
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+    before = _partial_cube(eff)
+    assert "tide_coops" not in before["data_vars"]
+
+    write_tides(p, g, days)
+    _assemble(p, eff, products=[DataProduct.tides])
+    after = _partial_cube(eff)
+
+    added = {d.split(": ")[-1] for d in _diff_snapshots(before, after)
+             if "channel ADDED" in d}
+    assert "tide_coops" in added and "tide_range_coops" in added
+    assert not {a for a in added if not a.startswith("tide")}, f"unrelated channels: {added}"
+
+
+def test_coverage_after_a_partial_rebuild_equals_a_full_ones(tmp_path):
+    """Coverage is tallied on the MERGED block, so it counts the carried channels as well as
+    the rebuilt ones -- no per-product merge, and no product silently reading 0%."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        full = json.loads(ds.attrs["coverage"])
+
+    _assemble(p, eff, products=[DataProduct.mur])
+    with xr.open_zarr(eff["out_dir"] / f"{AOI}.zarr") as ds:
+        assert json.loads(ds.attrs["coverage"]) == full
+
+
+def test_the_stores_time_chunk_survives_a_partial_rebuild(tmp_path):
+    """The rebuild must inherit the store's on-disk time chunk, not the configured one: a
+    previous assembly may have deliberately reduced it under the memory budget, and silently
+    re-chunking the whole cube back would undo that."""
+    p, g, days = _partial_project(tmp_path, n_days=8)
+    eff = _partial_eff(p, block_days=2)
+    _assemble(p, eff)
+    zpath = eff["out_dir"] / f"{AOI}.zarr"
+    with xr.open_zarr(zpath) as ds:
+        before = datacube.source_time_chunk(ds)
+
+    _assemble(p, eff, products=[DataProduct.mur])
+
+    with xr.open_zarr(zpath) as ds:
+        assert datacube.source_time_chunk(ds) == before
+
+
+def test_a_failure_part_way_through_a_partial_rebuild_leaves_the_cube_intact(
+        tmp_path, monkeypatch):
+    """The one that matters most. A partial rebuild rewrites the store it is reading, so a
+    botched write destroys channels it was not even rebuilding. `store.atomic` is what stops
+    that, and this is the test that proves it."""
+    p, g, days = _partial_project(tmp_path, n_days=8)
+    eff = _partial_eff(p, block_days=2)
+    _assemble(p, eff)
+    zpath = eff["out_dir"] / f"{AOI}.zarr"
+    with xr.open_zarr(zpath) as ds:
+        before = _snapshot(ds)
+
+    calls = {"n": 0}
+    real_append = datacube.append_zarr
+
+    def flaky(ds, path, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ConnectionError("the filesystem went away mid-rebuild")
+        return real_append(ds, path, **kw)
+
+    monkeypatch.setattr(datacube, "append_zarr", flaky)
+    with pytest.raises(ConnectionError):
+        _assemble(p, eff, products=[DataProduct.mur])
+
+    with xr.open_zarr(zpath) as ds:
+        assert _diff_snapshots(before, _snapshot(ds)) == []
+    assert not list(zpath.parent.glob(f"{AOI}.zarr.part-*")), "scratch left behind"
+    assert not list(zpath.parent.glob(f"{AOI}.zarr.old-*")), "stash left behind"
+
+
+def test_a_partial_rebuild_without_a_cube_is_skipped_not_built(tmp_path):
+    """There is nothing to carry the other products through FROM, so this cannot be served by
+    quietly assembling the whole cube -- that would hide a mistyped or forgotten first run."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p)
+    _assemble(p, eff, products=[DataProduct.mur])
+    assert not (eff["out_dir"] / f"{AOI}.zarr").exists()
+
+
+def test_a_cube_without_the_ownership_ledger_refuses_a_partial_rebuild(tmp_path):
+    """A cube assembled before ownership was recorded cannot say which channels belong to the
+    named product, so the rebuild stops and says to assemble once in full."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+    zpath = eff["out_dir"] / f"{AOI}.zarr"
+    import zarr
+    grp = zarr.open_group(str(zpath), mode="r+")
+    attrs = {k: v for k, v in dict(grp.attrs).items() if k != "channel_owners"}
+    grp.attrs.put(attrs)
+    zarr.consolidate_metadata(grp.store)
+
+    with pytest.raises(datacube.PartialRebuildError, match="no channel ownership"):
+        _assemble(p, eff, products=[DataProduct.mur])
+
+
+@pytest.mark.parametrize("n_days,match", [(5, "time axis|day"), (4, None)])
+def test_a_changed_time_axis_refuses_a_partial_rebuild(tmp_path, n_days, match):
+    """The carried channels come off the store on ITS axis; the rebuilt ones are built on the
+    config's. A partial rebuild means nothing once those disagree."""
+    p, g, days = _partial_project(tmp_path, n_days=4)
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+
+    longer = _long_project(tmp_path, n_days=n_days)
+    eff2 = _partial_eff(longer)
+    if match is None:
+        _assemble(longer, eff2, products=[DataProduct.mur])       # unchanged window: fine
+        return
+    with pytest.raises(datacube.PartialRebuildError, match="day"):
+        _assemble(longer, eff2, products=[DataProduct.mur])
+
+
+def test_a_changed_grid_refuses_a_partial_rebuild(tmp_path):
+    """Same reasoning as the time axis: every carried channel would be on the OLD grid."""
+    p, g, days = _partial_project(tmp_path)
+    eff = _partial_eff(p)
+    _assemble(p, eff)
+
+    wider = parse_config({
+        "name": "dc", "output_dir": str(tmp_path),
+        "time": {"start_date": str(p.time.start_date), "end_date": str(p.time.end_date)},
+        "products": {"bathymetry": None},
+        "regions": [{"name": "r", "areas": [
+            {"name": AOI, "center_lat": 45.5, "center_lon": -123.9,
+             "buffer_ns_km": 4, "buffer_ew_km": 4}]}],      # a bigger AoI -> a bigger grid
+    })
+    with pytest.raises(datacube.PartialRebuildError, match="grid"):
+        _assemble(wider, _partial_eff(wider), products=[DataProduct.mur])
+
+
+# --- the selection mapping -------------------------------------------------- #
+def test_contributor_keys_resolves_products_to_contributors():
+    assert datacube.contributor_keys(None) is None          # None == assemble everything
+    assert datacube.contributor_keys([]) is None
+    assert datacube.contributor_keys([DataProduct.mur]) == {"mur"}
+    # Moving platforms reach the cube through the in-situ contributor (`cube_via`).
+    assert datacube.contributor_keys([DataProduct.insitu_mobile]) == {"insitu"}
+    # Every per-overpass thermal sensor shares one contributor, so naming any names all.
+    assert datacube.contributor_keys([DataProduct.ecostress]) == {"sensors"}
+    assert datacube.contributor_keys(
+        [DataProduct.ecostress, DataProduct.landsat]) == {"sensors"}
+
+
+def test_a_selection_with_no_cube_channels_is_rejected(monkeypatch):
+    """Better to stop than to rewrite a whole store with not one channel changed.
+
+    No product sets `cube_opt_out` today, so the branch is reached by making the mapping say
+    "no channels" rather than by skipping -- the error is the contract, not the registry.
+    """
+    monkeypatch.setattr(datacube, "contributor_for_product", lambda spec: None)
+    with pytest.raises(datacube.PartialRebuildError, match="nothing to rebuild"):
+        datacube.contributor_keys([DataProduct.mur])
+
+
+def test_contributor_plan_pulls_in_the_slot_producers_it_needs():
+    """A selection is closed over the slot graph, and the closure keeps the full run order."""
+    full = [c.key for c in datacube.contributor_plan(None)]
+    assert full == [c.key for c in datacube._topo_order(datacube.CONTRIBUTORS)]
+
+    # A leaf needs nobody.
+    assert [c.key for c in datacube.contributor_plan({"mur"})] == ["mur"]
+    # in-situ reads both slots, so both producers come along...
+    insitu = [c.key for c in datacube.contributor_plan({"insitu"})]
+    assert set(insitu) == {"sensors", "met", "insitu"}
+    # ...and the closure must preserve the full order, or a slot is read before it is written.
+    assert insitu == [k for k in full if k in set(insitu)]
+    assert set(c.key for c in datacube.contributor_plan({"met_overpass"})) == {
+        "sensors", "met_overpass"}
 
 
 def test_a_contributor_that_varies_its_channels_by_block_is_a_hard_error(tmp_path):
