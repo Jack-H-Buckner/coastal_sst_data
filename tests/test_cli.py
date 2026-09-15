@@ -131,31 +131,67 @@ def test_grids_prints_each_aoi(config_file, capsys):
     assert "a1" in out and "EPSG:" in out         # base text output (no --plot)
 
 
-def test_assemble_subcommand_dispatches(config_file, monkeypatch):
-    seen = {}
-    def stub(project, *, aois=None, dry_run=False, overwrite=False, memory_budget_gb=None):
+def _stub_assemble(monkeypatch, seen):
+    def stub(project, *, aois=None, dry_run=False, overwrite=False, memory_budget_gb=None,
+             products=None):
         seen.update(aois=aois, dry_run=dry_run, overwrite=overwrite,
-                    memory_budget_gb=memory_budget_gb)
+                    memory_budget_gb=memory_budget_gb, products=products)
     monkeypatch.setattr("coastal_sst_data.processes.datacube.assemble", stub)
+    return seen
+
+
+def test_assemble_subcommand_dispatches(config_file, monkeypatch):
+    seen = _stub_assemble(monkeypatch, {})
 
     cli.main(["assemble", "--config", config_file, "--aoi", "a1", "--overwrite"])
 
     assert seen["aois"] == ["a1"]
     assert seen["overwrite"] is True and seen["dry_run"] is False
     assert seen["memory_budget_gb"] is None      # unset -> detect, exactly as before
+    assert seen["products"] is None              # unset -> assemble every product, as before
 
 
 def test_assemble_forwards_an_explicit_memory_budget(config_file, monkeypatch):
     """The knob an orchestrator uses to DIVIDE the budget between concurrent AoIs -- and a
     user needs by hand when the machine is shared."""
-    seen = {}
-    def stub(project, *, aois=None, dry_run=False, overwrite=False, memory_budget_gb=None):
-        seen.update(memory_budget_gb=memory_budget_gb)
-    monkeypatch.setattr("coastal_sst_data.processes.datacube.assemble", stub)
+    seen = _stub_assemble(monkeypatch, {})
 
     cli.main(["assemble", "--config", config_file, "--memory-budget-gb", "12.5"])
 
     assert seen["memory_budget_gb"] == 12.5
+
+
+def test_assemble_forwards_a_product_selection(config_file, monkeypatch):
+    """`--products` is how a user re-runs one product's channels into an existing cube after
+    changing its options, instead of paying for the whole cube again."""
+    seen = _stub_assemble(monkeypatch, {})
+
+    cli.main(["assemble", "--config", config_file, "--products", "mur", "insitu"])
+
+    assert seen["products"] == [DataProduct.mur, DataProduct.insitu]
+    assert seen["overwrite"] is False, "naming products must not imply --overwrite"
+
+
+def test_assemble_rejects_an_unknown_product(config_file, monkeypatch):
+    """A typo must stop the run, not quietly rebuild nothing."""
+    _stub_assemble(monkeypatch, {})
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["assemble", "--config", config_file, "--products", "mru"])
+    assert "unknown product" in str(exc.value)
+
+
+def test_assemble_reports_a_partial_rebuild_error_as_a_message(config_file, monkeypatch):
+    """A failed PRECONDITION (no cube, no ownership ledger, a moved time axis) is the user's to
+    fix and each message says how, so it must arrive as a message rather than a traceback."""
+    from coastal_sst_data.processes import datacube
+
+    def boom(project, **kw):
+        raise datacube.PartialRebuildError("this cube records no channel ownership")
+    monkeypatch.setattr("coastal_sst_data.processes.datacube.assemble", boom)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["assemble", "--config", config_file, "--products", "mur"])
+    assert "no channel ownership" in str(exc.value)
 
 
 def test_run_forwards_assemble_flag(config_file, monkeypatch):

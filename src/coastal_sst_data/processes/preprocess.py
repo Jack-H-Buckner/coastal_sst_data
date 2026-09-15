@@ -874,29 +874,12 @@ def finalize_preprocess_attrs(src_attrs: dict, block_attrs: dict, eff: dict, g: 
 _PP_TRANSIENT_FACTOR = 3.0
 
 
-def source_time_chunk(ds_cube: xr.Dataset) -> int | None:
-    """The on-disk time chunk of the store `ds_cube` was opened from, or None.
-
-    From `encoding["chunks"]`, which the Zarr backend fills with the array's REAL chunk shape --
-    not `.chunks`, which is the dask chunking `chunks="auto"` may have fused, and not
-    `datacube.chunks.time`, which is the CONFIGURED value. Those differ on exactly the cubes
-    this matters for: the assembler reduces the time chunk when the memory budget cannot hold
-    one chunk's worth of days, and preprocess must inherit that reduction rather than quietly
-    undo it by re-chunking the whole store back to the config.
-    """
-    seen = set()
-    for name, da in ds_cube.data_vars.items():
-        if "time" not in da.dims:
-            continue
-        ch = da.encoding.get("chunks")
-        if ch:
-            seen.add(int(ch[list(da.dims).index("time")]))
-    if not seen:
-        return None
-    if len(seen) > 1:
-        log.warning("  the cube's variables disagree on their time chunk (%s); taking the "
-                    "largest so every append stays aligned", sorted(seen))
-    return max(seen)
+# The two helpers every cube-REWRITING stage needs -- inheriting the store's time chunk, and
+# scrubbing the source's encoding off a carried-over block -- live in `datacube` now: a partial
+# assemble rewrites a cube too, and neither helper is preprocess's to own. Re-exported under
+# their old names so this module's callers (and its tests) read unchanged.
+source_time_chunk = datacube.source_time_chunk
+_for_write = datacube._for_write
 
 
 def _run_window_stats(eff: dict, ds_cube: xr.Dataset, g: AoiGrid, all_days, blocks,
@@ -923,27 +906,6 @@ def _run_window_stats(eff: dict, ds_cube: xr.Dataset, g: AoiGrid, all_days, bloc
                              pd.DatetimeIndex(all_days[sl]), all_days=all_days, ds_all=ds_cube,
                              window=window, cache=cache), p)
             step.window.reduce(probe, p)
-
-
-def _for_write(ds_blk: xr.Dataset, eff: dict, time_chunk: int) -> xr.Dataset:
-    """A block ready for `to_zarr`: the SOURCE store's encoding scrubbed, dask chunks matched.
-
-    A block is `ds_cube.isel(time=...)`, so every channel carried over from the source still
-    holds the encoding of the store it was OPENED from -- `chunks`, `preferred_chunks`, codecs,
-    all measured against the OLD layout. Zarr would then be told two different chunkings for one
-    array, and on an append (which passes no `encoding=`) the stale one wins. The assembler
-    never had this problem: its blocks are freshly built arrays.
-
-    The rechunk is the other half. A zarr chunk spanning more than one dask chunk makes xarray
-    refuse the write outright; a dask chunk spanning the whole grid makes every `to_zarr` task
-    materialise a full slab, times the thread pool -- which is how the untouched channels, the
-    ones that are supposed to just stream through, would blow the budget anyway.
-    """
-    out = ds_blk.copy()
-    for v in out.data_vars:            # data_vars only: the `time` coord's units/calendar must
-        out[v].encoding = {}           # survive, or the axis is rewritten in a different epoch
-    return out.chunk({"time": time_chunk,
-                      "y": eff["chunks"].get("y", -1), "x": eff["chunks"].get("x", -1)})
 
 
 def _preprocess_blocked(ds_cube: xr.Dataset, g: AoiGrid, eff: dict, zpath: Path, *,

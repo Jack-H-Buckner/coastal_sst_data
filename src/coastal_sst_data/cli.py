@@ -64,9 +64,17 @@ def _cmd_run(args):
 def _cmd_assemble(args):
     from .processes import datacube
     project = load_config(args.config)
-    datacube.assemble(project, aois=args.aois, dry_run=args.dry_run,
-                      overwrite=args.overwrite,
-                      memory_budget_gb=args.memory_budget_gb)
+    try:
+        datacube.assemble(project, aois=args.aois, dry_run=args.dry_run,
+                          overwrite=args.overwrite,
+                          memory_budget_gb=args.memory_budget_gb,
+                          products=_parse_products(args.products))
+    except datacube.PartialRebuildError as exc:
+        # A partial rebuild's preconditions (a selection with cube channels, a cube carrying
+        # the ownership ledger, an unchanged time axis) are the user's to fix, and each message
+        # says how. Its own class, not a bare RuntimeError, so an actual assembly bug still
+        # reaches the user as a traceback rather than being dressed up as bad input.
+        raise SystemExit(str(exc))
 
 
 def _cmd_preprocess(args):
@@ -317,6 +325,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Knit the aligned per-product outputs into per-AoI datacubes.")
     add_common(p_asm)
     p_asm.add_argument("--aoi", nargs="+", dest="aois", help="Only these AoI name(s).")
+    p_asm.add_argument("--products", nargs="+",
+                       help="Rebuild ONLY these products' channels into the existing cube, "
+                            "carrying every other channel through untouched. Needs a cube "
+                            "already assembled in full; implies a rewrite, so --overwrite is "
+                            "not required. The per-overpass thermal sensors share one "
+                            "contributor and are always rebuilt together.")
     p_asm.add_argument("--overwrite", action="store_true", help="Rebuild existing .zarr cubes.")
     p_asm.add_argument("--dry-run", action="store_true", help="Report only; write nothing.")
     p_asm.add_argument("--memory-budget-gb", type=float, default=None,
